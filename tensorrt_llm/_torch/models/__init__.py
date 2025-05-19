@@ -8,6 +8,7 @@ from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_mistral import MistralForCausalLM
+from .modeling_mistral3 import Mistral3Model
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
 from .modeling_nemotron_h import NemotronHForCausalLM
@@ -33,6 +34,7 @@ __all__ = [
     "LlavaNextModel",
     "MistralForCausalLM",
     "MixtralForCausalLM",
+    "Mistral3Model",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
     "NemotronNASForCausalLM",

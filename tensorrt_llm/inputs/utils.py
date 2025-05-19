@@ -322,4 +322,5 @@ INPUT_FORMATTER_MAP = {
     "qwen2_vl": format_qwen2_vl_input,
     "qwen2_5_vl": format_qwen2_vl_input,
     "llama4": format_generic_input,
+    "mistral3": format_generic_input,
 }
