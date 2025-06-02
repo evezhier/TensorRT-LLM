@@ -295,14 +295,14 @@ class SamplingParams:
                     f'In beam search, best_of ({self.best_of}) must be '
                     f'greater than or equal to n ({self.n}).')
 
-            if (self.best_of > 1 and self._greedy_decoding and
-                    not os.environ.get('TLLM_ALLOW_N_GREEDY_DECODING', None)):
-                raise ValueError(
-                    f'Greedy decoding in the LLM API does not allow multiple '
-                    f'returns. Please set to best_of=1, got best_of={self.best_of}. '
-                    f'Please set to best_of=1 or set an environment variable '
-                    f'TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 '
-                    f'under the greedy decoding.')
+            # if (self.best_of > 1 and self._greedy_decoding and
+            #         not os.environ.get('TLLM_ALLOW_N_GREEDY_DECODING', None)):
+            #     raise ValueError(
+            #         f'Greedy decoding in the LLM API does not allow multiple '
+            #         f'returns. Please set to best_of=1, got best_of={self.best_of}. '
+            #         f'Please set to best_of=1 or set an environment variable '
+            #         f'TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 '
+            #         f'under the greedy decoding.')
 
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
             raise ValueError(

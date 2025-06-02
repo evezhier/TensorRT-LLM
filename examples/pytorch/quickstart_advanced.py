@@ -98,6 +98,8 @@ def add_llm_args(parser):
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument('--load_format', type=str, default='auto')
+    parser.add_argument('--n', type=int, default=1)
+    parser.add_argument('--best_of', type=int, default=None)
 
     # Speculative decoding
     parser.add_argument('--spec_decode_algo', type=str, default=None)
@@ -187,6 +189,8 @@ def setup_llm(args):
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        n=args.n,
+        best_of=args.best_of
     )
     return llm, sampling_params
 
