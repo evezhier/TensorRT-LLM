@@ -58,7 +58,11 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
 
     result.isFinal = std::all_of(
         mSequenceFinalVec->begin(), mSequenceFinalVec->end(), [](bool isSequenceFinal) { return isSequenceFinal; });
-
+    TLLM_LOG_INFO("result.isSequenceFinal request %lu sequenceIndex %lu of %lu is %d", mRequestId, result.sequenceIndex, mSequenceFinalVec->size(), result.isSequenceFinal);
+    for(auto x :*mSequenceFinalVec){
+        std::cout << (x? "1": "0") << " ";
+        }
+    std::cout<<std::endl;
     auto const maxNbTokens = getMaxBeamNumTokens();
 
     if (isDisaggContextTransmissionState() && isContextOnlyRequest())

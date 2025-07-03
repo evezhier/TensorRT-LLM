@@ -204,8 +204,9 @@ def main():
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        for j, o in enumerate(output.outputs):
+            generated_text = o.text
+            print(f"[{i}] Prompt: {prompt!r}, Generated text: [{j}]{generated_text!r}")
 
 
 if __name__ == '__main__':

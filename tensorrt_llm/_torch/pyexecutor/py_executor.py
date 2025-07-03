@@ -67,11 +67,17 @@ def _get_from_request_queue(request_queue, timeout: datetime.timedelta,
                 items.append(queue_item)
                 if queue_item[0] != SHUTDOWN_REQUEST_ID:
                     # if it is request, not shutdown signal
-                    req_count += 1
+                    req_with_children = _get_num_child_requests(queue_item[1])+1 
+                    if req_with_children < max_req_count:
+                        req_count += req_with_children
+                    else: break # TODO okozlova: what if all request children don't fit in?
     except queue.Empty:
         pass
     return items
 
+def _get_num_child_requests(request: ExecutorRequest):
+    sampling_config = request.sampling_config
+    return 0 if sampling_config.beam_width > 1 else (sampling_config.num_return_sequences or 1) - 1
 
 @functools.cache
 def _load_iteration_indexes(env_var: str):
@@ -292,6 +298,7 @@ class PyExecutor:
         """
         Enqueue new requests
         """
+        logger.info(f"Enqueueing {len(requests)} requests")
         req_ids = []
         try:
             self.enqueue_lock.acquire()
@@ -299,8 +306,16 @@ class PyExecutor:
             start_time = time.time()
             for request in requests:
                 self.start_times[self.next_req_id] = start_time
-                self.request_queue.put((self.next_req_id, request))
+                child_req_ids = []
+                req_id = self.next_req_id
                 req_ids.append(self.next_req_id)
+                num_child_requests = _get_num_child_requests(request)
+                for _ in range (num_child_requests):
+                    self.next_req_id += 1
+                    child_req_ids.append(self.next_req_id)
+                    logger.info(f"Adding new child request with id {self.next_req_id}") 
+                self.request_queue.put((req_id, request, child_req_ids))
+                #self.request_queue.put((self.next_req_id, request))
                 self.next_req_id += 1
         finally:
             self.enqueue_lock.release()
@@ -406,6 +421,7 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
+            logger.info(f"Enqueuing new request with id {self.next_req_id}")
             req_id = self.next_req_id
             if self.enable_iter_perf_stats:
                 self.start_times[req_id] = time.time()
@@ -413,7 +429,13 @@ class PyExecutor:
             if query is not None:
                 self.request_queue.put((req_id, request, query))
             else:
-                self.request_queue.put((req_id, request))
+                child_req_ids = []
+                num_child_requests = _get_num_child_requests(request)
+                for _ in range(num_child_requests):
+                    self.next_req_id += 1
+                    child_req_ids.append(self.next_req_id)
+                    logger.info(f"Adding new child request with id {self.next_req_id}") 
+                self.request_queue.put((req_id, request, child_req_ids))  # TODO okozlova:
             self.next_req_id += 1
         finally:
             self.enqueue_lock.release()
@@ -1310,10 +1332,16 @@ class PyExecutor:
             if request[0] == SHUTDOWN_REQUEST_ID:
                 return True
         for req_item in new_requests:
-            req_id, exe_req = req_item
-            req = executor_request_to_llm_request(req_id, exe_req)
+            req_id, exe_req, child_req_ids = req_item
+            req = executor_request_to_llm_request(
+                req_id, exe_req, child_req_ids)
+            logger.info(f"children: {req.children}")
             self.active_requests.append(req)
-
+            logger.info(f"Request {req.request_id}: state: {req.state}")
+            for child in req.children:
+                self.active_requests.append(child)
+                logger.info(f"Child {child.request_id}: state: {child.state}")
+        logger.info(f"active_requests: {len(self.active_requests)}")
         return False
 
     def _finish_dummy_request(self, scheduled_requests: ScheduledRequests):
@@ -1472,8 +1500,10 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        logger.info(f"self.active_requests: {self.active_requests}")
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
+        logger.info(scheduler_output)
         scheduled_requests = ScheduledRequests()
 
         scheduled_requests.context_requests = scheduler_output.context_requests
@@ -1961,7 +1991,7 @@ class PyExecutor:
         # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
         self.canceled_requests = []
         for request in self.active_requests:
-            req_id = request.py_request_id
+            req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id in self.canceled_req_ids:
                 self._terminate_request(request)
                 request.finish_by_reason(FinishReason.CANCELLED)
@@ -2030,6 +2060,7 @@ class PyExecutor:
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
                     new_active_requests.append(request)
+                    logger.info(f"Request {request.request_id} is generation-only")
                     continue
 
             request.draft_tokens = request.py_draft_tokens
@@ -2037,15 +2068,21 @@ class PyExecutor:
             response: Response = request.create_response(False, self.dist.rank)
             request_done = False
             if response:
-                request_done = response.result.is_final
+                logger.info(f"got response for {request.request_id}")
+                request_done = request.is_finished
                 new_responses.update({req_id: response})
             if request_done:
+                logger.info(f"got final result for {request.request_id}")
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:
-                    requests_to_terminate.append(request)
+                    if response.result.is_final:
+                        requests_to_terminate.append(request)
+                        for child in request.children:
+                            requests_to_terminate.append(child)
             else:
                 new_active_requests.append(request)
+                logger.info(f"not done, appending: {request.request_id} with state: {request.state}")
         self.active_requests = new_active_requests
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
