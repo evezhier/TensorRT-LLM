@@ -1637,10 +1637,10 @@ class BaseLlmArgs(StrictBaseModel):
             "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub.",
             default=None)
 
-    tokenizer_mode: Literal['auto', 'slow'] = Field(
+    tokenizer_mode: Literal['auto', 'slow', 'mistral'] = Field(
         default='auto',
         description="The mode to initialize the tokenizer.",
-        json_schema_extra={"type": "Literal['auto', 'slow']"})
+        json_schema_extra={"type": "Literal['auto', 'slow', 'mistral']"})
 
     skip_tokenizer_init: bool = Field(
         default=False,

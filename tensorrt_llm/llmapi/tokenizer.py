@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Literal
 
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
@@ -19,6 +19,9 @@ except ImportError:
         f"HF incremental detokenization is unsupported by tokenizer<0.21.0; fallback to TRTLLM incremental detokenization."
     )
     TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = "TRTLLM"
+
+from mistral_common.tokens.tokenizers.mistral import Tekkenizer
+from mistral_common.tokens.tokenizers.mistral import MistralTokenizer as MistralCommonTokenizer
 
 
 class TokenizerBase(PreTrainedTokenizerBase):
@@ -267,6 +270,11 @@ class TransformersTokenizer(TokenizerBase):
             return prev_text + curr_new_text, states
 
 
+class MistralTokenizer(MistralCommonTokenizer):
+    def __init__(self, tokenizer):
+        raise NotImplementedError
+
+
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
                                           TokenizerBase]] = None,
                       **kwargs) -> Optional[TokenizerBase]:
@@ -361,5 +369,19 @@ def load_hf_tokenizer(model_dir: str,
     except Exception as e:
         logger.warning(
             f"Failed to load hf tokenizer from {model_dir}, encounter error: {e}"
+        )
+        return None
+
+
+def load_mistral_tokenizer(tokenizer_file: str,
+                            **kwargs) -> Optional[MistralTokenizer]:
+        try:
+            return MistralTokenizer.from_file(
+                tokenizer_file,
+                **kwargs)
+
+        except Exception as e:
+            logger.warning(
+            f"Failed to load mistral tokenizer from {tokenizer_file}, encounter error: {e}"
         )
         return None

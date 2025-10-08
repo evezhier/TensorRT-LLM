@@ -19,6 +19,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
+                                                       _load_weights_impl_v2,
                                                        register_auto_model)
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
@@ -619,8 +620,17 @@ class Mistral3PatchMerger(torch.nn.Module):
         image_features = self.merging_layer(image_features)
         return image_features
 
-    def load_weights(self, weights):
-        _load_weights_impl(self, weights)
+    def load_weights(self, weights, **kwargs):
+        weight_mapper = kwargs.get("weight_mapper")
+        params_map = kwargs.get("params_map")
+        if weight_mapper:
+            if params_map:
+                params_map.pop("attention")
+            _load_weights_impl_v2(self, weights, 
+                                weight_mapper=weight_mapper, 
+                                params_map=params_map)
+        else:
+            _load_weights_impl(self, weights)
 
 
 # Original implementation:
@@ -673,8 +683,17 @@ class Mistral3MultiModalProjector(torch.nn.Module):
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights):
-        _load_weights_impl(self, weights)
+    def load_weights(self, weights, **kwargs):
+        weight_mapper = kwargs.get("weight_mapper")
+        params_map = kwargs.get("params_map")
+        if weight_mapper:
+            if params_map:
+                params_map.pop("attention")
+            _load_weights_impl_v2(self, weights, 
+                                weight_mapper=weight_mapper, 
+                                params_map=params_map)
+        else:
+            _load_weights_impl(self, weights)
 
 
 def _filter_weights(weights: Dict[str, torch.Tensor],
