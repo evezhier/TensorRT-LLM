@@ -14,6 +14,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_pixtral
+from tensorrt_llm._torch.models.checkpoints import BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
+    MistralWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     find_input_mm_embeds, fuse_input_embeds, get_multimodal_embeddings)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -396,17 +399,33 @@ class Mistral3VLM(PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
-    def load_weights(self, weights: Dict, *args, **kwargs):
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: Optional["BaseWeightMapper"] = None,
+                     *args,
+                     **kwargs):
         llm_weights = _filter_weights(weights, "language_model.")
-        self.llm.load_weights(llm_weights, *args, **kwargs)
+        if weight_mapper and isinstance(weight_mapper, MistralWeightMapper):
+            params_map = weight_mapper.mistral_llm_mapping
+        self.llm.load_weights(llm_weights,
+                              weight_mapper=weight_mapper,
+                              params_map=params_map)
 
         vit_weights = _filter_weights(weights, "vision_tower.")
+        if weight_mapper and isinstance(weight_mapper, MistralWeightMapper):
+            vit_weights = weight_mapper.rename_by_params_map(
+                weights=vit_weights, params_map=weight_mapper.pixtral_mapping)
         self._vision_tower.load_weights(vit_weights, *args, **kwargs)
 
         mm_projector_weights = _filter_weights(weights,
                                                "multi_modal_projector.")
         # `_load_weights_impl` assumes `config.hidden_size` exists, which is not the case for the
         # top-level `Mistral3Config`.
+        if weight_mapper and isinstance(weight_mapper, MistralWeightMapper):
+            mm_projector_weights = weight_mapper.rename_by_params_map(
+                weights=mm_projector_weights,
+                params_map=weight_mapper.pixtral_mapping,
+            )
         self._multi_modal_projector.load_state_dict(mm_projector_weights)
 
     def infer_max_seq_len(self) -> int:
@@ -463,14 +482,16 @@ class Mistral3VLM(PreTrainedModel):
         # `ModelConfig` class.
         sub_model_config: ModelConfig[MistralConfig] = dataclasses.replace(
             model_config,
-            pretrained_config=getattr(model_config.pretrained_config, name),
+            pretrained_config=model_config.pretrained_config.get_text_config()
+            if name == "text" else getattr(model_config.pretrained_config,
+                                           name),
             **changes,
         )
         # Make sure some fields that are not explicitly included in the sub config, but present
         # in the top-level config, are replicated.
-        if (hasattr(sub_model_config.pretrained_config, "torch_dtype")
-                and sub_model_config.pretrained_config.torch_dtype is None):
-            sub_model_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
+        if (hasattr(sub_model_config.pretrained_config, "dtype")
+                and sub_model_config.pretrained_config.dtype is None):
+            sub_model_config.pretrained_config.dtype = model_config.pretrained_config.dtype
 
         return sub_model_config
 
@@ -620,17 +641,17 @@ class Mistral3PatchMerger(torch.nn.Module):
         image_features = self.merging_layer(image_features)
         return image_features
 
-    def load_weights(self, weights, **kwargs):
-        weight_mapper = kwargs.get("weight_mapper")
-        params_map = kwargs.get("params_map")
+    def load_weights(self,
+                     weights,
+                     weight_mapper: Optional["BaseWeightMapper"] = None,
+                     params_map: Optional[Dict] = None):
         if weight_mapper:
-            if params_map:
-                params_map.pop("attention")
-            _load_weights_impl_v2(self, weights, 
-                                weight_mapper=weight_mapper, 
-                                params_map=params_map)
+            _load_weights_impl_v2(self,
+                                  weights,
+                                  weight_mapper=weight_mapper,
+                                  params_map=params_map)
         else:
-            _load_weights_impl(self, weights)
+            _load_weights_impl(self, weights, params_map=params_map)
 
 
 # Original implementation:
@@ -683,17 +704,17 @@ class Mistral3MultiModalProjector(torch.nn.Module):
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
 
-    def load_weights(self, weights, **kwargs):
-        weight_mapper = kwargs.get("weight_mapper")
-        params_map = kwargs.get("params_map")
+    def load_weights(self,
+                     weights,
+                     weight_mapper: Optional["BaseWeightMapper"] = None,
+                     params_map: Optional[Dict] = None):
         if weight_mapper:
-            if params_map:
-                params_map.pop("attention")
-            _load_weights_impl_v2(self, weights, 
-                                weight_mapper=weight_mapper, 
-                                params_map=params_map)
+            _load_weights_impl_v2(self,
+                                  weights,
+                                  weight_mapper=weight_mapper,
+                                  params_map=params_map)
         else:
-            _load_weights_impl(self, weights)
+            _load_weights_impl(self, weights, params_map=params_map)
 
 
 def _filter_weights(weights: Dict[str, torch.Tensor],
