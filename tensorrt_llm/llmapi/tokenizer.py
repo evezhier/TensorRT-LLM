@@ -4,6 +4,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union, Literal
 
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
+from transformers.tokenization_mistral_common import (
+    MistralCommonTokenizer as TransformersMistralTokenizer,
+)
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
@@ -19,9 +22,6 @@ except ImportError:
         f"HF incremental detokenization is unsupported by tokenizer<0.21.0; fallback to TRTLLM incremental detokenization."
     )
     TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = "TRTLLM"
-
-from mistral_common.tokens.tokenizers.mistral import Tekkenizer
-from mistral_common.tokens.tokenizers.mistral import MistralTokenizer as MistralCommonTokenizer
 
 
 class TokenizerBase(PreTrainedTokenizerBase):
@@ -245,7 +245,7 @@ class TransformersTokenizer(TokenizerBase):
         *,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: Optional[bool] = None
-    ) -> Tuple[str, dict]:
+        ) -> Tuple[str, dict]:
         if states is None:
             states = {
                 'decode_stream':
@@ -270,10 +270,214 @@ class TransformersTokenizer(TokenizerBase):
             return prev_text + curr_new_text, states
 
 
-class MistralTokenizer(MistralCommonTokenizer):
-    def __init__(self, tokenizer):
+# Adapted from:
+# https://github.com/vllm-project/vllm/blob/8e67b2557aae7204c697d7a5c61e00754da465be/vllm/transformers_utils/tokenizers/mistral.py#L166
+class MistralTokenizer(TransformersTokenizer):
+    def __init__(self, tokenizer: "TransformersMistralTokenizer"):
+        from mistral_common.tokens.tokenizers.sentencepiece import (
+            SentencePieceTokenizer,
+        )
+        from mistral_common.tokens.tokenizers.tekken import Tekkenizer
+
+        self.transformers_tokenizer = tokenizer
+        self.mistral = tokenizer.tokenizer
+        self.instruct = self.mistral.instruct_tokenizer
+        self.tokenizer = self.instruct.tokenizer
+
+        _mistral_version_str = str(self.tokenizer.version.value)
+        self.version: int = int(_mistral_version_str.split("v")[-1])
+
+        self.is_tekken = isinstance(self.tokenizer, Tekkenizer)
+        self.is_spm = isinstance(self.tokenizer, SentencePieceTokenizer)
+        if not (self.is_tekken or self.is_spm):
+            raise TypeError(f"Unsupported tokenizer: {type(self.tokenizer)}")
+
+        # Reverse order to ensure that the lowest token id is kept.
+        self._vocab_dict = {
+            self.convert_ids_to_tokens([i], skip_special_tokens=False)[0]: i
+            for i in range(self.vocab_size - 1, -1, -1)
+        }
+        # Sort the dict for convenience
+        self._vocab_dict = dict(sorted(self._vocab_dict.items(), key=lambda x: x[1]))
+
+        # Vocab sorted by token id.
+        self._vocab = self.tokenizer._vocab
+        self._max_token_id = self.vocab_size - 1
+
+        self._all_special_tokens_set = set(self.all_special_tokens)
+
+    @property
+    def all_special_tokens(self) -> list[str]:
+        from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
+
+        return [
+            self.tokenizer.decode([i], special_token_policy=SpecialTokenPolicy.KEEP)
+            for i in self.all_special_ids
+        ]
+    
+    def __call__(self, text: str, *args, **kwargs) -> Any:
+        return self.transformers_tokenizer(
+                text=text,
+                *args, **kwargs
+            )
+    
+    @property
+    def name_or_path(self) -> str:
         raise NotImplementedError
 
+    def __len__(self) -> int:
+        return self.transformers_tokenizer.vocab_size
+
+    def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
+        raise NotImplementedError
+
+    def get_chat_template(self,
+                          chat_template: Optional[str] = None,
+                          tools: Optional[List[Dict]] = None) -> str:
+        raise NotImplementedError
+    
+    #TODO okozlova
+    @classmethod
+    def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
+        if Path(pretrained_model_dir).is_file():
+            tokenizer = TransformersMistralTokenizer(tokenizer_path=pretrained_model_dir)
+        else:
+            tokenizer = TransformersMistralTokenizer.from_pretrained(pretrained_model_dir)
+        return cls(tokenizer)
+
+    def clean_up_tokenization(self, out_string: str) -> str:
+        #self.transformers_tokenizer.clean_up_tokenization(out_string)
+        raise NotImplementedError
+        
+    @property
+    def is_fast(self) -> bool:
+        return True
+
+    def get_added_vocab(self) -> Dict[str, int]:
+        # Mistral tokenizers have no added vocabulary
+        return {}
+
+    def convert_tokens_to_string(self, 
+                                 tokens: list[str], 
+                                 skip_special_tokens: bool = False,
+                                 spaces_between_special_tokens: bool = True) -> str:
+        from mistral_common.tokens.tokenizers.base import (
+            SpecialTokenPolicy,
+            SpecialTokens,
+        )
+        from mistral_common.tokens.tokenizers.sentencepiece import (
+            SentencePieceTokenizer,
+        )
+        from mistral_common.tokens.tokenizers.tekken import Tekkenizer
+
+        to_decode_special_tokens = {SpecialTokens.tool_calls}
+        if self.is_tekken:
+            assert isinstance(self.tokenizer, Tekkenizer), type(self.tokenizer)
+            tokens = [
+                t
+                for t in tokens
+                if (t in to_decode_special_tokens or t not in self.all_special_tokens)
+            ]
+
+            if any(isinstance(t, bytes) for t in tokens):
+                # we need to encode and decode all tokens again
+                ids = [_tekken_token_to_id(self.tokenizer, t) for t in tokens]
+                # We filtered unwanted special tokens before
+                # so we can decode the rest.
+                decoded = self.tokenizer.decode(ids, SpecialTokenPolicy.KEEP)
+            else:
+                decoded = "".join(tokens)
+        else:
+            # make sure certain special tokens like Tool calls are
+            # not decoded
+            assert isinstance(self.tokenizer, SentencePieceTokenizer), type(
+                self.tokenizer
+            )
+
+            regular_tokens: list[str] = []
+            decoded_list: list[str] = []
+            decoded = ""
+
+            for token in tokens:
+                if token in to_decode_special_tokens:
+                    if regular_tokens:
+                        decoded_list.append(
+                            self.tokenizer.decode(
+                                regular_tokens, SpecialTokenPolicy.IGNORE
+                            )
+                        )
+                        regular_tokens = []
+                    decoded_list.append(token)
+                else:
+                    regular_tokens.append(token)
+
+            if regular_tokens:
+                decoded_list.append(
+                    self.tokenizer.decode(regular_tokens, SpecialTokenPolicy.IGNORE)
+                )
+            decoded = "".join(decoded_list)
+
+        return decoded
+
+    def convert_ids_to_tokens(
+        self,
+        ids: list[int],
+        skip_special_tokens: bool = True,
+    ) -> Union[str, List[str]]:
+        from mistral_common.tokens.tokenizers.base import (
+            SpecialTokenPolicy,
+            SpecialTokens,
+        )
+        from mistral_common.tokens.tokenizers.instruct import InstructTokenizerV13
+
+        if not skip_special_tokens:
+            return [self.tokenizer.id_to_piece(token_id) for token_id in ids]
+
+        non_skip_special_tokens_ids = {
+            self.tokenizer.get_control_token(SpecialTokens.tool_calls),
+        }
+        if isinstance(self.instruct, InstructTokenizerV13):
+            if self.instruct.BEGIN_THINK:
+                non_skip_special_tokens_ids.add(self.instruct.BEGIN_THINK)
+            if self.instruct.END_THINK:
+                non_skip_special_tokens_ids.add(self.instruct.END_THINK)
+
+        ids_kept = [
+            i
+            for i in ids
+            if i in non_skip_special_tokens_ids or not self._is_special_token_id(i)
+        ]
+
+        # We filtered unwanted special tokens so we can decode the rest.
+        tokens = [self.tokenizer.id_to_piece(token_id) for token_id in ids_kept]
+
+        if any("�" in t for t in tokens) and self.is_tekken:
+            # if a decoded token contains the replacement character, then the
+            # token has an incomplete UTF-8 character so we must use bytes
+            # See: https://github.com/vllm-project/vllm/pull/8640
+            #      https://github.com/vllm-project/vllm/pull/9625
+            # if underlying tokenizer is sentencepiece, we just add "�".
+            # We filtered unwanted special tokens so we can decode the rest.
+            tokens = [
+                self.tokenizer.id_to_byte_piece(token_id, SpecialTokenPolicy.KEEP)
+                if token_id not in self.all_special_ids
+                else self.tokenizer.decode([token_id], SpecialTokenPolicy.KEEP)
+                for token_id in ids_kept
+            ]
+
+        return tokens
+    
+    def hf_decode_incrementally(
+        self,
+        token_ids: List[int],
+        prev_text: Optional[str] = None,
+        states: Optional[dict] = None,
+        *,
+        skip_special_tokens: bool = False,
+        clean_up_tokenization_spaces: Optional[bool] = None
+        ) -> Tuple[str, dict]:
+        raise NotImplementedError
+        
 
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
                                           TokenizerBase]] = None,
