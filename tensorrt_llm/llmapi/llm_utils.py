@@ -6,7 +6,7 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 import transformers
@@ -38,7 +38,7 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 from .mpi_session import MPINodeState, MpiSession
-from .tokenizer import TransformersTokenizer, load_hf_tokenizer
+from .tokenizer import TransformersTokenizer, load_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (download_hf_model, download_hf_pretrained_config,
                     enable_llm_debug, get_directory_size_in_gb, logger_debug,
@@ -295,10 +295,10 @@ class ModelLoader:
         ''' Save the built engine on a single GPU to the given path. '''
         model.engine.save(engine_dir)
         if model.mapping.rank == 0:
-            tokenizer = ModelLoader.load_hf_tokenizer(
+            tokenizer = ModelLoader.load_tokenizer(
                 model_dir,
                 trust_remote_code=self.llm_args.trust_remote_code,
-                use_fast=self.llm_args.tokenizer_mode != 'slow')
+                tokenizer_mode=self.llm_args.tokenizer_mode)
             if tokenizer is not None:
                 tokenizer.save_pretrained(engine_dir)
 
@@ -562,12 +562,13 @@ class ModelLoader:
         self._engine = Engine.from_dir(self._model_dir)
 
     @staticmethod
-    def load_hf_tokenizer(model_dir,
-                          trust_remote_code: bool = True,
-                          use_fast: bool = True,
-                          **kwargs) -> Optional[TransformersTokenizer]:
-        if (tokenizer := load_hf_tokenizer(model_dir, trust_remote_code,
-                                           use_fast, **kwargs)) is not None:
+    def load_tokenizer(model_dir,
+                       trust_remote_code: bool = True,
+                       tokenizer_mode: Literal['auto', 'slow',
+                                               'mistral'] = 'auto',
+                       **kwargs) -> Optional[TransformersTokenizer]:
+        if (tokenizer := load_tokenizer(model_dir, trust_remote_code,
+                                        tokenizer_mode, **kwargs)) is not None:
             return tokenizer
         else:
             logger.warning(f"Failed to load tokenizer from {model_dir}")

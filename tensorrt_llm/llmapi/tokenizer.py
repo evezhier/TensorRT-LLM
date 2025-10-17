@@ -1,12 +1,16 @@
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, Literal
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
+from mistral_common.tokens.tokenizers.base import (SpecialTokenPolicy,
+                                                   SpecialTokens)
+from mistral_common.tokens.tokenizers.sentencepiece import \
+    SentencePieceTokenizer
+from mistral_common.tokens.tokenizers.tekken import Tekkenizer
 from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
                           PreTrainedTokenizerFast)
-from transformers.tokenization_mistral_common import (
-    MistralCommonTokenizer as TransformersMistralTokenizer,
-)
+from transformers.tokenization_mistral_common import \
+    MistralCommonTokenizer as TransformersMistralTokenizer
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
@@ -245,7 +249,7 @@ class TransformersTokenizer(TokenizerBase):
         *,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: Optional[bool] = None
-        ) -> Tuple[str, dict]:
+    ) -> Tuple[str, dict]:
         if states is None:
             states = {
                 'decode_stream':
@@ -273,11 +277,8 @@ class TransformersTokenizer(TokenizerBase):
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/8e67b2557aae7204c697d7a5c61e00754da465be/vllm/transformers_utils/tokenizers/mistral.py#L166
 class MistralTokenizer(TransformersTokenizer):
+
     def __init__(self, tokenizer: "TransformersMistralTokenizer"):
-        from mistral_common.tokens.tokenizers.sentencepiece import (
-            SentencePieceTokenizer,
-        )
-        from mistral_common.tokens.tokenizers.tekken import Tekkenizer
 
         self.transformers_tokenizer = tokenizer
         self.mistral = tokenizer.tokenizer
@@ -295,38 +296,83 @@ class MistralTokenizer(TransformersTokenizer):
         # Reverse order to ensure that the lowest token id is kept.
         self._vocab_dict = {
             self.convert_ids_to_tokens([i], skip_special_tokens=False)[0]: i
-            for i in range(self.vocab_size - 1, -1, -1)
+            for i in range(self.transformers_tokenizer.vocab_size - 1, -1, -1)
         }
         # Sort the dict for convenience
-        self._vocab_dict = dict(sorted(self._vocab_dict.items(), key=lambda x: x[1]))
+        self._vocab_dict = dict(
+            sorted(self._vocab_dict.items(), key=lambda x: x[1]))
 
         # Vocab sorted by token id.
         self._vocab = self.tokenizer._vocab
-        self._max_token_id = self.vocab_size - 1
+        self._max_token_id = self.transformers_tokenizer.vocab_size - 1
 
         self._all_special_tokens_set = set(self.all_special_tokens)
 
+    #TODO okozlova
+    @classmethod
+    def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
+        if Path(pretrained_model_dir).is_file():
+            tokenizer = TransformersMistralTokenizer(
+                tokenizer_path=pretrained_model_dir)
+        else:
+            tokenizer = TransformersMistralTokenizer.from_pretrained(
+                pretrained_model_dir)
+        return cls(tokenizer)
+
     @property
     def all_special_tokens(self) -> list[str]:
-        from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
-
         return [
-            self.tokenizer.decode([i], special_token_policy=SpecialTokenPolicy.KEEP)
+            self.tokenizer.decode([i],
+                                  special_token_policy=SpecialTokenPolicy.KEEP)
             for i in self.all_special_ids
         ]
-    
+
+    @property
+    def all_special_ids(self) -> list[int]:
+        from mistral_common.tokens.tokenizers.sentencepiece import \
+            SentencePieceTokenizer
+        from mistral_common.tokens.tokenizers.tekken import Tekkenizer
+
+        if self.is_tekken:
+            assert isinstance(self.tokenizer, Tekkenizer), type(self.tokenizer)
+            special_ids = {
+                t["rank"]
+                for t in self.tokenizer._all_special_tokens
+            }
+        elif self.is_spm:
+            assert isinstance(self.tokenizer,
+                              SentencePieceTokenizer), type(self.tokenizer)
+            special_ids = self.tokenizer._control_tokens
+        else:
+            raise ValueError(f"Unknown tokenizer type: {type(self.tokenizer)}")
+        return sorted(special_ids)
+
+    @property
+    def bos_token_id(self) -> int:
+        return self.tokenizer.bos_id
+
+    @property
+    def eos_token_id(self) -> int:
+        return self.tokenizer.eos_id
+
+    @property
+    def sep_token(self) -> str:
+        raise NotImplementedError()
+
+    @property
+    def pad_token(self) -> str:
+        return self.transformers_tokenizer.pad_token
+
+    @property
+    def pad_token_id(self) -> int:
+        return self.transformers_tokenizer.pad_token_id
+
     def __call__(self, text: str, *args, **kwargs) -> Any:
-        return self.transformers_tokenizer(
-                text=text,
-                *args, **kwargs
-            )
-    
+        return self.transformers_tokenizer(text=text, *args, **kwargs)
+
     @property
     def name_or_path(self) -> str:
         raise NotImplementedError
-
-    def __len__(self) -> int:
-        return self.transformers_tokenizer.vocab_size
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         raise NotImplementedError
@@ -335,20 +381,11 @@ class MistralTokenizer(TransformersTokenizer):
                           chat_template: Optional[str] = None,
                           tools: Optional[List[Dict]] = None) -> str:
         raise NotImplementedError
-    
-    #TODO okozlova
-    @classmethod
-    def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
-        if Path(pretrained_model_dir).is_file():
-            tokenizer = TransformersMistralTokenizer(tokenizer_path=pretrained_model_dir)
-        else:
-            tokenizer = TransformersMistralTokenizer.from_pretrained(pretrained_model_dir)
-        return cls(tokenizer)
 
     def clean_up_tokenization(self, out_string: str) -> str:
         #self.transformers_tokenizer.clean_up_tokenization(out_string)
         raise NotImplementedError
-        
+
     @property
     def is_fast(self) -> bool:
         return True
@@ -357,31 +394,58 @@ class MistralTokenizer(TransformersTokenizer):
         # Mistral tokenizers have no added vocabulary
         return {}
 
-    def convert_tokens_to_string(self, 
-                                 tokens: list[str], 
-                                 skip_special_tokens: bool = False,
-                                 spaces_between_special_tokens: bool = True) -> str:
-        from mistral_common.tokens.tokenizers.base import (
-            SpecialTokenPolicy,
-            SpecialTokens,
-        )
-        from mistral_common.tokens.tokenizers.sentencepiece import (
-            SentencePieceTokenizer,
-        )
+    def _tekken_token_to_id(self, tokenizer: "Tekkenizer",
+                            t: str | bytes) -> int:
+
+        assert isinstance(tokenizer, Tekkenizer), type(tokenizer)
+
+        t_bytes = t.encode("utf-8") if not isinstance(t, bytes) else t
+        shift = tokenizer.num_special_tokens
+        try:
+            return shift + tokenizer._tekken_token2id_nospecial[t_bytes]
+        except KeyError:
+            t_str = t_bytes.decode("utf-8")
+            if t_str in tokenizer._special_tokens_reverse_vocab:
+                return tokenizer._special_tokens_reverse_vocab[t_str]
+            logger.warning(
+                "Failed to convert token %s to id, replacing with <unk>",
+                t_bytes)
+            return tokenizer.unk_id
+
+    def _is_special_token_id(self, token_id: int) -> bool:
+        from mistral_common.tokens.tokenizers.sentencepiece import \
+            SentencePieceTokenizer
         from mistral_common.tokens.tokenizers.tekken import Tekkenizer
+
+        if self.is_spm:
+            assert isinstance(self.tokenizer,
+                              SentencePieceTokenizer), type(self.tokenizer)
+            return token_id in self.tokenizer._control_tokens
+        if self.is_tekken:
+            assert isinstance(self.tokenizer, Tekkenizer), type(self.tokenizer)
+            return token_id < self.tokenizer.num_special_tokens
+        else:
+            raise ValueError(f"Unknown tokenizer type: {type(self.tokenizer)}")
+
+    def convert_tokens_to_string(
+            self,
+            tokens: list[str],
+            skip_special_tokens: bool = False,
+            spaces_between_special_tokens: bool = True) -> str:
 
         to_decode_special_tokens = {SpecialTokens.tool_calls}
         if self.is_tekken:
             assert isinstance(self.tokenizer, Tekkenizer), type(self.tokenizer)
             tokens = [
-                t
-                for t in tokens
-                if (t in to_decode_special_tokens or t not in self.all_special_tokens)
+                t for t in tokens if (t in to_decode_special_tokens
+                                      or t not in self.all_special_tokens)
             ]
 
             if any(isinstance(t, bytes) for t in tokens):
                 # we need to encode and decode all tokens again
-                ids = [_tekken_token_to_id(self.tokenizer, t) for t in tokens]
+                ids = [
+                    self._tekken_token_to_id(self.tokenizer, t) for t in tokens
+                ]
                 # We filtered unwanted special tokens before
                 # so we can decode the rest.
                 decoded = self.tokenizer.decode(ids, SpecialTokenPolicy.KEEP)
@@ -390,9 +454,8 @@ class MistralTokenizer(TransformersTokenizer):
         else:
             # make sure certain special tokens like Tool calls are
             # not decoded
-            assert isinstance(self.tokenizer, SentencePieceTokenizer), type(
-                self.tokenizer
-            )
+            assert isinstance(self.tokenizer,
+                              SentencePieceTokenizer), type(self.tokenizer)
 
             regular_tokens: list[str] = []
             decoded_list: list[str] = []
@@ -402,10 +465,8 @@ class MistralTokenizer(TransformersTokenizer):
                 if token in to_decode_special_tokens:
                     if regular_tokens:
                         decoded_list.append(
-                            self.tokenizer.decode(
-                                regular_tokens, SpecialTokenPolicy.IGNORE
-                            )
-                        )
+                            self.tokenizer.decode(regular_tokens,
+                                                  SpecialTokenPolicy.IGNORE))
                         regular_tokens = []
                     decoded_list.append(token)
                 else:
@@ -413,22 +474,51 @@ class MistralTokenizer(TransformersTokenizer):
 
             if regular_tokens:
                 decoded_list.append(
-                    self.tokenizer.decode(regular_tokens, SpecialTokenPolicy.IGNORE)
-                )
+                    self.tokenizer.decode(regular_tokens,
+                                          SpecialTokenPolicy.IGNORE))
             decoded = "".join(decoded_list)
 
         return decoded
 
+    def encode(
+        self,
+        text: str,
+        truncation: bool | None = None,
+        max_length: int | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> List[int]:
+        if add_special_tokens is not None:
+            return self.transformers_tokenizer.encode(
+                text,
+                truncation=truncation,
+                max_length=max_length,
+                add_special_tokens=add_special_tokens,
+            )
+        else:
+            encoded = self.tokenizer.encode(text, bos=True, eos=False)
+
+            if truncation is not False and max_length is not None:
+                return encoded[:max_length]
+            else:
+                return encoded
+
+    def decode(self,
+               token_ids: list[int] | int,
+               skip_special_tokens: bool = True,
+               *args,
+               **kwargs) -> str:
+        return self.transformers_tokenizer.decode(
+            token_ids, skip_special_tokens=skip_special_tokens)
+
     def convert_ids_to_tokens(
         self,
-        ids: list[int],
+        ids: Union[int, List[int]],
         skip_special_tokens: bool = True,
     ) -> Union[str, List[str]]:
-        from mistral_common.tokens.tokenizers.base import (
-            SpecialTokenPolicy,
-            SpecialTokens,
-        )
-        from mistral_common.tokens.tokenizers.instruct import InstructTokenizerV13
+        from mistral_common.tokens.tokenizers.base import (SpecialTokenPolicy,
+                                                           SpecialTokens)
+        from mistral_common.tokens.tokenizers.instruct import \
+            InstructTokenizerV13
 
         if not skip_special_tokens:
             return [self.tokenizer.id_to_piece(token_id) for token_id in ids]
@@ -443,9 +533,8 @@ class MistralTokenizer(TransformersTokenizer):
                 non_skip_special_tokens_ids.add(self.instruct.END_THINK)
 
         ids_kept = [
-            i
-            for i in ids
-            if i in non_skip_special_tokens_ids or not self._is_special_token_id(i)
+            i for i in ids if i in non_skip_special_tokens_ids
+            or not self._is_special_token_id(i)
         ]
 
         # We filtered unwanted special tokens so we can decode the rest.
@@ -459,14 +548,15 @@ class MistralTokenizer(TransformersTokenizer):
             # if underlying tokenizer is sentencepiece, we just add "�".
             # We filtered unwanted special tokens so we can decode the rest.
             tokens = [
-                self.tokenizer.id_to_byte_piece(token_id, SpecialTokenPolicy.KEEP)
-                if token_id not in self.all_special_ids
-                else self.tokenizer.decode([token_id], SpecialTokenPolicy.KEEP)
+                self.tokenizer.id_to_byte_piece(token_id,
+                                                SpecialTokenPolicy.KEEP)
+                if token_id not in self.all_special_ids else
+                self.tokenizer.decode([token_id], SpecialTokenPolicy.KEEP)
                 for token_id in ids_kept
             ]
 
         return tokens
-    
+
     def hf_decode_incrementally(
         self,
         token_ids: List[int],
@@ -475,9 +565,9 @@ class MistralTokenizer(TransformersTokenizer):
         *,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: Optional[bool] = None
-        ) -> Tuple[str, dict]:
+    ) -> Tuple[str, dict]:
         raise NotImplementedError
-        
+
 
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
                                           TokenizerBase]] = None,
@@ -492,8 +582,11 @@ def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
             'trust_remote_code': True,
             'use_fast': True,
         }
+        tokenizer_mode = kwargs.pop('tokenizer_mode', None)
+        kwargs['use_fast'] = tokenizer_mode != 'slow'
         default_kwargs.update(kwargs)
-        return TransformersTokenizer.from_pretrained(obj, **default_kwargs)
+        tokenizer_cls = MistralTokenizer if tokenizer_mode == 'mistral' else TransformersTokenizer
+        return tokenizer_cls.from_pretrained(obj, **default_kwargs)
     elif isinstance(obj, TokenizerBase):
         return obj
     elif isinstance(obj, PreTrainedTokenizerBase):
@@ -578,14 +671,27 @@ def load_hf_tokenizer(model_dir: str,
 
 
 def load_mistral_tokenizer(tokenizer_file: str,
-                            **kwargs) -> Optional[MistralTokenizer]:
-        try:
-            return MistralTokenizer.from_file(
-                tokenizer_file,
-                **kwargs)
+                           **kwargs) -> Optional[MistralTokenizer]:
+    try:
+        return MistralTokenizer.from_pretrained(tokenizer_file, **kwargs)
 
-        except Exception as e:
-            logger.warning(
+    except Exception as e:
+        logger.warning(
             f"Failed to load mistral tokenizer from {tokenizer_file}, encounter error: {e}"
         )
-        return None
+    return None
+
+
+def load_tokenizer(model_dir: str,
+                   trust_remote_code: bool = True,
+                   tokenizer_mode: Literal['auto', 'slow', 'mistral'] = 'auto',
+                   **kwargs) -> Optional[TransformersTokenizer]:
+
+    if tokenizer_mode == 'mistral':
+        return load_mistral_tokenizer(tokenizer_file=model_dir)
+    else:
+        use_fast = tokenizer_mode != 'slow'
+        return load_hf_tokenizer(model_dir=model_dir,
+                                 trust_remote_code=trust_remote_code,
+                                 use_fast=use_fast,
+                                 **kwargs)

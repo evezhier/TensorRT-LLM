@@ -718,10 +718,10 @@ class BaseLLM:
             if num_lora_dirs == 1:
                 tokenizer_path = self.args.lora_config.lora_dir[0]
                 try:
-                    tokenizer = ModelLoader.load_hf_tokenizer(
+                    tokenizer = ModelLoader.load_tokenizer(
                         tokenizer_path,
                         trust_remote_code=self.args.trust_remote_code,
-                        use_fast=self.args.tokenizer_mode != 'slow')
+                        tokenizer_mode=self.args.tokenizer_mode)
                     if tokenizer is None:
                         tokenizer_path = self.args.model
                     else:
@@ -732,10 +732,10 @@ class BaseLLM:
                 tokenizer_path = self.args.model
         else:
             tokenizer_path = self.args.model
-        return ModelLoader.load_hf_tokenizer(
+        return ModelLoader.load_tokenizer(
             tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
-            use_fast=self.args.tokenizer_mode != 'slow')
+            tokenizer_mode=self.args.tokenizer_mode)
 
     @property
     def tokenizer(self) -> Optional[TokenizerBase]:

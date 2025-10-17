@@ -222,7 +222,7 @@ class PyTorchModelEngine(ModelEngine):
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
         self._disable_overlap_scheduler = self.llm_args.disable_overlap_scheduler
         self._torch_compile_backend = None
-        self.dtype = self.model.config.torch_dtype
+        self.dtype = self.model.config.torch_dtype or self.model.model_config.torch_dtype
         self._init_model_capacity()
 
         self.cuda_graph_config = self.llm_args.cuda_graph_config

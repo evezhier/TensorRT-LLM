@@ -1979,7 +1979,7 @@ class BaseLlmArgs(StrictBaseModel):
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
                 trust_remote_code=self.trust_remote_code,
-                use_fast=self.tokenizer_mode != 'slow')
+                tokenizer_mode=self.tokenizer_mode)
         return self
 
     @model_validator(mode="after")
