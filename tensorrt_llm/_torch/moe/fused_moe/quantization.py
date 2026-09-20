@@ -5150,14 +5150,16 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                     module.intermediate_size_per_partition, dim=0)
 
             if w3_weight_shard is not None:
-                dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+                dst_w3_weight.copy_(w3_weight_shard.contiguous().view(
+                    dst_w3_weight.dtype))
             if w1_weight_shard is not None:
-                dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+                dst_w1_weight.copy_(w1_weight_shard.contiguous().view(
+                    dst_w1_weight.dtype))
         else:
             # Non-gated activation (e.g., ReLU2): buffer only contains w1
             if w1_weight_shard is not None:
-                dst_w3_w1_weight.copy_(
-                    w1_weight_shard.view(dst_w3_w1_weight.dtype))
+                dst_w3_w1_weight.copy_(w1_weight_shard.contiguous().view(
+                    dst_w3_w1_weight.dtype))
 
         # Shuffle deferred to process_weights_after_loading().
 
