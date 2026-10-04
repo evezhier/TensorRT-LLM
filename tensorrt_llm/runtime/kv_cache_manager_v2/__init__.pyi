@@ -230,6 +230,30 @@ class DiskCacheTierConfig:
     def tier(self) -> CacheTier: ...
     def assert_valid(self) -> None: ...
 
+@dataclass(slots=True, frozen=True)
+class SelectionUnitLayout:
+    """Where one selection unit's bytes sit inside a sparse buffer.
+
+    Buffer-relative, carrying no page offset. ``BufferConfig`` is an input to the
+    ``KVCacheManager`` constructor, while a buffer's placement inside a cold page is not
+    settled until the cold-page codec is configured during that construction, so a
+    page-relative offset could not be supplied here. The manager adds both page offsets
+    itself, which is why this path requires the default cold-page codec: its cold page is
+    a plain concatenation of buffers, so their offsets are known.
+
+    Describes the cold side only. The default codec relocates a buffer's bytes verbatim,
+    so a unit is laid out identically in a cold page and in a hot slot, and one set of
+    strides serves both with only the unit index differing.
+
+    ``num_chunks * chunk_bytes`` must equal ``BufferConfig.size``, which is already
+    per-unit.
+    """
+
+    num_chunks: int  # one per head; 1 for token-major
+    chunk_bytes: int  # contiguous bytes of one unit within one chunk
+    chunk_stride: int
+    unit_stride: int
+
 @dataclass(slots=True)
 class BufferConfig:
     """One buffer of a layer's KV cache.
@@ -247,10 +271,22 @@ class BufferConfig:
     buffer of its lifecycle, a sparse buffer requires a lifecycle of its own; sharing one
     with a non-sparse buffer raises from the ``KVCacheManager`` constructor.
 
-    The buffer still has a GPU-tier pool, but for a sparse buffer it also carries scratch,
-    in the manner of SWA scratch reuse: the per-layer pure-history pages a step actually
-    selects are copied up by :meth:`KVCacheManager.fetch_sparse_pages`. That region is
-    sized by the selection width, not by sequence length.
+    The buffer still has a GPU-tier pool. For a sparse buffer that pool additionally
+    backs a per-request history cache: each :class:`_KVCache` reserves up to
+    ``max_cached_units`` of it and holds
+    ``min(max_cached_units, history_length // tokens_per_block)``. Because a page already
+    carries one buffer per coalesced layer, reserved pages give every layer its own
+    entries -- so an entry is a (page, layer) pair, and one page may hold different
+    layers' data for different ordinals. :meth:`KVCacheManager.fetch_sparse_pages` fills
+    them, replacing by LRU.
+
+    Set ``max_cached_units`` to two to four times ``num_selected_blocks``: a cache only
+    as large as the selection width can retain nothing between steps, and retention of
+    units not selected this step is where the hit rate comes from.
+
+    ``sparse_unit_layout`` tells the manager where a selection unit's bytes are. Leave it
+    unset for a buffer whose cold form is compressed, or whose units are not locatable by
+    arithmetic; such a buffer supplies extraction code instead.
 
     A block leaves ``GPU_LEVEL`` for ``CACHE_LEVEL1`` once it becomes pure history -- once
     its ordinal falls below the watermark set by :meth:`_KVCache.set_history_length` --
@@ -272,6 +308,9 @@ class BufferConfig:
     size: int
     tokens_per_block_override: int | None = None
     is_sparse: bool = False
+    num_selected_blocks: int = 0
+    max_cached_units: int = 0
+    sparse_unit_layout: SelectionUnitLayout | None = None
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -682,6 +721,55 @@ def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
     consumes an explicitly supplied codec, including an attempt that fails.
     """
 
+class Batch:
+    """The ``_KVCache`` objects stepped together, and their device-side mirror.
+
+    Owns the batch row order and every per-row device array the sparse path reads: a page
+    table per layer group, the eligible-block counts, and the staging buffers behind
+    them. Every such array is indexed by row, and each must agree on which row a request
+    occupies, so the order lives here rather than being re-established per call.
+
+    Rows are slots rather than positions in a compacted list: removing a member leaves a
+    hole for reuse instead of shifting later rows, keeping array shapes and addresses
+    stable across steps, which is what CUDA graph capture requires.
+
+    Membership is exclusive -- a ``_KVCache`` belongs to at most one ``Batch``.
+
+    A member marks its row dirty whenever its locks change: a committed block, a beam
+    fork, an SWA recycle, a ``history_length`` advance. Publication then refreshes only
+    dirty rows, so mutating a member directly costs a republish rather than producing a
+    stale table.
+    """
+
+    def __init__(self, manager: KVCacheManager) -> None: ...
+    def add_kv_cache(self, kv_cache: _KVCache) -> None: ...
+    def remove_kv_cache(self, kv_cache: _KVCache) -> None: ...
+    def resize(
+        self,
+        capacities: Sequence[int | None],
+        history_lengths: Sequence[int | None],
+        stream: CudaStream,
+    ) -> list[bool]:
+        """Resize every member, then publish once.
+
+        One result per row, in row order: a member rolls back on its own, so a batch can
+        partially fail. A table published after a partial failure describes the
+        post-rollback state.
+        """
+
+    def publish(self, stream: CudaStream) -> None:
+        """Refresh the dirty rows of the device arrays, enqueuing on ``stream``.
+
+        Page indices are published as stored -- level-relative, unscaled, and with
+        ``BAD_PAGE_INDEX`` preserved rather than folded to a safe slot. A sparse table
+        numbers pure-history and input-token entries in different levels' pools, so only
+        the sentinel separates an absent block from slot zero; the dense path's scaled
+        block offsets cannot serve here for that reason.
+        """
+
+    def page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
+        """``int32[max_batch, max_blocks_per_seq]`` base page indices for one group."""
+
 class KVCacheManager:
     def __init__(
         self,
@@ -706,50 +794,23 @@ class KVCacheManager:
         and this reports only which rule applies. An ordinary buffer locks every page to
         ``GPU_LEVEL``.
 
-        Neither level is what a caller addresses to read a page staged by
-        :meth:`fetch_sparse_pages`. Those live in the ``GPU_LEVEL`` pool's scratch region,
-        reached through the unchanged :meth:`get_mem_pool_base_address`.
+        Neither level is what a caller addresses to read a unit resolved by
+        :meth:`fetch_sparse_pages`. Those live in the request's history cache, which is
+        reserved from the ``GPU_LEVEL`` pool and reached through the unchanged
+        :meth:`get_mem_pool_base_address`.
         """
 
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
-    def copy_base_page_indices_to_device(
-        self,
-        kv_caches: Sequence[_KVCache],
-        layer_group_id: LayerGroupId,
-        out: DeviceArray,  # int32[batch, max_blocks_per_seq]
-        stream: CudaStream,
-        beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
-    ) -> None:
-        """Gather a batch's base page indices for one layer group into a device array.
-
-        Row b of ``out`` is the table :meth:`_KVCache.get_base_page_indices` reports for
-        ``kv_caches[b]``, padded to the array's width with ``BAD_PAGE_INDEX``. Rows are
-        positional, so the caller fixes the batch order here and every later call --
-        :meth:`fetch_sparse_pages` above all -- inherits it.
-
-        Indices are reported as stored: level-relative, unscaled, and with
-        ``BAD_PAGE_INDEX`` preserved rather than folded to a safe slot. For a sparse
-        buffer that is what makes the table usable, since a pure-history entry and an
-        input-token entry are numbered in different levels' pools and only the sentinel
-        distinguishes an absent block from slot zero.
-
-        The source is host memory, so this enqueues a transfer on ``stream`` and returns.
-        The table is only valid until the batch's locks next change -- a committed block,
-        a beam fork, an SWA recycle, a ``history_length`` advance -- so it belongs in the
-        same per-step preparation as the dense path's block offsets.
-        """
-
     def fetch_sparse_pages(
         self,
+        batch: Batch,
         buffers: Sequence[BufferId],
-        page_table: DeviceArray,  # int32[batch, max_blocks_per_seq]
         selected: DeviceArray,  # int32[batch, topk]
-        num_blocks: DeviceArray,  # int32[batch]
         out: DeviceArray,  # int32[batch, max_blocks_per_seq]
         stream: CudaStream,
     ) -> None:
-        """Stage a batch's selected pure-history pages into each buffer's GPU scratch pool.
+        """Resolve a batch's selections against each buffer's per-request history cache.
 
         Device-driven and stream-ordered throughout: the selection is read from device
         memory, so the host neither inspects it nor decides anything, and the call
@@ -757,37 +818,40 @@ class KVCacheManager:
         sharing a stream, or across streams with an event. Every shape is static across
         steps, so the call is capturable in a CUDA graph.
 
-        ``buffers`` must share one layer group, so that a single ``page_table`` addresses
-        them all; each must be ``BufferConfig.is_sparse``.
+        ``buffers`` must share one layer group, so that the batch's single page table for
+        that group addresses them all; each must be ``BufferConfig.is_sparse``.
 
-        ``page_table`` is that group's base page indices as filled by
-        :meth:`copy_base_page_indices_to_device`, whose batch order it inherits.
         ``selected`` holds block ordinals, ``topk`` uniform across requests and ``-1``
-        past a request's valid count. ``num_blocks`` is how many blocks of each request
-        are eligible to be selected, and bounds the walk; it counts blocks rather than
-        tokens because selection, staging and ``out`` are all in block units, so no
-        request here needs token granularity.
+        past a request's valid count. The page table and the per-request count of
+        eligible blocks come from ``batch``, whose row order ``selected`` and ``out``
+        both inherit.
 
         Eligible means below the history watermark: a block at or above it holds input
         tokens and is locked to ``GPU_LEVEL``, so resolving it against the host pool
         would address unrelated memory. The call cannot detect an out-of-range ordinal,
-        so honouring ``num_blocks`` is the selector's responsibility.
+        so naming only eligible ordinals is the selector's responsibility.
 
-        Pages are copied into the scratch region of each buffer's ``GPU_LEVEL`` pool,
-        which this manager owns and sizes from the configured selection width. The
-        scratch slot for the j-th selection of request b is positional, so no allocation
-        happens per call and the mapping is stable under graph replay.
+        Each selected unit is looked up in the owning request's cache for that layer.
+        A hit is reused in place; a miss is copied from the locked host page into a slot
+        taken from the free list, evicting least-recently-used when it is empty.
+        Reservation at :meth:`_KVCache.resume` guarantees room for a full selection
+        width, so a fetch always satisfies its own layer, and within a step a fetch may
+        evict entries of layers already processed but never one a later kernel still
+        needs.
 
-        ``out`` is shaped like ``page_table`` rather than compacted, and is written in
-        full: entry ``[b][ord]`` is the ``GPU_LEVEL`` scratch index holding block ``ord``
-        when ``ord`` was selected for request b, and ``BAD_PAGE_INDEX`` otherwise. A
-        kernel that indexes a page table by block ordinal therefore consumes ``out`` in
-        place of ``page_table``, against :meth:`get_mem_pool_base_address` as usual, with
-        its selection array unchanged.
+        Copies leave the host page authoritative rather than moving it, so a cache entry
+        is always clean and eviction moves no data. The copies are a snapshot, which is
+        sound only because a block below the watermark is committed history and
+        immutable.
 
-        The staged pages are a snapshot. That is sound only because a block below the
-        watermark is committed history and immutable.
+        ``out`` is shaped like the page table rather than compacted, and is written in
+        full: entry ``[b][ord]`` is the ``GPU_LEVEL`` index holding block ``ord`` when
+        ``ord`` was selected for request b, and ``BAD_PAGE_INDEX`` otherwise. A kernel
+        that indexes a page table by block ordinal therefore consumes ``out`` in place of
+        the batch's table, against :meth:`get_mem_pool_base_address` as usual, with its
+        selection array unchanged.
         """
+
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_converter(
         self, layer_id: LayerId, data_role: DataRole
