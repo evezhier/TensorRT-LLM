@@ -1569,7 +1569,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("pool_group_index", [](kv::PoolGroupDesc const& self) { return self.poolGroupIndex.value(); })
         .def_ro("num_slots", &kv::PoolGroupDesc::numSlots)
         .def_ro("slot_desc", &kv::PoolGroupDesc::slotDesc)
-        .def_prop_ro("pools", [](kv::PoolGroupDesc const& self) { return self.pools.raw(); });
+        .def_prop_ro("pools", [](kv::PoolGroupDesc const& self) { return self.pools.raw(); })
+        .def_ro("memory_tier", &kv::PoolGroupDesc::memoryTier);
 
     nb::class_<kv::ExpandedBuffer>(m, "ExpandedBuffer")
         .def_ro("id", &kv::ExpandedBuffer::id)
@@ -1790,8 +1791,48 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
 
+    nb::class_<kv::TransferPage>(m, "TransferPage")
+        .def_prop_ro("layer_group_id", [](kv::TransferPage const& self) { return self.layerGroup.value(); })
+        .def_prop_ro("ordinal", [](kv::TransferPage const& self) { return self.ordinal.value(); })
+        .def_prop_ro("cache_level", [](kv::TransferPage const& self) { return self.cacheLevel.value(); })
+        .def_prop_ro("slot_id", [](kv::TransferPage const& self) { return self.slotId.value(); })
+        .def_prop_ro("pool_group", [](kv::TransferPage const& self) { return self.poolGroup.value(); })
+        .def_prop_ro("pool_index", [](kv::TransferPage const& self) { return self.poolIndex.value(); })
+        .def_ro("memory_tier", &kv::TransferPage::memoryTier)
+        .def_ro("address", &kv::TransferPage::address)
+        .def_ro("bytes", &kv::TransferPage::bytes)
+        .def_ro("pool_base_address", &kv::TransferPage::poolBaseAddress)
+        .def_ro("pool_bytes", &kv::TransferPage::poolBytes)
+        .def_ro("valid_tokens", &kv::TransferPage::validTokens);
+
     // ---- KvCache -----------------------------------------------------------
     nb::class_<kv::KvCache>(m, "_KVCache")
+        .def("begin_external_read", [](kv::KvCache& self, std::vector<int> const& groups, int tokens)
+            {
+                std::vector<kv::LayerGroupId> ids;
+                for (auto group : groups)
+                    ids.emplace_back(group);
+                return self.beginExternalRead(ids, tokens);
+            },
+            nb::arg("layer_group_ids"), nb::arg("tokens"), nb::call_guard<nb::gil_scoped_release>())
+        .def("reserve_external_receive", [](kv::KvCache& self, int group, int ordinal, int level)
+            {
+                return self.reserveExternalReceive(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, kv::CacheLevel{level});
+            },
+            nb::arg("layer_group_id"), nb::arg("ordinal"), nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_external_access_pages", &kv::KvCache::getExternalAccessPages, nb::arg("access_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("external_access_ready", &kv::KvCache::externalAccessReady, nb::arg("access_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("wait_external_access_ready", &kv::KvCache::waitExternalAccessReady, nb::arg("access_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("expose_external_access", &kv::KvCache::exposeExternalAccess, nb::arg("access_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("end_external_access", &kv::KvCache::endExternalAccess, nb::arg("access_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("finalize_external_receive", [](kv::KvCache& self, uint64_t id, int validTokens, intptr_t stream)
+            { self.finalizeExternalReceive(id, validTokens, reinterpret_cast<CUstream>(stream)); },
+            nb::arg("access_id"), nb::arg("valid_tokens"), nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resume",
             [](kv::KvCache& self, nb::object stream)

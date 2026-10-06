@@ -44,6 +44,7 @@ struct PoolGroupDesc
     SlotCount numSlots = 0;
     SlotDesc slotDesc;
     TypedVec<PoolIndex, PoolDesc> pools;
+    CacheTier memoryTier = CacheTier::GPU_MEM;
 };
 
 //! Location of the page-index array passed to encode() and decode().

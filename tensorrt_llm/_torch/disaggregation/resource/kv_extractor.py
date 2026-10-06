@@ -53,7 +53,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -664,6 +664,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
 
     for pg_desc in pool_group_descs:
         storage_pg_idx = int(pg_desc.pool_group_index)
+        memory_type = "DRAM" if pg_desc.memory_tier == CacheTier.HOST_MEM else "VRAM"
         storage_pg_to_list_idx[storage_pg_idx] = len(pool_groups)
         pool_groups.append(
             PhysicalPoolGroup(
@@ -672,6 +673,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                         base_address=int(pool.base_address),
                         slot_bytes=int(pool.slot_bytes),
                         num_slots=int(pg_desc.num_slots),
+                        memory_type=memory_type,
                     )
                     for pool in pg_desc.pools
                 ]

@@ -22,7 +22,7 @@ import numpy as np
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, GPU_LEVEL
 
 from .page import AttentionLayerGroup
 from .utils import get_global_layer_ids
@@ -197,6 +197,16 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def tokens_per_block(self) -> int:
         return self._mgr.tokens_per_block
 
+    def begin_external_read(self, req: LlmRequest, groups: list[int], tokens: int):
+        """Pin native physical storage before constructing host-aware transport extents."""
+        return self._mgr.kv_cache_map[req.py_request_id].begin_external_read(groups, tokens)
+
+    def reserve_external_receive(self, req: LlmRequest, group: int, ordinal: int, level: int):
+        """Reserve unpublished native storage for a suspended receive request."""
+        return self._mgr.kv_cache_map[req.py_request_id].reserve_external_receive(
+            group, ordinal, level
+        )
+
     def _global_cached_token_count(self, req: LlmRequest) -> int:
         if not self.enable_block_reuse:
             return 0
@@ -210,19 +220,13 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         cache = self._mgr.kv_cache_map[req.py_request_id]
         if not cache.is_active:
             raise RuntimeError("GPU KV transfer requires an active request with locked GPU pages")
-        snapshot = cache.get_page_storage_snapshot(group_idx)
-        slots = np.asarray(snapshot.base_page_indices, dtype=np.int64)
-        levels = snapshot.cache_levels
-        if len(levels) != len(slots):
-            raise ValueError("KV storage snapshot indices and cache levels must have equal lengths")
-        # Raw slot IDs are nonnegative in both GPU and host pools. Only the
-        # explicit storage tier distinguishes a GPU offset from a host offset.
-        if any(slot >= 0 and level != GPU_LEVEL for slot, level in zip(slots, levels)):
+        pool_group = self._mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)[group_idx]
+        if self._mgr.impl.pool_group_descs[pool_group].memory_tier != CacheTier.GPU_MEM:
             raise RuntimeError(
                 "GPU KV transfer requires locked GPU pages; offloaded history requires "
-                "a native transfer lease and host pool layout"
+                "a native external-access claim and host pool layout"
             )
-        return slots
+        return np.asarray(cache.get_base_page_indices(group_idx), dtype=np.int64)
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         slots = self._gpu_page_indices(req, group_idx)

@@ -574,7 +574,33 @@ KvCacheStatus: TypeAlias = _Status
 
 IndexSeq = array.array[int] | memoryview[int]
 
+class TransferPage:
+    layer_group_id: int
+    ordinal: int
+    cache_level: int
+    slot_id: int
+    pool_group: int
+    pool_index: int
+    memory_tier: CacheTier
+    address: int
+    bytes: int
+    pool_base_address: int
+    pool_bytes: int
+    valid_tokens: int
+
 class _KVCache:
+    def begin_external_read(self, layer_group_ids: list[LayerGroupId], tokens: int) -> int: ...
+    def reserve_external_receive(
+        self, layer_group_id: LayerGroupId, ordinal: int, cache_level: CacheLevel
+    ) -> int: ...
+    def get_external_access_pages(self, access_id: int) -> list[TransferPage]: ...
+    def external_access_ready(self, access_id: int) -> bool: ...
+    def wait_external_access_ready(self, access_id: int) -> None: ...
+    def expose_external_access(self, access_id: int) -> None: ...
+    def end_external_access(self, access_id: int) -> None: ...
+    def finalize_external_receive(
+        self, access_id: int, valid_tokens: int, cuda_stream: CudaStream
+    ) -> None: ...
     Status: ClassVar[Type[_Status]]
     id: Any
     def __init__(
@@ -764,6 +790,7 @@ class PoolGroupDesc:
     num_slots: int
     slot_desc: SlotDesc
     pools: Sequence[PoolDesc]
+    memory_tier: CacheTier
 
 # From _core/_kv_cache_manager.py
 class HalfOpenRange:

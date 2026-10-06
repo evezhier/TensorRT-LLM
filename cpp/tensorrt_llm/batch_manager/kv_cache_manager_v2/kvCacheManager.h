@@ -122,6 +122,7 @@ class Batch;
 // KvCacheManager — top-level KV cache manager.
 // Mirrors Python's KVCacheManager.
 // ---------------------------------------------------------------------------
+
 class KvCacheManager : public std::enable_shared_from_this<KvCacheManager>
 {
 public:
@@ -597,9 +598,12 @@ public:
     friend class KvCacheIntrospection;
 
 private:
+    friend class KvCache;
+
     // First member, so the registration covers the whole lifetime: it is taken before any state
     // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
     PoisonHold mPoisonHold;
+    size_t mNumExternalAccesses = 0;
 
     //! Guards all mutable state reachable from this manager. See the scope note above.
     mutable ReentrantSharedMutex mApiMutex;

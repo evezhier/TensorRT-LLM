@@ -32,6 +32,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -156,6 +157,23 @@ private:
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
 
+//! A concrete coalesced pool region. Addresses are transport addresses, including CPU addresses for host pools.
+struct TransferPage
+{
+    LayerGroupId layerGroup;
+    BlockOrdinal ordinal;
+    CacheLevel cacheLevel;
+    SlotId slotId;
+    PoolGroupIndex poolGroup;
+    PoolIndex poolIndex;
+    CacheTier memoryTier;
+    MemAddress address;
+    size_t bytes;
+    MemAddress poolBaseAddress;
+    size_t poolBytes;
+    int validTokens;
+};
+
 // ---------------------------------------------------------------------------
 // KvCache — manages the per-sequence KV cache state.
 // Mirrors Python's _KVCache.
@@ -188,6 +206,21 @@ public:
     KvCache(KvCache const&) = delete;
     KvCache& operator=(KvCache const&) = delete;
 
+    //! Request-local, monotonically increasing external-access IDs; never reuse an ID.
+    //! Acquire after submitting final producer writes, and stop model writes until access settles.
+    uint64_t beginExternalRead(std::vector<LayerGroupId> const& groups, int tokens);
+    uint64_t reserveExternalReceive(LayerGroupId group, BlockOrdinal ordinal, CacheLevel level);
+    std::vector<TransferPage> getExternalAccessPages(uint64_t id) const;
+    bool externalAccessReady(uint64_t id) const;
+    void waitExternalAccessReady(uint64_t id) const;
+    //! Wait for CUDA readiness before publication. Exposed claims retain this cache until settlement.
+    void exposeExternalAccess(uint64_t id);
+    //! Caller proves physical access stopped. Cancellation alone is insufficient. Unknown IDs are rejected.
+    //! Discarding an exposed receive invalidates its request, which must then be closed.
+    void endExternalAccess(uint64_t id);
+    //! Install verified receive coverage without reuse commit. Retain the pin until endExternalAccess().
+    void finalizeExternalReceive(uint64_t id, int validTokens, CUstream stream);
+
     // ---- State machine -----------------------------------------------------
 
     // Resume: check utilization and lock active pages at their required storage levels.
@@ -198,7 +231,7 @@ public:
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     void suspend();
 
-    // Close: release all blocks back to KvCacheManager.
+    // Close: release blocks, deferring physical reclamation until every transfer lease settles.
     void close();
 
     // Commit or discard request-local statistics accumulated since the previous scheduler commit.
@@ -416,6 +449,7 @@ public:
     // make the new stream wait for the old one before switching (cross-stream sync).
     void setCudaStream(CUstream stream)
     {
+        _checkNoExternalAccess();
         if (mCudaStream.has_value())
         {
             if (mStatus == Status::ACTIVE)
@@ -698,6 +732,7 @@ private:
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
     void _checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const;
     void _resizePageIndexBuffers(BlockOrdinal newNumBlocks);
+    void _checkNoExternalAccess() const;
 
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
@@ -708,6 +743,25 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    struct ExternalAccess
+    {
+        std::vector<SharedPtr<Page>> pinned;
+        std::vector<TransferPage> descriptors;
+        std::vector<CachedCudaEvent> events;
+        std::optional<Slot> destination;
+        CacheLevel destinationLevel{kHotLevel};
+        int validTokens = 0;
+        bool exposed = false;
+    };
+    uint64_t _registerExternalAccess(std::unique_ptr<ExternalAccess>& access);
+    void _releaseExternalAccess(uint64_t id);
+    ExternalAccess const& _getExternalAccess(uint64_t id) const;
+    std::unordered_map<uint64_t, std::unique_ptr<ExternalAccess>> mExternalAccesses;
+    uint64_t mNextExternalAccessId = 1;
+    // Exposure retains this request without allocation; settlement of the last claim breaks the cycle.
+    std::shared_ptr<KvCache> mExternalAccessKeepAlive;
+    bool mExternalCloseRequested = false;
+    bool mExternalReceiveFailed = false;
     std::optional<int> mExpectedPromptLength;
     bool mGenerationAllocReady = false;
 
