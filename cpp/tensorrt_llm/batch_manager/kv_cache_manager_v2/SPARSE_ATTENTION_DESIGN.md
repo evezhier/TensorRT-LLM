@@ -488,16 +488,17 @@ tensors without this package depending on torch.
 
 ## Implementation notes
 
-Four places where existing code assumes level 0 and fails quietly rather than loudly:
+Places where existing code assumes level 0 and fails quietly rather than loudly.
 
-- **`page.cpp:560`, `releaseSlot(mLifeCycle, kHotLevel, ...)`** returns a lock's slot to the
-  *hot* pool unconditionally. A page locked at level 1 would have its host slot freed into
-  the GPU pool's free list, corrupting both, surfacing later as an unrelated allocation
-  handing out a bogus address.
+Slot release is already level-aware: `Page::~Page()` releases with the page's own
+`cacheLevel`, and the `kHotLevel` in `ScratchSlotLock::unlock()` is correct, since SWA
+prefill scratch is GPU-only by definition.
+
 - **`_lockHeldBlocks`**, the OOM rollback for `resize`, calls `batchedLockToGpu`. A sparse
   resize failing partway would re-lock demoted pages at level 0, leaving the page table
   holding level-0 indices the fetch path resolves against the host pool. Failure path only,
-  so it survives happy-path testing.
+  so it survives happy-path testing. *(Addressed: `StaleBackup` now records the page's lock
+  level and `batchedLockPages` restores it.)*
 - **`_unlockStaleBlocks` is not the demotion hook.** It exists for SWA blocks outside the
   window, whose content is *dead*; sparse history is live and will be read. Same trigger and
   range arithmetic, different disposition — routing sparse layers through it drops history
