@@ -70,9 +70,9 @@ entry and the selection unit is already a page.
 4. **All GPU residency is the per-request cache.** A sparse buffer has no separately
    managed GPU pages: both the block being written and the history a step selects occupy
    cache entries, drawn from the same reservation and replaced by the same LRU.
-5. **The host page is authoritative once the block is finalized.** A block is flushed to
-   its host page at `commit()`, after which its cache entry is clean and evictable. Before
-   that the entry is dirty and ineligible for eviction.
+5. **The host page is authoritative once the watermark passes the block.** A block is
+   flushed to its host page by the `resize()` that raises `history_length` past it, after
+   which its cache entry is evictable. Before that it holds the only copy and is pinned.
 6. **Extraction is pluggable**, because KVCM2 buffers are opaque bytes and a sub-page unit
    cannot be located without layout knowledge.
 
@@ -92,11 +92,12 @@ Nothing resolves against the GPU pool, and no caller has to know which rule appl
 which ordinal.
 
 A block's data reaches its host page by a **flush**: a copy on the owning `KvCache`'s
-stream that does **not** evict the GPU entry, which stays cached and merely becomes clean.
+stream that does **not** evict the GPU entry, which stays cached and merely stops being
+pinned.
 
 The governing rule is that **a block must be flushed before it can be selected**. Selectable
-means below the watermark, so `resize()` is the deadline and must flush anything still
-dirty that the watermark has passed.
+means below the watermark, so `resize()` is the deadline and must flush everything the
+watermark has just passed.
 
 `resize()` rather than `setHistoryLength()` because it is the single chokepoint: the
 latter is `resize(nullopt, hist)`, `setCapacity()` is `resize(cap, nullopt)`, and a caller
@@ -105,32 +106,46 @@ that. Flushing inside `resize()` also composes with its rollback: a flush is a c
 block flushed before a failed resize stays correctly flushed — early is always safe, and
 only late is not.
 
-`commit()` flushes earlier, and should: only finalized pages enter the radix tree, so the
-host page is the artifact a later request reuses. But commit is an optimisation, not the
-guarantee — `stopCommitting()`, a `CommitState` other than `ALLOWED`, or a request with
-reuse disabled all mean a block may never be committed. Relying on commit alone would leave
-such a block dirty indefinitely: either pinned until the request ends, exhausting the cache,
-or evicted while its host page is still empty.
+`resize()` is also the *only* flush site. `commit()` needs none of its own: the manager
+maintains `num_committed_tokens <= history_length <= capacity`, so a committed block is
+already at or below the watermark and was flushed by the `resize()` that took the watermark
+past it. Where `commit()` would advance the watermark it does so by calling `resize()`,
+which flushes on the way through.
 
 `history_length` therefore keeps two jobs: it defines selection eligibility, and it is the
 flush deadline.
 
-### Dirty entries
+### Unflushed entries carry no state
 
-A block is dirty from its first write until its flush completes. Prefill and decode share
-one manager under in-flight batching, so the dirty set is not one entry: it is every
-in-flight block, which during prefill is the whole chunk being processed. Two facts still
+An entry holds either a fetched copy of a history page or the live, still-growing block.
+The first is read-only by construction — fetch only ever targets ordinals below the
+watermark — and the second is written by definition. So the two populations are
+distinguished by the ordinal alone:
+
+```
+unflushed  <=>  resident_ordinal >= history_length / unit_tokens
+```
+
+Nothing records this. History is monotonic (`resize()` rejects a decrease), so an ordinal
+that was history stays history and a resident ordinal at or above the watermark cannot be a
+stale fetched copy. The flush at `resize()` covers exactly `[old_history, new_history)`, so
+the flushed prefix always equals the watermark and there is no second high-water mark to
+keep. A per-entry dirty bitmap would be derived state that can only ever disagree with the
+ordinal it was derived from.
+
+Prefill and decode share one manager under in-flight batching, so the unflushed set is not
+one entry: it is every in-flight block, which during prefill is the whole chunk. Two facts
 keep this from being a general write-back cache:
 
-- **Dirty entries are private.** Only finalized pages enter the radix tree, so an unflushed
-  block has exactly one owner: no aliasing, no cross-request coherence, no concurrent
-  writers.
-- **The dirty set is bounded and declared**, not discovered — see `max_input_length` below.
-  Reservation covers it, so a fetch never meets a cache full of dirty entries.
+- **Unflushed entries are private.** Only finalized pages enter the radix tree, so an
+  unflushed block has exactly one owner: no aliasing, no cross-request coherence, no
+  concurrent writers.
+- **The unflushed set is bounded and declared**, not discovered — see `max_input_length`
+  below. Reservation covers it, so a fetch never meets a cache with nothing to evict.
 
-Eviction eligibility is therefore the single predicate *clean*. There is no
-evict-a-dirty-entry path to implement: a dirty entry is simply not a candidate, and the
-reservation guarantees enough clean ones remain.
+Eviction eligibility is therefore one comparison against the watermark. There is no
+evict-an-unflushed-entry path to implement: such an entry is simply not a candidate, and
+the reservation guarantees enough candidates remain.
 
 ## Per-request reservation
 
@@ -145,7 +160,7 @@ notion of "history pages" distinct from the rest.
 
 ```
 units = min(N, history_length / unit_tokens)      history, replaced by LRU
-      + divUp(max_input_length, unit_tokens)      in flight, dirty until flushed
+      + divUp(max_input_length, unit_tokens)      in flight, pinned until flushed
 pages = divUp(units, expansion)
 ```
 
@@ -453,8 +468,8 @@ recency bookkeeping runs rather than after it.
 No host involvement, so the call enqueues and returns. Every shape is static across steps.
 
 Fetch is not the only path that allocates a cache entry: starting a new block allocates one
-directly, outside any fetch, and holds it dirty until commit. Both draw from the same free
-list.
+directly, outside any fetch, and holds it pinned until the watermark passes it. Both draw
+from the same free list.
 
 ### Capacity and eviction
 
@@ -604,11 +619,10 @@ Recorded because each looks like an open question and is not:
 - **`num_blocks` lives on the device, in `Batch`.** Deriving it per call from the watermark
   would produce a host value the kernel cannot use, costing an H2D per layer.
 - **Eviction never copies.** An entry is evictable only once flushed, so evicting is a
-  free-list push. Flushes are triggered by commit or by the watermark, never by eviction
-  pressure.
-- **The dirty bit is not a general pinning scheme.** One entry per `(request, layer)`,
-  private because unflushed blocks are not in the radix tree, and MRU throughout its life.
-  Ordering between layers still comes from LRU recency alone.
+  free-list push. Flushes are triggered by the watermark alone, never by eviction pressure.
+- **Pinning is not a general scheme.** The pinned set is the in-flight blocks, private
+  because unflushed blocks are not in the radix tree, and bounded by `max_input_length`.
+  Ordering between the rest still comes from LRU recency alone.
 - **No stale-key invalidation.** Per-request cache scope makes it impossible.
 - **`tokens_per_block_override` is not a granularity lever.** See *One pool, one index
   space*.
