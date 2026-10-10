@@ -150,6 +150,7 @@ PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 ScratchDesc = _cpp.ScratchDesc
+SelectionUnitLayout = _cpp.SelectionUnitLayout
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
 SsmLayerConfig = _cpp.SsmLayerConfig
@@ -252,6 +253,7 @@ __all__ = [
     "Priority",
     "ReuseScope",
     "ScratchDesc",
+    "SelectionUnitLayout",
     "KVCacheIterationStatsDelta",
     "ReusedBlocksByLevel",
     "KVCacheStatsDelta",

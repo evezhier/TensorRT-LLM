@@ -1587,13 +1587,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
+    nb::class_<kv::SelectionUnitLayout>(m, "SelectionUnitLayout")
+        .def(nb::init<uint32_t, uint32_t, uint32_t, uint32_t>(), nb::arg("num_chunks"), nb::arg("chunk_bytes"),
+            nb::arg("chunk_stride"), nb::arg("unit_stride"))
+        .def_rw("num_chunks", &kv::SelectionUnitLayout::numChunks)
+        .def_rw("chunk_bytes", &kv::SelectionUnitLayout::chunkBytes)
+        .def_rw("chunk_stride", &kv::SelectionUnitLayout::chunkStride)
+        .def_rw("unit_stride", &kv::SelectionUnitLayout::unitStride) DEF_COPY(kv::SelectionUnitLayout);
+
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool>(), nb::arg("role"), nb::arg("size"),
-            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int,
+                 std::optional<kv::SelectionUnitLayout>>(),
+            nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
+            nb::arg("is_sparse") = false, nb::arg("num_selected_blocks") = 0, nb::arg("max_cached_units") = 0,
+            nb::arg("sparse_unit_layout") = std::nullopt)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
-        .def_rw("is_sparse", &kv::BufferConfig::isSparse) DEF_COPY(kv::BufferConfig);
+        .def_rw("is_sparse", &kv::BufferConfig::isSparse)
+        .def_rw("num_selected_blocks", &kv::BufferConfig::numSelectedBlocks)
+        .def_rw("max_cached_units", &kv::BufferConfig::maxCachedUnits)
+        .def_rw("sparse_unit_layout", &kv::BufferConfig::sparseUnitLayout) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),

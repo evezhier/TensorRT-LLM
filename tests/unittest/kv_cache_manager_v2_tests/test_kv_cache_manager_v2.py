@@ -58,6 +58,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         PageIndexMode,
         PlannedDropHandle,
         ReuseScope,
+        SelectionUnitLayout,
         SlidingWindowSize,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -109,6 +110,7 @@ else:
         PageIndexMode,
         PlannedDropHandle,
         ReuseScope,
+        SelectionUnitLayout,
         SlidingWindowSize,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -333,6 +335,66 @@ class TestSparseBufferConfig(unittest.TestCase):
             layers=[layer],
         )
         self.assertTrue(config.layers[0].buffers[0].is_sparse)
+
+    def test_sparse_sizing_defaults_and_roundtrip(self):
+        plain = BufferConfig("key", 4096)
+        self.assertEqual((plain.num_selected_blocks, plain.max_cached_units), (0, 0))
+        self.assertIsNone(plain.sparse_unit_layout)
+
+        layout = SelectionUnitLayout(
+            num_chunks=4, chunk_bytes=1024, chunk_stride=4096, unit_stride=1024
+        )
+        buffer = BufferConfig(
+            "key",
+            4096,
+            is_sparse=True,
+            num_selected_blocks=16,
+            max_cached_units=64,
+            sparse_unit_layout=layout,
+        )
+        copied = deepcopy(buffer)
+        buffer.max_cached_units = 0
+        self.assertEqual(copied.max_cached_units, 64)
+        self.assertEqual(copied.sparse_unit_layout.num_chunks, 4)
+
+    def test_rejects_sparse_fields_on_dense_buffer(self):
+        layer = AttentionLayerConfig(0, [BufferConfig("key", 4096, num_selected_blocks=4)])
+        with self.assertRaisesRegex(ValueError, "sparse-only fields"):
+            self._make_config(layer)
+
+    def test_rejects_cache_narrower_than_selection(self):
+        layer = AttentionLayerConfig(
+            0,
+            [BufferConfig("key", 4096, is_sparse=True, num_selected_blocks=16, max_cached_units=8)],
+        )
+        with self.assertRaisesRegex(ValueError, "maxCachedUnits"):
+            self._make_config(layer)
+
+    def test_rejects_layout_disagreeing_with_size(self):
+        layer = AttentionLayerConfig(
+            0,
+            [
+                BufferConfig(
+                    "key",
+                    4096,
+                    is_sparse=True,
+                    num_selected_blocks=16,
+                    max_cached_units=64,
+                    # 4 * 512 is 2048, not the declared 4096.
+                    sparse_unit_layout=SelectionUnitLayout(4, 512, 4096, 512),
+                )
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "must equal the buffer size"):
+            self._make_config(layer)
+
+    @staticmethod
+    def _make_config(layer: "AttentionLayerConfig") -> "KVCacheManagerConfig":
+        return KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+            layers=[layer],
+        )
 
     def test_rejects_mixed_layer_buffers(self):
         layer = AttentionLayerConfig(

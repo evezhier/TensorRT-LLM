@@ -258,48 +258,44 @@ class SelectionUnitLayout:
 class BufferConfig:
     """One buffer of a layer's KV cache.
 
-    ``is_sparse`` marks a buffer whose history is held on the host and disk tiers and
-    read by sparse-attention block selection (see :meth:`KVCacheManager.is_sparse`).
+    ``is_sparse`` marks a buffer whose history is held on the host tier and read by
+    sparse-attention selection (see :meth:`KVCacheManager.is_sparse`).
 
     It changes where a page locks, and that is what distinguishes it. An ordinary buffer
-    locks every page to ``GPU_LEVEL``. A sparse buffer locks a block holding input tokens
-    to ``GPU_LEVEL``, but a pure-history block to ``CACHE_LEVEL1`` -- which must be
-    configured with tier ``HOST_MEM``. Configuring level 1 with another tier, or declaring
-    fewer than two cache tiers, raises from the ``KVCacheManager`` constructor.
+    locks every page to ``GPU_LEVEL``. A sparse buffer locks **every** page to
+    ``CACHE_LEVEL1``, which must be configured with tier ``HOST_MEM``; configuring level 1
+    with another tier, or declaring fewer than two cache tiers, raises from the
+    ``KVCacheManager`` constructor. The page-index table is therefore uniform, and nothing
+    resolves against the GPU pool.
 
     Because lock location is a per-buffer rule and a page is one slot shared by every
     buffer of its lifecycle, a sparse buffer requires a lifecycle of its own; sharing one
     with a non-sparse buffer raises from the ``KVCacheManager`` constructor.
 
-    The buffer still has a GPU-tier pool. For a sparse buffer that pool additionally
-    backs a per-request history cache: each :class:`_KVCache` reserves up to
-    ``max_cached_units`` of it and holds
-    ``min(max_cached_units, history_length // tokens_per_block)``. Because a page already
-    carries one buffer per coalesced layer, reserved pages give every layer its own
-    entries -- so an entry is a (page, layer) pair, and one page may hold different
-    layers' data for different ordinals. :meth:`KVCacheManager.fetch_sparse_pages` fills
-    them, replacing by LRU.
+    All GPU residency is a per-request cache drawn from the sparse pool's GPU tier: both
+    the block being written and the history a step selects are entries in it. Each
+    :class:`_KVCache` holds ``min(max_cached_units, history_length // tokens_per_block)``
+    history entries plus one for the block in flight. Because a page already carries one
+    buffer per coalesced layer, reserved pages give every layer its own entries -- so an
+    entry is a (page, layer) pair, and one page may hold different layers' data for
+    different ordinals. :meth:`KVCacheManager.fetch_sparse_pages` fills them, replacing by
+    LRU.
 
-    Set ``max_cached_units`` to two to four times ``num_selected_blocks``: a cache only
-    as large as the selection width can retain nothing between steps, and retention of
-    units not selected this step is where the hit rate comes from.
+    Set ``max_cached_units`` to two to four times ``num_selected_blocks``: a cache only as
+    wide as the selection retains nothing between steps, and retention of units not
+    selected this step is where the hit rate comes from. Both default to zero, meaning the
+    fetch path is not configured for this buffer; sparse storage and locking work without
+    them, and constructing the cache rejects zero.
 
     ``sparse_unit_layout`` tells the manager where a selection unit's bytes are. Leave it
     unset for a buffer whose cold form is compressed, or whose units are not locatable by
     arithmetic; such a buffer supplies extraction code instead.
 
-    A block leaves ``GPU_LEVEL`` for ``CACHE_LEVEL1`` once it becomes pure history -- once
-    its ordinal falls below the watermark set by :meth:`_KVCache.set_history_length` --
-    and is re-locked there rather than unlocked. Advancing ``history_length`` is therefore
-    what pays the device-to-host copy; it is issued on the owning :class:`_KVCache`'s
-    stream. Rewinding ``history_length`` below a block already demoted raises; a demoted
-    block is not promoted back.
-
-    A sparse buffer's page-index table is consequently mixed: entries below the history
-    watermark are ``CACHE_LEVEL1`` slot indices, entries above it are ``GPU_LEVEL`` ones.
-    Only the former may be resolved against the host pool, which is what makes
-    "selections name only pure-history ordinals" a precondition of
-    :meth:`KVCacheManager.fetch_sparse_pages` rather than a property it can check.
+    A block's data reaches its host page by a flush that leaves the GPU entry cached and
+    merely marks it clean. A block must be flushed before it can be selected, so
+    :meth:`_KVCache.set_history_length` is the deadline; ``commit()`` flushes earlier,
+    since only finalized pages are shareable. Only a clean entry is evictable, which is
+    what protects the block still being written.
 
     Fixed at construction: the storage layout derived from it is built once.
     """
@@ -786,17 +782,13 @@ class KVCacheManager:
     def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
         """Whether this buffer was declared ``BufferConfig.is_sparse``.
 
-        A sparse buffer's pages do not all lock in one place. A block still holding input
-        tokens locks to ``GPU_LEVEL``; once it falls below the history watermark it is
-        re-locked to ``CACHE_LEVEL1``. Its pages are therefore split across two levels at
-        any moment, and :meth:`_KVCache.get_base_page_indices` reports each in its own
-        level's numbering -- so the answer is a property of the block, not of the buffer,
-        and this reports only which rule applies. An ordinary buffer locks every page to
-        ``GPU_LEVEL``.
+        A sparse buffer locks every page to ``CACHE_LEVEL1``; an ordinary buffer locks
+        every page to ``GPU_LEVEL``. Either way the level is a property of the buffer, so
+        :meth:`_KVCache.get_base_page_indices` reports one level's numbering throughout.
 
-        Neither level is what a caller addresses to read a unit resolved by
-        :meth:`fetch_sparse_pages`. Those live in the request's history cache, which is
-        reserved from the ``GPU_LEVEL`` pool and reached through the unchanged
+        That level is not what a caller addresses to read a unit resolved by
+        :meth:`fetch_sparse_pages`. Those live in the request's cache, reserved from the
+        ``GPU_LEVEL`` pool and reached through the unchanged
         :meth:`get_mem_pool_base_address`.
         """
 

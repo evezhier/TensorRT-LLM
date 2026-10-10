@@ -97,6 +97,48 @@ inline size_t cacheTierQuota(CacheTierConfig const& cfg)
 // Buffer configuration (one KV buffer inside an attention layer).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// SelectionUnitLayout — where one selection unit's bytes sit inside a buffer.
+//
+// Buffer-relative, carrying no page offset: BufferConfig is an input to the
+// KVCacheManager constructor, while a buffer's placement inside a cold page is not
+// settled until the cold-page codec is configured during that construction. The manager
+// supplies both page offsets, which is why this path requires the default codec, whose
+// cold page is a plain concatenation of buffers.
+//
+// Describes the cold side only. The default codec relocates a buffer's bytes verbatim,
+// so a unit is laid out identically in a cold page and in a hot slot; one set of strides
+// serves both, with only the unit index differing.
+// ---------------------------------------------------------------------------
+struct SelectionUnitLayout
+{
+    uint32_t numChunks = 1;   //!< One per head; 1 for token-major.
+    uint32_t chunkBytes = 0;  //!< Contiguous bytes of one unit within one chunk.
+    uint32_t chunkStride = 0; //!< Distance between consecutive chunks.
+    uint32_t unitStride = 0;  //!< Distance between consecutive selection units.
+
+    //! @param unitSize Bytes of one selection unit, i.e. BufferConfig::size.
+    void validate(size_t unitSize) const
+    {
+        if (numChunks == 0 || chunkBytes == 0)
+        {
+            throw std::invalid_argument("SelectionUnitLayout: numChunks and chunkBytes must be non-zero");
+        }
+        if (static_cast<size_t>(numChunks) * chunkBytes != unitSize)
+        {
+            throw std::invalid_argument("SelectionUnitLayout: numChunks * chunkBytes must equal the buffer size");
+        }
+        if (numChunks > 1 && chunkStride < chunkBytes)
+        {
+            throw std::invalid_argument("SelectionUnitLayout: chunkStride must not overlap consecutive chunks");
+        }
+        if (unitStride < chunkBytes)
+        {
+            throw std::invalid_argument("SelectionUnitLayout: unitStride must not overlap consecutive units");
+        }
+    }
+};
+
 struct BufferConfig
 {
     DataRole role;
@@ -107,6 +149,44 @@ struct BufferConfig
     std::optional<int> tokensPerBlockOverride;
 
     bool isSparse = false; //!< Whether history uses the sparse attention lifecycle.
+
+    //! Selection width: units a sparse-attention step selects per layer. Sparse buffers only.
+    int numSelectedBlocks = 0;
+
+    //! Upper bound on per-request GPU cache entries. Two to four times numSelectedBlocks;
+    //! a cache only as wide as the selection retains nothing between steps. Sparse buffers only.
+    int maxCachedUnits = 0;
+
+    //! Where a selection unit's bytes sit. Leave unset for a buffer whose cold form is
+    //! compressed or whose units are not locatable by arithmetic; such a buffer supplies
+    //! extraction code instead.
+    std::optional<SelectionUnitLayout> sparseUnitLayout;
+
+    void validate() const
+    {
+        if (!isSparse)
+        {
+            if (numSelectedBlocks != 0 || maxCachedUnits != 0 || sparseUnitLayout.has_value())
+            {
+                throw std::invalid_argument("BufferConfig: sparse-only fields set on a non-sparse buffer");
+            }
+            return;
+        }
+        // Zero means the fetch path is not configured for this buffer: sparse storage and
+        // locking work without it, and the per-request cache rejects it when constructed.
+        if (numSelectedBlocks < 0 || maxCachedUnits < 0)
+        {
+            throw std::invalid_argument("BufferConfig: numSelectedBlocks and maxCachedUnits must not be negative");
+        }
+        if (numSelectedBlocks > 0 && maxCachedUnits < numSelectedBlocks)
+        {
+            throw std::invalid_argument("BufferConfig: maxCachedUnits must be at least numSelectedBlocks");
+        }
+        if (sparseUnitLayout.has_value())
+        {
+            sparseUnitLayout->validate(size);
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -164,6 +244,7 @@ struct AttentionLayerConfig
             {
                 throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
             }
+            buf.validate();
         }
     }
 };
@@ -192,6 +273,7 @@ struct SsmLayerConfig
             {
                 throw std::invalid_argument("Sparse buffers are only supported for attention layers");
             }
+            buf.validate();
         }
     }
 };
