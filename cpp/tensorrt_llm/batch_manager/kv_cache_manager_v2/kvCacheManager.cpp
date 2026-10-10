@@ -142,6 +142,8 @@ KvCacheManager::~KvCacheManager()
 void KvCacheManager::_computeSparseCachePages()
 {
     mSparseCachePages = TypedVec<LifeCycleId, int>(mStorage->numLifeCycles(), 0);
+    mSparseCacheBuffers = TypedVec<LifeCycleId, int>(mStorage->numLifeCycles(), 0);
+    mSparseCacheEntries = TypedVec<LifeCycleId, int>(mStorage->numLifeCycles(), 0);
 
     for (auto const& layer : mConfig.layers)
     {
@@ -163,6 +165,9 @@ void KvCacheManager::_computeSparseCachePages()
             int const expansion = mConfig.tokensPerBlock / buf.tokensPerBlockOverride.value_or(mConfig.tokensPerBlock);
             int const pages = divUp(buf.maxCachedUnits + 1, expansion);
             mSparseCachePages[lcId] = std::max(mSparseCachePages[lcId], pages);
+            mSparseCacheEntries[lcId] = std::max(mSparseCacheEntries[lcId], pages * expansion);
+            // One more (layer, role) slice carried by every page of this life cycle.
+            ++mSparseCacheBuffers[lcId];
         }
     }
 }

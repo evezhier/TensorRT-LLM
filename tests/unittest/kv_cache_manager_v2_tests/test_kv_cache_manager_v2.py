@@ -478,6 +478,55 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_cache_state_starts_free(self):
+        manager = self._manager(max_cached_units=4)
+        try:
+            lc_id = manager.get_layer_group_id(0)
+            buffers = manager.get_sparse_cache_buffers_per_page(0)
+            entries = manager.get_sparse_cache_entries_per_buffer(0)
+            self.assertEqual(buffers, 1)
+            self.assertGreaterEqual(entries, 5)
+
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                ordinals = _introspection.sparse_cache_resident_ordinals(cache, lc_id)
+                self.assertEqual(len(ordinals), buffers * entries)
+                self.assertTrue(all(o == BAD_PAGE_INDEX for o in ordinals), ordinals)
+                cache.close()
+        finally:
+            manager.shutdown()
+
+    def test_cache_state_is_dropped_with_the_pages(self):
+        manager = self._manager(max_cached_units=4)
+        try:
+            lc_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                self.assertNotEqual(_introspection.sparse_cache_resident_ordinals(cache, lc_id), [])
+                cache.suspend()
+                # The metadata describes pages the request no longer holds, so it goes too.
+                self.assertEqual(_introspection.sparse_cache_resident_ordinals(cache, lc_id), [])
+                self.assertTrue(cache.resume(handle))
+                self.assertNotEqual(_introspection.sparse_cache_resident_ordinals(cache, lc_id), [])
+                cache.close()
+        finally:
+            manager.shutdown()
+
+    def test_unconfigured_life_cycle_has_no_cache_state(self):
+        manager = self._manager(max_cached_units=0)
+        try:
+            lc_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                self.assertEqual(_introspection.sparse_cache_resident_ordinals(cache, lc_id), [])
+                cache.close()
+        finally:
+            manager.shutdown()
+
     def test_pages_are_released_on_suspend_and_retaken_on_resume(self):
         manager = self._manager(max_cached_units=4)
         try:

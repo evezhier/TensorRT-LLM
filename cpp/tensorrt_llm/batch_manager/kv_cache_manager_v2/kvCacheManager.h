@@ -330,6 +330,20 @@ public:
         return lifeCycle < mSparseCachePages.size() ? mSparseCachePages[lifeCycle] : 0;
     }
 
+    //! Sparse buffers carried by one page of this life cycle: the (layer, role) slices a
+    //! reserved page yields, and so the number of independent caches it feeds.
+    [[nodiscard]] int sparseCacheBuffersPerPage(LifeCycleId lifeCycle) const noexcept
+    {
+        return lifeCycle < mSparseCacheBuffers.size() ? mSparseCacheBuffers[lifeCycle] : 0;
+    }
+
+    //! Cache entries each of those buffers gets: pages * expansion, so at least
+    //! max_cached_units + 1.
+    [[nodiscard]] int sparseCacheEntriesPerBuffer(LifeCycleId lifeCycle) const noexcept
+    {
+        return lifeCycle < mSparseCacheEntries.size() ? mSparseCacheEntries[lifeCycle] : 0;
+    }
+
     LifeCycleRegistry const& lifeCycles() const noexcept
     {
         return mLifeCycles;
@@ -443,8 +457,10 @@ private:
     KVCacheManagerConfig mConfig;
     LifeCycleRegistry mLifeCycles;
 
-    // Indexed by life cycle; see sparseCachePages().
+    // All indexed by life cycle; see the sparseCache* accessors.
     TypedVec<LifeCycleId, int> mSparseCachePages;
+    TypedVec<LifeCycleId, int> mSparseCacheBuffers;
+    TypedVec<LifeCycleId, int> mSparseCacheEntries;
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;

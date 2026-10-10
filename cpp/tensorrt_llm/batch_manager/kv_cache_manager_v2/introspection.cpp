@@ -101,6 +101,16 @@ TypedVec<PoolGroupIndex, SlotCount> KvCacheIntrospection::computeSlotsForBatch(K
     return manager.storage().computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
 }
 
+std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId)
+{
+    LifeCycleId const id{lcId};
+    if (id >= kvCache.mSparseCacheState.size())
+    {
+        return {};
+    }
+    return kvCache.mSparseCacheState[id].readResidentOrdinals();
+}
+
 bool KvCacheIntrospection::allTreePagesDroppable(KvCacheManager& manager)
 {
     for (auto const& [_, root] : manager.radixTree().roots())

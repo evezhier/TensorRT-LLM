@@ -2141,6 +2141,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("kv_cache"), nb::arg("ordinal"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
         nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("sparse_cache_resident_ordinals", &kv::KvCacheIntrospection::sparseCacheResidentOrdinals,
+        nb::arg("kv_cache"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "is_commit_allowed",
         [](kv::KvCache const& kvCache) { return kvCache.commitState() == kv::KvCache::CommitState::ALLOWED; },
@@ -2652,6 +2654,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_id"),
             "Pages of the sparse pool a request reserves for this layer's per-layer GPU cache. "
             "Zero when the layer is not sparse or its fetch path is unconfigured.")
+        .def(
+            "get_sparse_cache_buffers_per_page",
+            [](kv::KvCacheManager const& self, kv::LayerId layerId)
+            { return self.sparseCacheBuffersPerPage(self.getLayerGroupId(layerId)); },
+            nb::arg("layer_id"),
+            "Sparse buffers carried by one page of this layer's life cycle, i.e. the number of "
+            "independent caches a reserved page feeds.")
+        .def(
+            "get_sparse_cache_entries_per_buffer",
+            [](kv::KvCacheManager const& self, kv::LayerId layerId)
+            { return self.sparseCacheEntriesPerBuffer(self.getLayerGroupId(layerId)); },
+            nb::arg("layer_id"), "Cache entries each sparse buffer gets: pages * expansion.")
         .def("get_page_index_converter", &kv::KvCacheManager::getPageIndexConverter, nb::arg("layer_id"),
             nb::arg("data_role"))
         .def(

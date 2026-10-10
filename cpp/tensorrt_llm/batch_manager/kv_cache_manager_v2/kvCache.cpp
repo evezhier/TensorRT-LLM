@@ -92,6 +92,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
     mScratchSlots.resize(manager.storage().numLifeCycles());
     mSparseCacheSlots.resize(manager.storage().numLifeCycles());
+    mSparseCacheState.resize(manager.storage().numLifeCycles());
 
     TLLM_CHECK_WITH_INFO(!(manager.textOnly() && textOnly == std::optional<bool>{false}),
         "text_only=false is not allowed when the manager is configured text_only=true");
@@ -377,6 +378,11 @@ bool KvCache::resume(std::optional<CUstream> stream)
                         /*skipWait=*/true);
                     tmpSlots[lc].pop_back();
                     scratchReadyEvents.push_back(mSparseCacheSlots[lc].back().slot().readyEvent.handle());
+                }
+                if (sparseCacheDelta[lc] > 0 && mSparseCacheState[lc].empty())
+                {
+                    mSparseCacheState[lc] = SparseCacheState(mManager->sparseCacheBuffersPerPage(lc),
+                        mManager->sparseCacheEntriesPerBuffer(lc), reinterpret_cast<CUstream>(cudaStream()));
                 }
 
                 // Remaining slots are scratch slots.
@@ -3051,6 +3057,8 @@ void KvCache::_freeReservedGpuSlots()
             lock.unlock();
         lcSlots.clear();
     }
+    for (auto& state : mSparseCacheState)
+        state = SparseCacheState{};
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

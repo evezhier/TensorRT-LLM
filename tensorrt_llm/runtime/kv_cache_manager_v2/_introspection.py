@@ -205,6 +205,14 @@ def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     return list(_cpp().storage_utilization(manager, cache_level))
 
 
+def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
+    """Resident unit ordinal per sparse cache entry, laid out [buffer][entry].
+
+    BAD_PAGE_INDEX marks a free entry. Empty when the life cycle reserves no cache.
+    """
+    return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
+
+
 def grains_for_slots(num_slots: int, slot_size_list: list[int], granularity: int) -> int:
     """Return the grain count required for a pool group slot count."""
     return int(_cpp().grains_for_slots(num_slots, slot_size_list, granularity))

@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
+#include "kv_cache_manager_v2/sparseCache.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
@@ -680,6 +681,10 @@ private:
     // resume(), released at suspend() and close(). Empty unless a sparse buffer of that
     // life cycle has its fetch path configured.
     TypedVec<LifeCycleId, std::vector<SparseCacheSlotLock>> mSparseCacheSlots;
+
+    // Device-resident residency, recency and dirty state describing those pages. Created
+    // with them and destroyed with them, so the metadata never outlives what it describes.
+    TypedVec<LifeCycleId, SparseCacheState> mSparseCacheState;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

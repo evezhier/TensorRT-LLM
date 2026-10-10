@@ -42,6 +42,11 @@ public:
     static std::optional<bool> committedPageIsLinked(KvCache const& kvCache, int ordinal, int lcId);
     static bool allTreePagesDroppable(KvCacheManager& manager);
 
+    // White-box hooks: the device-resident state of a request's sparse history cache for
+    // one life cycle. Synchronises and copies back, so it is test-only. Empty when the
+    // life cycle has no cache reserved.
+    static std::vector<int32_t> sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId);
+
     // White-box hook: minimum per-pool-group slot counts to support a BatchDesc.
     // Reaches StorageManager::computePoolGroupSlotsForBatch() (private) via friendship.
     static TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(KvCacheManager& manager, BatchDesc const& batch,
