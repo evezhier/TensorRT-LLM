@@ -64,16 +64,18 @@ entry and the selection unit is already a page.
 2. **`BufferConfig.is_sparse` is a per-buffer flag** and changes where a page locks.
    A sparse buffer requires a lifecycle of its own. Sparse buffers of the same size still
    coalesce with each other.
-3. **Lock location depends on the block, not the buffer.** A block holding input tokens
-   locks to level 0 as always. A pure-history block locks to level 1.
-4. **The GPU tier still serves sparse buffers**, holding both the non-history blocks of the
-   same lifecycle and a per-request cache of selected history.
-5. **Fetch copies, never moves.** The host page stays locked and authoritative, so every
-   cache entry is clean and eviction moves no data.
+3. **Every page of a sparse buffer locks at level 1**, regardless of what it holds. Lock
+   location is a property of the buffer, not of the block.
+4. **All GPU residency is the per-request cache.** A sparse buffer has no separately
+   managed GPU pages: both the block being written and the history a step selects occupy
+   cache entries, drawn from the same reservation and replaced by the same LRU.
+5. **The host page is authoritative once the block is finalized.** A block is flushed to
+   its host page at `commit()`, after which its cache entry is clean and evictable. Before
+   that the entry is dirty and ineligible for eviction.
 6. **Extraction is pluggable**, because KVCM2 buffers are opaque bytes and a sub-page unit
    cannot be located without layout knowledge.
 
-## Locking and demotion
+## Locking and flush
 
 `acquirePageIndex` already writes the page's *current* slot id with no level assumption
 (`page.cpp:401`):
@@ -83,29 +85,62 @@ int old = kvc->updateBasePageIndex(
     mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, slotIdToPageIndexValue(pg.slotId()));
 ```
 
-so `getBasePageIndices()` reports level-1 slot ids for demoted blocks with no change. The
-level assumption lives entirely in the *lock* path.
+so `getBasePageIndices()` reports level-1 slot ids with no change, and because every page
+of a sparse buffer locks there, the table is **uniform**: every entry is a level-1 slot id.
+Nothing resolves against the GPU pool, and no caller has to know which rule applies to
+which ordinal.
 
-Demotion is driven by `setHistoryLength()`, which already computes the affected block
-range. When a block crosses the watermark its page is copied to level 1 and **re-locked
-there**, not unlocked. Rewinding `history_length` below an already-demoted block is
-rejected.
+A block's data reaches its host page by a **flush**: a copy on the owning `KvCache`'s
+stream that does **not** evict the GPU entry, which stays cached and merely becomes clean.
 
-A sparse buffer's page-index table is therefore mixed: entries below the watermark are
-level-1 slot ids, entries above it are level-0 ones. Only the former may be resolved
-against the host pool, which makes "selections name only pure-history units" a
-precondition of the fetch rather than something it can check.
+The governing rule is that **a block must be flushed before it can be selected**. Selectable
+means below the watermark, so `setHistoryLength()` is the deadline and must flush anything
+still dirty that the watermark has passed.
+
+`commit()` flushes earlier, and should: only finalized pages enter the radix tree, so the
+host page is the artifact a later request reuses. But commit is an optimisation, not the
+guarantee — `stopCommitting()`, a `CommitState` other than `ALLOWED`, or a request with
+reuse disabled all mean a block may never be committed. Relying on commit alone would leave
+such a block dirty indefinitely: either pinned until the request ends, exhausting the cache,
+or evicted while its host page is still empty.
+
+`history_length` therefore keeps two jobs: it defines selection eligibility, and it is the
+flush deadline.
+
+### Dirty entries
+
+A block being written is dirty until its flush completes. Three facts keep this from being
+a general write-back cache:
+
+- **At most one dirty entry per `(request, layer)`** — the block currently being filled.
+- **It is private.** Only finalized pages enter the radix tree, so an unflushed block has
+  exactly one owner: no aliasing, no cross-request coherence, no concurrent writers.
+- **Its lifetime is bounded** by one block fill, and it is the most-recently-used entry
+  throughout, since it is written every step.
+
+Eviction eligibility is therefore the single predicate *clean*, and the bit flips once per
+block lifetime. There is no evict-a-dirty-entry path to implement.
 
 ## Per-request reservation
 
-Each `KvCache` reserves up to **N** pages from the sparse pool's GPU tier for its history
-cache, where N is an upper bound configured per sparse buffer. The number actually held is
+Two separate reservations, easily confused.
+
+**Host tier.** Every block of the sequence has a locked host page, so the count is
+`divUp(capacity, tokens_per_block)` — the existing per-sequence locking logic, unchanged.
+Only the level differs. This is the payoff of uniform locking: nothing new to size, and no
+notion of "history pages" distinct from the rest.
+
+**GPU tier.** The cache, bounded by `max_cached_units` (**N** in *Sizing*, two to four times
+the selection width), holding
 
 ```
 min(N, history_length / tokens_per_block)
 ```
 
-so a short sequence reserves little and a long one saturates.
+entries, so a short sequence caches little and a long one saturates. One further entry is
+reserved for the block currently being written, which is dirty until flushed and so cannot
+be an eviction candidate; keeping it outside N preserves the history cache's capacity
+guarantee.
 
 Reservation happens at `resume()` and fails there if capacity is unavailable; the fetch
 path never has to handle exhaustion.
@@ -359,14 +394,19 @@ blocks the next:
 
 | stage | delivers | needed when |
 | --- | --- | --- |
-| 1 | descriptor path, single fused kernel, no plugin interface at all | always — covers uncompressed cold pages, which is the common case |
-| 2 | `ISparseUnitGather`, two kernels on that path | a compressed or non-arithmetic cold representation appears |
+| 1 | descriptor path, single fused kernel, no plugin interface at all | always — the flush is a verbatim copy, so cold layout equals hot layout |
+| 2 | `ISparseUnitGather`, two kernels on that path | compression, or any other non-arithmetic cold representation |
 | 3 | LTO-IR + nvJitLink to re-fuse stage 2 | stage 2's second launch measurably costs something |
 
 Stage 1 needs no extension point, so the first implementation carries no plugin machinery,
 no registration, and no dispatch. `ISparseUnitGather` is introduced only alongside the first
 codec that requires it, which is also the first point at which its shape can be validated
 against a real consumer rather than guessed.
+
+Compressing history on the way to host belongs to stage 2. It is attractive — history is
+the bulk of the footprint and is written once and read rarely — but it breaks the identity
+between cold and hot layout that the descriptor path depends on, and raises a lossy-versus-
+lossless question the first stage does not need to answer.
 
 ## Fetch
 
@@ -386,31 +426,42 @@ recency bookkeeping runs rather than after it.
 
 No host involvement, so the call enqueues and returns. Every shape is static across steps.
 
+Fetch is not the only path that allocates a cache entry: starting a new block allocates one
+directly, outside any fetch, and holds it dirty until commit. Both draw from the same free
+list.
+
 ### Capacity and eviction
 
 Capacity is guaranteed by reservation, not back-pressure: a fetch can always satisfy its
 own layer, because the reservation covers a full selection width. Within a step a fetch may
 evict entries of layers already processed but never one a later kernel still needs, which
-LRU recency delivers without a pin bit — layer N's entries are most-recently-used when
-layer N+1 fetches.
+LRU recency delivers — layer N's entries are most-recently-used when layer N+1 fetches.
+
+An entry is evictable only when **clean**. That predicate is what protects the block being
+written, so it is a correctness bit rather than a policy hint — but it is also the only one,
+and it is set once per block at commit.
 
 ### Preconditions the caller owns
 
-Selections must name only pure-history units. At or above the watermark a page-table entry
-is a level-0 index, which resolved against the host pool addresses unrelated memory. The
-kernel cannot detect this; `num_blocks` carries each request's eligible count.
+Selections must name only pure-history units; `num_blocks` carries each request's eligible
+count.
+
+Naming an ineligible one is no longer a memory-safety problem. The table is uniform, so the
+ordinal resolves to a real host page of the same request — but an unflushed block's host
+page has no valid contents yet, so the result is stale data rather than unrelated memory.
+A debug check against the flushed state can catch it; silence would be a wrong answer, not
+corruption.
 
 ## One pool, one index space
 
-The sparse pool's GPU tier holds cached history and the non-history blocks of the same
-lifecycle, in one index space. That is what lets the fetch emit a **single** index list
-covering both, and therefore why existing attention kernels need no change: a kernel still
-indexes one page table by ordinal against one pool base.
+The sparse pool's GPU tier holds nothing but cache entries — selected history and the block
+being written alike. That is what lets the fetch emit a **single** index list covering both,
+and therefore why existing attention kernels need no change: a kernel still indexes one page
+table by ordinal against one pool base.
 
 Indices are unit-granular. With `E` units per page and `N_b` buffers per page, layer L's
 unit u of page p is at `(p * N_b + L) * E + u` — the expanded index space
-`PageIndexConverter` already produces. The positions mean different things for a cached
-entry and an ordinary page, but the address computation is identical.
+`PageIndexConverter` already produces.
 
 Note that `tokens_per_block_override` is only an index-conversion mechanism: it yields
 `expansion = tokens_per_block / tokens_per_block_override` and scales `BufferConfig.size`
@@ -488,25 +539,27 @@ tensors without this package depending on torch.
 
 ## Implementation notes
 
-Places where existing code assumes level 0 and fails quietly rather than loudly.
-
 Slot release is already level-aware: `Page::~Page()` releases with the page's own
 `cacheLevel`, and the `kHotLevel` in `ScratchSlotLock::unlock()` is correct, since SWA
 prefill scratch is GPU-only by definition.
 
 - **`_lockHeldBlocks`**, the OOM rollback for `resize`, calls `batchedLockToGpu`. A sparse
-  resize failing partway would re-lock demoted pages at level 0, leaving the page table
-  holding level-0 indices the fetch path resolves against the host pool. Failure path only,
-  so it survives happy-path testing. *(Addressed: `StaleBackup` now records the page's lock
-  level and `batchedLockPages` restores it.)*
-- **`_unlockStaleBlocks` is not the demotion hook.** It exists for SWA blocks outside the
+  resize failing partway would re-lock pages at level 0, leaving the page table holding
+  level-0 indices in a table everything else assumes is level-1. Failure path only, so it
+  survives happy-path testing. *(Addressed: `StaleBackup` now records the page's lock level
+  and `batchedLockPages` restores it.)*
+- **`_unlockStaleBlocks` is not the flush hook.** It exists for SWA blocks outside the
   window, whose content is *dead*; sparse history is live and will be read. Same trigger and
-  range arithmetic, different disposition — routing sparse layers through it drops history
-  instead of demoting it. It also gates on `windowSize.has_value()`, so for a full-attention
+  range arithmetic, different disposition — routing sparse layers through it drops the data
+  instead of flushing it. It also gates on `windowSize.has_value()`, so for a full-attention
   sparse layer it fires on nothing.
-- **`_shortcutSetHistoryLength`** bails out when the SWA stale range is unchanged. A sparse
-  demote range advances on a different schedule, so the comparison must include it or the
-  fast path silently skips demotion.
+- **`_shortcutSetHistoryLength`** bails out when the SWA stale range is unchanged. The flush
+  range advances on a different schedule, so the comparison must include it or the fast path
+  silently skips a flush — leaving a block dirty past the point where selection may name it.
+- **Commit is not a substitute for the watermark deadline.** Flushing at `commit()` is worth
+  doing, but `stopCommitting()`, a `CommitState` other than `ALLOWED`, and reuse-disabled
+  requests all produce blocks that are never committed. The watermark hook is what makes the
+  flush guaranteed.
 
 Also: the host pool is far larger than the GPU pool, so a page index must be widened to 64
 bits before multiplying by the page stride. MSA already does this
@@ -518,9 +571,12 @@ Recorded because each looks like an open question and is not:
 
 - **`num_blocks` lives on the device, in `Batch`.** Deriving it per call from the watermark
   would produce a host value the kernel cannot use, costing an H2D per layer.
-- **Eviction never copies.** Fetch copies rather than moves, so the host page stays
-  authoritative and every entry is clean; evicting is a free-list push.
-- **No pin bit.** LRU recency already orders earlier layers ahead of the current one.
+- **Eviction never copies.** An entry is evictable only once flushed, so evicting is a
+  free-list push. Flushes are triggered by commit or by the watermark, never by eviction
+  pressure.
+- **The dirty bit is not a general pinning scheme.** One entry per `(request, layer)`,
+  private because unflushed blocks are not in the radix tree, and MRU throughout its life.
+  Ordering between layers still comes from LRU recency alone.
 - **No stale-key invalidation.** Per-request cache scope makes it impossible.
 - **`tokens_per_block_override` is not a granularity lever.** See *One pool, one index
   space*.
@@ -534,6 +590,10 @@ Recorded because each looks like an open question and is not:
 - Whether `N` is uniform across requests. Uniform keeps reservation a counter and shapes
   static; varying it by context length would improve hit rates for long requests at the
   cost of ragged device arrays.
+- Whether rewinding past a commit is already rejected. The watermark-driven design needed an
+  explicit rule against rewinding below a demoted block; with commit as the flush point that
+  rule should be subsumed by existing commit semantics, but `stopCommitting()` and
+  `maxRewindLen` should be checked rather than assumed.
 
 ## References
 
