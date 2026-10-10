@@ -2645,6 +2645,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_layer_group_id",
             [](kv::KvCacheManager const& self, kv::LayerId layerId) { return self.getLayerGroupId(layerId).value(); },
             nb::arg("layer_id"))
+        .def(
+            "get_sparse_cache_pages",
+            [](kv::KvCacheManager const& self, kv::LayerId layerId)
+            { return self.sparseCachePages(self.getLayerGroupId(layerId)); },
+            nb::arg("layer_id"),
+            "Pages of the sparse pool a request reserves for this layer's per-layer GPU cache. "
+            "Zero when the layer is not sparse or its fetch path is unconfigured.")
         .def("get_page_index_converter", &kv::KvCacheManager::getPageIndexConverter, nb::arg("layer_id"),
             nb::arg("data_role"))
         .def(

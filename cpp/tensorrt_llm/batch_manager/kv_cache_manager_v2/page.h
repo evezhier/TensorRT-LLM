@@ -305,4 +305,14 @@ private:
     LifeCycleId mLifeCycle;
 };
 
+// ---------------------------------------------------------------------------
+// SparseCacheSlotLock — a GPU slot reserved for a request's sparse history cache.
+//
+// Mechanically identical to a scratch slot: hold a GPU slot for the owning KvCache and
+// release it to the GPU pool on destruction. The alias names the second purpose, which
+// is not SWA prefill reuse; the shared type is expected to be renamed to something
+// purpose-neutral once both callers are in place.
+// ---------------------------------------------------------------------------
+using SparseCacheSlotLock = ScratchSlotLock;
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

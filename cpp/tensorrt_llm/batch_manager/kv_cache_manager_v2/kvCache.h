@@ -618,7 +618,8 @@ private:
     void _recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<ScratchSlotLock>>& excess);
 
     // Release all scratch slots back to storage.
-    void _freeScratchSlots();
+    // Release every GPU slot this request reserves: SWA scratch and sparse history cache.
+    void _freeReservedGpuSlots();
 
     // Whether any lifecycle would require scratch blocks at the current state.
     bool _wouldUseSwaScratchBlocks() const;
@@ -674,6 +675,11 @@ private:
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
+
+    // Pages backing this request's sparse history cache, by life cycle. Reserved at
+    // resume(), released at suspend() and close(). Empty unless a sparse buffer of that
+    // life cycle has its fetch path configured.
+    TypedVec<LifeCycleId, std::vector<SparseCacheSlotLock>> mSparseCacheSlots;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

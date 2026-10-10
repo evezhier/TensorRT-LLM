@@ -125,6 +125,8 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
         mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
 
+    _computeSparseCachePages();
+
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();
     _resetIterationPeakNumBlocks();
@@ -135,6 +137,34 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 KvCacheManager::~KvCacheManager()
 {
     KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
+}
+
+void KvCacheManager::_computeSparseCachePages()
+{
+    mSparseCachePages = TypedVec<LifeCycleId, int>(mStorage->numLifeCycles(), 0);
+
+    for (auto const& layer : mConfig.layers)
+    {
+        auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
+        if (attn == nullptr)
+        {
+            continue;
+        }
+        LifeCycleId const lcId = mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock));
+        for (auto const& buf : attn->buffers)
+        {
+            if (!buf.isSparse || buf.maxCachedUnits <= 0)
+            {
+                continue;
+            }
+            // A page carries `expansion` units of this buffer, so fewer pages are needed as the
+            // selection unit shrinks. Reserve one entry beyond maxCachedUnits for the block being
+            // written, which stays dirty until flushed and so is never an eviction candidate.
+            int const expansion = mConfig.tokensPerBlock / buf.tokensPerBlockOverride.value_or(mConfig.tokensPerBlock);
+            int const pages = divUp(buf.maxCachedUnits + 1, expansion);
+            mSparseCachePages[lcId] = std::max(mSparseCachePages[lcId], pages);
+        }
+    }
 }
 
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const

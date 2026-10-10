@@ -408,6 +408,93 @@ class TestSparseBufferConfig(unittest.TestCase):
             )
 
 
+class TestSparseCacheReservation(unittest.TestCase):
+    """GPU pages a request reserves to back its sparse history cache."""
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @staticmethod
+    def _manager(max_cached_units: int) -> KVCacheManager:
+        # Both widths are zero together: a selection width without a cache to hold it is
+        # rejected at construction, so "fetch path unconfigured" means both are unset.
+        num_selected = 4 if max_cached_units > 0 else 0
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=128,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig(
+                                "key",
+                                4096,
+                                is_sparse=True,
+                                num_selected_blocks=num_selected,
+                                max_cached_units=max_cached_units,
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+
+    @staticmethod
+    def _free(manager: KVCacheManager) -> int:
+        return sum(stats.free for stats in manager.get_storage_statistics())
+
+    def _free_delta_across_resume(self, max_cached_units: int) -> int:
+        """GPU slots a single resume consumes, for the given cache width."""
+        manager = self._manager(max_cached_units)
+        try:
+            before = self._free(manager)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                used = before - self._free(manager)
+                cache.close()
+            self.assertEqual(self._free(manager), before)
+            return used
+        finally:
+            manager.shutdown()
+
+    def test_page_count_covers_width_plus_the_block_being_written(self):
+        manager = self._manager(max_cached_units=4)
+        try:
+            self.assertEqual(manager.get_sparse_cache_pages(0), 5)
+        finally:
+            manager.shutdown()
+
+    def test_reservation_is_exactly_the_configured_pages(self):
+        # Differential: the only difference between the two managers is the cache width,
+        # so the extra slots consumed by resume are the reservation and nothing else.
+        self.assertEqual(self._free_delta_across_resume(4) - self._free_delta_across_resume(0), 5)
+
+    def test_unconfigured_fetch_path_reserves_nothing(self):
+        manager = self._manager(max_cached_units=0)
+        try:
+            self.assertEqual(manager.get_sparse_cache_pages(0), 0)
+        finally:
+            manager.shutdown()
+
+    def test_pages_are_released_on_suspend_and_retaken_on_resume(self):
+        manager = self._manager(max_cached_units=4)
+        try:
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                resumed = self._free(manager)
+                cache.suspend()
+                self.assertGreaterEqual(self._free(manager) - resumed, 5)
+                self.assertTrue(cache.resume(handle))
+                self.assertEqual(self._free(manager), resumed)
+                cache.close()
+        finally:
+            manager.shutdown()
+
+
 class TestKVCacheManagerV2(unittest.TestCase):
     engine: FakeEngine
     cfg: KVCacheManagerConfig

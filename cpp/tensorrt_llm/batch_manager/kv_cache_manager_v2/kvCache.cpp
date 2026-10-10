@@ -91,6 +91,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
     mScratchSlots.resize(manager.storage().numLifeCycles());
+    mSparseCacheSlots.resize(manager.storage().numLifeCycles());
 
     TLLM_CHECK_WITH_INFO(!(manager.textOnly() && textOnly == std::optional<bool>{false}),
         "text_only=false is not allowed when the manager is configured text_only=true");
@@ -324,6 +325,18 @@ bool KvCache::resume(std::optional<CUstream> stream)
         numSlotsNeeded[lc] += scratchDeltaCounts[lc];
     }
 
+    // Pages backing this request's sparse history cache. Held until close(), so a resume
+    // after suspend tops up only what is missing. Zero for every life cycle whose fetch
+    // path is unconfigured, which keeps non-sparse deployments untouched.
+    TypedVec<LifeCycleId, int> sparseCacheDelta(numLc, 0);
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+    {
+        int const want = mManager->sparseCachePages(lc);
+        int const have = static_cast<int>(mSparseCacheSlots[lc].size());
+        sparseCacheDelta[lc] = std::max(0, want - have);
+        numSlotsNeeded[lc] += sparseCacheDelta[lc];
+    }
+
     // Only allocate if any slots are needed.
     bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
     if (anyNeeded)
@@ -357,6 +370,15 @@ bool KvCache::resume(std::optional<CUstream> stream)
                     deferredSlots[lc] = std::move(tmpSlots[lc].back());
                     tmpSlots[lc].pop_back();
                 }
+                // Sparse history cache pages, carved out before the scratch remainder.
+                for (int i = 0; i < sparseCacheDelta[lc] && !tmpSlots[lc].empty(); ++i)
+                {
+                    mSparseCacheSlots[lc].emplace_back(std::move(tmpSlots[lc].back()), *this, lc,
+                        /*skipWait=*/true);
+                    tmpSlots[lc].pop_back();
+                    scratchReadyEvents.push_back(mSparseCacheSlots[lc].back().slot().readyEvent.handle());
+                }
+
                 // Remaining slots are scratch slots.
                 auto& scratchSlots = mScratchSlots[lc];
                 scratchSlots.reserve(scratchSlots.size() + tmpSlots[lc].size());
@@ -603,7 +625,7 @@ void KvCache::suspend()
         }
         // Free scratch slots inside scope — unlock() needs finishEvent().
         // Mirrors Python: _free_scratch_slots() inside `with self._record_event()`.
-        _freeScratchSlots();
+        _freeReservedGpuSlots();
     }
     mStatus = Status::SUSPENDED;
     if (_shouldRecordStats())
@@ -872,7 +894,7 @@ void KvCache::_clearBlocks()
     // Drop last block first (mirrors Python: while self._blocks: self._blocks.pop()).
     while (!mBlocks.empty())
         mBlocks.pop_back();
-    _freeScratchSlots();
+    _freeReservedGpuSlots();
     // Clear SSM blocks.
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     if (ssmLcId.has_value())
@@ -3015,9 +3037,15 @@ void KvCache::_recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<Scrat
     }
 }
 
-void KvCache::_freeScratchSlots()
+void KvCache::_freeReservedGpuSlots()
 {
     for (auto& lcSlots : mScratchSlots)
+    {
+        for (auto& lock : lcSlots)
+            lock.unlock();
+        lcSlots.clear();
+    }
+    for (auto& lcSlots : mSparseCacheSlots)
     {
         for (auto& lock : lcSlots)
             lock.unlock();

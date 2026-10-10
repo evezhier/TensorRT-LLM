@@ -317,6 +317,19 @@ public:
         return mConfig;
     }
 
+    //! Pages of the sparse pool a request reserves for this life cycle's per-layer GPU cache.
+    //!
+    //! Zero when the life cycle is not sparse, or when its fetch path is unconfigured
+    //! (BufferConfig::maxCachedUnits is zero), in which case no reservation is made.
+    //!
+    //! One page yields one cache entry per coalesced layer, or `expansion` entries when the
+    //! selection unit is smaller than a page, so the page count covers maxCachedUnits entries
+    //! plus the one held by the block currently being written.
+    [[nodiscard]] int sparseCachePages(LifeCycleId lifeCycle) const noexcept
+    {
+        return lifeCycle < mSparseCachePages.size() ? mSparseCachePages[lifeCycle] : 0;
+    }
+
     LifeCycleRegistry const& lifeCycles() const noexcept
     {
         return mLifeCycles;
@@ -418,6 +431,9 @@ private:
 
     PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);
+
+    // Fill mSparseCachePages from the configured sparse buffers. Called once at construction.
+    void _computeSparseCachePages();
     void _updateIterationPeakNumBlocks();
 
     // Current per-pool-group utilization ratios for the hot and cold representations.
@@ -426,6 +442,9 @@ private:
 
     KVCacheManagerConfig mConfig;
     LifeCycleRegistry mLifeCycles;
+
+    // Indexed by life cycle; see sparseCachePages().
+    TypedVec<LifeCycleId, int> mSparseCachePages;
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;
