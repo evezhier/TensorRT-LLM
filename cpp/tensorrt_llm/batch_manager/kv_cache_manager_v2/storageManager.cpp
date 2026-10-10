@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/logger.h"
@@ -551,6 +552,65 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newGpuSlots(
     DropRecorder const& dropRecorder)
 {
     return newSlots(kHotLevel, numSlotsPerLc, migrationRecorder, dropRecorder);
+}
+
+TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newResidentSlots(
+    TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder,
+    DropRecorder const& dropRecorder)
+{
+    LifeCycleId const numLc = numSlotsPerLc.size();
+    TypedVec<LifeCycleId, CacheLevel> levels(numLc);
+    std::set<CacheLevel> present;
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+    {
+        levels[lc] = residencyLevel(lc);
+        if (numSlotsPerLc[lc] > 0)
+        {
+            present.insert(levels[lc]);
+        }
+    }
+    if (present.size() <= 1)
+    {
+        // Every life cycle that wants slots shares one level; one allocation covers them.
+        CacheLevel const level = present.empty() ? kHotLevel : *present.begin();
+        return newSlots(level, numSlotsPerLc, migrationRecorder, dropRecorder);
+    }
+
+    TypedVec<LifeCycleId, std::vector<Slot>> result(numLc);
+    // Each level allocates from a different pool, so a later failure must hand back
+    // what the earlier levels already took before the error reaches the caller.
+    auto rollback = FuncGuard(
+        [&]()
+        {
+            for (LifeCycleId lc{0}; lc < numLc; ++lc)
+            {
+                for (auto& slot : result[lc])
+                {
+                    releaseSlot(lc, levels[lc], std::move(slot));
+                }
+            }
+        });
+    for (CacheLevel const level : present)
+    {
+        TypedVec<LifeCycleId, SlotCount> counts(numLc, 0);
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+        {
+            if (levels[lc] == level)
+            {
+                counts[lc] = numSlotsPerLc[lc];
+            }
+        }
+        auto allocated = newSlots(level, counts, migrationRecorder, dropRecorder);
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+        {
+            if (levels[lc] == level)
+            {
+                result[lc] = std::move(allocated[lc]);
+            }
+        }
+    }
+    rollback.cancel();
+    return result;
 }
 
 std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
@@ -1347,6 +1407,17 @@ int64_t StorageManager::prefetch(
 LifeCycle const& StorageManager::getLifeCycle(LifeCycleId lc) const
 {
     return mLifeCycles[lc];
+}
+
+CacheLevel StorageManager::residencyLevel(LifeCycleId lc) const
+{
+    auto const* attention = std::get_if<AttnLifeCycle>(&getLifeCycle(lc));
+    if (attention != nullptr && attention->isSparse && kSparseHistoryLevel < numCacheLevels()
+        && cacheTier(kSparseHistoryLevel) == CacheTier::HOST_MEM)
+    {
+        return kSparseHistoryLevel;
+    }
+    return kHotLevel;
 }
 
 PoolGroupIndex StorageManager::getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const

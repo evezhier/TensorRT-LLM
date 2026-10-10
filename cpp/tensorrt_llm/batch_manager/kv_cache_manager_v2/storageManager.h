@@ -151,6 +151,11 @@ public:
     TypedVec<LifeCycleId, std::vector<Slot>> newGpuSlots(TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
+    // Allocate slots for all life cycles, each at its own residency level. Equivalent to
+    // newGpuSlots when no sparse life cycle is asking for slots.
+    TypedVec<LifeCycleId, std::vector<Slot>> newResidentSlots(TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+
     // Allocate slots for a single pool group at the given cache level.
     // Returns numSlots Slot objects. Throws OutOfPagesError if allocation fails.
     std::vector<Slot> newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
@@ -206,6 +211,12 @@ public:
     }
 
     LifeCycle const& getLifeCycle(LifeCycleId lc) const;
+
+    // The cache level the pages of this life cycle live at while locked, and the
+    // level their slots are allocated from. kHotLevel for every life cycle except
+    // sparse-attention ones, whose pages stay in device-mapped host memory and
+    // reach the kernels through the per-request device cache instead.
+    CacheLevel residencyLevel(LifeCycleId lc) const;
 
     LifeCycleId numLifeCycles() const noexcept
     {

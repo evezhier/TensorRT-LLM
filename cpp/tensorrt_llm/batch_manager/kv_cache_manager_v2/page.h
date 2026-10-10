@@ -279,7 +279,10 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
 class ScratchSlotLock
 {
 public:
-    ScratchSlotLock(Slot slot, KvCache& owner, LifeCycleId lifeCycle, bool skipWait = false);
+    // cacheLevel is the level the slot was allocated from, and the level it is
+    // returned to. Scratch for a life cycle whose pages are not GPU-resident is
+    // allocated from that life cycle's residency level, not from the hot level.
+    ScratchSlotLock(Slot slot, KvCache& owner, LifeCycleId lifeCycle, CacheLevel cacheLevel, bool skipWait = false);
     ~ScratchSlotLock();
 
     ScratchSlotLock(ScratchSlotLock&& other) noexcept;
@@ -299,10 +302,16 @@ public:
         return mSlot;
     }
 
+    CacheLevel cacheLevel() const noexcept
+    {
+        return mCacheLevel;
+    }
+
 private:
     Slot mSlot;
     KvCache* mOwner;
     LifeCycleId mLifeCycle;
+    CacheLevel mCacheLevel;
 };
 
 // ---------------------------------------------------------------------------

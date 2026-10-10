@@ -99,17 +99,7 @@ SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal or
 
 CacheLevel Page::queryLockLevel() const
 {
-    if (cacheLevel == kHotLevel)
-    {
-        return kHotLevel;
-    }
-    auto const* attention = std::get_if<AttnLifeCycle>(&manager->getLifeCycle(lifeCycle));
-    if (attention != nullptr && attention->isSparse && kSparseHistoryLevel < manager->numCacheLevels()
-        && manager->cacheTier(kSparseHistoryLevel) == CacheTier::HOST_MEM)
-    {
-        return kSparseHistoryLevel;
-    }
-    return kHotLevel;
+    return manager->residencyLevel(lifeCycle);
 }
 
 // ---------------------------------------------------------------------------
@@ -542,9 +532,10 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
 // ScratchSlotLock
 // ---------------------------------------------------------------------------
 
-ScratchSlotLock::ScratchSlotLock(Slot slot, KvCache& owner, LifeCycleId lifeCycle, bool skipWait)
+ScratchSlotLock::ScratchSlotLock(Slot slot, KvCache& owner, LifeCycleId lifeCycle, CacheLevel cacheLevel, bool skipWait)
     : mOwner(&owner)
     , mLifeCycle(lifeCycle)
+    , mCacheLevel(cacheLevel)
 {
     if (!skipWait)
     {
@@ -565,6 +556,7 @@ ScratchSlotLock::ScratchSlotLock(ScratchSlotLock&& other) noexcept
     : mSlot(std::move(other.mSlot))
     , mOwner(other.mOwner)
     , mLifeCycle(other.mLifeCycle)
+    , mCacheLevel(other.mCacheLevel)
 {
     // Invalidate moved-from: mSlot move only transfers readyEvent, not slotId (trivially-copyable).
     other.mSlot.resetSlot();
@@ -589,6 +581,7 @@ ScratchSlotLock& ScratchSlotLock::operator=(ScratchSlotLock&& other) noexcept
         other.mSlot.resetSlot(); // Invalidate moved-from slotId.
         mOwner = other.mOwner;
         mLifeCycle = other.mLifeCycle;
+        mCacheLevel = other.mCacheLevel;
         other.mOwner = nullptr;
     }
     return *this;
@@ -606,7 +599,7 @@ void ScratchSlotLock::unlock()
 {
     TLLM_CHECK_DEBUG(mSlot.hasValidSlot());
     mSlot.readyEvent = mOwner->finishEvent();
-    mOwner->storageManager()->releaseSlot(mLifeCycle, kHotLevel, std::move(mSlot));
+    mOwner->storageManager()->releaseSlot(mLifeCycle, mCacheLevel, std::move(mSlot));
     TLLM_CHECK_DEBUG(!mSlot.hasValidSlot());
 }
 

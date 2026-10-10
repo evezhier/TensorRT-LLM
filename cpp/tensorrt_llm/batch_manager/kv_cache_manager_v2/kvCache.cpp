@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/math.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
@@ -264,13 +265,6 @@ void KvCache::setMaxInputLength(int maxInputLength)
     mMaxInputLength = maxInputLength;
 }
 
-CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
-{
-    bool const readOnly = page.isCommitted()
-        || (ordinal != kBadBlockOrdinal && ordinal < BlockOrdinal{mHistoryLength / mTokensPerBlock});
-    return readOnly ? page.queryLockLevel() : kHotLevel;
-}
-
 void KvCache::activate()
 {
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
@@ -296,7 +290,7 @@ void KvCache::activate()
         }
         auto& holder = std::get<SharedPtr<PageHolder>>(*bp);
         TLLM_CHECK_DEBUG(holder);
-        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId, _lockLevel(*holder->page, ap.ordinal)});
+        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId, holder->page->queryLockLevel()});
     }
 
     {
@@ -376,20 +370,38 @@ bool KvCache::resume(std::optional<CUstream> stream)
     // Pages backing this request's sparse history cache. Held until close(), so a resume
     // after suspend tops up only what is missing. Zero for every life cycle whose fetch
     // path is unconfigured, which keeps non-sparse deployments untouched.
-    TypedVec<LifeCycleId, int> sparseCacheDelta(numLc, 0);
+    // These are GPU pages whatever the life cycle's residency level is: the cache is what
+    // makes host-resident sparse history reachable by the attention kernels.
+    TypedVec<LifeCycleId, SlotCount> sparseCacheDelta(numLc, 0);
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
         int const want = _sparseCachePages(lc);
         int const have = static_cast<int>(mSparseCacheSlots[lc].size());
         sparseCacheDelta[lc] = std::max(0, want - have);
-        numSlotsNeeded[lc] += sparseCacheDelta[lc];
     }
 
     // Only allocate if any slots are needed.
-    bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
-    if (anyNeeded)
+    bool const anyResident
+        = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
+    bool const anySparseCache
+        = std::any_of(sparseCacheDelta.begin(), sparseCacheDelta.end(), [](SlotCount n) { return n > 0; });
+    if (anyResident || anySparseCache)
     {
-        TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots;
+        TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots(numLc);
+        TypedVec<LifeCycleId, std::vector<Slot>> sparseCacheSlots(numLc);
+        // The two allocations draw on different pools, so the first must be handed back if
+        // the second cannot be satisfied.
+        auto releaseSparseCache = FuncGuard(
+            [&]()
+            {
+                for (LifeCycleId lc{0}; lc < numLc; ++lc)
+                {
+                    for (auto& slot : sparseCacheSlots[lc])
+                    {
+                        storageMgr.releaseSlot(lc, kHotLevel, std::move(slot));
+                    }
+                }
+            });
         try
         {
             MigrationRecorder const migrationRecorder
@@ -397,19 +409,42 @@ bool KvCache::resume(std::optional<CUstream> stream)
                       CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
             DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
             { _recordDroppedPages(pages, cacheLevel); };
-            tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
+            if (anySparseCache)
+            {
+                sparseCacheSlots = storageMgr.newSlots(kHotLevel, sparseCacheDelta, migrationRecorder, dropRecorder);
+            }
+            if (anyResident)
+            {
+                tmpSlots = storageMgr.newResidentSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
+            }
         }
         catch (OutOfPagesError const&)
         {
             return false;
         }
+        releaseSparseCache.cancel();
 
         // Separate deferred vs scratch slots, and collect scratch ready events.
         std::vector<CUevent> scratchReadyEvents;
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
+            for (auto& slot : sparseCacheSlots[lc])
+            {
+                mSparseCacheSlots[lc].emplace_back(std::move(slot), *this, lc, kHotLevel, /*skipWait=*/true);
+                scratchReadyEvents.push_back(mSparseCacheSlots[lc].back().slot().readyEvent.handle());
+            }
+            if (sparseCacheDelta[lc] > 0)
+            {
+                // Sized from the pages now held. Recreating on growth is safe only while
+                // nothing is cached; once entries hold data, growth must preserve them.
+                int const entries = static_cast<int>(mSparseCacheSlots[lc].size()) * mManager->sparseCacheExpansion(lc);
+                mSparseCacheState[lc] = SparseCacheState(
+                    mManager->sparseCacheBuffersPerPage(lc), entries, reinterpret_cast<CUstream>(cudaStream()));
+            }
+
             if (!tmpSlots[lc].empty())
             {
+                CacheLevel const residency = storageMgr.residencyLevel(lc);
                 // Mirrors Python: `if self._never_resumed and (... SsmLifeCycle or has_partial):`
                 bool needsDeferred = mNeverResumed && ((ssmLcId.has_value() && lc == *ssmLcId) || hasPartial);
                 if (needsDeferred)
@@ -418,30 +453,13 @@ bool KvCache::resume(std::optional<CUstream> stream)
                     deferredSlots[lc] = std::move(tmpSlots[lc].back());
                     tmpSlots[lc].pop_back();
                 }
-                // Sparse history cache pages, carved out before the scratch remainder.
-                for (int i = 0; i < sparseCacheDelta[lc] && !tmpSlots[lc].empty(); ++i)
-                {
-                    mSparseCacheSlots[lc].emplace_back(std::move(tmpSlots[lc].back()), *this, lc,
-                        /*skipWait=*/true);
-                    tmpSlots[lc].pop_back();
-                    scratchReadyEvents.push_back(mSparseCacheSlots[lc].back().slot().readyEvent.handle());
-                }
-                if (sparseCacheDelta[lc] > 0)
-                {
-                    // Sized from the pages now held. Recreating on growth is safe only while
-                    // nothing is cached; once entries hold data, growth must preserve them.
-                    int const entries
-                        = static_cast<int>(mSparseCacheSlots[lc].size()) * mManager->sparseCacheExpansion(lc);
-                    mSparseCacheState[lc] = SparseCacheState(
-                        mManager->sparseCacheBuffersPerPage(lc), entries, reinterpret_cast<CUstream>(cudaStream()));
-                }
 
                 // Remaining slots are scratch slots.
                 auto& scratchSlots = mScratchSlots[lc];
                 scratchSlots.reserve(scratchSlots.size() + tmpSlots[lc].size());
                 for (auto& slot : tmpSlots[lc])
                 {
-                    scratchSlots.emplace_back(std::move(slot), *this, lc,
+                    scratchSlots.emplace_back(std::move(slot), *this, lc, residency,
                         /*skipWait=*/true);
                     scratchReadyEvents.push_back(scratchSlots.back().slot().readyEvent.handle());
                 }
@@ -572,7 +590,8 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 blockOrdinal = lastOrdinal;
             }
 
-            auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kHotLevel, beamIdx);
+            auto newPage = makeShared<UncommittedPage>(
+                *this, blockOrdinal, lcIdx, storageManager()->residencyLevel(lcIdx), beamIdx);
             newPage->setSlot(newSlot);
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
@@ -616,7 +635,7 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
-        CacheLevel const destination = std::max(target, _lockLevel(*page, activePage.ordinal));
+        CacheLevel const destination = std::max(target, page->queryLockLevel());
         if (page->cacheLevel < destination || !seen.insert(page.get()).second)
         {
             continue;
@@ -1321,7 +1340,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 DropRecorder const dropRecorder
                     = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
                 { _recordDroppedPages(pages, cacheLevel); };
-                newSlots = mManager->storage().newGpuSlots(allocCounts, migrationRecorder, dropRecorder);
+                newSlots = mManager->storage().newResidentSlots(allocCounts, migrationRecorder, dropRecorder);
             }
             catch (OutOfPagesError const&)
             {
@@ -1390,7 +1409,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             {
                 auto slot = std::move(slots[lc].back());
                 slots[lc].pop_back();
-                mScratchSlots[lc].emplace_back(std::move(slot), *this, lc, /*skipWait=*/true);
+                mScratchSlots[lc].emplace_back(
+                    std::move(slot), *this, lc, mManager->storage().residencyLevel(lc), /*skipWait=*/true);
             }
         }
 
@@ -1448,7 +1468,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     }
                     auto slot = std::move(slots[lc].back());
                     slots[lc].pop_back();
-                    auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, bi);
+                    auto page = makeShared<UncommittedPage>(*this, ord, lc, storageManager()->residencyLevel(lc), bi);
                     page->setSlot(slot);
                     sb.pages[bi][lc] = page->lock(*this, bi, ord, lc, /*skipWait=*/true);
                 }
@@ -1648,7 +1668,7 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
               CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
     DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
     { _recordDroppedPages(pages, cacheLevel); };
-    auto newSlots = storage.newGpuSlots(slotCounts, migrationRecorder, dropRecorder);
+    auto newSlots = storage.newResidentSlots(slotCounts, migrationRecorder, dropRecorder);
 
     // Page-index rows must exist before locking the copied pages because lock()
     // immediately publishes the page index through updateBasePageIndex().
@@ -1678,7 +1698,7 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
         iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(storage, kHotLevel, lc);
         _recordDirectIterationStats(lc, iterationStats);
 
-        auto page = makeShared<UncommittedPage>(*this, ordinal, lc, kHotLevel, beamIdx);
+        auto page = makeShared<UncommittedPage>(*this, ordinal, lc, storageManager()->residencyLevel(lc), beamIdx);
         page->setSlot(slot);
         return page->lock(*this, beamIdx, ordinal, lc, /*skipWait=*/true);
     };
@@ -1981,7 +2001,7 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                     bp = std::move(holder);
                 }
                 reuseTasks.push_back({existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord),
-                    lc, _lockLevel(*existingPage, static_cast<BlockOrdinal>(ord))});
+                    lc, existingPage->queryLockLevel()});
             }
         }
         if (!reuseTasks.empty())

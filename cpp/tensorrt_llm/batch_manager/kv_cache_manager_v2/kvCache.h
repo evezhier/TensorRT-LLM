@@ -493,10 +493,6 @@ private:
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
 
-    // Keep cold sparse history (and immutable reuse sources) in host memory.
-    // Writable pages require GPU storage; GPU history stays there until explicitly offloaded.
-    CacheLevel _lockLevel(Page const& page, BlockOrdinal ordinal) const;
-
     // Cache pages this request needs for one life cycle: history entries plus one per
     // in-flight unit, converted to pages. Zero when the life cycle has no fetch path.
     [[nodiscard]] int _sparseCachePages(LifeCycleId lifeCycle) const;
