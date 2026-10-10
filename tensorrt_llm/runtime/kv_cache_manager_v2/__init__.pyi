@@ -577,6 +577,26 @@ class _KVCache:
     ) -> Iterator[int]: ...
     def resize(self, capacity: int | None, history_length: int | None = None) -> bool: ...
     @property
+    def max_input_length(self) -> int | None:
+        """Bound on ``capacity - history_length``: how far capacity may outrun the watermark.
+
+        ``None`` unless a sparse buffer's fetch path is configured, since a bound on
+        in-flight blocks describes nothing without a cache to hold them. Where it does
+        apply it starts at zero -- capacity may not outrun the watermark until a caller
+        raises it -- and :meth:`resize` rejects a gap wider than it.
+
+        It matters because every block above the watermark is in flight: its data lives only
+        in a sparse cache entry until a flush reaches it, so the reservation must cover them
+        all. Raise it before the :meth:`resize` that opens the gap.
+
+        Declared rather than inferred so the reservation stays static and a shortfall surfaces
+        at :meth:`resume`, where a caller can act on it, rather than mid-step where nobody
+        can. Lowering it when prefill completes is what returns pages to the global pool.
+        """
+
+    @max_input_length.setter
+    def max_input_length(self, value: int) -> None: ...
+    @property
     def capacity(self) -> int: ...
     @capacity.setter
     def capacity(self, capacity: int) -> None: ...

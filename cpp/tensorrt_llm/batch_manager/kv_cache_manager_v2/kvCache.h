@@ -211,6 +211,21 @@ public:
     // Returns true on success, false when the resize ran out of pages and was rolled back.
     bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt);
 
+    // ---- Sparse history cache ----------------------------------------------
+
+    //! Bound on capacity - history_length: how far capacity may outrun the watermark.
+    //!
+    //! Required once a sparse buffer's fetch path is configured and the two differ, because
+    //! the cache must hold every in-flight block and the reservation is sized from this.
+    //! Set it before the resize() that opens the gap. Lowering it when prefill completes is
+    //! what returns pages to the global pool.
+    void setMaxInputLength(int maxInputLength);
+
+    [[nodiscard]] std::optional<int> maxInputLength() const noexcept
+    {
+        return mMaxInputLength;
+    }
+
     // Convenience: set only capacity or history length.
     void setCapacity(int capacity);
     void setHistoryLength(int historyLength);
@@ -482,6 +497,14 @@ private:
     // Writable pages require GPU storage; GPU history stays there until explicitly offloaded.
     CacheLevel _lockLevel(Page const& page, BlockOrdinal ordinal) const;
 
+    // Cache pages this request needs for one life cycle: history entries plus one per
+    // in-flight unit, converted to pages. Zero when the life cycle has no fetch path.
+    [[nodiscard]] int _sparseCachePages(LifeCycleId lifeCycle) const;
+
+    // Whether any life cycle has a configured sparse fetch path, and so whether
+    // max_input_length is required.
+    [[nodiscard]] bool _hasSparseCache() const;
+
     // Internal helpers.
     // Turn the per-block cache levels observed while holding the matched pages into logical token
     // counts. Called at the end of _setupForReuse, which collects them in the same walk.
@@ -685,6 +708,9 @@ private:
     // Device-resident residency, recency and dirty state describing those pages. Created
     // with them and destroyed with them, so the metadata never outlives what it describes.
     TypedVec<LifeCycleId, SparseCacheState> mSparseCacheState;
+
+    // See setMaxInputLength(). Unset until a caller declares it.
+    std::optional<int> mMaxInputLength;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

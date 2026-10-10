@@ -1798,6 +1798,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return self.resize(capacity, historyLength); },
             nb::arg("capacity") = std::nullopt, nb::arg("history_length") = std::nullopt,
             nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_rw(
+            "max_input_length", [](kv::KvCache const& self) { return self.maxInputLength(); },
+            [](kv::KvCache& self, int value) { self.setMaxInputLength(value); },
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
@@ -2648,12 +2652,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager const& self, kv::LayerId layerId) { return self.getLayerGroupId(layerId).value(); },
             nb::arg("layer_id"))
         .def(
-            "get_sparse_cache_pages",
+            "get_sparse_cache_max_units",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
-            { return self.sparseCachePages(self.getLayerGroupId(layerId)); },
+            { return self.sparseCacheMaxUnits(self.getLayerGroupId(layerId)); },
             nb::arg("layer_id"),
-            "Pages of the sparse pool a request reserves for this layer's per-layer GPU cache. "
-            "Zero when the layer is not sparse or its fetch path is unconfigured.")
+            "History entries a request's sparse cache holds for this layer, in selection units. "
+            "The in-flight population is bounded per request by _KVCache.max_input_length, so the "
+            "page count is a property of the request rather than the manager.")
+        .def(
+            "get_sparse_cache_expansion",
+            [](kv::KvCacheManager const& self, kv::LayerId layerId)
+            { return self.sparseCacheExpansion(self.getLayerGroupId(layerId)); },
+            nb::arg("layer_id"), "Selection units carried by one page; one when a unit is a whole page.")
         .def(
             "get_sparse_cache_buffers_per_page",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
@@ -2661,11 +2671,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_id"),
             "Sparse buffers carried by one page of this layer's life cycle, i.e. the number of "
             "independent caches a reserved page feeds.")
-        .def(
-            "get_sparse_cache_entries_per_buffer",
-            [](kv::KvCacheManager const& self, kv::LayerId layerId)
-            { return self.sparseCacheEntriesPerBuffer(self.getLayerGroupId(layerId)); },
-            nb::arg("layer_id"), "Cache entries each sparse buffer gets: pages * expansion.")
         .def("get_page_index_converter", &kv::KvCacheManager::getPageIndexConverter, nb::arg("layer_id"),
             nb::arg("data_role"))
         .def(

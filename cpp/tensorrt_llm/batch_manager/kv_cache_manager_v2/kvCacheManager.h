@@ -317,17 +317,22 @@ public:
         return mConfig;
     }
 
-    //! Pages of the sparse pool a request reserves for this life cycle's per-layer GPU cache.
+    //! History entries a request's sparse cache holds for this life cycle, in selection
+    //! units. Zero when the life cycle is not sparse or its fetch path is unconfigured.
     //!
-    //! Zero when the life cycle is not sparse, or when its fetch path is unconfigured
-    //! (BufferConfig::maxCachedUnits is zero), in which case no reservation is made.
-    //!
-    //! One page yields one cache entry per coalesced layer, or `expansion` entries when the
-    //! selection unit is smaller than a page, so the page count covers maxCachedUnits entries
-    //! plus the one held by the block currently being written.
-    [[nodiscard]] int sparseCachePages(LifeCycleId lifeCycle) const noexcept
+    //! This is the history population only. The in-flight population is bounded per request
+    //! by KvCache::maxInputLength(), so the page count is a property of the request, not of
+    //! the manager.
+    [[nodiscard]] int sparseCacheMaxUnits(LifeCycleId lifeCycle) const noexcept
     {
-        return lifeCycle < mSparseCachePages.size() ? mSparseCachePages[lifeCycle] : 0;
+        return lifeCycle < mSparseCacheMaxUnits.size() ? mSparseCacheMaxUnits[lifeCycle] : 0;
+    }
+
+    //! Selection units carried by one page of this life cycle, i.e. tokens_per_block divided
+    //! by the unit's token count. One when the unit is a whole page.
+    [[nodiscard]] int sparseCacheExpansion(LifeCycleId lifeCycle) const noexcept
+    {
+        return lifeCycle < mSparseCacheExpansion.size() ? mSparseCacheExpansion[lifeCycle] : 1;
     }
 
     //! Sparse buffers carried by one page of this life cycle: the (layer, role) slices a
@@ -335,13 +340,6 @@ public:
     [[nodiscard]] int sparseCacheBuffersPerPage(LifeCycleId lifeCycle) const noexcept
     {
         return lifeCycle < mSparseCacheBuffers.size() ? mSparseCacheBuffers[lifeCycle] : 0;
-    }
-
-    //! Cache entries each of those buffers gets: pages * expansion, so at least
-    //! max_cached_units + 1.
-    [[nodiscard]] int sparseCacheEntriesPerBuffer(LifeCycleId lifeCycle) const noexcept
-    {
-        return lifeCycle < mSparseCacheEntries.size() ? mSparseCacheEntries[lifeCycle] : 0;
     }
 
     LifeCycleRegistry const& lifeCycles() const noexcept
@@ -446,8 +444,8 @@ private:
     PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);
 
-    // Fill mSparseCachePages from the configured sparse buffers. Called once at construction.
-    void _computeSparseCachePages();
+    // Fill the sparse cache shape tables from the configured buffers. Called once at construction.
+    void _computeSparseCacheShape();
     void _updateIterationPeakNumBlocks();
 
     // Current per-pool-group utilization ratios for the hot and cold representations.
@@ -458,9 +456,9 @@ private:
     LifeCycleRegistry mLifeCycles;
 
     // All indexed by life cycle; see the sparseCache* accessors.
-    TypedVec<LifeCycleId, int> mSparseCachePages;
+    TypedVec<LifeCycleId, int> mSparseCacheMaxUnits;
+    TypedVec<LifeCycleId, int> mSparseCacheExpansion;
     TypedVec<LifeCycleId, int> mSparseCacheBuffers;
-    TypedVec<LifeCycleId, int> mSparseCacheEntries;
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;

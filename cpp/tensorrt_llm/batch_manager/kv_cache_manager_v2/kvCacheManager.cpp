@@ -125,7 +125,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
         mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
 
-    _computeSparseCachePages();
+    _computeSparseCacheShape();
 
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();
@@ -139,11 +139,12 @@ KvCacheManager::~KvCacheManager()
     KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
 }
 
-void KvCacheManager::_computeSparseCachePages()
+void KvCacheManager::_computeSparseCacheShape()
 {
-    mSparseCachePages = TypedVec<LifeCycleId, int>(mStorage->numLifeCycles(), 0);
-    mSparseCacheBuffers = TypedVec<LifeCycleId, int>(mStorage->numLifeCycles(), 0);
-    mSparseCacheEntries = TypedVec<LifeCycleId, int>(mStorage->numLifeCycles(), 0);
+    LifeCycleId const numLc = mStorage->numLifeCycles();
+    mSparseCacheMaxUnits = TypedVec<LifeCycleId, int>(numLc, 0);
+    mSparseCacheExpansion = TypedVec<LifeCycleId, int>(numLc, 1);
+    mSparseCacheBuffers = TypedVec<LifeCycleId, int>(numLc, 0);
 
     for (auto const& layer : mConfig.layers)
     {
@@ -159,13 +160,9 @@ void KvCacheManager::_computeSparseCachePages()
             {
                 continue;
             }
-            // A page carries `expansion` units of this buffer, so fewer pages are needed as the
-            // selection unit shrinks. Reserve one entry beyond maxCachedUnits for the block being
-            // written, which stays dirty until flushed and so is never an eviction candidate.
             int const expansion = mConfig.tokensPerBlock / buf.tokensPerBlockOverride.value_or(mConfig.tokensPerBlock);
-            int const pages = divUp(buf.maxCachedUnits + 1, expansion);
-            mSparseCachePages[lcId] = std::max(mSparseCachePages[lcId], pages);
-            mSparseCacheEntries[lcId] = std::max(mSparseCacheEntries[lcId], pages * expansion);
+            mSparseCacheMaxUnits[lcId] = std::max(mSparseCacheMaxUnits[lcId], buf.maxCachedUnits);
+            mSparseCacheExpansion[lcId] = std::max(mSparseCacheExpansion[lcId], expansion);
             // One more (layer, role) slice carried by every page of this life cycle.
             ++mSparseCacheBuffers[lcId];
         }

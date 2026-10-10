@@ -90,6 +90,13 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     }
 
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
+    // Zero means "capacity may not outrun the watermark yet", which is the right starting
+    // point for a request that has not begun prefilling. Left unset without a sparse cache,
+    // where a bound on in-flight blocks describes nothing.
+    if (_hasSparseCache())
+    {
+        mMaxInputLength = 0;
+    }
     mScratchSlots.resize(manager.storage().numLifeCycles());
     mSparseCacheSlots.resize(manager.storage().numLifeCycles());
     mSparseCacheState.resize(manager.storage().numLifeCycles());
@@ -217,6 +224,46 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
     return blockPageGetPage(blockPage);
 }
 
+bool KvCache::_hasSparseCache() const
+{
+    LifeCycleId const numLc = mManager->storage().numLifeCycles();
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+    {
+        if (mManager->sparseCacheMaxUnits(lc) > 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+int KvCache::_sparseCachePages(LifeCycleId lifeCycle) const
+{
+    int const maxUnits = mManager->sparseCacheMaxUnits(lifeCycle);
+    if (maxUnits <= 0)
+    {
+        return 0;
+    }
+    int const expansion = mManager->sparseCacheExpansion(lifeCycle);
+    int const unitTokens = mTokensPerBlock / expansion;
+    // Every block above the watermark is in flight: its data lives only in a cache entry
+    // until a flush reaches it, so the cache must hold all of them alongside the history it
+    // caches. maxInputLength() bounds that population; resize() requires it to be set.
+    int const inFlightUnits = divUp(mMaxInputLength.value_or(0), unitTokens);
+    return divUp(maxUnits + inFlightUnits, expansion);
+}
+
+void KvCache::setMaxInputLength(int maxInputLength)
+{
+    KVCM2_API_GUARD();
+    auto const lock = mManager->lockExclusive();
+    if (maxInputLength < 0)
+    {
+        throw std::invalid_argument("max_input_length must not be negative");
+    }
+    mMaxInputLength = maxInputLength;
+}
+
 CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
 {
     bool const readOnly = page.isCommitted()
@@ -332,7 +379,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
     TypedVec<LifeCycleId, int> sparseCacheDelta(numLc, 0);
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
-        int const want = mManager->sparseCachePages(lc);
+        int const want = _sparseCachePages(lc);
         int const have = static_cast<int>(mSparseCacheSlots[lc].size());
         sparseCacheDelta[lc] = std::max(0, want - have);
         numSlotsNeeded[lc] += sparseCacheDelta[lc];
@@ -379,10 +426,14 @@ bool KvCache::resume(std::optional<CUstream> stream)
                     tmpSlots[lc].pop_back();
                     scratchReadyEvents.push_back(mSparseCacheSlots[lc].back().slot().readyEvent.handle());
                 }
-                if (sparseCacheDelta[lc] > 0 && mSparseCacheState[lc].empty())
+                if (sparseCacheDelta[lc] > 0)
                 {
-                    mSparseCacheState[lc] = SparseCacheState(mManager->sparseCacheBuffersPerPage(lc),
-                        mManager->sparseCacheEntriesPerBuffer(lc), reinterpret_cast<CUstream>(cudaStream()));
+                    // Sized from the pages now held. Recreating on growth is safe only while
+                    // nothing is cached; once entries hold data, growth must preserve them.
+                    int const entries
+                        = static_cast<int>(mSparseCacheSlots[lc].size()) * mManager->sparseCacheExpansion(lc);
+                    mSparseCacheState[lc] = SparseCacheState(
+                        mManager->sparseCacheBuffersPerPage(lc), entries, reinterpret_cast<CUstream>(cudaStream()));
                 }
 
                 // Remaining slots are scratch slots.
@@ -1150,6 +1201,18 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         throw std::invalid_argument("History length cannot be decreased");
     if (newCap < newHist)
         throw std::invalid_argument("History length cannot exceed capacity");
+
+    // Blocks above the watermark are in flight: their data lives only in sparse cache
+    // entries, so the reservation must cover them and must be sized from a declared bound
+    // rather than discovered mid-step.
+    if (newCap != newHist && _hasSparseCache())
+    {
+        // Always set when a sparse cache is configured; see the constructor.
+        if (newCap - newHist > mMaxInputLength.value_or(0))
+        {
+            throw std::invalid_argument("capacity - history_length exceeds the declared max_input_length");
+        }
+    }
 
     // Scratch reuse: enforce constraint.
     bool enableScratch = mEnableSwaScratchReuse;
