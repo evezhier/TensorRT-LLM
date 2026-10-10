@@ -273,13 +273,17 @@ class BufferConfig:
     with a non-sparse buffer raises from the ``KVCacheManager`` constructor.
 
     All GPU residency is a per-request cache drawn from the sparse pool's GPU tier: both
-    the block being written and the history a step selects are entries in it. Each
-    :class:`_KVCache` holds ``min(max_cached_units, history_length // tokens_per_block)``
-    history entries plus one for the block in flight. Because a page already carries one
-    buffer per coalesced layer, reserved pages give every layer its own entries -- so an
-    entry is a (page, layer) pair, and one page may hold different layers' data for
-    different ordinals. :meth:`KVCacheManager.fetch_sparse_pages` fills them, replacing by
-    LRU.
+    the blocks still being written and the history a step selects are entries in it. Each
+    :class:`_KVCache` holds ``min(max_cached_units, history_length // unit_tokens)`` history
+    entries, replaced by LRU, plus one entry per in-flight unit -- every block above the
+    watermark, bounded by :attr:`_KVCache.max_input_length`. Prefill and decode share one
+    manager, so that second population is a whole chunk during prefill rather than a single
+    block.
+
+    Because a page already carries one buffer per coalesced layer, reserved pages give every
+    layer its own entries -- so an entry is a (page, layer) pair, and one page may hold
+    different layers' data for different ordinals.
+    :meth:`KVCacheManager.fetch_sparse_pages` fills the history entries.
 
     Set ``max_cached_units`` to two to four times ``num_selected_blocks``: a cache only as
     wide as the selection retains nothing between steps, and retention of units not
@@ -293,7 +297,8 @@ class BufferConfig:
 
     A block's data reaches its host page by a flush that leaves the GPU entry cached and
     merely marks it clean. A block must be flushed before it can be selected, so
-    :meth:`_KVCache.set_history_length` is the deadline; ``commit()`` flushes earlier,
+    :meth:`_KVCache.resize` is the deadline, that being the one call through which the
+    watermark ever moves; ``commit()`` flushes earlier,
     since only finalized pages are shareable. Only a clean entry is evictable, which is
     what protects the block still being written.
 

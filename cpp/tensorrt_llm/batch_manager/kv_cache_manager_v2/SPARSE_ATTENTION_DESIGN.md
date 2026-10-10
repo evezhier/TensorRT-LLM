@@ -32,9 +32,10 @@ Two existing properties make this cheap:
 | --- | --- |
 | page | the KVCM2 allocation, locking and migration unit: `tokens_per_block` tokens |
 | buffer | one layer's slice of a page; several coalesce into one page |
-| selection unit | what the backend selects; a factor or a multiple of `tokens_per_block` |
+| selection unit | what the backend selects; a factor of `tokens_per_block`, never larger |
+| in-flight | blocks above the watermark: written but not yet flushed |
 | expansion | selection units per page, `tokens_per_block / tokens_per_block_override` |
-| pure history | a block whose ordinal is below the `set_history_length()` watermark |
+| pure history | a block whose ordinal is below the history watermark set by `resize()` |
 
 ## Scope
 
@@ -94,8 +95,15 @@ A block's data reaches its host page by a **flush**: a copy on the owning `KvCac
 stream that does **not** evict the GPU entry, which stays cached and merely becomes clean.
 
 The governing rule is that **a block must be flushed before it can be selected**. Selectable
-means below the watermark, so `setHistoryLength()` is the deadline and must flush anything
-still dirty that the watermark has passed.
+means below the watermark, so `resize()` is the deadline and must flush anything still
+dirty that the watermark has passed.
+
+`resize()` rather than `setHistoryLength()` because it is the single chokepoint: the
+latter is `resize(nullopt, hist)`, `setCapacity()` is `resize(cap, nullopt)`, and a caller
+may advance capacity and history together in one call. Hooking the wrapper would miss
+that. Flushing inside `resize()` also composes with its rollback: a flush is a copy, so a
+block flushed before a failed resize stays correctly flushed — early is always safe, and
+only late is not.
 
 `commit()` flushes earlier, and should: only finalized pages enter the radix tree, so the
 host page is the artifact a later request reuses. But commit is an optimisation, not the
@@ -109,17 +117,20 @@ flush deadline.
 
 ### Dirty entries
 
-A block being written is dirty until its flush completes. Three facts keep this from being
-a general write-back cache:
+A block is dirty from its first write until its flush completes. Prefill and decode share
+one manager under in-flight batching, so the dirty set is not one entry: it is every
+in-flight block, which during prefill is the whole chunk being processed. Two facts still
+keep this from being a general write-back cache:
 
-- **At most one dirty entry per `(request, layer)`** — the block currently being filled.
-- **It is private.** Only finalized pages enter the radix tree, so an unflushed block has
-  exactly one owner: no aliasing, no cross-request coherence, no concurrent writers.
-- **Its lifetime is bounded** by one block fill, and it is the most-recently-used entry
-  throughout, since it is written every step.
+- **Dirty entries are private.** Only finalized pages enter the radix tree, so an unflushed
+  block has exactly one owner: no aliasing, no cross-request coherence, no concurrent
+  writers.
+- **The dirty set is bounded and declared**, not discovered — see `max_input_length` below.
+  Reservation covers it, so a fetch never meets a cache full of dirty entries.
 
-Eviction eligibility is therefore the single predicate *clean*, and the bit flips once per
-block lifetime. There is no evict-a-dirty-entry path to implement.
+Eviction eligibility is therefore the single predicate *clean*. There is no
+evict-a-dirty-entry path to implement: a dirty entry is simply not a candidate, and the
+reservation guarantees enough clean ones remain.
 
 ## Per-request reservation
 
@@ -130,20 +141,35 @@ Two separate reservations, easily confused.
 Only the level differs. This is the payoff of uniform locking: nothing new to size, and no
 notion of "history pages" distinct from the rest.
 
-**GPU tier.** The cache, bounded by `max_cached_units` (**N** in *Sizing*, two to four times
-the selection width), holding
+**GPU tier.** The cache holds two populations, and must be sized for both:
 
 ```
-min(N, history_length / tokens_per_block)
+units = min(N, history_length / unit_tokens)      history, replaced by LRU
+      + divUp(max_input_length, unit_tokens)      in flight, dirty until flushed
+pages = divUp(units, expansion)
 ```
 
-entries, so a short sequence caches little and a long one saturates. One further entry is
-reserved for the block currently being written, which is dirty until flushed and so cannot
-be an eviction candidate; keeping it outside N preserves the history cache's capacity
-guarantee.
+`N` is `max_cached_units` (*Sizing*: two to four times the selection width), so a short
+sequence caches little history and a long one saturates.
 
-Reservation happens at `resume()` and fails there if capacity is unavailable; the fetch
-path never has to handle exhaustion.
+The second term exists because prefill and decode share one manager. An in-flight block's
+data lives only in its cache entry until the watermark passes it, so the cache must hold
+every block above the watermark — one or two in decode, but a whole chunk in prefill.
+
+### `max_input_length`
+
+A per-request bound on `capacity - history_length`, i.e. on how far capacity may outrun the
+watermark. It is required once sparsity is enabled and the two differ, and must be set
+before the `resize()` that creates the gap, because the reservation is sized from it.
+
+Declaring it rather than inferring it is what keeps the reservation static and the failure
+loud: the alternative is a cache that grows mid-step and can fail where no caller can
+recover. Lowering it is the lever that returns memory — when prefill completes, a caller
+drops it to the maximum draft length for decode, and the pages beyond the new bound go back
+to the global pool.
+
+Reservation happens at `resume()` and when `max_input_length` rises; it fails there if
+capacity is unavailable, so the fetch path never has to handle exhaustion.
 
 ### Why per-request pages give per-layer caches for free
 
@@ -553,9 +579,15 @@ prefill scratch is GPU-only by definition.
   range arithmetic, different disposition — routing sparse layers through it drops the data
   instead of flushing it. It also gates on `windowSize.has_value()`, so for a full-attention
   sparse layer it fires on nothing.
-- **`_shortcutSetHistoryLength`** bails out when the SWA stale range is unchanged. The flush
-  range advances on a different schedule, so the comparison must include it or the fast path
-  silently skips a flush — leaving a block dirty past the point where selection may name it.
+- **`_shortcutSetHistoryLength` skips the flush for exactly our configuration.** It reports
+  "unchanged" when no SWA stale range moved, and for a full-attention layer
+  `windowSize.has_value()` is false, so nothing is ever reported as moved: it assigns
+  `mHistoryLength` and returns true, and `resize()` returns early before reaching its body.
+  A flush placed in that body never runs. The shortcut must either carry the flush or be
+  declined while a sparse flush is pending.
+- **Hook `resize()`, not `setHistoryLength()`.** The latter is `resize(nullopt, hist)` and
+  `setCapacity()` is `resize(cap, nullopt)`, so `resize()` is the only place the watermark
+  moves — and a caller may move capacity and history in the same call.
 - **Commit is not a substitute for the watermark deadline.** Flushing at `commit()` is worth
   doing, but `stopCommitting()`, a `CommitState` other than `ALLOWED`, and reuse-disabled
   requests all produce blocks that are never committed. The watermark hook is what makes the
@@ -581,19 +613,19 @@ Recorded because each looks like an open question and is not:
 - **`tokens_per_block_override` is not a granularity lever.** See *One pool, one index
   space*.
 
-## Open questions
+## Resolved
 
-- Whether the decode-only assumption should be enforced or merely documented, given the
-  sizing derivation depends on it.
-- For a selection unit spanning multiple pages: whether the device slots must be
-  contiguous, and how eviction handles k-at-a-time.
-- Whether `N` is uniform across requests. Uniform keeps reservation a counter and shapes
-  static; varying it by context length would improve hit rates for long requests at the
-  cost of ragged device arrays.
-- Whether rewinding past a commit is already rejected. The watermark-driven design needed an
-  explicit rule against rewinding below a demoted block; with commit as the flush point that
-  rule should be subsumed by existing commit semantics, but `stopCommitting()` and
-  `maxRewindLen` should be checked rather than assumed.
+- **There is no decode-only assumption.** Prefill and decode share one manager under
+  in-flight batching, so in-flight blocks are cached too and `max_input_length` bounds them.
+- **A selection unit never exceeds `tokens_per_block`.** Sub-page units are supported
+  through `expansion`; a unit spanning several pages is rejected, which retires the
+  questions of slot contiguity and k-at-a-time eviction.
+- **`N` is a uniform upper bound**, not per-request. Ragged device arrays would cost the
+  static shapes graph capture needs.
+- **History never moves backwards.** `resize()` rejects any decrease outright
+  (`kvCache.cpp`: "History length cannot be decreased"), and the only other assignment
+  initialises a fresh request from a prefix match. A flushed block can therefore never be
+  rewound into, with no rule of our own required.
 
 ## References
 
