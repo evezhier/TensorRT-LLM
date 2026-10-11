@@ -70,11 +70,25 @@ public:
     // arithmetic can be checked against a known byte pattern. Returns the destination pool
     // after the copy. Synchronises.
     static std::vector<uint8_t> sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
-        std::vector<int32_t> const& pageTable, size_t devicePoolBytes, uint64_t devicePageStride,
+        std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& devicePool, uint64_t devicePageStride,
         std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& srcBufferOffset,
         std::vector<uint32_t> const& dstBufferOffset, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
         uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal,
-        std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth, int numLayers);
+        std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth, int numLayers,
+        bool writeBack);
+
+    // White-box hook: the entries holding units a watermark move has just passed.
+    // Synchronises.
+    struct SparseFlushList
+    {
+        std::vector<int32_t> ordinal; //!< [layer][maxFlushUnits]
+        std::vector<int32_t> slot;    //!< [layer][maxFlushUnits]
+        std::vector<int32_t> count;   //!< [layer]
+        int32_t status = 0;
+    };
+
+    static SparseFlushList sparseFlushList(std::vector<int32_t> const& residentOrdinal, int numLayers,
+        int entriesPerLayer, int fromUnits, int toUnits, int maxFlushUnits);
 
     // White-box hook: minimum per-pool-group slot counts to support a BatchDesc.
     // Reaches StorageManager::computePoolGroupSlotsForBatch() (private) via friendship.

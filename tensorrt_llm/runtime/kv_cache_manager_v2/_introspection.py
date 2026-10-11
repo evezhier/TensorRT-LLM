@@ -230,7 +230,7 @@ def sparse_unit_copy(
     host_pool: bytes | list[int],
     host_page_stride: int,
     page_table: list[int],
-    device_pool_bytes: int,
+    device_pool: bytes | list[int],
     device_page_stride: int,
     cache_pages: list[int],
     src_buffer_offset: list[int],
@@ -245,17 +245,20 @@ def sparse_unit_copy(
     miss_count: list[int],
     selection_width: int,
     num_layers: int,
+    write_back: bool = False,
 ) -> list[int]:
-    """Fill cache entries from a caller-supplied source pool, returning the destination.
+    """Move units between a caller-supplied cold pool and cache entries.
 
-    Exercises the copy's address arithmetic against a known byte pattern. Synchronises.
+    Exercises the copy's address arithmetic against a known byte pattern. Returns the
+    destination pool: the cache pool when fetching, the cold pool when writing back.
+    Synchronises.
     """
     return list(
         _cpp().sparse_unit_copy(
             list(host_pool),
             host_page_stride,
             page_table,
-            device_pool_bytes,
+            list(device_pool),
             device_page_stride,
             cache_pages,
             src_buffer_offset,
@@ -270,8 +273,42 @@ def sparse_unit_copy(
             miss_count,
             selection_width,
             num_layers,
+            write_back,
         )
     )
+
+
+class SparseFlushList(NamedTuple):
+    """Entries holding units a watermark move has just passed."""
+
+    ordinal: list[int]
+    slot: list[int]
+    count: list[int]
+    status: int
+
+
+def sparse_flush_list(
+    resident_ordinal: list[int],
+    num_layers: int,
+    entries_per_layer: int,
+    from_units: int,
+    to_units: int,
+    max_flush_units: int,
+) -> SparseFlushList:
+    """Collect the entries whose units fall in ``[from_units, to_units)``.
+
+    These are the units the watermark has just made selectable, so they must reach their
+    host pages before any later fetch can read them. Synchronises.
+    """
+    ordinal, slot, count, status = _cpp().sparse_flush_list(
+        resident_ordinal,
+        num_layers,
+        entries_per_layer,
+        from_units,
+        to_units,
+        max_flush_units,
+    )
+    return SparseFlushList(list(ordinal), list(slot), list(count), int(status))
 
 
 def sparse_resolve(

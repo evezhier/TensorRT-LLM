@@ -40,6 +40,8 @@ enum class SparseResolveStatus : int32_t
     //! capacityUnits - historyUnits exceeded maxInFlightUnits, i.e. the request grew past
     //! the max_input_length it declared.
     kInFlightOverflow = 2,
+    //! More units crossed the watermark in one move than maxFlushUnits allows for.
+    kFlushOverflow = 3,
 };
 
 //! One layer group's resolve: turn a selection of unit ordinals into cache entry indices,
@@ -112,13 +114,25 @@ struct SparseUnitLayout
     uint32_t unitStride = 0;
 };
 
-//! Fill the entries the resolve allocated, copying each missed unit out of its
-//! device-mapped host page.
+//! Which way a unit moves between its cold page and its cache entry.
+enum class SparseCopyDirection : uint8_t
+{
+    //! Host page -> cache entry, filling an entry the resolve allocated for a miss.
+    kFetch = 0,
+    //! Cache entry -> host page, writing back a unit the watermark has passed.
+    kWriteBack = 1,
+};
+
+//! Move units between their cold pages and their cache entries.
 //!
 //! The default codec relocates buffer bytes verbatim, so a unit has the same internal
 //! shape on both sides and one layout describes both; only the buffer's offset within a
 //! page and the unit's index differ. See "Fast path: a layout value" in
 //! SPARSE_ATTENTION_DESIGN.md.
+//!
+//! Both directions use the same addressing: the cold side is reached through the page
+//! table by unit ordinal, the hot side through the cache page list by entry index. Only
+//! which of the two is the source changes.
 struct SparseUnitCopyArgs
 {
     //! Pool holding the cold pages. Device-mapped host memory, so the kernel addresses it
@@ -137,23 +151,55 @@ struct SparseUnitCopyArgs
 
     //! [numLayers] offset of this layer's buffer within a cold page and within a cache
     //! page. They differ: a cold page is a concatenation in codec order.
-    uint32_t const* srcBufferOffset = nullptr;
-    uint32_t const* dstBufferOffset = nullptr;
+    uint32_t const* hostBufferOffset = nullptr;
+    uint32_t const* deviceBufferOffset = nullptr;
+
+    SparseCopyDirection direction = SparseCopyDirection::kFetch;
 
     SparseUnitLayout layout;
     //! Selection units per buffer, i.e. tokens_per_block / tokens_per_block_override.
     int32_t expansion = 1;
 
-    //! The resolve's miss list.
-    int32_t const* missOrdinal = nullptr;
-    int32_t const* missSlot = nullptr;
-    int32_t const* missCount = nullptr;
-    int32_t selectionWidth = 0;
+    //! The work list: the resolve's misses when fetching, the flush list when writing
+    //! back. [numLayers][workWidth], of which the first workCount[layer] are valid.
+    int32_t const* workOrdinal = nullptr;
+    int32_t const* workSlot = nullptr;
+    int32_t const* workCount = nullptr;
+    int32_t workWidth = 0;
     int32_t numLayers = 0;
 };
 
-//! Launch the copies. One CTA per potential miss; CTAs past a layer's miss count exit.
+//! Launch the copies. One CTA per potential work item; CTAs past a layer's count exit.
 void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream);
+
+//! Collect the entries holding units the watermark has just passed, so they can be written
+//! back to their host pages.
+//!
+//! Found by scanning the reverse map rather than probing: the units wanted are a contiguous
+//! ordinal range, and the map has to be read in full either way.
+struct SparseFlushListArgs
+{
+    SparseCacheView cache;
+
+    //! [1] and [1]: the unit ordinals the watermark moved across, as [from, to). Device
+    //! resident for the same reason the resolve's watermarks are.
+    int32_t const* fromUnits = nullptr;
+    int32_t const* toUnits = nullptr;
+
+    //! [numLayers][maxFlushUnits] units to write back and the entries holding them.
+    int32_t* outOrdinal = nullptr;
+    int32_t* outSlot = nullptr;
+    //! [numLayers] how many.
+    int32_t* outCount = nullptr;
+    //! Bound on one watermark move, which cannot exceed the declared in-flight span.
+    int32_t maxFlushUnits = 0;
+
+    //! [1] SparseResolveStatus. The caller must clear it before the launch.
+    int32_t* status = nullptr;
+};
+
+//! Launch the flush-list scan. One CTA per layer.
+void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream);
 
 //! Launch the resolve. One CTA per layer; enqueues and returns.
 //!

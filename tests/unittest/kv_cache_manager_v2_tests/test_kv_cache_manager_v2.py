@@ -782,7 +782,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=page_stride,
             page_table=page_table,
-            device_pool_bytes=page_stride * 2,
+            device_pool=[0] * (page_stride * 2),
             device_page_stride=page_stride,
             cache_pages=[1, 0],
             src_buffer_offset=[0],
@@ -814,7 +814,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=page_stride,
             page_table=[0],
-            device_pool_bytes=page_stride,
+            device_pool=[0] * (page_stride),
             device_page_stride=page_stride,
             cache_pages=[0],
             src_buffer_offset=[0],
@@ -848,7 +848,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=page_stride,
             page_table=[0],
-            device_pool_bytes=page_stride,
+            device_pool=[0] * (page_stride),
             device_page_stride=page_stride,
             cache_pages=[0],
             src_buffer_offset=[0, unit],
@@ -875,7 +875,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=unit,
             page_table=[0],
-            device_pool_bytes=unit,
+            device_pool=[0] * (unit),
             device_page_stride=unit,
             cache_pages=[0],
             src_buffer_offset=[0],
@@ -901,7 +901,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=unit * 2,
             page_table=[0],
-            device_pool_bytes=unit * 2,
+            device_pool=[0] * (unit * 2),
             device_page_stride=unit * 2,
             cache_pages=[0],
             src_buffer_offset=[0],
@@ -918,6 +918,119 @@ class TestSparseUnitCopy(unittest.TestCase):
             num_layers=1,
         )
         self.assertEqual(result[unit:], host[unit:])
+
+
+class TestSparseFlush(unittest.TestCase):
+    """Writing a unit back to its host page once the watermark passes it."""
+
+    FLUSH_OVERFLOW = 3
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    def test_only_units_the_watermark_crossed_are_listed(self):
+        # Entries hold units 3, 7, 11 and one free entry.
+        resident = [3, 7, 11, BAD_PAGE_INDEX]
+        result = _introspection.sparse_flush_list(
+            resident,
+            num_layers=1,
+            entries_per_layer=4,
+            from_units=5,
+            to_units=11,
+            max_flush_units=4,
+        )
+        self.assertEqual(result.status, 0)
+        self.assertEqual(result.count, [1], "only unit 7 is in [5, 11)")
+        self.assertEqual(result.ordinal[0], 7)
+        self.assertEqual(result.slot[0], 1)
+
+    def test_a_watermark_that_moved_nothing_lists_nothing(self):
+        resident = [3, 7, 11, BAD_PAGE_INDEX]
+        result = _introspection.sparse_flush_list(
+            resident, num_layers=1, entries_per_layer=4, from_units=8, to_units=8, max_flush_units=4
+        )
+        self.assertEqual(result.count, [0])
+
+    def test_layers_are_scanned_independently(self):
+        # Layer 0 holds unit 4, layer 1 holds unit 9; only layer 0's is in range.
+        resident = [4, BAD_PAGE_INDEX, 9, BAD_PAGE_INDEX]
+        result = _introspection.sparse_flush_list(
+            resident, num_layers=2, entries_per_layer=2, from_units=0, to_units=5, max_flush_units=2
+        )
+        self.assertEqual(result.count, [1, 0])
+        self.assertEqual(result.ordinal[0], 4)
+
+    def test_overflowing_the_flush_bound_is_reported(self):
+        resident = [0, 1, 2, 3]
+        result = _introspection.sparse_flush_list(
+            resident, num_layers=1, entries_per_layer=4, from_units=0, to_units=4, max_flush_units=2
+        )
+        self.assertEqual(result.status, self.FLUSH_OVERFLOW)
+
+    def test_write_back_inverts_the_fetch(self):
+        """Fetching a unit and writing it back must reproduce the cold page."""
+        unit, units = 16, 2
+        page_stride = unit * units
+        cold = [(i * 5 + 3) % 251 for i in range(page_stride)]
+        common = dict(
+            host_page_stride=page_stride,
+            page_table=[0],
+            device_page_stride=page_stride,
+            cache_pages=[0],
+            src_buffer_offset=[0],
+            dst_buffer_offset=[0],
+            num_chunks=1,
+            chunk_bytes=unit,
+            chunk_stride=0,
+            unit_stride=unit,
+            expansion=units,
+            miss_ordinal=[1],
+            miss_slot=[1],
+            miss_count=[1],
+            selection_width=1,
+            num_layers=1,
+        )
+        hot = _introspection.sparse_unit_copy(
+            host_pool=cold, device_pool=[0] * page_stride, write_back=False, **common
+        )
+        self.assertEqual(hot[unit:], cold[unit:], "the fetch landed the unit")
+
+        # Write that same entry back over a blanked cold page; the unit must return.
+        restored = _introspection.sparse_unit_copy(
+            host_pool=[0] * page_stride, device_pool=hot, write_back=True, **common
+        )
+        self.assertEqual(restored[unit:], cold[unit:], "the write-back restored the unit")
+        self.assertEqual(restored[:unit], [0] * unit, "only the listed unit moved")
+
+    def test_write_back_moves_into_the_cold_page(self):
+        # The device pool is zeroed by the hook, so a write-back must blank the cold unit
+        # it targets and leave the rest of the cold page alone.
+        unit, units = 16, 2
+        page_stride = unit * units
+        cold = [(i * 5 + 3) % 251 for i in range(page_stride)]
+        result = _introspection.sparse_unit_copy(
+            host_pool=cold,
+            host_page_stride=page_stride,
+            page_table=[0],
+            device_pool=[0] * (page_stride),
+            device_page_stride=page_stride,
+            cache_pages=[0],
+            src_buffer_offset=[0],
+            dst_buffer_offset=[0],
+            num_chunks=1,
+            chunk_bytes=unit,
+            chunk_stride=0,
+            unit_stride=unit,
+            expansion=units,
+            miss_ordinal=[1],
+            miss_slot=[1],
+            miss_count=[1],
+            selection_width=1,
+            num_layers=1,
+            write_back=True,
+        )
+        self.assertEqual(result[unit:], [0] * unit, "unit 1 was overwritten from the entry")
+        self.assertEqual(result[:unit], cold[:unit], "unit 0 was untouched")
 
 
 class TestKVCacheManagerV2(unittest.TestCase):

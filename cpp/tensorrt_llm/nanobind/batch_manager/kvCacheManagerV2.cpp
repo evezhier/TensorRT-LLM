@@ -2165,11 +2165,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
         nb::arg("max_in_flight_units"));
     mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),
-        nb::arg("host_page_stride"), nb::arg("page_table"), nb::arg("device_pool_bytes"), nb::arg("device_page_stride"),
+        nb::arg("host_page_stride"), nb::arg("page_table"), nb::arg("device_pool"), nb::arg("device_page_stride"),
         nb::arg("cache_pages"), nb::arg("src_buffer_offset"), nb::arg("dst_buffer_offset"), nb::arg("num_chunks"),
         nb::arg("chunk_bytes"), nb::arg("chunk_stride"), nb::arg("unit_stride"), nb::arg("expansion"),
         nb::arg("miss_ordinal"), nb::arg("miss_slot"), nb::arg("miss_count"), nb::arg("selection_width"),
-        nb::arg("num_layers"), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("num_layers"), nb::arg("write_back") = false, nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "sparse_flush_list",
+        [](std::vector<int32_t> const& residentOrdinal, int numLayers, int entriesPerLayer, int fromUnits, int toUnits,
+            int maxFlushUnits)
+        {
+            auto r = kv::KvCacheIntrospection::sparseFlushList(
+                residentOrdinal, numLayers, entriesPerLayer, fromUnits, toUnits, maxFlushUnits);
+            return std::make_tuple(std::move(r.ordinal), std::move(r.slot), std::move(r.count), r.status);
+        },
+        nb::arg("resident_ordinal"), nb::arg("num_layers"), nb::arg("entries_per_layer"), nb::arg("from_units"),
+        nb::arg("to_units"), nb::arg("max_flush_units"));
     mIntrospection.def(
         "is_commit_allowed",
         [](kv::KvCache const& kvCache) { return kvCache.commitState() == kv::KvCache::CommitState::ALLOWED; },

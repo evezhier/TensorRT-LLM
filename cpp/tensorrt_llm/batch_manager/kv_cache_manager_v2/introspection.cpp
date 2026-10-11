@@ -203,11 +203,11 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
 }
 
 std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
-    std::vector<int32_t> const& pageTable, size_t devicePoolBytes, uint64_t devicePageStride,
+    std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& devicePool, uint64_t devicePageStride,
     std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& srcBufferOffset,
     std::vector<uint32_t> const& dstBufferOffset, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
     uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
-    std::vector<int32_t> const& missCount, int selectionWidth, int numLayers)
+    std::vector<int32_t> const& missCount, int selectionWidth, int numLayers, bool writeBack)
 {
     CUdeviceptr hostPtr = 0;
     cuCheck(cuMemAlloc(&hostPtr, hostPool.size()));
@@ -215,9 +215,9 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     cuCheck(cuMemcpyHtoD(hostPtr, hostPool.data(), hostPool.size()));
 
     CUdeviceptr devicePtr = 0;
-    cuCheck(cuMemAlloc(&devicePtr, devicePoolBytes));
+    cuCheck(cuMemAlloc(&devicePtr, devicePool.size()));
     CudaUniqPtr destination{reinterpret_cast<std::byte*>(devicePtr)};
-    cuCheck(cuMemsetD8(devicePtr, 0, devicePoolBytes));
+    cuCheck(cuMemcpyHtoD(devicePtr, devicePool.data(), devicePool.size()));
 
     auto table = deviceCopy(pageTable);
     auto pages = deviceCopy(cachePages);
@@ -235,25 +235,70 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.deviceBase = devicePtr;
     args.devicePageStride = devicePageStride;
     args.cachePages = reinterpret_cast<int32_t const*>(pages.get());
-    args.srcBufferOffset = reinterpret_cast<uint32_t const*>(srcOffsets.get());
-    args.dstBufferOffset = reinterpret_cast<uint32_t const*>(dstOffsets.get());
+    args.hostBufferOffset = reinterpret_cast<uint32_t const*>(srcOffsets.get());
+    args.deviceBufferOffset = reinterpret_cast<uint32_t const*>(dstOffsets.get());
+    args.direction = writeBack ? SparseCopyDirection::kWriteBack : SparseCopyDirection::kFetch;
     args.layout.numChunks = numChunks;
     args.layout.chunkBytes = chunkBytes;
     args.layout.chunkStride = chunkStride;
     args.layout.unitStride = unitStride;
     args.expansion = expansion;
-    args.missOrdinal = reinterpret_cast<int32_t const*>(missOrd.get());
-    args.missSlot = reinterpret_cast<int32_t const*>(missSlotBuf.get());
-    args.missCount = reinterpret_cast<int32_t const*>(missCountBuf.get());
-    args.selectionWidth = selectionWidth;
+    args.workOrdinal = reinterpret_cast<int32_t const*>(missOrd.get());
+    args.workSlot = reinterpret_cast<int32_t const*>(missSlotBuf.get());
+    args.workCount = reinterpret_cast<int32_t const*>(missCountBuf.get());
+    args.workWidth = selectionWidth;
     args.numLayers = numLayers;
 
     launchSparseUnitCopy(args, nullptr);
     cuCheck(cuStreamSynchronize(nullptr));
 
-    std::vector<uint8_t> out(devicePoolBytes);
-    cuCheck(cuMemcpyDtoH(out.data(), devicePtr, devicePoolBytes));
+    // Write-back moves into the cold pool, so that is the side worth returning.
+    CUdeviceptr const result = writeBack ? hostPtr : devicePtr;
+    size_t const resultBytes = writeBack ? hostPool.size() : devicePool.size();
+    std::vector<uint8_t> out(resultBytes);
+    cuCheck(cuMemcpyDtoH(out.data(), result, resultBytes));
     return out;
+}
+
+KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std::vector<int32_t> const& residentOrdinal,
+    int numLayers, int entriesPerLayer, int fromUnits, int toUnits, int maxFlushUnits)
+{
+    auto const entryCount = static_cast<size_t>(numLayers) * entriesPerLayer;
+    if (residentOrdinal.size() != entryCount)
+    {
+        throw std::invalid_argument("sparseFlushList: input size must match the declared shape");
+    }
+    auto const listCount = static_cast<size_t>(numLayers) * maxFlushUnits;
+
+    auto resident = deviceCopy(residentOrdinal);
+    auto from = deviceCopy(std::vector<int32_t>(1, fromUnits));
+    auto to = deviceCopy(std::vector<int32_t>(1, toUnits));
+    auto outOrdinal = deviceCopy(std::vector<int32_t>(listCount, kNoSparseSlot));
+    auto outSlot = deviceCopy(std::vector<int32_t>(listCount, kNoSparseSlot));
+    auto outCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
+    auto status = deviceCopy(std::vector<int32_t>(1, 0));
+
+    SparseFlushListArgs args;
+    args.cache.residentOrdinal = reinterpret_cast<int32_t*>(resident.get());
+    args.cache.numLayers = numLayers;
+    args.cache.entriesPerLayer = entriesPerLayer;
+    args.fromUnits = reinterpret_cast<int32_t const*>(from.get());
+    args.toUnits = reinterpret_cast<int32_t const*>(to.get());
+    args.outOrdinal = reinterpret_cast<int32_t*>(outOrdinal.get());
+    args.outSlot = reinterpret_cast<int32_t*>(outSlot.get());
+    args.outCount = reinterpret_cast<int32_t*>(outCount.get());
+    args.maxFlushUnits = maxFlushUnits;
+    args.status = reinterpret_cast<int32_t*>(status.get());
+
+    launchSparseFlushList(args, nullptr);
+    cuCheck(cuStreamSynchronize(nullptr));
+
+    SparseFlushList result;
+    result.ordinal = readBack(outOrdinal, listCount);
+    result.slot = readBack(outSlot, listCount);
+    result.count = readBack(outCount, static_cast<size_t>(numLayers));
+    result.status = readBack(status, 1).front();
+    return result;
 }
 
 bool KvCacheIntrospection::allTreePagesDroppable(KvCacheManager& manager)

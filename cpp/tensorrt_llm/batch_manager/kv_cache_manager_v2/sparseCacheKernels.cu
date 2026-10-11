@@ -383,19 +383,19 @@ __device__ inline void copyChunk(char* dst, char const* src, uint32_t bytes)
     }
 }
 
-//! One CTA per (layer, miss).
+//! One CTA per (layer, work item).
 __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyArgs args)
 {
     int32_t const layer = static_cast<int32_t>(blockIdx.y);
     int32_t const j = static_cast<int32_t>(blockIdx.x);
-    if (j >= args.missCount[layer])
+    if (j >= args.workCount[layer])
     {
         return;
     }
 
-    auto const index = static_cast<ptrdiff_t>(layer) * args.selectionWidth + j;
-    int32_t const ordinal = args.missOrdinal[index];
-    int32_t const slot = args.missSlot[index];
+    auto const index = static_cast<ptrdiff_t>(layer) * args.workWidth + j;
+    int32_t const ordinal = args.workOrdinal[index];
+    int32_t const slot = args.workSlot[index];
 
     // A unit ordinal names a unit within a block; a cache entry names a unit within a
     // reserved page. Both divide by the same expansion.
@@ -411,10 +411,15 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     auto const hostPage = static_cast<uint64_t>(args.pageTable[block]);
     auto const devicePage = static_cast<uint64_t>(args.cachePages[cachePage]);
 
-    auto const* src = reinterpret_cast<char const*>(args.hostBase + hostPage * args.hostPageStride
-        + args.srcBufferOffset[layer] + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
-    auto* dst = reinterpret_cast<char*>(args.deviceBase + devicePage * args.devicePageStride
-        + args.dstBufferOffset[layer] + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
+    // The cold side is reached by ordinal through the page table, the hot side by entry
+    // index through the cache page list. Direction only chooses which one is read.
+    auto* cold = reinterpret_cast<char*>(args.hostBase + hostPage * args.hostPageStride + args.hostBufferOffset[layer]
+        + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
+    auto* hot = reinterpret_cast<char*>(args.deviceBase + devicePage * args.devicePageStride
+        + args.deviceBufferOffset[layer] + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
+    bool const fetching = args.direction == SparseCopyDirection::kFetch;
+    char const* src = fetching ? cold : hot;
+    char* dst = fetching ? hot : cold;
 
     for (uint32_t c = 0; c < args.layout.numChunks; ++c)
     {
@@ -423,26 +428,88 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     }
 }
 
+//! One CTA per layer. The units wanted form a contiguous ordinal range, so a scan of the
+//! reverse map finds them without a probe index.
+__global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushListArgs args)
+{
+    int32_t const layer = static_cast<int32_t>(blockIdx.x);
+    int32_t const entries = args.cache.entriesPerLayer;
+    int32_t const from = *args.fromUnits;
+    int32_t const to = *args.toUnits;
+
+    __shared__ int32_t count;
+    if (threadIdx.x == 0)
+    {
+        count = 0;
+    }
+    __syncthreads();
+
+    int32_t const* residentOrdinal = args.cache.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
+    int32_t* outOrdinal = args.outOrdinal + static_cast<ptrdiff_t>(layer) * args.maxFlushUnits;
+    int32_t* outSlot = args.outSlot + static_cast<ptrdiff_t>(layer) * args.maxFlushUnits;
+
+    for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
+    {
+        int32_t const ord = residentOrdinal[s];
+        if (ord < from || ord >= to)
+        {
+            continue;
+        }
+        int32_t const j = atomicAdd(&count, 1);
+        if (j < args.maxFlushUnits)
+        {
+            outOrdinal[j] = ord;
+            outSlot[j] = s;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        if (count > args.maxFlushUnits)
+        {
+            atomicExch(args.status, static_cast<int32_t>(SparseResolveStatus::kFlushOverflow));
+            count = args.maxFlushUnits;
+        }
+        args.outCount[layer] = count;
+    }
+}
+
 } // namespace
+
+void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
+{
+    if (args.cache.numLayers <= 0 || args.cache.entriesPerLayer <= 0 || args.maxFlushUnits <= 0)
+    {
+        throw std::invalid_argument("launchSparseFlushList: layers, entries and flush bound must be positive");
+    }
+    if (args.fromUnits == nullptr || args.toUnits == nullptr || args.outOrdinal == nullptr || args.outSlot == nullptr
+        || args.outCount == nullptr || args.status == nullptr)
+    {
+        throw std::invalid_argument("launchSparseFlushList: every device array must be provided");
+    }
+    sparseFlushListKernel<<<args.cache.numLayers, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
 
 void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
 {
-    if (args.numLayers <= 0 || args.selectionWidth <= 0 || args.expansion <= 0)
+    if (args.numLayers <= 0 || args.workWidth <= 0 || args.expansion <= 0)
     {
-        throw std::invalid_argument("launchSparseUnitCopy: layers, selection width and expansion must be positive");
+        throw std::invalid_argument("launchSparseUnitCopy: layers, work width and expansion must be positive");
     }
     if (args.layout.numChunks == 0 || args.layout.chunkBytes == 0)
     {
         throw std::invalid_argument("launchSparseUnitCopy: the unit layout must describe a non-empty unit");
     }
-    if (args.pageTable == nullptr || args.cachePages == nullptr || args.srcBufferOffset == nullptr
-        || args.dstBufferOffset == nullptr || args.missOrdinal == nullptr || args.missSlot == nullptr
-        || args.missCount == nullptr)
+    if (args.pageTable == nullptr || args.cachePages == nullptr || args.hostBufferOffset == nullptr
+        || args.deviceBufferOffset == nullptr || args.workOrdinal == nullptr || args.workSlot == nullptr
+        || args.workCount == nullptr)
     {
         throw std::invalid_argument("launchSparseUnitCopy: every device array must be provided");
     }
 
-    dim3 const grid(static_cast<unsigned>(args.selectionWidth), static_cast<unsigned>(args.numLayers));
+    dim3 const grid(static_cast<unsigned>(args.workWidth), static_cast<unsigned>(args.numLayers));
     sparseUnitCopyKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
