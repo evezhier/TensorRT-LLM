@@ -317,15 +317,23 @@ public:
         return mConfig;
     }
 
-    //! History entries a request's sparse cache holds for this life cycle, in selection
-    //! units. Zero when the life cycle is not sparse or its fetch path is unconfigured.
+    //! Cells a request's sparse cache holds per buffer of this life cycle, counting both
+    //! populations: the history it caches and everything still in flight. Zero when the life
+    //! cycle is not sparse or its fetch path is unconfigured.
     //!
-    //! This is the history population only. The in-flight population is bounded per request
-    //! by KvCache::maxInputLength(), so the reservation is a property of the request, not of
-    //! the manager.
+    //! The reservation follows from this alone, so it is a property of the manager. What it
+    //! leaves above the selection width is the headroom KvCache::maxInputLength() reports.
     [[nodiscard]] int sparseCacheMaxUnits(LifeCycleId lifeCycle) const noexcept
     {
         return lifeCycle < mSparseCacheMaxUnits.size() ? mSparseCacheMaxUnits[lifeCycle] : 0;
+    }
+
+    //! Units a step selects per buffer of this life cycle. The cache must hold a whole
+    //! selection on top of everything in flight, so this is what the in-flight headroom is
+    //! measured against.
+    [[nodiscard]] int sparseCacheSelectionWidth(LifeCycleId lifeCycle) const noexcept
+    {
+        return lifeCycle < mSparseCacheSelection.size() ? mSparseCacheSelection[lifeCycle] : 0;
     }
 
     //! Selection units carried by one buffer of this life cycle, i.e. tokens_per_block
@@ -471,6 +479,7 @@ private:
     TypedVec<LifeCycleId, int> mSparseCacheMaxUnits;
     TypedVec<LifeCycleId, int> mSparseCacheExpansion;
     TypedVec<LifeCycleId, int> mSparseCacheBuffers;
+    TypedVec<LifeCycleId, int> mSparseCacheSelection;
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;

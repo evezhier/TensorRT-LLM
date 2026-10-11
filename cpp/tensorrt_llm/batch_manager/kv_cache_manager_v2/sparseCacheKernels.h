@@ -38,7 +38,7 @@ enum class SparseResolveStatus : int32_t
     //! it means the cache was sized below the selection width plus the in-flight span.
     kOutOfEntries = 1,
     //! capacityUnits - historyUnits exceeded maxInFlightUnits, i.e. the request grew past
-    //! the max_input_length it declared.
+    //! the in-flight headroom its cache width leaves.
     kInFlightOverflow = 2,
     //! More units crossed the watermark in one move than maxFlushUnits allows for.
     kFlushOverflow = 3,
@@ -78,8 +78,8 @@ struct SparseResolveArgs
     //! historyUnits. Entries past the live count are left untouched. The model writes new
     //! KV through these, so they are resolved before the selection takes any victim.
     int32_t* inFlightSlot = nullptr;
-    //! Array stride, bounding capacityUnits - historyUnits. Derived from the declared
-    //! max_input_length, so the shape stays static while the live count varies.
+    //! Array stride, bounding capacityUnits - historyUnits. Follows from the cache width,
+    //! so the shape stays static while the live count varies.
     int32_t maxInFlightUnits = 0;
 
     //! [numLayers][selectionWidth] the history units that were not resident, and the
@@ -207,7 +207,7 @@ struct SparseFlushListArgs
     int32_t* outSlot = nullptr;
     //! [numLayers] how many.
     int32_t* outCount = nullptr;
-    //! Bound on one watermark move, which cannot exceed the declared in-flight span.
+    //! Bound on one watermark move, which cannot exceed the in-flight headroom.
     int32_t maxFlushUnits = 0;
 
     //! [1] SparseResolveStatus. The caller must clear it before the launch.

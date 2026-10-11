@@ -216,16 +216,14 @@ public:
 
     //! Bound on capacity - history_length: how far capacity may outrun the watermark.
     //!
-    //! Required once a sparse buffer's fetch path is configured and the two differ, because
-    //! the cache must hold every in-flight block and the reservation is sized from this.
-    //! Set it before the resize() that opens the gap. Lowering it when prefill completes is
-    //! what returns pages to the global pool.
-    void setMaxInputLength(int maxInputLength);
-
-    [[nodiscard]] std::optional<int> maxInputLength() const noexcept
-    {
-        return mMaxInputLength;
-    }
+    //! Derived, not declared. The cache holds a whole selection plus every unit still in
+    //! flight, so whatever the reservation has above the selection width is the in-flight
+    //! headroom, and that headroom in tokens is this bound. Size it through
+    //! BufferConfig::maxCachedUnits.
+    //!
+    //! nullopt when no sparse buffer has a cache, where a bound on in-flight blocks
+    //! describes nothing. The smallest bound across sparse life cycles when several differ.
+    [[nodiscard]] std::optional<int> maxInputLength() const;
 
     // Convenience: set only capacity or history length.
     void setCapacity(int capacity);
@@ -736,12 +734,9 @@ private:
     // life cycle has its fetch path configured.
     TypedVec<LifeCycleId, std::vector<SparseCacheSlotLock>> mSparseCacheSlots;
 
-    // Device-resident residency, recency and dirty state describing those pages. Created
+    // Device-resident residency, recency and write-back scratch for those pages. Created
     // with them and destroyed with them, so the metadata never outlives what it describes.
     TypedVec<LifeCycleId, SparseCacheState> mSparseCacheState;
-
-    // See setMaxInputLength(). Unset until a caller declares it.
-    std::optional<int> mMaxInputLength;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -418,7 +418,8 @@ class TestSparseCacheReservation(unittest.TestCase):
     def _manager(max_cached_units: int) -> KVCacheManager:
         # Both widths are zero together: a selection width without a cache to hold it is
         # rejected at construction, so "fetch path unconfigured" means both are unset.
-        num_selected = 4 if max_cached_units > 0 else 0
+        # The cache must exceed the selection, since the surplus is the in-flight headroom.
+        num_selected = 2 if max_cached_units > 0 else 0
         return KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=128,
@@ -447,14 +448,12 @@ class TestSparseCacheReservation(unittest.TestCase):
     def _free(manager: KVCacheManager) -> int:
         return sum(stats.free for stats in manager.get_storage_statistics())
 
-    def _free_delta_across_resume(self, max_cached_units: int, max_input_length: int = 0) -> int:
+    def _free_delta_across_resume(self, max_cached_units: int) -> int:
         """GPU slots a single resume consumes, for the given cache width."""
         manager = self._manager(max_cached_units)
         try:
             before = self._free(manager)
             cache = manager.create_kv_cache()
-            if max_input_length > 0:
-                cache.max_input_length = max_input_length
             with TemporaryCudaStream([]) as stream:
                 self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
                 used = before - self._free(manager)
@@ -464,15 +463,24 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_bound_defaults_only_where_it_applies(self):
+    def test_the_input_bound_follows_from_the_cache_width(self):
         sparse = self._manager(max_cached_units=4)
         try:
             cache = sparse.create_kv_cache()
-            # Zero, not None: a request that has not begun prefilling has no gap yet.
-            self.assertEqual(cache.max_input_length, 0)
+            # Four cells less a selection of two leaves two units in flight, and a unit is a
+            # whole 128-token block here.
+            self.assertEqual(cache.max_input_length, 256)
             cache.close()
         finally:
             sparse.shutdown()
+
+        wider = self._manager(max_cached_units=6)
+        try:
+            cache = wider.create_kv_cache()
+            self.assertEqual(cache.max_input_length, 512, "surplus cells are in-flight headroom")
+            cache.close()
+        finally:
+            wider.shutdown()
 
         dense = self._manager(max_cached_units=0)
         try:
@@ -483,7 +491,7 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             dense.shutdown()
 
-    def test_shape_constants_describe_one_page(self):
+    def test_shape_constants_describe_one_buffer(self):
         manager = self._manager(max_cached_units=4)
         try:
             self.assertEqual(manager.get_sparse_cache_max_units(0), 4)
@@ -492,20 +500,13 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_reservation_covers_history_and_in_flight(self):
+    def test_the_reservation_is_the_declared_cache_width(self):
         # Differential against an unconfigured manager, so the extra slots are the
-        # reservation and nothing else. With expansion 1 and a 128-token block, a
-        # max_input_length of 256 is two in-flight units on top of the four history ones.
-        self.assertEqual(
-            self._free_delta_across_resume(4, max_input_length=0)
-            - self._free_delta_across_resume(0),
-            4,
-        )
-        self.assertEqual(
-            self._free_delta_across_resume(4, max_input_length=256)
-            - self._free_delta_across_resume(0),
-            6,
-        )
+        # reservation and nothing else. max_cached_units counts both populations, so the
+        # reservation follows from configuration alone and no per-request input enters it.
+        baseline = self._free_delta_across_resume(0)
+        self.assertEqual(self._free_delta_across_resume(4) - baseline, 4)
+        self.assertEqual(self._free_delta_across_resume(6) - baseline, 6)
 
     def test_unconfigured_fetch_path_reserves_nothing(self):
         manager = self._manager(max_cached_units=0)
@@ -514,17 +515,16 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_resize_requires_a_declared_input_bound(self):
+    def test_resize_rejects_a_gap_the_cache_cannot_pin(self):
         manager = self._manager(max_cached_units=4)
         try:
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
-                cache.max_input_length = 256
                 self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
-                # Within the declared bound.
+                # Within the derived bound of 256.
                 self.assertTrue(cache.resize(256, 0))
-                # Beyond it: capacity would outrun the watermark further than declared.
-                with self.assertRaisesRegex(ValueError, "exceeds the declared max_input_length"):
+                # Beyond it: those blocks could not all be held in flight at once.
+                with self.assertRaisesRegex(ValueError, "can hold in flight"):
                     cache.resize(512, 0)
                 cache.close()
         finally:
@@ -535,8 +535,8 @@ class TestSparseCacheReservation(unittest.TestCase):
         try:
             lc_id = manager.get_layer_group_id(0)
             buffers = manager.get_sparse_cache_buffer_count(0)
-            # max_input_length is 0 below, so the cache is the history population alone:
-            # 4 units at expansion 1 is 4 pages, hence 4 entries per buffer.
+            # max_cached_units counts every cell, so 4 units at expansion 1 is 4 slots and
+            # 4 entries per buffer.
             entries = manager.get_sparse_cache_max_units(0)
             self.assertEqual(buffers, 1)
             self.assertEqual(entries, 4)
@@ -613,7 +613,6 @@ class TestSparseCacheReservation(unittest.TestCase):
         try:
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
-                cache.max_input_length = 256
                 self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
                 lc_id = manager.get_layer_group_id(0)
                 self.assertEqual(
@@ -639,7 +638,6 @@ class TestSparseCacheReservation(unittest.TestCase):
         try:
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
-                cache.max_input_length = 256
                 self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
                 lc_id = manager.get_layer_group_id(0)
                 cache.resize(64, 64)
@@ -825,7 +823,7 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.resident_ordinal[selected], 5)
         self.assertEqual(result.miss_count, [1], "only the history unit is fetched")
 
-    def test_growing_past_the_declared_input_bound_is_reported(self):
+    def test_growing_past_the_derived_input_bound_is_reported(self):
         result = self._resolve(
             self._free(8),
             [-1],
@@ -846,7 +844,7 @@ class TestSparseResolve(unittest.TestCase):
 
 
 class TestSparseUnitCopy(unittest.TestCase):
-    """The copy that fills a cache entry from its cold page."""
+    """Moving a unit between its cold page and its cache cell, in both directions."""
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -870,7 +868,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_pool=[0] * (page_stride * 2),
             device_page_stride=page_stride,
             cache_pages=[1, 0],
-            src_buffer_offset=[0],
+            cold_buffer_offset=[0],
             sub_slots_per_layer=1,
             buffers_per_slot=1,
             buffer_bytes=page_stride,
@@ -904,7 +902,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_pool=[0] * (page_stride),
             device_page_stride=page_stride,
             cache_pages=[0],
-            src_buffer_offset=[0],
+            cold_buffer_offset=[0],
             sub_slots_per_layer=1,
             buffers_per_slot=1,
             buffer_bytes=page_stride,
@@ -941,7 +939,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[0],
             # Deliberately crossed: layer 0's buffer is second in the cold page.
-            src_buffer_offset=[unit, 0],
+            cold_buffer_offset=[unit, 0],
             sub_slots_per_layer=1,
             buffers_per_slot=2,
             buffer_bytes=unit,
@@ -971,7 +969,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_pool=[0] * (unit),
             device_page_stride=unit,
             cache_pages=[0],
-            src_buffer_offset=[0],
+            cold_buffer_offset=[0],
             sub_slots_per_layer=1,
             buffers_per_slot=1,
             buffer_bytes=unit,
@@ -999,7 +997,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_pool=[0] * (unit * 2),
             device_page_stride=unit * 2,
             cache_pages=[0],
-            src_buffer_offset=[0],
+            cold_buffer_offset=[0],
             sub_slots_per_layer=1,
             buffers_per_slot=1,
             buffer_bytes=unit * 2,
@@ -1074,7 +1072,7 @@ class TestSparseFlush(unittest.TestCase):
             page_table=[0],
             device_page_stride=page_stride,
             cache_pages=[0],
-            src_buffer_offset=[0],
+            cold_buffer_offset=[0],
             sub_slots_per_layer=1,
             buffers_per_slot=1,
             buffer_bytes=page_stride,
@@ -1114,7 +1112,7 @@ class TestSparseFlush(unittest.TestCase):
             device_pool=[0] * (page_stride),
             device_page_stride=page_stride,
             cache_pages=[0],
-            src_buffer_offset=[0],
+            cold_buffer_offset=[0],
             sub_slots_per_layer=1,
             buffers_per_slot=1,
             buffer_bytes=page_stride,

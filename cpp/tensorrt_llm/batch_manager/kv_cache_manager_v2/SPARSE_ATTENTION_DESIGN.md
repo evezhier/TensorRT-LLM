@@ -1,7 +1,9 @@
 # Sparse attention in KVCacheManagerV2
 
-Status: design. No implementation yet. Part of the Python surface is declared in
-`tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi` and is behind this document.
+Status: implemented except for the fetch call and `Batch`. Storage and locking, the
+per-request reservation and device state, the resolve, copy and flush-list kernels, and the
+write-back at `resize()` are in place. Compression, `ISparseUnitGather` and kernel fusion
+remain future work, as marked below.
 
 Read `AGENTS.md` in this directory first for the storage, locking and concurrency model
 this builds on.
@@ -140,7 +142,7 @@ keep this from being a general write-back cache:
 - **Unflushed entries are private.** Only finalized pages enter the radix tree, so an
   unflushed block has exactly one owner: no aliasing, no cross-request coherence, no
   concurrent writers.
-- **The unflushed set is bounded and declared**, not discovered — see `max_input_length`
+- **The unflushed set is bounded by the cache width**, not discovered — see `max_input_length`
   below. Reservation covers it, so a fetch never meets a cache with nothing to evict.
 
 Eviction eligibility is therefore one comparison against the watermark. There is no
@@ -156,51 +158,67 @@ Two separate reservations, easily confused.
 Only the level differs. This is the payoff of uniform locking: nothing new to size, and no
 notion of "history pages" distinct from the rest.
 
-**GPU tier.** The cache holds two populations, and must be sized for both:
+**GPU tier.** `max_cached_units` is the whole cache, counting both populations:
 
 ```
-units = min(N, history_length / unit_tokens)      history, replaced by LRU
-      + divUp(max_input_length, unit_tokens)      in flight, pinned until flushed
-pages = divUp(units, expansion)
+cells  = max_cached_units                         one buffer's cells
+slots  = divUp(cells, expansion)                  what the reservation takes
 ```
 
-`N` is `max_cached_units` (*Sizing*: two to four times the selection width), so a short
-sequence caches little history and a long one saturates.
+The two populations are disjoint — the selection is below the watermark, everything in
+flight is above it — so the cache must hold a full selection *plus* every in-flight unit at
+once. That is the only constraint, and it is what makes the second population derivable
+rather than declared.
 
-The second term exists because prefill and decode share one manager. An in-flight block's
-data lives only in its cache entry until the watermark passes it, so the cache must hold
-every block above the watermark — one or two in decode, but a whole chunk in prefill.
+The in-flight term exists because prefill and decode share one manager. An in-flight
+block's data lives only in its cache cell until the watermark passes it, so the cache must
+hold every block above the watermark — one or two in decode, but a whole chunk in prefill.
+
+*Sizing*: two to four times the selection width is the usual starting point for the history
+half, but the surplus above the selection is also the in-flight headroom, so size for the
+larger of the two demands.
 
 ### `max_input_length`
 
-A per-request bound on `capacity - history_length`, i.e. on how far capacity may outrun the
-watermark. It is required once sparsity is enabled and the two differ, and must be set
-before the `resize()` that creates the gap, because the reservation is sized from it.
+A bound on `capacity - history_length`, i.e. on how far capacity may outrun the watermark.
+**Derived, not declared**:
 
-Declaring it rather than inferring it is what keeps the reservation static and the failure
-loud: the alternative is a cache that grows mid-step and can fail where no caller can
-recover. Lowering it is the lever that returns memory — when prefill completes, a caller
-drops it to the maximum draft length for decode, and the pages beyond the new bound go back
-to the global pool.
+```
+headroom = slots * expansion - selection_width    cells not needed for a full selection
+bound    = headroom * unit_tokens
+```
 
-Reservation happens at `resume()` and when `max_input_length` rises; it fails there if
-capacity is unavailable, so the fetch path never has to handle exhaustion.
+An earlier revision made this a per-request setter, with the reservation sized from it. That
+is a second knob that has to agree with the first: `max_cached_units` already fixes the
+memory, so a declared bound could only ever be a restatement of it — and one the caller
+could get wrong, discovering the mismatch at a `resize()` far from the configuration that
+caused it. Deriving it also recovers what rounding to whole slots leaves over, which a
+declared bound would strand.
 
-### Why per-request pages give per-layer caches for free
+The reservation therefore depends on configuration alone. It happens once at `resume()` and
+fails there if capacity is unavailable, so the fetch path never has to handle exhaustion.
 
-A page already carries one buffer per coalesced layer. Reserving N pages therefore gives
-**each layer N independent cache entries**, with no new allocation granularity and no
-buffer-level free list. Layer L can only ever occupy position L within a page, so the
-per-layer free list is just "which of my N pages is free for layer L".
+`resize()` still checks the gap against this bound. It is the host-side counterpart of the
+resolve kernel's in-flight overflow report: one catches a request outgrowing its cache
+before the step, the other if it somehow reaches the device.
 
-The consequence is that a cache entry is `(page, layer)`, not `page`. One reserved page
-may hold different layers' data for entirely different ordinals. This breaks an assumption
-that runs through KVCM2 — that a page is both the unit of allocation *and* the unit of
-identity — and code reasoning about "the block this page holds" has no answer for a sparse
-cache page.
+### Why per-request slots give per-layer caches for free
 
-When the selection unit is smaller than a page, a page holds `expansion` units per layer,
-so N pages give `N * expansion` unit-slots per layer and the entry is `(page, layer, unit)`.
+A reserved slot is `buffers_per_slot` buffer-sized cells, and a cell can hold any layer's
+unit. Entries resolve through a flat sub-slot index, so the per-layer partition is a free
+choice rather than a consequence of the page layout — see *One pool, one index space*.
+Coalescing earns nothing inside the cache, because layers select different units and so
+share nothing.
+
+The consequence is that a cache entry is not a page. One reserved slot may hold different
+layers' data for entirely different ordinals, so an entry is `(layer, entry index)`. This
+breaks an assumption that runs through KVCM2 — that a page is both the unit of allocation
+*and* the unit of identity — and code reasoning about "the block this page holds" has no
+answer for a sparse cache slot.
+
+When the selection unit is smaller than a page, each cell holds `expansion` units, so a
+reservation of N slots gives `N * buffers_per_slot * expansion` units in total. An entry is
+`(layer, entry index)`, resolved to a cell by the sub-slot arithmetic above.
 
 ## Device-side cache
 
@@ -401,9 +419,14 @@ necessary, adding a base is a small internal refactor; neither type crosses an A
 
 ### Kernel structure
 
-The descriptor path is **one kernel**. KVCM2 resolves selections, updates LRU, allocates
-slots and performs the copies itself, because a layout is data it can interpret rather than
-code it must call. Nothing is split and nothing needs fusing.
+The descriptor path crosses **no plugin boundary**. KVCM2 resolves selections, updates LRU,
+allocates cells and performs the copies itself, because a layout is data it can interpret
+rather than code it must call.
+
+It is two launches — a resolve and a copy — but that split is internal and chosen, not
+forced: the resolve writes a miss list the copy consumes, which is what lets the PCIe
+copies be issued before the recency bookkeeping. Fusing them would be a local optimisation,
+not an interface change.
 
 The gather path is **two kernels**: KVCM2's kernel resolves selections, updates LRU and
 allocates slots, writing a miss list to a device array; the implementation's kernel performs
@@ -435,9 +458,9 @@ blocks the next:
 
 | stage | delivers | needed when |
 | --- | --- | --- |
-| 1 | descriptor path, single fused kernel, no plugin interface at all | always — the flush is a verbatim copy, so cold layout equals hot layout |
-| 2 | `ISparseUnitGather`, two kernels on that path | compression, or any other non-arithmetic cold representation |
-| 3 | LTO-IR + nvJitLink to re-fuse stage 2 | stage 2's second launch measurably costs something |
+| 1 | descriptor path, no plugin interface at all | always — the flush is a verbatim copy, so cold layout equals hot layout |
+| 2 | `ISparseUnitGather`, an extraction launch owned by the implementation | compression, or any other non-arithmetic cold representation |
+| 3 | LTO-IR + nvJitLink to fuse stage 2's extraction in | stage 2's extra launch measurably costs something |
 
 Stage 1 needs no extension point, so the first implementation carries no plugin machinery,
 no registration, and no dispatch. `ISparseUnitGather` is introduced only alongside the first
@@ -467,9 +490,12 @@ recency bookkeeping runs rather than after it.
 
 No host involvement, so the call enqueues and returns. Every shape is static across steps.
 
-Fetch is not the only path that allocates a cache entry: starting a new block allocates one
-directly, outside any fetch, and holds it pinned until the watermark passes it. Both draw
-from the same free list.
+The selection is not the only thing that needs a cell. The block being written needs one
+too, and needs it before the selection takes any victim. Both are resolved by the same
+probe, over one virtual list: the in-flight ordinals `[history_units, capacity_units)`
+first, then the selection. An in-flight unit differs in exactly one way — a miss allocates
+its cell but never joins the copy list, because its host page holds nothing to fetch until
+the watermark passes it.
 
 ### Capacity and eviction
 
@@ -546,18 +572,18 @@ N should be `2k`–`4k`, not `k`. `k` is the correctness floor — it guarantees
 satisfy its layer — but it leaves no room for retention, and retention across steps is
 where the hit rate comes from. HiSparse finds `B ∈ [2k, 4k]` the useful range.
 
-The split between cache reservation and ordinary full pages follows from `k` rather than
-being configured separately. This is a decode-time feature, so a sequence holds one or two
-blocks of non-history tokens at a time:
+There is no separate budget for in-flight blocks. The sparse pool's GPU tier holds nothing
+but cache cells, and an in-flight block occupies one of the same cells the selection draws
+on, so `max_cached_units` covers both:
 
 ```
-cache reservation  = max_batch_size * N            (N in [2k, 4k])
-full pages        ~= max_batch_size * (1 or 2)
+cache reservation = max_batch_size * N             (N in [2k, 4k])
+in-flight headroom = N - k                         what max_input_length reports
 ```
 
-with `max_batch_size` from `constraints`. An explicit ratio between the regions stays
-available as an escape hatch. Extending sparse attention to prefill would remove the small
-constant on the non-history side and invalidate this derivation.
+with `max_batch_size` from `constraints`. Because the surplus above `k` is what bounds a
+request's input length, `N` has to satisfy whichever demand is larger: retention wants
+`2k`–`4k`, and a prefill chunk wants enough cells to pin the whole chunk at once.
 
 ## Python surface
 
@@ -603,10 +629,10 @@ prefill scratch is GPU-only by definition.
 - **Hook `resize()`, not `setHistoryLength()`.** The latter is `resize(nullopt, hist)` and
   `setCapacity()` is `resize(cap, nullopt)`, so `resize()` is the only place the watermark
   moves — and a caller may move capacity and history in the same call.
-- **Commit is not a substitute for the watermark deadline.** Flushing at `commit()` is worth
-  doing, but `stopCommitting()`, a `CommitState` other than `ALLOWED`, and reuse-disabled
-  requests all produce blocks that are never committed. The watermark hook is what makes the
-  flush guaranteed.
+- **`commit()` is not a flush site at all.** The manager maintains
+  `num_committed_tokens <= history_length <= capacity`, so a committed block is already at
+  or below the watermark and was flushed by the `resize()` that passed it. Where `commit()`
+  advances the watermark it does so by calling `resize()`.
 
 Also: the host pool is far larger than the GPU pool, so a page index must be widened to 64
 bits before multiplying by the page stride. MSA already does this

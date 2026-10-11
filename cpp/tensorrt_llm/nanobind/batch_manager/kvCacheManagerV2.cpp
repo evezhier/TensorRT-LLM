@@ -1798,9 +1798,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return self.resize(capacity, historyLength); },
             nb::arg("capacity") = std::nullopt, nb::arg("history_length") = std::nullopt,
             nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_rw(
+        .def_prop_ro(
             "max_input_length", [](kv::KvCache const& self) { return self.maxInputLength(); },
-            [](kv::KvCache& self, int value) { self.setMaxInputLength(value); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
@@ -2170,7 +2169,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("max_in_flight_units"));
     mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),
         nb::arg("host_page_stride"), nb::arg("page_table"), nb::arg("device_pool"), nb::arg("device_page_stride"),
-        nb::arg("cache_pages"), nb::arg("src_buffer_offset"), nb::arg("sub_slots_per_layer"),
+        nb::arg("cache_pages"), nb::arg("cold_buffer_offset"), nb::arg("sub_slots_per_layer"),
         nb::arg("buffers_per_slot"), nb::arg("buffer_bytes"), nb::arg("num_chunks"), nb::arg("chunk_bytes"),
         nb::arg("chunk_stride"), nb::arg("unit_stride"), nb::arg("expansion"), nb::arg("miss_ordinal"),
         nb::arg("miss_slot"), nb::arg("miss_count"), nb::arg("selection_width"), nb::arg("num_layers"),
@@ -2695,21 +2694,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
             { return self.sparseCacheMaxUnits(self.getLayerGroupId(layerId)); },
             nb::arg("layer_id"),
-            "History entries a request's sparse cache holds for this layer, in selection units. "
-            "The in-flight population is bounded per request by _KVCache.max_input_length, so the "
-            "page count is a property of the request rather than the manager.")
+            "Cells a request's sparse cache holds per buffer of this layer, in selection units, "
+            "counting both the cached history and everything in flight. The reservation follows "
+            "from this alone; the surplus above the selection width is what "
+            "_KVCache.max_input_length reports.")
         .def(
             "get_sparse_cache_expansion",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
             { return self.sparseCacheExpansion(self.getLayerGroupId(layerId)); },
-            nb::arg("layer_id"), "Selection units carried by one page; one when a unit is a whole page.")
+            nb::arg("layer_id"), "Selection units carried by one buffer; one when a unit is a whole block.")
         .def(
             "get_sparse_cache_buffer_count",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
             { return self.sparseCacheBufferCount(self.getLayerGroupId(layerId)); },
             nb::arg("layer_id"),
-            "Sparse buffers carried by one page of this layer's life cycle, i.e. the number of "
-            "independent caches a reserved page feeds.")
+            "Sparse buffers of this layer's life cycle, one per (layer, role), each an "
+            "independent cache. Also the cells a reserved slot yields.")
         .def("get_page_index_converter", &kv::KvCacheManager::getPageIndexConverter, nb::arg("layer_id"),
             nb::arg("data_role"))
         .def(

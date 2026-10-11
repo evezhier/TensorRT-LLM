@@ -145,6 +145,7 @@ void KvCacheManager::_computeSparseCacheShape()
     mSparseCacheMaxUnits = TypedVec<LifeCycleId, int>(numLc, 0);
     mSparseCacheExpansion = TypedVec<LifeCycleId, int>(numLc, 1);
     mSparseCacheBuffers = TypedVec<LifeCycleId, int>(numLc, 0);
+    mSparseCacheSelection = TypedVec<LifeCycleId, int>(numLc, 0);
 
     for (auto const& layer : mConfig.layers)
     {
@@ -162,6 +163,7 @@ void KvCacheManager::_computeSparseCacheShape()
             }
             int const expansion = mConfig.tokensPerBlock / buf.tokensPerBlockOverride.value_or(mConfig.tokensPerBlock);
             mSparseCacheMaxUnits[lcId] = std::max(mSparseCacheMaxUnits[lcId], buf.maxCachedUnits);
+            mSparseCacheSelection[lcId] = std::max(mSparseCacheSelection[lcId], buf.numSelectedBlocks);
             mSparseCacheExpansion[lcId] = std::max(mSparseCacheExpansion[lcId], expansion);
             // One more independent cache, and one more cell in a reserved slot.
             ++mSparseCacheBuffers[lcId];

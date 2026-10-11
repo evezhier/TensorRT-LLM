@@ -30,10 +30,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // SparseCacheView — the device-resident state of one request's sparse history
 // cache for one life cycle, as the fetch kernel sees it.
 //
-// A reserved page carries one buffer per coalesced layer, so a page yields one entry per
-// layer (or `expansion` entries when the selection unit is smaller than a page). An entry
-// is therefore identified by (layer, entry index), not by page: one page may hold
-// different layers' data for entirely different ordinals.
+// A reserved slot is a row of buffer-sized cells, and any layer's unit may occupy any cell;
+// a cell holds `expansion` units when the selection unit is smaller than a buffer. An entry
+// is identified by (layer, entry index) and resolved to a cell arithmetically, so nothing
+// ties a layer to a fixed position.
 //
 // Both arrays are laid out [layer][entry], row-major over entriesPerLayer.
 // ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ struct SparseCacheView
     //! Scratch for one write-back: the units a watermark move crossed and the cells holding
     //! them, the watermark scalars the scan reads, the page slots of the blocks touched, and
     //! a status word. Sized once, because a single move cannot cross more units than the
-    //! declared in-flight span.
+    //! reservation's in-flight headroom.
     int32_t* flushOrdinal = nullptr;   //!< [numLayers][maxFlushUnits]
     int32_t* flushSlot = nullptr;      //!< [numLayers][maxFlushUnits]
     int32_t* flushCount = nullptr;     //!< [numLayers]
@@ -92,7 +92,7 @@ struct SparseCacheInit
     std::vector<int32_t> cachePageSlots;
     //! [numLayers] byte offset of each buffer within a cold page.
     std::vector<uint32_t> hostBufferOffset;
-    //! Bounds on one watermark move, from the declared max_input_length.
+    //! Bounds on one watermark move, from the in-flight headroom the reservation leaves.
     int32_t maxFlushUnits = 0;
     int32_t maxFlushBlocks = 0;
 };

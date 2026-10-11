@@ -208,7 +208,8 @@ def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
 def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     """Resident unit ordinal per sparse cache entry, laid out [buffer][entry].
 
-    BAD_PAGE_INDEX marks a free entry. Empty when the life cycle reserves no cache.
+    A free entry holds the bad-ordinal sentinel, which is -1, the same value as
+    BAD_PAGE_INDEX. Empty when the life cycle reserves no cache.
     """
     return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
 
@@ -250,7 +251,7 @@ def sparse_unit_copy(
     device_pool: bytes | list[int],
     device_page_stride: int,
     cache_pages: list[int],
-    src_buffer_offset: list[int],
+    cold_buffer_offset: list[int],
     sub_slots_per_layer: int,
     buffers_per_slot: int,
     buffer_bytes: int,
@@ -280,7 +281,7 @@ def sparse_unit_copy(
             list(device_pool),
             device_page_stride,
             cache_pages,
-            src_buffer_offset,
+            cold_buffer_offset,
             sub_slots_per_layer,
             buffers_per_slot,
             buffer_bytes,

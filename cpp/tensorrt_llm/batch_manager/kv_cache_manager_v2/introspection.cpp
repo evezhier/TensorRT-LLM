@@ -224,7 +224,7 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
 
 std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
     std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& devicePool, uint64_t devicePageStride,
-    std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& srcBufferOffset, int subSlotsPerLayer,
+    std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& coldBufferOffset, int subSlotsPerLayer,
     int buffersPerSlot, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
     uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
     std::vector<int32_t> const& missCount, int selectionWidth, int numLayers, bool writeBack)
@@ -244,7 +244,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     auto missOrd = deviceCopy(missOrdinal);
     auto missSlotBuf = deviceCopy(missSlot);
     auto missCountBuf = deviceCopy(missCount);
-    auto srcOffsets = deviceCopyU32(srcBufferOffset);
+    auto coldOffsets = deviceCopyU32(coldBufferOffset);
 
     SparseUnitCopyArgs args;
     args.hostBase = hostPtr;
@@ -254,7 +254,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.deviceBase = devicePtr;
     args.devicePageStride = devicePageStride;
     args.cachePages = reinterpret_cast<int32_t const*>(pages.get());
-    args.hostBufferOffset = reinterpret_cast<uint32_t const*>(srcOffsets.get());
+    args.hostBufferOffset = reinterpret_cast<uint32_t const*>(coldOffsets.get());
     args.subSlotsPerLayer = subSlotsPerLayer;
     args.buffersPerSlot = buffersPerSlot;
     args.bufferBytes = bufferBytes;

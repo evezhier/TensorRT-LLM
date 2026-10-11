@@ -94,13 +94,6 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     }
 
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
-    // Zero means "capacity may not outrun the watermark yet", which is the right starting
-    // point for a request that has not begun prefilling. Left unset without a sparse cache,
-    // where a bound on in-flight blocks describes nothing.
-    if (_hasSparseCache())
-    {
-        mMaxInputLength = 0;
-    }
     mScratchSlots.resize(manager.storage().numLifeCycles());
     mSparseCacheSlots.resize(manager.storage().numLifeCycles());
     mSparseCacheState.resize(manager.storage().numLifeCycles());
@@ -367,7 +360,7 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
     int const numBlocks = lastBlock - firstBlock + 1;
     if (numBlocks > view.maxFlushBlocks)
     {
-        throw LogicError("A watermark move crossed more blocks than the declared input bound allows");
+        throw LogicError("A watermark move crossed more blocks than the cache's in-flight headroom allows");
     }
 
     // Upload the watermark range and the page slots of the blocks it touched. Synchronous
@@ -419,23 +412,29 @@ int KvCache::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const
         return 0;
     }
     int const expansion = mManager->sparseCacheExpansion(lifeCycle);
-    int const unitTokens = mTokensPerBlock / expansion;
-    // Every block above the watermark is in flight: its data lives only in a cache cell
-    // until a flush reaches it, so the cache must hold all of them alongside the history it
-    // caches. maxInputLength() bounds that population; resize() requires it to be set.
-    int const inFlightUnits = divUp(mMaxInputLength.value_or(0), unitTokens);
-    return divUp(maxUnits + inFlightUnits, expansion);
+    // maxCachedUnits counts both populations, the history this caches and everything still
+    // in flight, so the reservation follows from configuration alone. What it leaves above
+    // the selection width is the in-flight headroom maxInputLength() reports.
+    return divUp(maxUnits, expansion);
 }
 
-void KvCache::setMaxInputLength(int maxInputLength)
+std::optional<int> KvCache::maxInputLength() const
 {
-    KVCM2_API_GUARD();
-    auto const lock = mManager->lockExclusive();
-    if (maxInputLength < 0)
+    std::optional<int> bound;
+    for (LifeCycleId lc{0}; lc < mSparseCacheState.size(); ++lc)
     {
-        throw std::invalid_argument("max_input_length must not be negative");
+        int const cells = _sparseCacheSubSlotsPerBuffer(lc) * mManager->sparseCacheExpansion(lc);
+        if (cells == 0)
+        {
+            continue;
+        }
+        // Whatever the reservation holds beyond a full selection is what can be in flight.
+        int const headroom = cells - mManager->sparseCacheSelectionWidth(lc);
+        int const unitTokens = mTokensPerBlock / mManager->sparseCacheExpansion(lc);
+        int const tokens = std::max(0, headroom) * unitTokens;
+        bound = bound.has_value() ? std::min(*bound, tokens) : tokens;
     }
-    mMaxInputLength = maxInputLength;
+    return bound;
 }
 
 void KvCache::activate()
@@ -445,7 +444,8 @@ void KvCache::activate()
 
     mFinishEvent.reset();
 
-    // Cold sparse history stays on host; writable pages require GPU storage.
+    // Residency is a property of the life cycle: every page of a sparse buffer locks at the
+    // host tier, written or not, and reaches the kernels through the per-request cache.
     auto activePages = _activePages();
     std::vector<BatchedLockTarget> targets;
     targets.reserve(activePages.size());
@@ -540,9 +540,9 @@ bool KvCache::resume(std::optional<CUstream> stream)
         numSlotsNeeded[lc] += scratchDeltaCounts[lc];
     }
 
-    // Pages backing this request's sparse history cache. Held until close(), so a resume
-    // after suspend tops up only what is missing. Zero for every life cycle whose fetch
-    // path is unconfigured, which keeps non-sparse deployments untouched.
+    // Pages backing this request's sparse cache. Released at suspend() along with the rest
+    // of the reservation, so a later resume takes them afresh. Zero for every life cycle
+    // whose fetch path is unconfigured, which keeps non-sparse deployments untouched.
     // These are GPU pages whatever the life cycle's residency level is: the cache is what
     // makes host-resident sparse history reachable by the attention kernels.
     TypedVec<LifeCycleId, SlotCount> sparseCacheDelta(numLc, 0);
@@ -624,7 +624,8 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 init.hostBufferOffset = _sparseColdPageOffsets(lc);
                 // A watermark move cannot cross more than the in-flight span it is draining.
                 int const expansion = mManager->sparseCacheExpansion(lc);
-                init.maxFlushUnits = divUp(mMaxInputLength.value_or(0), mTokensPerBlock / expansion) + 1;
+                int const cells = _sparseCacheSubSlotsPerBuffer(lc) * expansion;
+                init.maxFlushUnits = std::max(1, cells - mManager->sparseCacheSelectionWidth(lc)) + 1;
                 init.maxFlushBlocks = divUp(init.maxFlushUnits, expansion) + 1;
                 mSparseCacheState[lc] = SparseCacheState(init, reinterpret_cast<CUstream>(cudaStream()));
             }
@@ -1408,15 +1409,15 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     if (newCap < newHist)
         throw std::invalid_argument("History length cannot exceed capacity");
 
-    // Blocks above the watermark are in flight: their data lives only in sparse cache
-    // entries, so the reservation must cover them and must be sized from a declared bound
-    // rather than discovered mid-step.
+    // Blocks above the watermark are in flight: their data lives only in sparse cache cells,
+    // so the gap cannot exceed what the reservation can pin. The host-side counterpart of
+    // the resolve kernel's in-flight overflow report.
     if (newCap != newHist && _hasSparseCache())
     {
-        // Always set when a sparse cache is configured; see the constructor.
-        if (newCap - newHist > mMaxInputLength.value_or(0))
+        auto const bound = maxInputLength();
+        if (bound.has_value() && newCap - newHist > *bound)
         {
-            throw std::invalid_argument("capacity - history_length exceeds the declared max_input_length");
+            throw std::invalid_argument("capacity - history_length exceeds what the sparse cache can hold in flight");
         }
     }
 

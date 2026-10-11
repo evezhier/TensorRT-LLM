@@ -153,8 +153,13 @@ struct BufferConfig
     //! Selection width: units a sparse-attention step selects per layer. Sparse buffers only.
     int numSelectedBlocks = 0;
 
-    //! Upper bound on per-request GPU cache entries. Two to four times numSelectedBlocks;
-    //! a cache only as wide as the selection retains nothing between steps. Sparse buffers only.
+    //! Cells one buffer gets in a request's GPU cache, counting both populations: the
+    //! history it caches and every unit still in flight. Sparse buffers only.
+    //!
+    //! Two to four times numSelectedBlocks is the usual choice -- a cache only as wide as
+    //! the selection retains nothing between steps -- but the headroom above the selection
+    //! is also what bounds a request's input length, so size it for the larger of the two.
+    //! KvCache::maxInputLength() reports what a given value buys.
     int maxCachedUnits = 0;
 
     //! Where a selection unit's bytes sit. Leave unset for a buffer whose cold form is
@@ -178,9 +183,14 @@ struct BufferConfig
         {
             throw std::invalid_argument("BufferConfig: numSelectedBlocks and maxCachedUnits must not be negative");
         }
-        if (numSelectedBlocks > 0 && maxCachedUnits < numSelectedBlocks)
+        if (numSelectedBlocks > 0 && maxCachedUnits <= numSelectedBlocks)
         {
-            throw std::invalid_argument("BufferConfig: maxCachedUnits must be at least numSelectedBlocks");
+            // Equality leaves no cell for the block being written, so the request could not
+            // take a single token. The cache holds a full selection plus everything in
+            // flight, and those populations are disjoint: selection is below the watermark,
+            // in flight is above it.
+            throw std::invalid_argument(
+                "BufferConfig: maxCachedUnits must exceed numSelectedBlocks, to leave room for units in flight");
         }
         if (sparseUnitLayout.has_value())
         {

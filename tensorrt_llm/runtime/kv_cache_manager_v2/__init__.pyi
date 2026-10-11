@@ -268,39 +268,45 @@ class BufferConfig:
     ``KVCacheManager`` constructor. The page-index table is therefore uniform, and nothing
     resolves against the GPU pool.
 
-    Because lock location is a per-buffer rule and a page is one slot shared by every
-    buffer of its lifecycle, a sparse buffer requires a lifecycle of its own; sharing one
-    with a non-sparse buffer raises from the ``KVCacheManager`` constructor.
+    Lock location is decided per lifecycle, and a page is one slot shared by every buffer of
+    its lifecycle, so a sparse buffer requires a lifecycle of its own; sharing one with a
+    non-sparse buffer raises from the ``KVCacheManager`` constructor.
 
     All GPU residency is a per-request cache drawn from the sparse pool's GPU tier: both
-    the blocks still being written and the history a step selects are entries in it. Each
-    :class:`_KVCache` holds ``min(max_cached_units, history_length // unit_tokens)`` history
-    entries, replaced by LRU, plus one entry per in-flight unit -- every block above the
-    watermark, bounded by :attr:`_KVCache.max_input_length`. Prefill and decode share one
-    manager, so that second population is a whole chunk during prefill rather than a single
-    block.
+    the blocks still being written and the history a step selects are cells in it.
+    ``max_cached_units`` is the whole cache, counting both populations, and the reservation
+    follows from it alone. The two never overlap -- the selection is below the watermark,
+    everything in flight is above it -- so whatever the cache holds beyond a full selection
+    is the in-flight headroom, which is what :attr:`_KVCache.max_input_length` reports.
+    Prefill and decode share one manager, so that second population is a whole chunk during
+    prefill rather than a single block.
 
-    Because a page already carries one buffer per coalesced layer, reserved pages give every
-    layer its own entries -- so an entry is a (page, layer) pair, and one page may hold
-    different layers' data for different ordinals.
-    :meth:`KVCacheManager.fetch_sparse_pages` fills the history entries.
+    A reserved slot is a row of buffer-sized cells and any layer's unit may occupy any cell,
+    so an entry is a ``(layer, entry index)`` pair resolved to a cell arithmetically.
+    Coalescing earns nothing here, because layers select different units and so share
+    nothing. :meth:`KVCacheManager.fetch_sparse_pages` fills the cells a step selects.
 
-    Set ``max_cached_units`` to two to four times ``num_selected_blocks``: a cache only as
-    wide as the selection retains nothing between steps, and retention of units not
-    selected this step is where the hit rate comes from. Both default to zero, meaning the
-    fetch path is not configured for this buffer; sparse storage and locking work without
-    them, and constructing the cache rejects zero.
+    Two to four times ``num_selected_blocks`` is the usual starting point -- a cache only as
+    wide as the selection retains nothing between steps, and retention of units not selected
+    this step is where the hit rate comes from -- but the surplus is also what bounds a
+    request's input length, so size for whichever demand is larger. ``max_cached_units``
+    must exceed ``num_selected_blocks``, since equality would leave no cell for the block
+    being written. Both default to zero, meaning the fetch path is not configured for this
+    buffer; sparse storage and locking work without them.
 
-    ``sparse_unit_layout`` tells the manager where a selection unit's bytes are. Leave it
-    unset for a buffer whose cold form is compressed, or whose units are not locatable by
-    arithmetic; such a buffer supplies extraction code instead.
+    ``sparse_unit_layout`` tells the manager where a selection unit's bytes are. It is
+    required once ``max_cached_units`` is set, because a cell that cannot be located can be
+    neither filled nor written back. A buffer whose cold form is compressed, or whose units
+    are not locatable by arithmetic, supplies extraction code instead.
 
-    A block's data reaches its host page by a flush that leaves the GPU entry cached and
-    merely marks it clean. A block must be flushed before it can be selected, so
-    :meth:`_KVCache.resize` is the deadline, that being the one call through which the
-    watermark ever moves; ``commit()`` flushes earlier,
-    since only finalized pages are shareable. Only a clean entry is evictable, which is
-    what protects the block still being written.
+    A block's data reaches its host page by a write-back that leaves the cell cached and
+    merely stops pinning it. A block must be written back before it can be selected, so
+    :meth:`_KVCache.resize` is both the deadline and the only place it happens -- that being
+    the one call through which the watermark ever moves. ``commit()`` is not a separate
+    write-back site: a committed block is already at or below the watermark, and where
+    ``commit()`` advances the watermark it calls :meth:`_KVCache.resize`. A cell is
+    evictable exactly when its unit is below the watermark, which is what protects the block
+    still being written.
 
     Fixed at construction: the storage layout derived from it is built once.
     """
@@ -581,21 +587,18 @@ class _KVCache:
         """Bound on ``capacity - history_length``: how far capacity may outrun the watermark.
 
         ``None`` unless a sparse buffer's fetch path is configured, since a bound on
-        in-flight blocks describes nothing without a cache to hold them. Where it does
-        apply it starts at zero -- capacity may not outrun the watermark until a caller
-        raises it -- and :meth:`resize` rejects a gap wider than it.
+        in-flight blocks describes nothing without a cache to hold them. :meth:`resize`
+        rejects a gap wider than this.
 
-        It matters because every block above the watermark is in flight: its data lives only
-        in a sparse cache entry until a flush reaches it, so the reservation must cover them
-        all. Raise it before the :meth:`resize` that opens the gap.
+        Read-only, because it is a consequence rather than a choice. Every block above the
+        watermark is in flight -- its data lives only in a sparse cache cell until a flush
+        reaches it -- and the cache must also hold a whole selection. So whatever
+        :attr:`BufferConfig.max_cached_units` provides above the selection width is the
+        in-flight headroom, and this reports that headroom in tokens. Size it there.
 
-        Declared rather than inferred so the reservation stays static and a shortfall surfaces
-        at :meth:`resume`, where a caller can act on it, rather than mid-step where nobody
-        can. Lowering it when prefill completes is what returns pages to the global pool.
+        The smallest bound across sparse life cycles, when several differ.
         """
 
-    @max_input_length.setter
-    def max_input_length(self, value: int) -> None: ...
     @property
     def capacity(self) -> int: ...
     @capacity.setter
@@ -844,9 +847,11 @@ class KVCacheManager:
         both inherit.
 
         Eligible means below the history watermark: a block at or above it holds input
-        tokens and is locked to ``GPU_LEVEL``, so resolving it against the host pool
-        would address unrelated memory. The call cannot detect an out-of-range ordinal,
-        so naming only eligible ordinals is the selector's responsibility.
+        tokens whose host page has not been written back yet, so selecting it would read
+        stale bytes. Not a memory-safety problem -- the page table is uniform, so the
+        ordinal resolves to a real page of the same request -- but a wrong answer. The call
+        cannot detect an ineligible ordinal, so naming only eligible ones is the selector's
+        responsibility.
 
         Each selected unit is looked up in the owning request's cache for that layer.
         A hit is reused in place; a miss is copied from the locked host page into a slot
@@ -856,10 +861,10 @@ class KVCacheManager:
         evict entries of layers already processed but never one a later kernel still
         needs.
 
-        Copies leave the host page authoritative rather than moving it, so a cache entry
-        is always clean and eviction moves no data. The copies are a snapshot, which is
-        sound only because a block below the watermark is committed history and
-        immutable.
+        Copies leave the host page authoritative rather than moving it, so evicting a
+        fetched cell moves no data. The copies are a snapshot, which is sound only because a
+        block below the watermark is already written back and immutable. A cell holding an
+        in-flight block is the one exception, and is never an eviction candidate.
 
         ``out`` is shaped like the page table rather than compacted, and is written in
         full: entry ``[b][ord]`` is the ``GPU_LEVEL`` index holding block ``ord`` when
