@@ -240,6 +240,15 @@ def batch_page_table(batch: Any, layer_group_id: int) -> list[int]:
     return list(_cpp().batch_page_table(batch, layer_group_id))
 
 
+def batch_sparse_view_entries(batch: Any, layer_group_id: int) -> list[int]:
+    """Entries per buffer of each row's published sparse cache view.
+
+    Zero where no view is staged, so this is non-zero exactly where a member holds a
+    reservation for that layer group. Synchronises.
+    """
+    return list(_cpp().batch_sparse_view_entries(batch, layer_group_id))
+
+
 def batch_watermarks(batch: Any) -> tuple[list[int], list[int]]:
     """A Batch's published per-row (history_length, capacity), in tokens.
 

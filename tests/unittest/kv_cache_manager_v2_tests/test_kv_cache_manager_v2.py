@@ -1148,6 +1148,65 @@ class TestBatch(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_sparse_cache_views_are_staged_per_row(self):
+        """What is mirrored is the handle, not the memory: the reservation stays per request.
+
+        A view appears for a member holding one and stays absent for a free row, so the
+        fetch can tell the two apart.
+        """
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=128,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig(
+                                "key",
+                                4096,
+                                is_sparse=True,
+                                num_selected_blocks=2,
+                                max_cached_units=4,
+                                sparse_unit_layout=SelectionUnitLayout(1, 4096, 0, 4096),
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+        cache = None
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
+            lg_id = manager.get_layer_group_id(0)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                # Before anyone resumes, no reservation exists, so no view does either.
+                batch.publish(handle)
+                self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
+
+                cache = manager.create_kv_cache()
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+                batch.publish(handle)
+                entries = _introspection.batch_sparse_view_entries(batch, lg_id)
+                self.assertEqual(entries[0], manager.get_sparse_cache_max_units(0))
+                self.assertEqual(entries[1], 0, "the free row stays absent")
+
+                # suspend() releases the reservation, so the view must go with it rather
+                # than leaving the fetch a handle into freed memory.
+                batch.wait_published()
+                cache.suspend()
+                batch.publish(handle)
+                self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
     def test_rows_are_slots_so_a_hole_is_reused(self):
         manager = self._manager()
         try:

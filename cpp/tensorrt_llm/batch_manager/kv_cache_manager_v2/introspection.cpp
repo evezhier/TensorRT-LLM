@@ -133,6 +133,22 @@ std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, in
     return out;
 }
 
+std::vector<int32_t> KvCacheIntrospection::batchSparseViewEntries(Batch const& batch, int layerGroupId)
+{
+    auto const rows = static_cast<size_t>(batch.maxBatchSize());
+    std::vector<SparseCacheView> views(rows);
+    cuCheck(
+        cuMemcpyDtoH(views.data(), batch.sparseCacheViews(LayerGroupId{layerGroupId}), sizeof(SparseCacheView) * rows));
+
+    std::vector<int32_t> out;
+    out.reserve(rows);
+    for (auto const& view : views)
+    {
+        out.push_back(view.residentOrdinal == nullptr ? 0 : view.entriesPerLayer);
+    }
+    return out;
+}
+
 std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batchWatermarks(Batch const& batch)
 {
     auto const view = batch.watermarks();

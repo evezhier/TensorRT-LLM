@@ -2178,6 +2178,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("batch_page_table", &kv::KvCacheIntrospection::batchPageTable, nb::arg("batch"),
         nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("batch_sparse_view_entries", &kv::KvCacheIntrospection::batchSparseViewEntries, nb::arg("batch"),
+        nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "batch_watermarks",
         [](kv::Batch const& batch)

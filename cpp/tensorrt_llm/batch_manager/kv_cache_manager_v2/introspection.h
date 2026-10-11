@@ -58,6 +58,10 @@ public:
     // [max_batch][max_blocks_per_seq]. Synchronises.
     static std::vector<int32_t> batchPageTable(Batch const& batch, int layerGroupId);
 
+    // White-box hook: entriesPerLayer of each row's published sparse cache view, zero where
+    // no view is staged. Non-zero exactly where a member holds a reservation. Synchronises.
+    static std::vector<int32_t> batchSparseViewEntries(Batch const& batch, int layerGroupId);
+
     // White-box hook: a Batch's published per-row watermarks as (history_length, capacity).
     // Synchronises.
     static std::pair<std::vector<int32_t>, std::vector<int32_t>> batchWatermarks(Batch const& batch);

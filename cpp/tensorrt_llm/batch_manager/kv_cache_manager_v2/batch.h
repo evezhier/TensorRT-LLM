@@ -19,6 +19,7 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
+#include "kv_cache_manager_v2/sparseCache.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
@@ -134,6 +135,18 @@ public:
 
     [[nodiscard]] PageTableView pageTable(LayerGroupId layerGroupId) const;
 
+    //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
+    //!
+    //! A device array of SparseCacheView, indexed by row. A free row, or a member whose
+    //! cache is not reserved, reads as a default-constructed view -- null pointers and zero
+    //! counts -- which the kernel skips.
+    //!
+    //! The views hold pointers into each request's own allocation, so what is mirrored is
+    //! the handle rather than the memory: the reservation stays with the request. They move
+    //! whenever a member resumes or suspends, which is why they are restaged on every
+    //! publish alongside the watermarks.
+    [[nodiscard]] CUdeviceptr sparseCacheViews(LayerGroupId layerGroupId) const;
+
     //! Per-row history length and capacity, published by the same transfer as the page
     //! tables. They have to travel together: the lengths bound which entries of a row are
     //! valid, so a kernel pairing one step's table with another step's lengths would read
@@ -175,9 +188,14 @@ private:
     [[nodiscard]] size_t _capacityOffset() const noexcept;
     [[nodiscard]] size_t _totalElements() const noexcept;
 
-    //! Refresh the staged watermarks from the members. Cheap, and it keeps KvCache ignorant
-    //! of the staging: only its page indices are written through setBasePageIndexBuf.
-    void _stageWatermarks();
+    //! Refresh the staged watermarks and cache views from the members. Cheap, and it keeps
+    //! KvCache ignorant of the staging: only its page indices are written through
+    //! setBasePageIndexBuf.
+    void _stageRowState();
+
+    //! Byte offset of the cache view region within the staged block.
+    [[nodiscard]] size_t _viewsOffsetBytes() const noexcept;
+    [[nodiscard]] size_t _totalBytes() const noexcept;
 
     KvCacheManager* mManager = nullptr;
     int mMaxBatchSize = 0;

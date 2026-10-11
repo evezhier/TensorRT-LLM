@@ -69,7 +69,7 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq)
     // pair. Splitting them would let a kernel read one step's table beside another step's
     // lengths, which is an out-of-range read rather than a stale answer.
     auto const elements = _totalElements();
-    mStaging = std::make_unique<HostMem>(sizeof(int32_t) * elements);
+    mStaging = std::make_unique<HostMem>(_totalBytes());
     auto* staging = reinterpret_cast<int32_t*>(mStaging->address());
     // A row that no member occupies must still read as "no such block" rather than as slot
     // zero, since the fetch has no other way to tell them apart.
@@ -77,10 +77,15 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq)
     // Watermarks of a free row are zero: a request with nothing eligible.
     std::fill(staging + _historyOffset(), staging + elements, 0);
 
+    // Views start default-constructed, so an unpublished batch reads as having no caches.
+    auto* views = reinterpret_cast<SparseCacheView*>(reinterpret_cast<std::byte*>(staging) + _viewsOffsetBytes());
+    auto const numViews = static_cast<size_t>(mNumLayerGroups.value()) * static_cast<size_t>(mMaxBatchSize);
+    std::fill(views, views + numViews, SparseCacheView{});
+
     CUdeviceptr device = 0;
-    cuCheck(cuMemAlloc(&device, sizeof(int32_t) * elements));
+    cuCheck(cuMemAlloc(&device, _totalBytes()));
     mDevice = CudaUniqPtr{reinterpret_cast<std::byte*>(device)};
-    cuCheck(cuMemcpyHtoD(device, staging, sizeof(int32_t) * elements));
+    cuCheck(cuMemcpyHtoD(device, staging, _totalBytes()));
 }
 
 Batch::~Batch()
@@ -118,16 +123,44 @@ size_t Batch::_totalElements() const noexcept
     return _capacityOffset() + static_cast<size_t>(mMaxBatchSize);
 }
 
-void Batch::_stageWatermarks()
+size_t Batch::_viewsOffsetBytes() const noexcept
 {
-    auto* base = reinterpret_cast<int32_t*>(mStaging->address());
+    // The views hold pointers, so the region starts at their alignment rather than wherever
+    // the int32 arrays happen to end.
+    size_t const bytes = sizeof(int32_t) * _totalElements();
+    size_t const align = alignof(SparseCacheView);
+    return (bytes + align - 1) / align * align;
+}
+
+size_t Batch::_totalBytes() const noexcept
+{
+    return _viewsOffsetBytes()
+        + sizeof(SparseCacheView) * static_cast<size_t>(mNumLayerGroups.value()) * static_cast<size_t>(mMaxBatchSize);
+}
+
+void Batch::_stageRowState()
+{
+    auto* bytes = reinterpret_cast<std::byte*>(mStaging->address());
+    auto* base = reinterpret_cast<int32_t*>(bytes);
     auto* history = base + _historyOffset();
     auto* capacity = base + _capacityOffset();
+    auto* views = reinterpret_cast<SparseCacheView*>(bytes + _viewsOffsetBytes());
+
     for (size_t row = 0; row < mRows.size(); ++row)
     {
         auto const* kvCache = mRows[row];
         history[row] = kvCache == nullptr ? 0 : kvCache->historyLength();
         capacity[row] = kvCache == nullptr ? 0 : kvCache->capacity();
+
+        for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
+        {
+            auto& slot = views[static_cast<size_t>(lg.value()) * mRows.size() + row];
+            // A free row, or a member holding no reservation for this group, leaves the
+            // default view: null pointers the kernel reads as "nothing to resolve here".
+            slot = kvCache == nullptr || lg >= kvCache->mSparseCacheState.size()
+                ? SparseCacheView{}
+                : kvCache->mSparseCacheState[lg].view();
+        }
     }
 }
 
@@ -248,11 +281,11 @@ void Batch::publish(CUstream stream)
 
     // The members write their own page indices, but not their watermarks; collect those
     // now so the single transfer below carries a matched pair.
-    _stageWatermarks();
+    _stageRowState();
 
     // Whole-table for now. Refreshing only the rows whose locks moved is an optimisation
     // the design allows for: it degrades into a slower step, never a wrong answer.
-    auto const bytes = sizeof(int32_t) * _totalElements();
+    auto const bytes = _totalBytes();
     cuCheck(cuMemcpyHtoDAsync(
         reinterpret_cast<CUdeviceptr>(mDevice.get()), reinterpret_cast<void*>(mStaging->address()), bytes, stream));
     mPublished = CachedCudaEvent{reinterpret_cast<CudaStream>(stream)};
@@ -281,6 +314,16 @@ PageTableView Batch::pageTable(LayerGroupId layerGroupId) const
     view.numRows = mMaxBatchSize;
     view.blocksPerRow = mMaxBlocksPerSeq;
     return view;
+}
+
+CUdeviceptr Batch::sparseCacheViews(LayerGroupId layerGroupId) const
+{
+    if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
+    {
+        throw std::out_of_range("Batch::sparseCacheViews: unknown layer group");
+    }
+    return reinterpret_cast<CUdeviceptr>(mDevice.get()) + _viewsOffsetBytes()
+        + sizeof(SparseCacheView) * static_cast<size_t>(layerGroupId.value()) * static_cast<size_t>(mMaxBatchSize);
 }
 
 WatermarkView Batch::watermarks() const
