@@ -476,37 +476,28 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
     int32_t const row = static_cast<int32_t>(blockIdx.y);
     int32_t const buffer = args.bufferBase + static_cast<int32_t>(blockIdx.x);
     auto* out = args.out
-        + (static_cast<ptrdiff_t>(row) * args.numBuffers + blockIdx.x) * static_cast<ptrdiff_t>(args.outStride);
-
-    // Written in full, so a stale index from a previous step can never be read back.
-    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < args.outStride; i += kThreads)
-    {
-        out[i] = kBadPageIndexValue;
-    }
+        + (static_cast<ptrdiff_t>(row) * args.numBuffers + blockIdx.x) * static_cast<ptrdiff_t>(args.selectionWidth);
 
     SparseCacheView const view = args.views[row];
-    if (view.residentOrdinal == nullptr)
-    {
-        return;
-    }
-    // The scatter below overwrites part of what the fill above wrote.
-    __syncthreads();
-
+    bool const reserved = view.residentOrdinal != nullptr;
     auto const base = static_cast<ptrdiff_t>(row) * args.selectionWidth;
+
+    // Every slot is written, so a stale index from a previous step can never be read back.
+    // One pass does it, because the output is the selection's own shape: a padded slot and
+    // an unreserved row both just take the sentinel here rather than needing a prior fill.
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < args.selectionWidth; i += kThreads)
     {
-        int32_t const ordinal = args.selected[base + i];
-        int32_t const slot = args.outSlot[base + i];
-        if (ordinal < 0 || slot < 0)
+        int32_t const slot = reserved ? args.outSlot[base + i] : kNoSparseSlot;
+        if (args.selected[base + i] < 0 || slot < 0)
         {
+            out[i] = kBadPageIndexValue;
             continue;
         }
-        KVCM2_SPARSE_REQUIRE(ordinal < args.outStride);
 
         int32_t const subSlot = buffer * args.subSlotsPerBuffer + slot / args.expansion;
         auto const page = view.cachePages[subSlot / args.buffersPerSlot];
         int32_t const cell = subSlot % args.buffersPerSlot;
-        out[ordinal] = (page * args.buffersPerSlot + cell) * args.expansion + slot % args.expansion;
+        out[i] = (page * args.buffersPerSlot + cell) * args.expansion + slot % args.expansion;
     }
 }
 
@@ -559,7 +550,7 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
 
 void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
 {
-    if (args.numRows <= 0 || args.numBuffers <= 0 || args.selectionWidth <= 0 || args.outStride <= 0)
+    if (args.numRows <= 0 || args.numBuffers <= 0 || args.selectionWidth <= 0)
     {
         throw std::invalid_argument("launchSparseOutIndices: every extent must be positive");
     }

@@ -891,7 +891,7 @@ class KVCacheManager:
         batch: Batch,
         buffers: Sequence[BufferId],
         selected: DeviceArray,  # int32[batch, topk]
-        out: DeviceArray,  # int32[batch, len(buffers), max_blocks_per_seq]
+        out: DeviceArray,  # int32[batch, len(buffers), topk]
         stream: CudaStream,
     ) -> None:
         """Resolve a batch's selections against each buffer's per-request history cache.
@@ -938,25 +938,32 @@ class KVCacheManager:
         block below the watermark is already written back and immutable. A cell holding an
         in-flight block is the one exception, and is never an eviction candidate.
 
-        ``out`` is shaped like the page table rather than compacted, and is written in
-        full: entry ``[b][i][ord]`` is the ``GPU_LEVEL`` index holding unit ``ord`` of
-        ``buffers[i]`` when ``ord`` was selected for request b, and ``BAD_PAGE_INDEX``
-        otherwise. A kernel that indexes a page table by ordinal therefore consumes a
-        slice of ``out`` in place of the batch's table, against
-        :meth:`get_mem_pool_base_address` as usual, with its selection array unchanged.
+        ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the
+        ``GPU_LEVEL`` index holding ``selected[b][k]`` for ``buffers[i]``, and
+        ``BAD_PAGE_INDEX`` where that slot carries no selection. Padding stays where the
+        selection put it rather than being packed out, so slot ``k`` of ``out`` and slot
+        ``k`` of ``selected`` describe the same unit.
+
+        Compact, in the selection's own order, rather than a table indexed by unit
+        ordinal, because that is the shape sparse attention kernels take: a token-sparse
+        kernel is handed the index list in place of its page table and reads one unit per
+        slot, and a block-sparse kernel takes the list beside a page table it still uses.
+        None indexes a table by ordinal, so producing one would only oblige the caller to
+        compact it again.
 
         The buffer dimension is a dimension rather than a separate array per buffer
         because attention kernels commonly want one tensor covering K and V. It cannot be
         dropped: a layer's buffers share the resolve, but not their cells. The cache packs
         one buffer's entries densely across every cell of the pages it reserved, rather
         than leaving each buffer at its nominal cell of a coalesced slot -- a layer would
-        otherwise reach only its own few cells of each page. So one ordinal resolves to a
-        different index per buffer, and each needs its own row.
+        otherwise reach only its own few cells of each page. So one selection resolves to
+        a different index per buffer, and each needs its own row.
 
-        Indices are in the expanded index space :class:`PageIndexConverter` produces, so
-        the last dimension is the expanded ordinal bound -- ``max_blocks_per_seq`` times
-        the buffer's ``expansion``, which is ``max_blocks_per_seq`` itself unless
-        ``tokens_per_block_override`` is set.
+        Indices are in the expanded index space :class:`PageIndexConverter` produces.
+
+        The selection is per layer, not per KV head: every head of a layer shares one
+        resident set. Algorithms that let different KV heads select different units are
+        therefore not expressible against this cache.
         """
 
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...

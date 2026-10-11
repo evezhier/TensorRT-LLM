@@ -1093,28 +1093,55 @@ class TestSparseFetch(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def _out(self, torch, rows: int, num_buffers: int, blocks: int):
-        return torch.full((rows, num_buffers, blocks), 12345, dtype=torch.int32, device="cuda")
+    def _out(self, torch, rows: int, num_buffers: int, width: int | None = None):
+        """Out is compact: one index per selection slot, not per unit ordinal."""
+        return torch.full(
+            (rows, num_buffers, self.SELECTED if width is None else width),
+            12345,
+            dtype=torch.int32,
+            device="cuda",
+        )
 
-    def test_only_selected_ordinals_are_written(self):
-        """Out is shaped like a page table, so it must be filled, not just scattered into."""
+    def test_every_selection_slot_is_written(self):
+        """A stale index must never survive, so padded slots take the sentinel too."""
         roles = ("key", "value")
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
-            out = self._out(torch, 2, len(roles), 4)
+            out = self._out(torch, 2, len(roles))
             manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
             torch.cuda.synchronize()
 
-            # Ordinal 0 resolved for both buffers of the member's row.
+            # Slot 0 carried a selection and resolved for both buffers of the member's row.
             self.assertTrue(bool((out[0, :, 0] != BAD_PAGE_INDEX).all()))
-            # Everything else is the sentinel, including the stale fill we started from.
-            self.assertTrue(bool((out[0, :, 1:] == BAD_PAGE_INDEX).all()))
+            # Slot 1 was padded, so it reads as absent rather than as the fill we started from.
+            self.assertTrue(bool((out[0, :, 1] == BAD_PAGE_INDEX).all()))
+
+    def test_the_output_follows_the_selection_order(self):
+        """Slot k of out and slot k of the selection describe the same unit.
+
+        Padding is left where the selection put it rather than packed out, which is what
+        lets a caller pair the two arrays without a second index.
+        """
+        roles = ("key",)
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            forward = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
+            first = self._out(torch, 2, len(roles))
+            manager.fetch_sparse_pages(batch, self._buffers(roles), forward, first, handle)
+
+            # The same two units, named in the other order: the indices must follow.
+            reverse = torch.tensor([[1, 0], [-1, -1]], dtype=torch.int32, device="cuda")
+            second = self._out(torch, 2, len(roles))
+            manager.fetch_sparse_pages(batch, self._buffers(roles), reverse, second, handle)
+            torch.cuda.synchronize()
+
+            self.assertEqual(int(first[0, 0, 0]), int(second[0, 0, 1]))
+            self.assertEqual(int(first[0, 0, 1]), int(second[0, 0, 0]))
 
     def test_a_row_holding_no_reservation_reads_as_absent(self):
         roles = ("key", "value")
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32, device="cuda")
-            out = self._out(torch, 2, len(roles), 4)
+            out = self._out(torch, 2, len(roles))
             manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
             torch.cuda.synchronize()
             self.assertTrue(
@@ -1126,29 +1153,29 @@ class TestSparseFetch(unittest.TestCase):
         """A layer's buffers share the resolve but not their cells.
 
         The cache packs one buffer's entries densely across the pages it reserved rather
-        than leaving each at its nominal cell, so one ordinal lands somewhere different in
-        every buffer. That is why out carries a buffer dimension at all.
+        than leaving each at its nominal cell, so one selection lands somewhere different
+        in every buffer. That is why out carries a buffer dimension at all.
         """
         roles = ("key", "value")
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
-            out = self._out(torch, 2, len(roles), 4)
+            out = self._out(torch, 2, len(roles))
             manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
             torch.cuda.synchronize()
 
-            for ordinal in (0, 1):
-                key, value = int(out[0, 0, ordinal]), int(out[0, 1, ordinal])
+            for slot in (0, 1):
+                key, value = int(out[0, 0, slot]), int(out[0, 1, slot])
                 self.assertNotEqual(key, BAD_PAGE_INDEX)
-                self.assertNotEqual(key, value, f"ordinal {ordinal} shares a cell")
+                self.assertNotEqual(key, value, f"selection slot {slot} shares a cell")
 
     def test_a_hit_resolves_to_the_same_index_as_the_fetch_that_filled_it(self):
         """A second call must reuse the entry rather than fetch it again."""
         roles = ("key",)
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
-            first = self._out(torch, 2, len(roles), 4)
+            first = self._out(torch, 2, len(roles))
             manager.fetch_sparse_pages(batch, self._buffers(roles), selected, first, handle)
-            second = self._out(torch, 2, len(roles), 4)
+            second = self._out(torch, 2, len(roles))
             manager.fetch_sparse_pages(batch, self._buffers(roles), selected, second, handle)
             torch.cuda.synchronize()
             self.assertEqual(int(first[0, 0, 0]), int(second[0, 0, 0]))
@@ -1163,7 +1190,7 @@ class TestSparseFetch(unittest.TestCase):
             self.assertNotIn(1, before)
 
             selected = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
-            out = self._out(torch, 2, len(roles), 4)
+            out = self._out(torch, 2, len(roles))
             manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
             torch.cuda.synchronize()
 
@@ -1179,7 +1206,7 @@ class TestSparseFetch(unittest.TestCase):
             # resolve updates for the whole layer, claimed they were resident.
             with self.assertRaises(ValueError):
                 manager.fetch_sparse_pages(
-                    batch, [BufferId(0, "key")], selected, self._out(torch, 2, 1, 4), handle
+                    batch, [BufferId(0, "key")], selected, self._out(torch, 2, 1), handle
                 )
 
     def test_out_must_carry_one_row_per_buffer(self):
@@ -1188,7 +1215,7 @@ class TestSparseFetch(unittest.TestCase):
             selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
             with self.assertRaises(ValueError):
                 manager.fetch_sparse_pages(
-                    batch, self._buffers(roles), selected, self._out(torch, 2, 1, 4), handle
+                    batch, self._buffers(roles), selected, self._out(torch, 2, 1), handle
                 )
 
 

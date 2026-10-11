@@ -300,7 +300,7 @@ std::vector<SelectionUnitLayout> KvCacheManager::sparseUnitLayouts(LifeCycleId l
 }
 
 void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
-    int selectionWidth, int32_t* out, int outStride, CUstream stream)
+    int selectionWidth, int32_t* out, CUstream stream)
 {
     if (buffers.empty())
     {
@@ -356,11 +356,6 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     }
 
     int const expansion = sparseCacheExpansion(lcId);
-    if (outStride < batch.maxBlocksPerSeq() * expansion)
-    {
-        throw std::invalid_argument("fetchSparsePages: out is narrower than the expanded ordinal bound");
-    }
-
     LayerGroupId const lgId{lcId.value()};
     auto const views = reinterpret_cast<SparseCacheView const*>(batch.sparseCacheViews(lgId));
     auto const watermarks = batch.watermarks();
@@ -413,7 +408,6 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     indices.outSlot = scratch.outSlot;
     indices.selectionWidth = selectionWidth;
     indices.out = out;
-    indices.outStride = outStride;
     indices.bufferBase = bufferBase;
     indices.numBuffers = numBuffers;
     indices.subSlotsPerBuffer = copy.subSlotsPerBuffer;

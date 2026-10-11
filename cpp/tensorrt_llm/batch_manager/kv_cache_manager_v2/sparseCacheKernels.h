@@ -225,17 +225,23 @@ struct SparseUnitCopyArgs
 //! layer's count exit.
 void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream);
 
-//! Turn a resolve's entry indices into a page table the attention kernel can read.
+//! Turn a resolve's entry indices into the index list an attention kernel can read.
 //!
 //! The entry index the resolve produced is private to the cache: it names a unit within a
 //! layer's partition. What a consumer needs is a value in the expanded index space,
-//! `(page * buffersPerSlot + cell) * expansion + unit`, which is what an unchanged
-//! attention kernel already indexes a page table with.
+//! `(page * buffersPerSlot + cell) * expansion + unit`.
+//!
+//! The result is compact -- one entry per selection slot, in the selection's own order --
+//! rather than a table indexed by unit ordinal. That is the shape every sparse attention
+//! consumer in this repository takes: a token-sparse kernel is handed the index list in
+//! place of its page table and reads one unit per slot, and a block-sparse kernel takes
+//! the list beside a page table it still uses. None indexes a table by ordinal, so
+//! producing one would only oblige the caller to compact it again.
 //!
 //! The buffer dimension cannot be collapsed. A layer's buffers share the resolve but not
 //! their cells, because the cache packs one buffer's entries densely across every cell of
 //! the pages it reserved rather than leaving each at its nominal cell of a coalesced slot.
-//! So one ordinal resolves to a different index per buffer.
+//! So one selection resolves to a different index per buffer.
 struct SparseOutIndexArgs
 {
     //! [numRows] per-row cache state; a row with a null residentOrdinal is filled with
@@ -249,12 +255,12 @@ struct SparseOutIndexArgs
     int32_t const* outSlot = nullptr;
     int32_t selectionWidth = 0;
 
-    //! [numRows][numBuffers][outStride] written in full: the index holding ordinal `ord` of
-    //! this call's buffer `i`, or kBadPageIndex where `ord` was not selected. Shaped like a
-    //! page table rather than compacted so that the consumer's selection array is unchanged.
+    //! [numRows][numBuffers][selectionWidth] written in full: entry `k` is the index
+    //! holding `selected[row][k]` for this call's buffer `i`, and kBadPageIndex where the
+    //! selection is padded or the row holds no reservation. Padding stays where the
+    //! selection put it rather than being packed out, so slot `k` of the output and slot
+    //! `k` of the selection describe the same unit.
     int32_t* out = nullptr;
-    //! Expanded ordinals per row, i.e. the page table's width times the expansion.
-    int32_t outStride = 0;
 
     //! The buffers this call writes, as for the copy.
     int32_t bufferBase = 0;

@@ -197,11 +197,15 @@ public:
     //! answer rather than a memory error, and the call cannot detect it, so it is the
     //! selector's responsibility.
     //!
-    //! `out` is [maxBatchSize][buffers.size()][outStride], written in full, in the
-    //! expanded index space getPageIndexConverter() produces. See
+    //! `out` is [maxBatchSize][buffers.size()][selectionWidth], written in full, in the
+    //! expanded index space getPageIndexConverter() produces: entry k is the index holding
+    //! `selected[row][k]`, or kBadPageIndex where that slot carries no selection.
+    //!
+    //! Compact, in the selection's own order, rather than a table indexed by unit ordinal,
+    //! because that is the shape sparse attention kernels take. See
     //! SPARSE_ATTENTION_DESIGN.md's "Fetch".
     void fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
-        int selectionWidth, int32_t* out, int outStride, CUstream stream);
+        int selectionWidth, int32_t* out, CUstream stream);
 
     // Group a set of BufferIds into contiguous AggregatedPageDesc descriptors.
     // Mirrors Python's KVCacheManager.get_aggregated_pages().

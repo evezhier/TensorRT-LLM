@@ -500,7 +500,20 @@ Each call then:
 4. allocate a slot per miss from the free list, evicting LRU when empty;
 5. extract and copy each miss from the device-mapped host page;
 6. promote hits above new misses in recency order;
-7. write the output index list.
+7. write the output index list: one index per selection slot, in the selection's own
+   order, `kBadPageIndex` where a slot is padded.
+
+The output is compact rather than a table indexed by unit ordinal, because that is the
+shape every sparse attention consumer in this repository takes. A token-sparse kernel is
+handed the index list in place of its page table — `attentionOp.cpp` assigns
+`kvPageIdxPtr = sparse_attn_indices`, and the trtllm-gen K/V TMA descriptors are rebuilt
+as a flat token array so one "page" is one token — while a block-sparse kernel takes the
+list beside a page table it still uses. None indexes a table by ordinal, so producing one
+would only oblige the caller to compact it again.
+
+One index per buffer, though. A layer's buffers share the resolve but not their cells, so
+the list carries a buffer dimension: `[row][buffer][selection]`, which is also the single
+tensor covering K and V that attention kernels tend to want.
 
 Steps 5 and 6 are independent. Because the probe in step 3 resolves misses directly, the
 copies — the only step that touches PCIe, and so the long pole — can be issued before the

@@ -2671,14 +2671,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     throw std::invalid_argument("fetch_sparse_pages: out's middle extent must be len(buffers)");
                 }
+                if (out.shape(2) != selected.shape(1))
+                {
+                    throw std::invalid_argument(
+                        "fetch_sparse_pages: out's last extent must be the selection width; the result is compact, "
+                        "one index per selection slot, not a table indexed by ordinal");
+                }
                 auto const handle
                     = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
                 auto* selectedPtr = selected.data();
                 auto* outPtr = out.data();
                 auto const width = static_cast<int>(selected.shape(1));
-                auto const stride = static_cast<int>(out.shape(2));
                 nb::gil_scoped_release rel;
-                self.fetchSparsePages(batch, buffers, selectedPtr, width, outPtr, stride, handle);
+                self.fetchSparsePages(batch, buffers, selectedPtr, width, outPtr, handle);
             },
             nb::arg("batch"), nb::arg("buffers"), nb::arg("selected"), nb::arg("out"), nb::arg("stream") = nb::none(),
             "Resolve a batch's selections against each buffer's per-request history cache.\n\n"
@@ -2687,8 +2692,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "layer's output. The whole layer, not a subset, because the resolve marks entries "
             "resident on behalf of every buffer at once.\n\n"
             "selected is int32[batch, topk] unit ordinals, negative where padded, and must name "
-            "only units below the history watermark. out is int32[batch, len(buffers), expanded "
-            "ordinals], written in full in the expanded index space.\n\n"
+            "only units below the history watermark. out is int32[batch, len(buffers), topk], "
+            "written in full in the expanded index space: entry k is the index holding "
+            "selected[b][k], or BAD_PAGE_INDEX where that slot carries no selection. Compact, in "
+            "the selection's own order, because that is the shape sparse attention kernels take.\n\n"
             "Device-driven and stream-ordered: enqueues and returns, and every shape is static, "
             "so a CUDA graph can capture it.")
         .def(
