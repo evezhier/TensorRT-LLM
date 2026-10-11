@@ -26,6 +26,7 @@
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/storageManager.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -146,7 +147,8 @@ std::vector<int32_t> readBack(CudaUniqPtr const& buffer, size_t count)
 
 KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
-    int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth, int historyUnits)
+    int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth, int historyUnits, int capacityUnits,
+    int maxInFlightUnits)
 {
     auto const entryCount = static_cast<size_t>(numLayers) * entriesPerLayer;
     auto const selectionCount = static_cast<size_t>(numLayers) * selectionWidth;
@@ -163,6 +165,10 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     auto missSlot = deviceCopy(std::vector<int32_t>(selectionCount, 0));
     auto missCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
     auto status = deviceCopy(std::vector<int32_t>(1, 0));
+    auto history = deviceCopy(std::vector<int32_t>(1, historyUnits));
+    auto capacity = deviceCopy(std::vector<int32_t>(1, capacityUnits));
+    auto const inFlightCount = static_cast<size_t>(numLayers) * static_cast<size_t>(std::max(maxInFlightUnits, 0));
+    auto inFlight = deviceCopy(std::vector<int32_t>(std::max<size_t>(inFlightCount, 1), kNoSparseSlot));
 
     SparseResolveArgs args;
     args.cache.residentOrdinal = reinterpret_cast<int32_t*>(resident.get());
@@ -171,7 +177,10 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     args.cache.entriesPerLayer = entriesPerLayer;
     args.selected = reinterpret_cast<int32_t const*>(selection.get());
     args.selectionWidth = selectionWidth;
-    args.historyUnits = historyUnits;
+    args.historyUnits = reinterpret_cast<int32_t const*>(history.get());
+    args.capacityUnits = reinterpret_cast<int32_t const*>(capacity.get());
+    args.inFlightSlot = reinterpret_cast<int32_t*>(inFlight.get());
+    args.maxInFlightUnits = maxInFlightUnits;
     args.outSlot = reinterpret_cast<int32_t*>(outSlot.get());
     args.missOrdinal = reinterpret_cast<int32_t*>(missOrdinal.get());
     args.missSlot = reinterpret_cast<int32_t*>(missSlot.get());
@@ -188,6 +197,7 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     result.missOrdinal = readBack(missOrdinal, selectionCount);
     result.missSlot = readBack(missSlot, selectionCount);
     result.missCount = readBack(missCount, static_cast<size_t>(numLayers));
+    result.inFlightSlot = inFlightCount > 0 ? readBack(inFlight, inFlightCount) : std::vector<int32_t>{};
     result.status = readBack(status, 1).front();
     return result;
 }

@@ -37,6 +37,9 @@ enum class SparseResolveStatus : int32_t
     //! More misses than evictable entries. Reservation is supposed to make this impossible;
     //! it means the cache was sized below the selection width plus the in-flight span.
     kOutOfEntries = 1,
+    //! capacityUnits - historyUnits exceeded maxInFlightUnits, i.e. the request grew past
+    //! the max_input_length it declared.
+    kInFlightOverflow = 2,
 };
 
 //! One layer group's resolve: turn a selection of unit ordinals into cache entry indices,
@@ -55,16 +58,32 @@ struct SparseResolveArgs
     //! Selected units per layer, uniform across layers and requests so shapes stay static.
     int32_t selectionWidth = 0;
 
-    //! Unit ordinals at or above this are in flight: they hold the only copy of their data,
-    //! so they are pinned against eviction. Equal to history_length / unit_tokens; see
+    //! [1] history_length / unit_tokens, and [1] capacity / unit_tokens. Device-resident
+    //! because both move every step: a captured graph must read the current value rather
+    //! than one baked in at capture.
+    //!
+    //! Ordinals below historyUnits are selectable history. Ordinals in
+    //! [historyUnits, capacityUnits) are in flight: the entry holds the only copy of their
+    //! data, so it is pinned against eviction and there is nothing to fetch for it. See
     //! "Unflushed entries carry no state" in SPARSE_ATTENTION_DESIGN.md.
-    int32_t historyUnits = 0;
+    int32_t const* historyUnits = nullptr;
+    int32_t const* capacityUnits = nullptr;
 
     //! [numLayers][selectionWidth] entry index per selection, kNoSparseSlot where padded.
     int32_t* outSlot = nullptr;
 
-    //! [numLayers][selectionWidth] the units that were not resident, and the entries given
-    //! to them. The copy stage reads these; only the first missCount[layer] are valid.
+    //! [numLayers][maxInFlightUnits] entry index per in-flight unit, in ordinal order from
+    //! historyUnits. Entries past the live count are left untouched. The model writes new
+    //! KV through these, so they are resolved before the selection takes any victim.
+    int32_t* inFlightSlot = nullptr;
+    //! Array stride, bounding capacityUnits - historyUnits. Derived from the declared
+    //! max_input_length, so the shape stays static while the live count varies.
+    int32_t maxInFlightUnits = 0;
+
+    //! [numLayers][selectionWidth] the history units that were not resident, and the
+    //! entries given to them. The copy stage reads these; only the first missCount[layer]
+    //! are valid. An in-flight unit that misses is allocated an entry but never appears
+    //! here: its host page holds nothing to fetch.
     int32_t* missOrdinal = nullptr;
     int32_t* missSlot = nullptr;
     //! [numLayers] number of misses.
@@ -77,10 +96,11 @@ struct SparseResolveArgs
 //! Shared memory one CTA needs for `entriesPerLayer` entries and `selectionWidth` selections.
 //! Grows as next_pow2(2 * entriesPerLayer) for the probe index, so it is the quantity that
 //! bounds how large a cache a single launch can serve.
-[[nodiscard]] size_t sparseResolveSharedBytes(int32_t entriesPerLayer, int32_t selectionWidth);
+[[nodiscard]] size_t sparseResolveSharedBytes(
+    int32_t entriesPerLayer, int32_t selectionWidth, int32_t maxInFlightUnits);
 
 //! Largest entriesPerLayer this kernel can serve on `device`, given its shared memory limit.
-[[nodiscard]] int32_t sparseResolveMaxEntries(int32_t selectionWidth, CUdevice device);
+[[nodiscard]] int32_t sparseResolveMaxEntries(int32_t selectionWidth, int32_t maxInFlightUnits, CUdevice device);
 
 //! Byte layout of one selection unit inside a buffer, mirroring config.h's
 //! SelectionUnitLayout. Repeated here so this header stays free of the config types.

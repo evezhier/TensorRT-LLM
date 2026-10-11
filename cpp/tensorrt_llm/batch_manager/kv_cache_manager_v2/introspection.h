@@ -58,12 +58,13 @@ public:
         std::vector<int32_t> missOrdinal;     //!< [layer][width], first missCount valid
         std::vector<int32_t> missSlot;        //!< [layer][width], first missCount valid
         std::vector<int32_t> missCount;       //!< [layer]
+        std::vector<int32_t> inFlightSlot;    //!< [layer][maxInFlightUnits]
         int32_t status = 0;                   //!< SparseResolveStatus
     };
 
     static SparseResolveProbe sparseResolve(std::vector<int32_t> const& residentOrdinal,
         std::vector<int32_t> const& lruOrder, int numLayers, int entriesPerLayer, std::vector<int32_t> const& selected,
-        int selectionWidth, int historyUnits);
+        int selectionWidth, int historyUnits, int capacityUnits, int maxInFlightUnits);
 
     // White-box hook: run the sparse unit copy over caller-supplied pools, so the address
     // arithmetic can be checked against a known byte pattern. Returns the destination pool

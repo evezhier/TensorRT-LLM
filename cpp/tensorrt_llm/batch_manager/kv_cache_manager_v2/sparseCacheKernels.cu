@@ -63,10 +63,13 @@ struct SmemLayout
     size_t scratch = 0;
     size_t order = 0;
     size_t missIdx = 0;
+    size_t missOrd = 0;
     size_t total = 0;
 };
 
-__host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entries, int32_t width) noexcept
+//! @param required Length of the virtual list the probe walks: in-flight units first,
+//! then the selection.
+__host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entries, int32_t required) noexcept
 {
     SmemLayout layout;
     size_t offset = 0;
@@ -81,7 +84,9 @@ __host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entr
     layout.order = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(entries));
     layout.missIdx = offset;
-    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(width));
+    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
+    layout.missOrd = offset;
+    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
     layout.total = offset;
     return layout;
 }
@@ -147,16 +152,34 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     int32_t const width = args.selectionWidth;
     uint32_t const mask = static_cast<uint32_t>(tableSize) - 1U;
 
-    SmemLayout const layout = smemLayout(tableSize, entries, width);
+    // Both watermarks are read from device memory: they move every step, so a captured
+    // graph must see the current value.
+    int32_t const historyUnits = *args.historyUnits;
+    int32_t const inFlight = *args.capacityUnits - historyUnits;
+    if (inFlight < 0 || inFlight > args.maxInFlightUnits)
+    {
+        if (threadIdx.x == 0)
+        {
+            atomicExch(args.status, static_cast<int32_t>(SparseResolveStatus::kInFlightOverflow));
+        }
+        return;
+    }
+    // The probe walks one virtual list: the in-flight units, which must be resident before
+    // the selection takes any victim, then the selection itself.
+    int32_t const required = inFlight + width;
+
+    SmemLayout const layout = smemLayout(tableSize, entries, args.maxInFlightUnits + width);
     auto* keys = reinterpret_cast<int32_t*>(smem + layout.keys);
     auto* vals = reinterpret_cast<int32_t*>(smem + layout.vals);
     auto* cls = reinterpret_cast<uint8_t*>(smem + layout.cls);
     auto* scratch = reinterpret_cast<int32_t*>(smem + layout.scratch);
     auto* order = reinterpret_cast<int32_t*>(smem + layout.order);
     auto* missIdx = reinterpret_cast<int32_t*>(smem + layout.missIdx);
+    auto* missOrd = reinterpret_cast<int32_t*>(smem + layout.missOrd);
 
     __shared__ typename BlockScan::TempStorage temp;
     __shared__ int32_t numMiss;
+    __shared__ int32_t numCopy;
 
     int32_t* residentOrdinal = args.cache.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
     int32_t* lruOrder = args.cache.lruOrder + static_cast<ptrdiff_t>(layer) * entries;
@@ -164,10 +187,12 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     int32_t* outSlot = args.outSlot + static_cast<ptrdiff_t>(layer) * width;
     int32_t* missOrdinal = args.missOrdinal + static_cast<ptrdiff_t>(layer) * width;
     int32_t* missSlot = args.missSlot + static_cast<ptrdiff_t>(layer) * width;
+    int32_t* inFlightSlot = args.inFlightSlot + static_cast<ptrdiff_t>(layer) * args.maxInFlightUnits;
 
     if (threadIdx.x == 0)
     {
         numMiss = 0;
+        numCopy = 0;
     }
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < tableSize; i += kThreads)
     {
@@ -197,14 +222,14 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     }
     __syncthreads();
 
-    // Probe once per selection. A hit resolves immediately; a miss joins the list the copy
-    // stage will read, so copies can be issued before any recency bookkeeping runs.
-    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < width; i += kThreads)
+    // Probe once per required unit. A hit resolves immediately; a miss is recorded against
+    // its position in the virtual list and resolved once a victim is chosen.
+    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < required; i += kThreads)
     {
-        int32_t const ord = selected[i];
+        int32_t const ord = i < inFlight ? historyUnits + i : selected[i - inFlight];
         if (ord < 0)
         {
-            outSlot[i] = kNoSparseSlot;
+            outSlot[i - inFlight] = kNoSparseSlot;
             continue;
         }
         uint32_t pos = slotOf(ord, mask);
@@ -217,13 +242,13 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
         if (key == ord)
         {
             int32_t const slot = vals[pos];
-            outSlot[i] = slot;
+            (i < inFlight ? inFlightSlot[i] : outSlot[i - inFlight]) = slot;
             cls[slot] = kClassHit;
         }
         else
         {
             int32_t const j = atomicAdd(&numMiss, 1);
-            missOrdinal[j] = ord;
+            missOrd[j] = ord;
             missIdx[j] = i;
         }
     }
@@ -236,7 +261,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
         int32_t const slot = lruOrder[p];
         int32_t const ord = residentOrdinal[slot];
         bool const free = ord == kFreeOrdinal;
-        bool const pinned = !free && ord >= args.historyUnits;
+        bool const pinned = !free && ord >= historyUnits;
         scratch[p] = (free || (cls[slot] == kClassUntouched && !pinned)) ? 1 : 0;
     }
     __syncthreads();
@@ -258,7 +283,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
         int32_t const slot = lruOrder[p];
         int32_t const ord = residentOrdinal[slot];
         bool const free = ord == kFreeOrdinal;
-        bool const pinned = !free && ord >= args.historyUnits;
+        bool const pinned = !free && ord >= historyUnits;
         bool const evictable = free || (cls[slot] == kClassUntouched && !pinned);
         if (!evictable)
         {
@@ -270,10 +295,20 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
         if (rankFromTail < numMiss)
         {
             int32_t const j = numMiss - 1 - rankFromTail;
-            residentOrdinal[slot] = missOrdinal[j];
-            missSlot[j] = slot;
-            outSlot[missIdx[j]] = slot;
+            int32_t const ordinal = missOrd[j];
+            int32_t const position = missIdx[j];
+            residentOrdinal[slot] = ordinal;
+            (position < inFlight ? inFlightSlot[position] : outSlot[position - inFlight]) = slot;
             cls[slot] = kClassFetched;
+            // Only history has anything to fetch. An in-flight unit's host page is not
+            // written until the watermark passes it, so copying from it would read stale
+            // bytes over the data the model is about to write.
+            if (ordinal < historyUnits)
+            {
+                int32_t const c = atomicAdd(&numCopy, 1);
+                missOrdinal[c] = ordinal;
+                missSlot[c] = slot;
+            }
         }
     }
     __syncthreads();
@@ -319,7 +354,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     }
     if (threadIdx.x == 0)
     {
-        args.missCount[layer] = numMiss;
+        args.missCount[layer] = numCopy;
     }
 }
 
@@ -412,19 +447,19 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
-size_t sparseResolveSharedBytes(int32_t entriesPerLayer, int32_t selectionWidth)
+size_t sparseResolveSharedBytes(int32_t entriesPerLayer, int32_t selectionWidth, int32_t maxInFlightUnits)
 {
-    return smemLayout(nextPow2(2 * entriesPerLayer), entriesPerLayer, selectionWidth).total;
+    return smemLayout(nextPow2(2 * entriesPerLayer), entriesPerLayer, maxInFlightUnits + selectionWidth).total;
 }
 
-int32_t sparseResolveMaxEntries(int32_t selectionWidth, CUdevice device)
+int32_t sparseResolveMaxEntries(int32_t selectionWidth, int32_t maxInFlightUnits, CUdevice device)
 {
     int limit = 0;
     cuCheck(cuDeviceGetAttribute(&limit, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device));
     int32_t best = 0;
     for (int32_t entries = 1; entries <= (1 << 20); entries <<= 1)
     {
-        if (sparseResolveSharedBytes(entries, selectionWidth) > static_cast<size_t>(limit))
+        if (sparseResolveSharedBytes(entries, selectionWidth, maxInFlightUnits) > static_cast<size_t>(limit))
         {
             break;
         }
@@ -440,13 +475,19 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
         throw std::invalid_argument("launchSparseResolve: layers, entries and selection width must be positive");
     }
     if (args.selected == nullptr || args.outSlot == nullptr || args.missOrdinal == nullptr || args.missSlot == nullptr
-        || args.missCount == nullptr || args.status == nullptr)
+        || args.missCount == nullptr || args.status == nullptr || args.historyUnits == nullptr
+        || args.capacityUnits == nullptr || (args.maxInFlightUnits > 0 && args.inFlightSlot == nullptr))
     {
         throw std::invalid_argument("launchSparseResolve: every device array must be provided");
     }
+    if (args.maxInFlightUnits < 0)
+    {
+        throw std::invalid_argument("launchSparseResolve: maxInFlightUnits must not be negative");
+    }
 
     int32_t const tableSize = nextPow2(2 * args.cache.entriesPerLayer);
-    size_t const shared = sparseResolveSharedBytes(args.cache.entriesPerLayer, args.selectionWidth);
+    size_t const shared
+        = sparseResolveSharedBytes(args.cache.entriesPerLayer, args.selectionWidth, args.maxInFlightUnits);
 
     CUdevice device = 0;
     cuCheck(cuCtxGetDevice(&device));

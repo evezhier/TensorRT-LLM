@@ -601,6 +601,7 @@ class TestSparseResolve(unittest.TestCase):
     # SparseResolveStatus
     OK = 0
     OUT_OF_ENTRIES = 1
+    IN_FLIGHT_OVERFLOW = 2
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -617,13 +618,23 @@ class TestSparseResolve(unittest.TestCase):
         num_layers: int = 1,
         lru: list[int] | None = None,
         history_units: int = 1 << 20,
+        capacity_units: int | None = None,
+        max_in_flight_units: int = 0,
     ):
         entries = len(resident) // num_layers
         width = len(selected) // num_layers
         if lru is None:
             lru = list(range(entries)) * num_layers
         return _introspection.sparse_resolve(
-            resident, lru, num_layers, entries, selected, width, history_units
+            resident,
+            lru,
+            num_layers,
+            entries,
+            selected,
+            width,
+            history_units,
+            history_units if capacity_units is None else capacity_units,
+            max_in_flight_units,
         )
 
     def test_an_empty_cache_misses_everything(self):
@@ -680,6 +691,64 @@ class TestSparseResolve(unittest.TestCase):
         # Every entry is in flight, so nothing can be given away.
         result = self._resolve([10, 11, 12, 13], [99], history_units=10)
         self.assertEqual(result.status, self.OUT_OF_ENTRIES)
+
+    def test_in_flight_units_become_resident_without_a_fetch(self):
+        # Units 10 and 11 are in flight: the model is about to write them, so they need
+        # entries but their host pages hold nothing to copy.
+        result = self._resolve(
+            self._free(4),
+            [-1],
+            history_units=10,
+            capacity_units=12,
+            max_in_flight_units=2,
+        )
+        self.assertEqual(result.status, self.OK)
+        self.assertEqual(result.miss_count, [0], "an in-flight unit is never fetched")
+        slots = result.in_flight_slot
+        self.assertEqual(len(set(slots)), 2, "each in-flight unit got its own entry")
+        self.assertEqual(result.resident_ordinal[slots[0]], 10)
+        self.assertEqual(result.resident_ordinal[slots[1]], 11)
+
+    def test_an_in_flight_unit_keeps_its_entry_across_steps(self):
+        # Unit 10 is already resident in entry 2 and still in flight.
+        resident = [1, 2, 10, 3]
+        result = self._resolve(
+            resident,
+            [-1],
+            history_units=10,
+            capacity_units=11,
+            max_in_flight_units=1,
+        )
+        self.assertEqual(result.in_flight_slot, [2], "a resident in-flight unit hits")
+        self.assertEqual(result.miss_count, [0])
+
+    def test_in_flight_units_are_resolved_before_the_selection(self):
+        # Two entries, one in-flight unit and one selected history unit: both fit, and the
+        # in-flight unit must not be the one that loses.
+        result = self._resolve(
+            self._free(2),
+            [5],
+            history_units=10,
+            capacity_units=11,
+            max_in_flight_units=1,
+        )
+        self.assertEqual(result.status, self.OK)
+        in_flight = result.in_flight_slot[0]
+        selected = result.out_slot[0]
+        self.assertNotEqual(in_flight, selected)
+        self.assertEqual(result.resident_ordinal[in_flight], 10)
+        self.assertEqual(result.resident_ordinal[selected], 5)
+        self.assertEqual(result.miss_count, [1], "only the history unit is fetched")
+
+    def test_growing_past_the_declared_input_bound_is_reported(self):
+        result = self._resolve(
+            self._free(8),
+            [-1],
+            history_units=0,
+            capacity_units=5,
+            max_in_flight_units=2,
+        )
+        self.assertEqual(result.status, self.IN_FLIGHT_OVERFLOW)
 
     def test_layers_resolve_independently(self):
         # Layer 0 hits, layer 1 misses.

@@ -222,6 +222,7 @@ class SparseResolveResult(NamedTuple):
     miss_ordinal: list[int]
     miss_slot: list[int]
     miss_count: list[int]
+    in_flight_slot: list[int]
     status: int
 
 
@@ -281,14 +282,27 @@ def sparse_resolve(
     selected: list[int],
     selection_width: int,
     history_units: int,
+    capacity_units: int = 0,
+    max_in_flight_units: int = 0,
 ) -> SparseResolveResult:
     """Run the sparse resolve kernel over caller-supplied cache state.
 
     Inputs are row-major [layer][entry] and [layer][selection_width]; a negative
-    selection entry is padding. Units at or above ``history_units`` are in flight and
-    are never chosen as eviction victims. Synchronises.
+    selection entry is padding. Ordinals in ``[history_units, capacity_units)`` are in
+    flight: they are made resident before the selection takes any victim, are never
+    chosen as victims themselves, and never enter the miss list because their host pages
+    hold nothing to fetch. Synchronises.
     """
-    resident, lru, out, miss_ord, miss_slot, miss_count, status = _cpp().sparse_resolve(
+    (
+        resident,
+        lru,
+        out,
+        miss_ord,
+        miss_slot,
+        miss_count,
+        in_flight,
+        status,
+    ) = _cpp().sparse_resolve(
         resident_ordinal,
         lru_order,
         num_layers,
@@ -296,6 +310,8 @@ def sparse_resolve(
         selected,
         selection_width,
         history_units,
+        max(capacity_units, history_units),
+        max_in_flight_units,
     )
     return SparseResolveResult(
         list(resident),
@@ -304,6 +320,7 @@ def sparse_resolve(
         list(miss_ord),
         list(miss_slot),
         list(miss_count),
+        list(in_flight),
         int(status),
     )
 
