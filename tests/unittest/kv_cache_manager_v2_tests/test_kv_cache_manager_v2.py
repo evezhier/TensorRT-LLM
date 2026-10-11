@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import array
+import contextlib
 import functools
 import gc
 import hashlib
@@ -1016,6 +1017,179 @@ class TestSparseUnitCopy(unittest.TestCase):
             buffer_layer=list(range(1)),
         )
         self.assertEqual(result[unit:], host[unit:])
+
+
+class TestSparseFetch(unittest.TestCase):
+    """KVCacheManager.fetch_sparse_pages: one layer's selections, resolved for a batch."""
+
+    TOKENS_PER_BLOCK = 128
+    SELECTED = 2
+    CACHED_UNITS = 4
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @classmethod
+    def _manager(cls, roles: tuple[str, ...] = ("key", "value")) -> KVCacheManager:
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=cls.TOKENS_PER_BLOCK,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig(
+                                role,
+                                4096,
+                                is_sparse=True,
+                                num_selected_blocks=cls.SELECTED,
+                                max_cached_units=cls.CACHED_UNITS,
+                                sparse_unit_layout=SelectionUnitLayout(1, 4096, 0, 4096),
+                            )
+                            for role in roles
+                        ],
+                    )
+                ],
+            )
+        )
+
+    @staticmethod
+    def _buffers(roles: tuple[str, ...]) -> list[BufferId]:
+        return [BufferId(0, role) for role in roles]
+
+    def _torch(self):
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to pass device arrays")
+        return torch
+
+    @contextlib.contextmanager
+    def _fixture(self, roles: tuple[str, ...] = ("key", "value"), rows: int = 2, blocks: int = 4):
+        """A resumed member in row 0 of a two-row batch, with history to select from."""
+        torch = self._torch()
+        manager = self._manager(roles)
+        cache = None
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=rows, max_blocks_per_seq=blocks)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                cache = manager.create_kv_cache()
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+                # Two whole blocks of history, so ordinals 0 and 1 are eligible.
+                tokens = 2 * self.TOKENS_PER_BLOCK
+                self.assertEqual(
+                    batch.resize([tokens, None], [tokens, None], handle), [True, False]
+                )
+                batch.publish(handle)
+                yield torch, manager, batch, cache, handle
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def _out(self, torch, rows: int, num_buffers: int, blocks: int):
+        return torch.full((rows, num_buffers, blocks), 12345, dtype=torch.int32, device="cuda")
+
+    def test_only_selected_ordinals_are_written(self):
+        """Out is shaped like a page table, so it must be filled, not just scattered into."""
+        roles = ("key", "value")
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
+            out = self._out(torch, 2, len(roles), 4)
+            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+            torch.cuda.synchronize()
+
+            # Ordinal 0 resolved for both buffers of the member's row.
+            self.assertTrue(bool((out[0, :, 0] != BAD_PAGE_INDEX).all()))
+            # Everything else is the sentinel, including the stale fill we started from.
+            self.assertTrue(bool((out[0, :, 1:] == BAD_PAGE_INDEX).all()))
+
+    def test_a_row_holding_no_reservation_reads_as_absent(self):
+        roles = ("key", "value")
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            selected = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32, device="cuda")
+            out = self._out(torch, 2, len(roles), 4)
+            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+            torch.cuda.synchronize()
+            self.assertTrue(
+                bool((out[1] == BAD_PAGE_INDEX).all()),
+                "a free row selects nothing, however the caller filled its selection",
+            )
+
+    def test_each_buffer_of_a_layer_gets_its_own_index(self):
+        """A layer's buffers share the resolve but not their cells.
+
+        The cache packs one buffer's entries densely across the pages it reserved rather
+        than leaving each at its nominal cell, so one ordinal lands somewhere different in
+        every buffer. That is why out carries a buffer dimension at all.
+        """
+        roles = ("key", "value")
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            selected = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
+            out = self._out(torch, 2, len(roles), 4)
+            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+            torch.cuda.synchronize()
+
+            for ordinal in (0, 1):
+                key, value = int(out[0, 0, ordinal]), int(out[0, 1, ordinal])
+                self.assertNotEqual(key, BAD_PAGE_INDEX)
+                self.assertNotEqual(key, value, f"ordinal {ordinal} shares a cell")
+
+    def test_a_hit_resolves_to_the_same_index_as_the_fetch_that_filled_it(self):
+        """A second call must reuse the entry rather than fetch it again."""
+        roles = ("key",)
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
+            first = self._out(torch, 2, len(roles), 4)
+            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, first, handle)
+            second = self._out(torch, 2, len(roles), 4)
+            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, second, handle)
+            torch.cuda.synchronize()
+            self.assertEqual(int(first[0, 0, 0]), int(second[0, 0, 0]))
+
+    def test_the_resolve_makes_the_selected_units_resident(self):
+        """The indices alone could be anything; residency is what the fetch actually changed."""
+        roles = ("key",)
+        with self._fixture(roles) as (torch, manager, batch, cache, handle):
+            lg_id = manager.get_layer_group_id(0)
+            before = _introspection.sparse_cache_resident_ordinals(cache, lg_id)
+            self.assertNotIn(0, before, "nothing is cached before the first fetch")
+            self.assertNotIn(1, before)
+
+            selected = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
+            out = self._out(torch, 2, len(roles), 4)
+            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+            torch.cuda.synchronize()
+
+            after = _introspection.sparse_cache_resident_ordinals(cache, lg_id)
+            self.assertIn(0, after, "the selected units are resident afterwards")
+            self.assertIn(1, after)
+
+    def test_buffers_must_be_one_whole_layer(self):
+        roles = ("key", "value")
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
+            # A subset would leave the buffers it omits stale while the metadata, which the
+            # resolve updates for the whole layer, claimed they were resident.
+            with self.assertRaises(ValueError):
+                manager.fetch_sparse_pages(
+                    batch, [BufferId(0, "key")], selected, self._out(torch, 2, 1, 4), handle
+                )
+
+    def test_out_must_carry_one_row_per_buffer(self):
+        roles = ("key", "value")
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
+            with self.assertRaises(ValueError):
+                manager.fetch_sparse_pages(
+                    batch, self._buffers(roles), selected, self._out(torch, 2, 1, 4), handle
+                )
 
 
 class TestSparseFlush(unittest.TestCase):

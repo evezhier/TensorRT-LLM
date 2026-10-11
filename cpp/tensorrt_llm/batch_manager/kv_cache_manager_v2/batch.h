@@ -44,6 +44,23 @@ struct PageTableView
     int32_t blocksPerRow = 0;
 };
 
+//! Device scratch one layer group's fetch resolves into, before the copy and the index
+//! scatter read it back.
+//!
+//! Owned by Batch rather than allocated per call because every extent is a configuration
+//! constant -- rows, selection width, in-flight headroom -- so one allocation serves every
+//! step, and a step that allocates nothing is a step a CUDA graph can capture.
+struct SparseFetchScratch
+{
+    int32_t* outSlot = nullptr;      //!< [numRows][selectionWidth]
+    int32_t* missOrdinal = nullptr;  //!< [numRows][selectionWidth]
+    int32_t* missSlot = nullptr;     //!< [numRows][selectionWidth]
+    int32_t* missCount = nullptr;    //!< [numRows]
+    int32_t* inFlightSlot = nullptr; //!< [numRows][maxInFlightUnits]
+    int32_t selectionWidth = 0;
+    int32_t maxInFlightUnits = 0;
+};
+
 //! Per-row watermarks, in tokens. Everything a step needs about how far a request has got
 //! derives from these two, at whatever granularity the consumer works in:
 //!
@@ -153,6 +170,10 @@ public:
     //! past the end of a row that has since been reused.
     [[nodiscard]] WatermarkView watermarks() const;
 
+    //! Scratch for one layer group's fetch. Null pointers when the group carries no sparse
+    //! cache, which is what makes "nothing to fetch here" cheap to detect.
+    [[nodiscard]] SparseFetchScratch const& sparseFetchScratch(LayerGroupId layerGroupId) const;
+
     //! Row of a member, or -1.
     [[nodiscard]] int rowOf(KvCache const& kvCache) const;
 
@@ -193,6 +214,8 @@ private:
     //! setBasePageIndexBuf.
     void _stageRowState();
 
+    void _allocateFetchScratch();
+
     //! Byte offset of the cache view region within the staged block.
     [[nodiscard]] size_t _viewsOffsetBytes() const noexcept;
     [[nodiscard]] size_t _totalBytes() const noexcept;
@@ -208,6 +231,10 @@ private:
     //! publish is a single asynchronous transfer per layer group.
     std::unique_ptr<HostMem> mStaging;
     CudaUniqPtr mDevice;
+
+    //! One allocation holding every layer group's fetch scratch, carved per group.
+    CudaUniqPtr mFetchScratch;
+    TypedVec<LifeCycleId, SparseFetchScratch> mScratch;
 
     //! Recorded after the publish copy, so the host can tell when the staging rows are
     //! free to write again. Null when no publish is in flight.

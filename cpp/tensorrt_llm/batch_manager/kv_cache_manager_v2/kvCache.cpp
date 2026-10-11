@@ -305,62 +305,20 @@ std::vector<uint32_t> KvCache::_sparseColdPageOffsets(LifeCycleId lifeCycle) con
 
 SparseUnitCopyArgs KvCache::_sparseCopyArgs(LifeCycleId lifeCycle) const
 {
-    auto& storage = mManager->storage();
-    auto const refs = _sparseBuffers(lifeCycle);
-    TLLM_CHECK(!refs.empty());
+    // The pools and the layout are the manager's, since they follow from configuration.
+    // What a request adds is its own reservation, and the whole-life-cycle work shape a
+    // write-back uses.
+    SparseUnitCopyArgs args = mManager->sparseCopyTemplate(lifeCycle);
 
-    // One pool, one layout. A life cycle spans one pool per distinct buffer size, so both
-    // hold whenever its sparse buffers are alike, and fail for the quantised shape where
-    // block scales are a separate, smaller DataRole with a layout of their own. Supporting
-    // that means one launch per pool, as the codec already does over its copy plans.
-    auto const first = mManager->bufferAttr(refs.front().id.layerId, refs.front().id.role);
-    for (auto const& ref : refs)
-    {
-        auto const attr = mManager->bufferAttr(ref.id.layerId, ref.id.role);
-        if (attr.poolIndex != first.poolIndex || attr.size != first.size)
-        {
-            throw LogicError("Sparse buffers of one life cycle must share a pool; mixed sizes are not supported yet");
-        }
-        if (ref.layout.numChunks != refs.front().layout.numChunks
-            || ref.layout.chunkBytes != refs.front().layout.chunkBytes
-            || ref.layout.chunkStride != refs.front().layout.chunkStride
-            || ref.layout.unitStride != refs.front().layout.unitStride)
-        {
-            throw LogicError("Sparse buffers of one life cycle must share a selection unit layout");
-        }
-    }
-
-    PoolGroupIndex const hotPg = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
-    PoolGroupIndex const coldPg = storage.getPoolGroupIndex(kSparseHistoryLevel, lifeCycle);
-    auto const hotSlotBytes = storage.slotSize(hotPg).at(first.poolIndex);
-    auto const coldSlotBytes = storage.slotSize(coldPg).at(PoolIndex{0});
-
-    SparseUnitCopyArgs args;
-    // The cold tier is one pool of whole cold pages, so slot 0 of pool 0 is its base. The
-    // host tier is registered device-mapped, so the kernel can address it directly.
-    args.hostBase = static_cast<CUdeviceptr>(
-        std::get<MemAddress>(storage.slotAddress(kSparseHistoryLevel, coldPg, SlotId{0}, PoolIndex{0})));
-    args.hostPageStride = coldSlotBytes;
-    args.deviceBase = static_cast<CUdeviceptr>(storage.getMemPoolBaseAddress(hotPg, first.poolIndex));
-    args.devicePageStride = hotSlotBytes;
-
-    auto const& view = mSparseCacheState[lifeCycle].view();
-    args.cachePages = view.cachePages;
-    args.hostBufferOffset = view.hostBufferOffset;
-    args.bufferBytes = first.size;
-    args.buffersPerSlot = static_cast<int32_t>(hotSlotBytes / first.size);
-    args.subSlotsPerBuffer = _sparseCacheSubSlotsPerBuffer(lifeCycle);
-    args.expansion = mManager->sparseCacheExpansion(lifeCycle);
-    args.bufferLayer = view.bufferLayer;
-    // Defaults to the whole life cycle; a one-layer fetch narrows them.
+    auto const& state = mSparseCacheState[lifeCycle];
+    auto const& view = state.view();
+    // One row: a write-back is per request. A batched fetch passes the batch's view array.
+    args.views = state.deviceView();
+    args.numRows = 1;
     args.bufferBase = 0;
     args.numBuffers = view.numBuffers;
     args.workRowBase = 0;
-
-    args.layout.numChunks = refs.front().layout.numChunks;
-    args.layout.chunkBytes = refs.front().layout.chunkBytes;
-    args.layout.chunkStride = refs.front().layout.chunkStride;
-    args.layout.unitStride = refs.front().layout.unitStride;
+    args.workRowStride = view.numLayers;
     return args;
 }
 
@@ -421,6 +379,7 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
 
     SparseUnitCopyArgs copyArgs = _sparseCopyArgs(lifeCycle);
     copyArgs.pageTable = view.flushPageSlice;
+    copyArgs.pageTableStride = numBlocks;
     copyArgs.numBlocks = numBlocks;
     copyArgs.pageTableBase = firstBlock;
     copyArgs.direction = SparseCopyDirection::kWriteBack;
@@ -433,16 +392,7 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
 
 int KvCache::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const
 {
-    int const maxUnits = mManager->sparseCacheMaxUnits(lifeCycle);
-    if (maxUnits <= 0)
-    {
-        return 0;
-    }
-    int const expansion = mManager->sparseCacheExpansion(lifeCycle);
-    // maxCachedUnits counts both populations, the history this caches and everything still
-    // in flight, so the reservation follows from configuration alone. What it leaves above
-    // the selection width is the in-flight headroom maxInputLength() reports.
-    return divUp(maxUnits, expansion);
+    return mManager->sparseCacheSubSlotsPerBuffer(lifeCycle);
 }
 
 std::optional<int> KvCache::maxInputLength() const
@@ -654,8 +604,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 init.bufferLayer = _sparseBufferLayers(lc);
                 // A watermark move cannot cross more than the in-flight span it is draining.
                 int const expansion = mManager->sparseCacheExpansion(lc);
-                int const cells = _sparseCacheSubSlotsPerBuffer(lc) * expansion;
-                init.maxFlushUnits = std::max(1, cells - mManager->sparseCacheSelectionWidth(lc)) + 1;
+                init.maxFlushUnits = mManager->sparseCacheMaxInFlightUnits(lc);
                 init.maxFlushBlocks = divUp(init.maxFlushUnits, expansion) + 1;
                 mSparseCacheState[lc] = SparseCacheState(init, reinterpret_cast<CUstream>(cudaStream()));
             }

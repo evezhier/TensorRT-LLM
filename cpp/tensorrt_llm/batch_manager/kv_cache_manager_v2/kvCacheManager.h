@@ -98,6 +98,8 @@ struct PageIndexConverter
     std::vector<int> operator()(int baseIndex) const;
 };
 
+class Batch;
+
 // ---------------------------------------------------------------------------
 // KvCacheManager — top-level KV cache manager.
 // Mirrors Python's KVCacheManager.
@@ -175,6 +177,31 @@ public:
 
     // Composite converter (scale + expansion).
     PageIndexConverter getPageIndexConverter(LayerId layerId, DataRole role) const;
+
+    //! Resolve a batch's selections against each buffer's per-request history cache.
+    //!
+    //! Device-driven and stream-ordered throughout: the selection is read from device
+    //! memory, so the host neither inspects it nor decides anything, and the call enqueues
+    //! onto `stream` and returns. Every shape is static across steps, so a CUDA graph can
+    //! capture it.
+    //!
+    //! `buffers` must be exactly one layer's sparse buffers. One layer, not one layer
+    //! group, because a layer's selection is computed from the previous layer's output, so
+    //! a step's selections are not all known at its start. The whole layer, not a subset,
+    //! because the resolve marks entries resident on behalf of every buffer at once:
+    //! filling only some would leave the rest stale while the metadata claimed otherwise.
+    //!
+    //! `selected` is [maxBatchSize][selectionWidth] unit ordinals, negative where padded,
+    //! and must name only units below the history watermark -- a unit at or above it has
+    //! not been written back, so fetching it would copy stale bytes. That is a wrong
+    //! answer rather than a memory error, and the call cannot detect it, so it is the
+    //! selector's responsibility.
+    //!
+    //! `out` is [maxBatchSize][buffers.size()][outStride], written in full, in the
+    //! expanded index space getPageIndexConverter() produces. See
+    //! SPARSE_ATTENTION_DESIGN.md's "Fetch".
+    void fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
+        int selectionWidth, int32_t* out, int outStride, CUstream stream);
 
     // Group a set of BufferIds into contiguous AggregatedPageDesc descriptors.
     // Mirrors Python's KVCacheManager.get_aggregated_pages().
@@ -363,6 +390,28 @@ public:
     {
         return lifeCycle < mSparseCacheBuffers.size() ? mSparseCacheBuffers[lifeCycle] : 0;
     }
+
+    //! Sub-slots a request's sparse cache reserves per buffer of this life cycle, i.e. the
+    //! cell count divided by the expansion. A property of configuration, not of any one
+    //! request, which is what lets a batch size its fetch scratch before any member exists.
+    [[nodiscard]] int sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const noexcept;
+
+    //! Bound on how far capacity can lead history, in units: whatever the cache holds
+    //! beyond a full selection. One definition, because the resolve's in-flight array and
+    //! the write-back's flush list are bounded by the same headroom.
+    [[nodiscard]] int sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept;
+
+    //! This life cycle's sparse buffers, in the order the cache numbers them: layers
+    //! outermost, so a layer's buffers are consecutive.
+    [[nodiscard]] std::vector<BufferId> sparseBufferIds(LifeCycleId lifeCycle) const;
+
+    //! Their selection unit layouts, in the same order.
+    [[nodiscard]] std::vector<SelectionUnitLayout> sparseUnitLayouts(LifeCycleId lifeCycle) const;
+
+    //! Everything a sparse copy needs that follows from configuration alone: the two pools,
+    //! the unit layout and the cell geometry. A caller fills in whose cache it is copying
+    //! into and which work list to read.
+    [[nodiscard]] SparseUnitCopyArgs sparseCopyTemplate(LifeCycleId lifeCycle) const;
 
     //! Storage attributes of one buffer: its pool, its offset within that pool's slot, its
     //! expanded size and its expansion. Forwarded because StorageManager keeps the table

@@ -16,8 +16,10 @@
  */
 
 #include "kv_cache_manager_v2/kvCacheManager.h"
+#include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -177,6 +179,247 @@ void KvCacheManager::_computeSparseCacheShape()
             }
         }
     }
+}
+
+int KvCacheManager::sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const noexcept
+{
+    int const maxUnits = sparseCacheMaxUnits(lifeCycle);
+    if (maxUnits <= 0)
+    {
+        return 0;
+    }
+    // maxCachedUnits counts both populations, the history this caches and everything still
+    // in flight, so the reservation follows from configuration alone.
+    return divUp(maxUnits, sparseCacheExpansion(lifeCycle));
+}
+
+int KvCacheManager::sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept
+{
+    int const cells = sparseCacheSubSlotsPerBuffer(lifeCycle) * sparseCacheExpansion(lifeCycle);
+    if (cells <= 0)
+    {
+        return 0;
+    }
+    // The +1 covers the partial unit at either end of a move.
+    return std::max(1, cells - sparseCacheSelectionWidth(lifeCycle)) + 1;
+}
+
+std::vector<BufferId> KvCacheManager::sparseBufferIds(LifeCycleId lifeCycle) const
+{
+    // The same walk, in the same order, that sized the cache in _computeSparseCacheShape.
+    std::vector<BufferId> ids;
+    for (auto const& layer : mConfig.layers)
+    {
+        auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
+        if (attn == nullptr || mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock)) != lifeCycle)
+        {
+            continue;
+        }
+        for (auto const& buf : attn->buffers)
+        {
+            if (buf.isSparse && buf.maxCachedUnits > 0)
+            {
+                ids.push_back(BufferId{attn->layerId, buf.role});
+            }
+        }
+    }
+    return ids;
+}
+
+SparseUnitCopyArgs KvCacheManager::sparseCopyTemplate(LifeCycleId lifeCycle) const
+{
+    auto const ids = sparseBufferIds(lifeCycle);
+    TLLM_CHECK(!ids.empty());
+    auto const layouts = sparseUnitLayouts(lifeCycle);
+
+    // One pool, one layout. A life cycle spans one pool per distinct buffer size, so both
+    // hold whenever its sparse buffers are alike, and fail for the quantised shape where
+    // block scales are a separate, smaller DataRole with a layout of their own. Supporting
+    // that means one launch per pool, as the codec already does over its copy plans.
+    auto const first = bufferAttr(ids.front().layerId, ids.front().role);
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        auto const attr = bufferAttr(ids[i].layerId, ids[i].role);
+        if (attr.poolIndex != first.poolIndex || attr.size != first.size)
+        {
+            throw LogicError("Sparse buffers of one life cycle must share a pool; mixed sizes are not supported yet");
+        }
+        if (layouts[i].numChunks != layouts.front().numChunks || layouts[i].chunkBytes != layouts.front().chunkBytes
+            || layouts[i].chunkStride != layouts.front().chunkStride
+            || layouts[i].unitStride != layouts.front().unitStride)
+        {
+            throw LogicError("Sparse buffers of one life cycle must share a selection unit layout");
+        }
+    }
+
+    PoolGroupIndex const hotPg = mStorage->getPoolGroupIndex(kHotLevel, lifeCycle);
+    PoolGroupIndex const coldPg = mStorage->getPoolGroupIndex(kSparseHistoryLevel, lifeCycle);
+    auto const hotSlotBytes = mStorage->slotSize(hotPg).at(first.poolIndex);
+    auto const coldSlotBytes = mStorage->slotSize(coldPg).at(PoolIndex{0});
+
+    SparseUnitCopyArgs args;
+    // The cold tier is one pool of whole cold pages, so slot 0 of pool 0 is its base. The
+    // host tier is registered device-mapped, so the kernel can address it directly.
+    args.hostBase = static_cast<CUdeviceptr>(
+        std::get<MemAddress>(mStorage->slotAddress(kSparseHistoryLevel, coldPg, SlotId{0}, PoolIndex{0})));
+    args.hostPageStride = coldSlotBytes;
+    args.deviceBase = static_cast<CUdeviceptr>(mStorage->getMemPoolBaseAddress(hotPg, first.poolIndex));
+    args.devicePageStride = hotSlotBytes;
+    args.bufferBytes = first.size;
+    args.buffersPerSlot = static_cast<int32_t>(hotSlotBytes / first.size);
+    args.subSlotsPerBuffer = sparseCacheSubSlotsPerBuffer(lifeCycle);
+    args.expansion = sparseCacheExpansion(lifeCycle);
+    args.layout.numChunks = layouts.front().numChunks;
+    args.layout.chunkBytes = layouts.front().chunkBytes;
+    args.layout.chunkStride = layouts.front().chunkStride;
+    args.layout.unitStride = layouts.front().unitStride;
+    return args;
+}
+
+std::vector<SelectionUnitLayout> KvCacheManager::sparseUnitLayouts(LifeCycleId lifeCycle) const
+{
+    std::vector<SelectionUnitLayout> layouts;
+    for (auto const& layer : mConfig.layers)
+    {
+        auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
+        if (attn == nullptr || mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock)) != lifeCycle)
+        {
+            continue;
+        }
+        for (auto const& buf : attn->buffers)
+        {
+            if (buf.isSparse && buf.maxCachedUnits > 0)
+            {
+                // Guaranteed by BufferConfig::validate: a cached sparse buffer has a layout.
+                TLLM_CHECK(buf.sparseUnitLayout.has_value());
+                layouts.push_back(*buf.sparseUnitLayout);
+            }
+        }
+    }
+    return layouts;
+}
+
+void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
+    int selectionWidth, int32_t* out, int outStride, CUstream stream)
+{
+    if (buffers.empty())
+    {
+        throw std::invalid_argument("fetchSparsePages: no buffers");
+    }
+    if (selected == nullptr || out == nullptr)
+    {
+        throw std::invalid_argument("fetchSparsePages: selected and out must be device pointers");
+    }
+
+    LayerId const layerId = buffers.front().layerId;
+    for (auto const& id : buffers)
+    {
+        if (id.layerId != layerId)
+        {
+            throw std::invalid_argument("fetchSparsePages: every buffer must belong to one layer");
+        }
+    }
+
+    LifeCycleId const lcId{getLayerGroupId(layerId).value()};
+    auto const all = sparseBufferIds(lcId);
+    // Buffers are grouped by layer, so this layer's are a contiguous run.
+    auto const first
+        = std::find_if(all.begin(), all.end(), [layerId](BufferId const& id) { return id.layerId == layerId; });
+    auto const last = std::find_if(first, all.end(), [layerId](BufferId const& id) { return id.layerId != layerId; });
+    if (!std::equal(first, last, buffers.begin(), buffers.end()))
+    {
+        throw std::invalid_argument(
+            "fetchSparsePages: buffers must be exactly this layer's sparse buffers, in the cache's order");
+    }
+
+    auto const bufferBase = static_cast<int32_t>(std::distance(all.begin(), first));
+    auto const numBuffers = static_cast<int32_t>(std::distance(first, last));
+    // The metadata row is the layer's index among those carrying a cache, which is the
+    // number of distinct layers before it in the same walk.
+    int32_t layerInGroup = 0;
+    for (auto it = all.begin(); it != first; ++it)
+    {
+        if (it == all.begin() || it->layerId != std::prev(it)->layerId)
+        {
+            ++layerInGroup;
+        }
+    }
+
+    auto const& scratch = batch.sparseFetchScratch(LayerGroupId{lcId.value()});
+    if (scratch.outSlot == nullptr)
+    {
+        throw std::invalid_argument("fetchSparsePages: this layer group carries no sparse cache");
+    }
+    if (selectionWidth != scratch.selectionWidth)
+    {
+        throw std::invalid_argument("fetchSparsePages: selectionWidth must match the configured numSelectedBlocks");
+    }
+
+    int const expansion = sparseCacheExpansion(lcId);
+    if (outStride < batch.maxBlocksPerSeq() * expansion)
+    {
+        throw std::invalid_argument("fetchSparsePages: out is narrower than the expanded ordinal bound");
+    }
+
+    LayerGroupId const lgId{lcId.value()};
+    auto const views = reinterpret_cast<SparseCacheView const*>(batch.sparseCacheViews(lgId));
+    auto const watermarks = batch.watermarks();
+    auto const table = batch.pageTable(lgId);
+    auto const numRows = batch.maxBatchSize();
+
+    SparseResolveArgs resolve;
+    resolve.views = views;
+    resolve.numRows = numRows;
+    resolve.layerInGroup = layerInGroup;
+    resolve.numLayers = sparseCacheLayerCount(lcId);
+    resolve.entriesPerLayer = sparseCacheSubSlotsPerBuffer(lcId) * expansion;
+    resolve.selected = selected;
+    resolve.selectionWidth = selectionWidth;
+    resolve.historyTokens = reinterpret_cast<int32_t const*>(watermarks.historyLength);
+    resolve.capacityTokens = reinterpret_cast<int32_t const*>(watermarks.capacity);
+    resolve.unitTokens = mConfig.tokensPerBlock / expansion;
+    resolve.outSlot = scratch.outSlot;
+    resolve.inFlightSlot = scratch.inFlightSlot;
+    resolve.maxInFlightUnits = scratch.maxInFlightUnits;
+    resolve.missOrdinal = scratch.missOrdinal;
+    resolve.missSlot = scratch.missSlot;
+    resolve.missCount = scratch.missCount;
+    launchSparseResolve(resolve, stream);
+
+    // The misses this layer produced, applied to each of its buffers. One list row per
+    // batch row, so the inner index is zero once workRowBase names the layer resolved.
+    SparseUnitCopyArgs copy = sparseCopyTemplate(lcId);
+    copy.views = views;
+    copy.numRows = numRows;
+    copy.pageTable = reinterpret_cast<int32_t const*>(table.data);
+    copy.pageTableStride = table.blocksPerRow;
+    copy.numBlocks = table.blocksPerRow;
+    copy.pageTableBase = 0;
+    copy.direction = SparseCopyDirection::kFetch;
+    copy.workOrdinal = scratch.missOrdinal;
+    copy.workSlot = scratch.missSlot;
+    copy.workCount = scratch.missCount;
+    copy.workWidth = selectionWidth;
+    copy.workRowStride = 1;
+    copy.workRowBase = layerInGroup;
+    copy.bufferBase = bufferBase;
+    copy.numBuffers = numBuffers;
+    launchSparseUnitCopy(copy, stream);
+
+    SparseOutIndexArgs indices;
+    indices.views = views;
+    indices.numRows = numRows;
+    indices.selected = selected;
+    indices.outSlot = scratch.outSlot;
+    indices.selectionWidth = selectionWidth;
+    indices.out = out;
+    indices.outStride = outStride;
+    indices.bufferBase = bufferBase;
+    indices.numBuffers = numBuffers;
+    indices.subSlotsPerBuffer = copy.subSlotsPerBuffer;
+    indices.buffersPerSlot = copy.buffersPerSlot;
+    indices.expansion = expansion;
+    launchSparseOutIndices(indices, stream);
 }
 
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const

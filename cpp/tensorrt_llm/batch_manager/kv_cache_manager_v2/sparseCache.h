@@ -138,6 +138,17 @@ public:
         return mView;
     }
 
+    //! A device copy of view(), as a one-row array.
+    //!
+    //! The copy kernel reads its per-row state through a view array, so that a batched
+    //! fetch can serve rows whose metadata lives in different requests' allocations. A
+    //! single-request write-back takes the same path with one row rather than a second
+    //! addressing mode. Fixed for the life of the reservation, like everything it names.
+    [[nodiscard]] SparseCacheView const* deviceView() const noexcept
+    {
+        return mDeviceView;
+    }
+
     [[nodiscard]] bool empty() const noexcept
     {
         return mMemory == nullptr;
@@ -156,6 +167,7 @@ public:
 private:
     CudaUniqPtr mMemory;
     SparseCacheView mView;
+    SparseCacheView* mDeviceView = nullptr;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -267,8 +267,10 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
         args.entriesPerLayer = entriesPerLayer;
         args.selected = reinterpret_cast<int32_t const*>(selection.get()) + selectionOffset;
         args.selectionWidth = selectionWidth;
-        args.historyUnits = reinterpret_cast<int32_t const*>(history.get());
-        args.capacityUnits = reinterpret_cast<int32_t const*>(capacity.get());
+        // The hook works in units, so one token is one unit.
+        args.historyTokens = reinterpret_cast<int32_t const*>(history.get());
+        args.capacityTokens = reinterpret_cast<int32_t const*>(capacity.get());
+        args.unitTokens = 1;
         args.inFlightSlot
             = reinterpret_cast<int32_t*>(inFlight.get()) + countOffset * static_cast<size_t>(maxInFlightUnits);
         args.maxInFlightUnits = maxInFlightUnits;
@@ -317,15 +319,29 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     auto coldOffsets = deviceCopyU32(coldBufferOffset);
     auto bufferLayerBuf = deviceCopy(bufferLayer);
 
+    // The kernel reads the reservation and the per-buffer maps through a view, so the hook
+    // assembles one standing in for a single request's cache state.
+    SparseCacheView view;
+    // Non-null only to mark the row live; the copy itself never reads the metadata arrays.
+    view.residentOrdinal = reinterpret_cast<int32_t*>(pages.get());
+    view.cachePages = reinterpret_cast<int32_t*>(pages.get());
+    view.hostBufferOffset = reinterpret_cast<uint32_t*>(coldOffsets.get());
+    view.bufferLayer = reinterpret_cast<int32_t*>(bufferLayerBuf.get());
+    CUdeviceptr viewPtr = 0;
+    cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView)));
+    CudaUniqPtr viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
+    cuCheck(cuMemcpyHtoD(viewPtr, &view, sizeof(SparseCacheView)));
+
     SparseUnitCopyArgs args;
+    args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
+    args.numRows = 1;
     args.hostBase = hostPtr;
     args.hostPageStride = hostPageStride;
     args.pageTable = reinterpret_cast<int32_t const*>(table.get());
+    args.pageTableStride = static_cast<int32_t>(pageTable.size());
     args.numBlocks = static_cast<int32_t>(pageTable.size());
     args.deviceBase = devicePtr;
     args.devicePageStride = devicePageStride;
-    args.cachePages = reinterpret_cast<int32_t const*>(pages.get());
-    args.hostBufferOffset = reinterpret_cast<uint32_t const*>(coldOffsets.get());
     args.subSlotsPerBuffer = subSlotsPerBuffer;
     args.buffersPerSlot = buffersPerSlot;
     args.bufferBytes = bufferBytes;
@@ -339,8 +355,9 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.workSlot = reinterpret_cast<int32_t const*>(missSlotBuf.get());
     args.workCount = reinterpret_cast<int32_t const*>(missCountBuf.get());
     args.workWidth = selectionWidth;
-    args.bufferLayer = reinterpret_cast<int32_t const*>(bufferLayerBuf.get());
     args.numBuffers = static_cast<int32_t>(bufferLayer.size());
+    // The hook's lists are per layer, as a write-back's are.
+    args.workRowStride = bufferLayer.empty() ? 1 : bufferLayer.back() + 1;
 
     launchSparseUnitCopy(args, nullptr);
     cuCheck(cuStreamSynchronize(nullptr));

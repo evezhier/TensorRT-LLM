@@ -1,9 +1,10 @@
 # Sparse attention in KVCacheManagerV2
 
-Status: implemented except for the fetch call and `Batch`. Storage and locking, the
-per-request reservation and device state, the resolve, copy and flush-list kernels, and the
-write-back at `resize()` are in place. Compression, `ISparseUnitGather` and kernel fusion
-remain future work, as marked below.
+Status: implemented for the default codec. Storage and locking, the per-request reservation
+and device state, `Batch`, the resolve, copy, index and flush-list kernels, the write-back
+at `resize()` and `KVCacheManager.fetch_sparse_pages` are in place. Compression,
+`ISparseUnitGather` and kernel fusion remain future work, as marked below; so do multi-beam
+requests and life cycles whose sparse buffers span more than one pool.
 
 Read `AGENTS.md` in this directory first for the storage, locking and concurrency model
 this builds on.

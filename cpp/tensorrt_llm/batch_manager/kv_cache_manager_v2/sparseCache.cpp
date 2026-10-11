@@ -91,11 +91,12 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
     // Cold-page offsets and the layer map are per buffer; everything above is per layer.
     size_t const offsetBytes = alignedBytes(sizeof(uint32_t) * static_cast<size_t>(numBuffers));
     size_t const bufferLayerBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(numBuffers));
+    size_t const viewBytes = alignedBytes(sizeof(SparseCacheView));
 
     CUdeviceptr base = 0;
     cuCheck(cuMemAlloc(&base,
         ordinalBytes + lruBytes + pageBytes + 2 * flushListBytes + countBytes + rangeBytes + sliceBytes + offsetBytes
-            + bufferLayerBytes));
+            + bufferLayerBytes + viewBytes));
     mMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
 
     auto* bytes = reinterpret_cast<std::byte*>(base);
@@ -116,6 +117,7 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
     mView.flushPageSlice = carve(sliceBytes);
     mView.hostBufferOffset = reinterpret_cast<uint32_t*>(carve(offsetBytes));
     mView.bufferLayer = carve(bufferLayerBytes);
+    mDeviceView = reinterpret_cast<SparseCacheView*>(carve(viewBytes));
     // -1 so that "no write-back has run" is distinguishable from "one ran and found
     // nothing to move", which is what lets a test tell the two apart.
     cuCheck(cuMemsetD32Async(
@@ -145,6 +147,9 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
     // Synchronous: `identity` is a stack temporary, so the copy must complete before return.
     cuCheck(cuMemcpyHtoD(
         reinterpret_cast<CUdeviceptr>(mView.lruOrder), identity.data(), sizeof(int32_t) * identity.size()));
+
+    // Last, so that it captures the carved pointers rather than a half-built view.
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mDeviceView), &mView, sizeof(SparseCacheView)));
 }
 
 std::vector<int32_t> SparseCacheState::readFlushCounts() const

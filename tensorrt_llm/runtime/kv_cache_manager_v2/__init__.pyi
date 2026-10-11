@@ -891,7 +891,7 @@ class KVCacheManager:
         batch: Batch,
         buffers: Sequence[BufferId],
         selected: DeviceArray,  # int32[batch, topk]
-        out: DeviceArray,  # int32[batch, max_blocks_per_seq]
+        out: DeviceArray,  # int32[batch, len(buffers), max_blocks_per_seq]
         stream: CudaStream,
     ) -> None:
         """Resolve a batch's selections against each buffer's per-request history cache.
@@ -902,8 +902,16 @@ class KVCacheManager:
         sharing a stream, or across streams with an event. Every shape is static across
         steps, so the call is capturable in a CUDA graph.
 
-        ``buffers`` must share one layer group, so that the batch's single page table for
-        that group addresses them all; each must be ``BufferConfig.is_sparse``.
+        ``buffers`` must be exactly one layer's sparse buffers, in the order
+        :meth:`get_mem_pool_base_address` numbers them. One layer, not one layer group:
+        a layer's selection is computed from the previous layer's output, so a step's
+        selections are not all known at its start. Consecutive layers that share a
+        selection still get a call each, so the first layer's copies start as early as
+        possible; pass the same ``selected`` to each.
+
+        The whole layer, not a subset, because the resolve marks entries resident on
+        behalf of every buffer at once: filling only some would leave the rest stale while
+        the metadata claimed otherwise.
 
         ``selected`` holds block ordinals, ``topk`` uniform across requests and ``-1``
         past a request's valid count. The page table and the per-request count of
@@ -931,11 +939,24 @@ class KVCacheManager:
         in-flight block is the one exception, and is never an eviction candidate.
 
         ``out`` is shaped like the page table rather than compacted, and is written in
-        full: entry ``[b][ord]`` is the ``GPU_LEVEL`` index holding block ``ord`` when
-        ``ord`` was selected for request b, and ``BAD_PAGE_INDEX`` otherwise. A kernel
-        that indexes a page table by block ordinal therefore consumes ``out`` in place of
-        the batch's table, against :meth:`get_mem_pool_base_address` as usual, with its
-        selection array unchanged.
+        full: entry ``[b][i][ord]`` is the ``GPU_LEVEL`` index holding unit ``ord`` of
+        ``buffers[i]`` when ``ord`` was selected for request b, and ``BAD_PAGE_INDEX``
+        otherwise. A kernel that indexes a page table by ordinal therefore consumes a
+        slice of ``out`` in place of the batch's table, against
+        :meth:`get_mem_pool_base_address` as usual, with its selection array unchanged.
+
+        The buffer dimension is a dimension rather than a separate array per buffer
+        because attention kernels commonly want one tensor covering K and V. It cannot be
+        dropped: a layer's buffers share the resolve, but not their cells. The cache packs
+        one buffer's entries densely across every cell of the pages it reserved, rather
+        than leaving each buffer at its nominal cell of a coalesced slot -- a layer would
+        otherwise reach only its own few cells of each page. So one ordinal resolves to a
+        different index per buffer, and each needs its own row.
+
+        Indices are in the expanded index space :class:`PageIndexConverter` produces, so
+        the last dimension is the expanded ordinal bound -- ``max_blocks_per_seq`` times
+        the buffer's ``expansion``, which is ``max_blocks_per_seq`` itself unless
+        ``tokens_per_block_override`` is set.
         """
 
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...

@@ -86,6 +86,70 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq)
     cuCheck(cuMemAlloc(&device, _totalBytes()));
     mDevice = CudaUniqPtr{reinterpret_cast<std::byte*>(device)};
     cuCheck(cuMemcpyHtoD(device, staging, _totalBytes()));
+
+    _allocateFetchScratch();
+}
+
+void Batch::_allocateFetchScratch()
+{
+    mScratch = TypedVec<LifeCycleId, SparseFetchScratch>(mNumLayerGroups, SparseFetchScratch{});
+
+    // Sized up front from configuration, so no step has to allocate. Laid out as one block
+    // because a per-group allocation would be a dozen tiny ones serving the same lifetime.
+    auto const rows = static_cast<size_t>(mMaxBatchSize);
+    size_t total = 0;
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        int const width = mManager->sparseCacheSelectionWidth(lcId);
+        if (mManager->sparseCacheMaxUnits(lcId) <= 0 || width <= 0)
+        {
+            continue;
+        }
+        auto& scratch = mScratch[lcId];
+        scratch.selectionWidth = width;
+        scratch.maxInFlightUnits = mManager->sparseCacheMaxInFlightUnits(lcId);
+        total += rows * (3 * static_cast<size_t>(width) + 1 + static_cast<size_t>(scratch.maxInFlightUnits));
+    }
+    if (total == 0)
+    {
+        return;
+    }
+
+    CUdeviceptr base = 0;
+    cuCheck(cuMemAlloc(&base, sizeof(int32_t) * total));
+    mFetchScratch = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
+
+    auto* cursor = reinterpret_cast<int32_t*>(base);
+    auto carve = [&cursor](size_t count)
+    {
+        auto* ptr = cursor;
+        cursor += count;
+        return ptr;
+    };
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        auto& scratch = mScratch[lcId];
+        if (scratch.selectionWidth == 0)
+        {
+            continue;
+        }
+        auto const width = static_cast<size_t>(scratch.selectionWidth);
+        scratch.outSlot = carve(rows * width);
+        scratch.missOrdinal = carve(rows * width);
+        scratch.missSlot = carve(rows * width);
+        scratch.missCount = carve(rows);
+        scratch.inFlightSlot = carve(rows * static_cast<size_t>(scratch.maxInFlightUnits));
+    }
+}
+
+SparseFetchScratch const& Batch::sparseFetchScratch(LayerGroupId layerGroupId) const
+{
+    LifeCycleId const lcId{layerGroupId.value()};
+    if (lcId >= mScratch.size())
+    {
+        throw std::out_of_range("Batch::sparseFetchScratch: no such layer group");
+    }
+    return mScratch[lcId];
 }
 
 Batch::~Batch()

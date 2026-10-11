@@ -350,6 +350,7 @@ static kv::KvCache::PriorityCb castPriorityCallback(kv::KvCacheManager const& ma
 //! stops the underlying allocation vanishing beneath it.
 using DeviceArray1D = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 using DeviceArray2D = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
+using DeviceArray3D = nb::ndarray<int32_t, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
 
 static int currentCudaDevice()
 {
@@ -2657,6 +2658,39 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "fetch_sparse_pages",
+            [](kv::KvCacheManager& self, kv::Batch& batch, std::vector<kv::BufferId> const& buffers,
+                DeviceArray2D const& selected, DeviceArray3D const& out, nb::object stream)
+            {
+                if (selected.shape(0) != out.shape(0))
+                {
+                    throw std::invalid_argument("fetch_sparse_pages: selected and out must agree on the batch size");
+                }
+                if (out.shape(1) != buffers.size())
+                {
+                    throw std::invalid_argument("fetch_sparse_pages: out's middle extent must be len(buffers)");
+                }
+                auto const handle
+                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                auto* selectedPtr = selected.data();
+                auto* outPtr = out.data();
+                auto const width = static_cast<int>(selected.shape(1));
+                auto const stride = static_cast<int>(out.shape(2));
+                nb::gil_scoped_release rel;
+                self.fetchSparsePages(batch, buffers, selectedPtr, width, outPtr, stride, handle);
+            },
+            nb::arg("batch"), nb::arg("buffers"), nb::arg("selected"), nb::arg("out"), nb::arg("stream") = nb::none(),
+            "Resolve a batch's selections against each buffer's per-request history cache.\n\n"
+            "buffers must be exactly one layer's sparse buffers, in the cache's order. One layer, "
+            "not one layer group, because a layer's selection is computed from the previous "
+            "layer's output. The whole layer, not a subset, because the resolve marks entries "
+            "resident on behalf of every buffer at once.\n\n"
+            "selected is int32[batch, topk] unit ordinals, negative where padded, and must name "
+            "only units below the history watermark. out is int32[batch, len(buffers), expanded "
+            "ordinals], written in full in the expanded index space.\n\n"
+            "Device-driven and stream-ordered: enqueues and returns, and every shape is static, "
+            "so a CUDA graph can capture it.")
         .def(
             "resize",
             [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)
