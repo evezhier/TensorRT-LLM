@@ -528,6 +528,33 @@ first, then the selection. An in-flight unit differs in exactly one way — a mi
 its cell but never joins the copy list, because its host page holds nothing to fetch until
 the watermark passes it.
 
+### Prefill is not served by this cache
+
+The fetch is a decode-phase call: one selection per request, because the resolve makes
+units resident in that request's cache and residency is a property of the request.
+
+Sparse attention kernels index their selection by **query token** — trtllm-gen's
+`ptrSparseMlaTopKLens` is `[numTokensQ]`, "where each tokenQ has a corresponding topK
+length" — and in a decode step a request contributes exactly one token, so the two agree.
+During prefill they do not: a chunk of N query tokens each choose their own units, whose
+union can reach N times the selection width. The reservation could then no longer cover a
+call, and a unit evicted to make room for a later query token would invalidate an index
+already returned for an earlier one. Taking one row per token instead of per request would
+make that reachable, not fix it.
+
+This is a difference in kind from the implementations in this repository, not a gap in
+degree. Their sparse prefill is real — the context path reuses the generation kernel with
+per-token indices — but their indices point straight at a GPU-resident KV pool, and the
+in-chunk tokens are reached by writing K/V to the cache before attention and forcing a
+local window in as ordinary indices. There is nothing to stage, so no per-request cache is
+needed. Here history is on host, which is exactly what makes prefill hard.
+
+Serving it would mean one of: leaving prefill dense over host memory; making the union of
+a chunk's selections resident in one pass and resolving each token against that, which
+bounds the problem only if the chunk is short or the selections overlap heavily; or
+treating the prefill chunk's own tokens as the always-attended region and sparsifying only
+the older history. Choosing between these is open work and not attempted here.
+
 ### Capacity and eviction
 
 Capacity is guaranteed by reservation, not back-pressure: a fetch can always satisfy its

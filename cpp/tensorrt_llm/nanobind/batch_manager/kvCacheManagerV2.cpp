@@ -2667,6 +2667,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     throw std::invalid_argument("fetch_sparse_pages: selected and out must agree on the batch size");
                 }
+                if (static_cast<int>(selected.shape(0)) != batch.maxBatchSize())
+                {
+                    throw std::invalid_argument(
+                        "fetch_sparse_pages: selected must carry one row per batch row, not one per query token; "
+                        "this is a decode-phase call and a request contributes a single selection to it");
+                }
                 if (out.shape(1) != buffers.size())
                 {
                     throw std::invalid_argument("fetch_sparse_pages: out's middle extent must be len(buffers)");

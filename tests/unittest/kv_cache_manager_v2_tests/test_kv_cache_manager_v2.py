@@ -1209,6 +1209,20 @@ class TestSparseFetch(unittest.TestCase):
                     batch, [BufferId(0, "key")], selected, self._out(torch, 2, 1), handle
                 )
 
+    def test_selected_must_carry_one_row_per_batch_row(self):
+        """Per query token is what a kernel's selection looks like; this call is not that.
+
+        A decode step gives a request one query token, so the two agree there. A prefill
+        chunk would give it many, and the resolve has no way to hold the union resident.
+        """
+        roles = ("key",)
+        with self._fixture(roles, rows=2) as (torch, manager, batch, _cache, handle):
+            # Four query tokens for a two-row batch: what a prefill caller would pass.
+            selected = torch.full((4, self.SELECTED), -1, dtype=torch.int32, device="cuda")
+            out = self._out(torch, 4, len(roles))
+            with self.assertRaises(ValueError):
+                manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+
     def test_out_must_carry_one_row_per_buffer(self):
         roles = ("key", "value")
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):

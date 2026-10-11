@@ -964,6 +964,22 @@ class KVCacheManager:
         The selection is per layer, not per KV head: every head of a layer shares one
         resident set. Algorithms that let different KV heads select different units are
         therefore not expressible against this cache.
+
+        **Decode only.** ``selected`` carries one row per batch row, so a request
+        contributes a single selection per call. Sparse attention kernels index their
+        selection by *query token*, which coincides with the request only while a request
+        contributes one token -- that is, during generation.
+
+        The restriction is not just the row count. The resolve makes the selected units
+        resident in the request's cache, which holds ``max_cached_units``; residency is a
+        property of the request, not of a query token. A prefill chunk of N query tokens
+        each choosing their own units has a union of up to N times the selection width, so
+        the reservation could no longer cover a call, and a unit evicted for a later query
+        token would invalidate an index already returned for an earlier one. Widening this
+        to one row per token would make that reachable rather than fix it.
+
+        Serving prefill from a host-resident history is an open design question; see
+        SPARSE_ATTENTION_DESIGN.md.
         """
 
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
