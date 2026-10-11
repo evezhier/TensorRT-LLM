@@ -126,6 +126,15 @@ CudaUniqPtr deviceCopy(std::vector<int32_t> const& values)
     return owned;
 }
 
+CudaUniqPtr deviceCopyU32(std::vector<uint32_t> const& values)
+{
+    CUdeviceptr ptr = 0;
+    cuCheck(cuMemAlloc(&ptr, sizeof(uint32_t) * values.size()));
+    CudaUniqPtr owned{reinterpret_cast<std::byte*>(ptr)};
+    cuCheck(cuMemcpyHtoD(ptr, values.data(), sizeof(uint32_t) * values.size()));
+    return owned;
+}
+
 std::vector<int32_t> readBack(CudaUniqPtr const& buffer, size_t count)
 {
     std::vector<int32_t> out(count);
@@ -181,6 +190,60 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     result.missCount = readBack(missCount, static_cast<size_t>(numLayers));
     result.status = readBack(status, 1).front();
     return result;
+}
+
+std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
+    std::vector<int32_t> const& pageTable, size_t devicePoolBytes, uint64_t devicePageStride,
+    std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& srcBufferOffset,
+    std::vector<uint32_t> const& dstBufferOffset, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
+    uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
+    std::vector<int32_t> const& missCount, int selectionWidth, int numLayers)
+{
+    CUdeviceptr hostPtr = 0;
+    cuCheck(cuMemAlloc(&hostPtr, hostPool.size()));
+    CudaUniqPtr source{reinterpret_cast<std::byte*>(hostPtr)};
+    cuCheck(cuMemcpyHtoD(hostPtr, hostPool.data(), hostPool.size()));
+
+    CUdeviceptr devicePtr = 0;
+    cuCheck(cuMemAlloc(&devicePtr, devicePoolBytes));
+    CudaUniqPtr destination{reinterpret_cast<std::byte*>(devicePtr)};
+    cuCheck(cuMemsetD8(devicePtr, 0, devicePoolBytes));
+
+    auto table = deviceCopy(pageTable);
+    auto pages = deviceCopy(cachePages);
+    auto missOrd = deviceCopy(missOrdinal);
+    auto missSlotBuf = deviceCopy(missSlot);
+    auto missCountBuf = deviceCopy(missCount);
+    auto srcOffsets = deviceCopyU32(srcBufferOffset);
+    auto dstOffsets = deviceCopyU32(dstBufferOffset);
+
+    SparseUnitCopyArgs args;
+    args.hostBase = hostPtr;
+    args.hostPageStride = hostPageStride;
+    args.pageTable = reinterpret_cast<int32_t const*>(table.get());
+    args.numBlocks = static_cast<int32_t>(pageTable.size());
+    args.deviceBase = devicePtr;
+    args.devicePageStride = devicePageStride;
+    args.cachePages = reinterpret_cast<int32_t const*>(pages.get());
+    args.srcBufferOffset = reinterpret_cast<uint32_t const*>(srcOffsets.get());
+    args.dstBufferOffset = reinterpret_cast<uint32_t const*>(dstOffsets.get());
+    args.layout.numChunks = numChunks;
+    args.layout.chunkBytes = chunkBytes;
+    args.layout.chunkStride = chunkStride;
+    args.layout.unitStride = unitStride;
+    args.expansion = expansion;
+    args.missOrdinal = reinterpret_cast<int32_t const*>(missOrd.get());
+    args.missSlot = reinterpret_cast<int32_t const*>(missSlotBuf.get());
+    args.missCount = reinterpret_cast<int32_t const*>(missCountBuf.get());
+    args.selectionWidth = selectionWidth;
+    args.numLayers = numLayers;
+
+    launchSparseUnitCopy(args, nullptr);
+    cuCheck(cuStreamSynchronize(nullptr));
+
+    std::vector<uint8_t> out(devicePoolBytes);
+    cuCheck(cuMemcpyDtoH(out.data(), devicePtr, devicePoolBytes));
+    return out;
 }
 
 bool KvCacheIntrospection::allTreePagesDroppable(KvCacheManager& manager)

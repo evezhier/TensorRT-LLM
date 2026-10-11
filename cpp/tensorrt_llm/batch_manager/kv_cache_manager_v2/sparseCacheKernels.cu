@@ -323,7 +323,94 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     }
 }
 
+//! Copy `bytes` from `src` to `dst`, 16 bytes at a time when every operand allows it.
+//! Cold reads cross PCIe, so the wide path is what makes the copy worth doing on the SM.
+__device__ inline void copyChunk(char* dst, char const* src, uint32_t bytes)
+{
+    bool const wide = (reinterpret_cast<uintptr_t>(dst) % 16U == 0U) && (reinterpret_cast<uintptr_t>(src) % 16U == 0U)
+        && (bytes % 16U == 0U);
+    if (wide)
+    {
+        auto* dst16 = reinterpret_cast<uint4*>(dst);
+        auto const* src16 = reinterpret_cast<uint4 const*>(src);
+        uint32_t const count = bytes / 16U;
+        for (uint32_t i = threadIdx.x; i < count; i += kThreads)
+        {
+            dst16[i] = src16[i];
+        }
+    }
+    else
+    {
+        for (uint32_t i = threadIdx.x; i < bytes; i += kThreads)
+        {
+            dst[i] = src[i];
+        }
+    }
+}
+
+//! One CTA per (layer, miss).
+__global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyArgs args)
+{
+    int32_t const layer = static_cast<int32_t>(blockIdx.y);
+    int32_t const j = static_cast<int32_t>(blockIdx.x);
+    if (j >= args.missCount[layer])
+    {
+        return;
+    }
+
+    auto const index = static_cast<ptrdiff_t>(layer) * args.selectionWidth + j;
+    int32_t const ordinal = args.missOrdinal[index];
+    int32_t const slot = args.missSlot[index];
+
+    // A unit ordinal names a unit within a block; a cache entry names a unit within a
+    // reserved page. Both divide by the same expansion.
+    int32_t const block = ordinal / args.expansion;
+    int32_t const srcUnit = ordinal % args.expansion;
+    int32_t const cachePage = slot / args.expansion;
+    int32_t const dstUnit = slot % args.expansion;
+    if (block >= args.numBlocks)
+    {
+        return;
+    }
+
+    auto const hostPage = static_cast<uint64_t>(args.pageTable[block]);
+    auto const devicePage = static_cast<uint64_t>(args.cachePages[cachePage]);
+
+    auto const* src = reinterpret_cast<char const*>(args.hostBase + hostPage * args.hostPageStride
+        + args.srcBufferOffset[layer] + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
+    auto* dst = reinterpret_cast<char*>(args.deviceBase + devicePage * args.devicePageStride
+        + args.dstBufferOffset[layer] + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
+
+    for (uint32_t c = 0; c < args.layout.numChunks; ++c)
+    {
+        auto const offset = static_cast<uint64_t>(c) * args.layout.chunkStride;
+        copyChunk(dst + offset, src + offset, args.layout.chunkBytes);
+    }
+}
+
 } // namespace
+
+void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
+{
+    if (args.numLayers <= 0 || args.selectionWidth <= 0 || args.expansion <= 0)
+    {
+        throw std::invalid_argument("launchSparseUnitCopy: layers, selection width and expansion must be positive");
+    }
+    if (args.layout.numChunks == 0 || args.layout.chunkBytes == 0)
+    {
+        throw std::invalid_argument("launchSparseUnitCopy: the unit layout must describe a non-empty unit");
+    }
+    if (args.pageTable == nullptr || args.cachePages == nullptr || args.srcBufferOffset == nullptr
+        || args.dstBufferOffset == nullptr || args.missOrdinal == nullptr || args.missSlot == nullptr
+        || args.missCount == nullptr)
+    {
+        throw std::invalid_argument("launchSparseUnitCopy: every device array must be provided");
+    }
+
+    dim3 const grid(static_cast<unsigned>(args.selectionWidth), static_cast<unsigned>(args.numLayers));
+    sparseUnitCopyKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
 
 size_t sparseResolveSharedBytes(int32_t entriesPerLayer, int32_t selectionWidth)
 {

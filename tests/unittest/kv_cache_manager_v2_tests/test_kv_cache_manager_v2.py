@@ -691,6 +691,166 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.resident_ordinal[2 + result.out_slot[2]], 42)
 
 
+class TestSparseUnitCopy(unittest.TestCase):
+    """The copy that fills a cache entry from its cold page."""
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @staticmethod
+    def _pattern(size: int) -> list[int]:
+        return [(i * 7 + 13) % 251 for i in range(size)]
+
+    def test_a_contiguous_unit_lands_at_its_entry(self):
+        # One layer, token-major: a unit is one contiguous run of bytes.
+        unit, units_per_page, pages = 32, 2, 3
+        page_stride = unit * units_per_page
+        host = self._pattern(page_stride * pages)
+        # Block 2 lives in host page 0, and its unit 1 is selected.
+        page_table = [9, 9, 0]
+        ordinal = 2 * units_per_page + 1
+        result = _introspection.sparse_unit_copy(
+            host_pool=host,
+            host_page_stride=page_stride,
+            page_table=page_table,
+            device_pool_bytes=page_stride * 2,
+            device_page_stride=page_stride,
+            cache_pages=[1, 0],
+            src_buffer_offset=[0],
+            dst_buffer_offset=[0],
+            num_chunks=1,
+            chunk_bytes=unit,
+            chunk_stride=0,
+            unit_stride=unit,
+            expansion=units_per_page,
+            miss_ordinal=[ordinal],
+            miss_slot=[0],
+            miss_count=[1],
+            selection_width=1,
+            num_layers=1,
+        )
+        # Entry 0 is page 0 of the cache, which is device page 1, unit 0.
+        expected = host[unit : unit * 2]
+        self.assertEqual(result[page_stride : page_stride + unit], expected)
+        # Nothing else was written.
+        self.assertEqual(result[:page_stride], [0] * page_stride)
+
+    def test_chunked_layout_follows_the_strides(self):
+        # Two heads: a unit is two runs, chunk_stride apart on both sides.
+        chunk, chunks, units = 16, 2, 2
+        chunk_stride = chunk * units
+        page_stride = chunk_stride * chunks
+        host = self._pattern(page_stride)
+        result = _introspection.sparse_unit_copy(
+            host_pool=host,
+            host_page_stride=page_stride,
+            page_table=[0],
+            device_pool_bytes=page_stride,
+            device_page_stride=page_stride,
+            cache_pages=[0],
+            src_buffer_offset=[0],
+            dst_buffer_offset=[0],
+            num_chunks=chunks,
+            chunk_bytes=chunk,
+            chunk_stride=chunk_stride,
+            unit_stride=chunk,
+            expansion=units,
+            miss_ordinal=[1],
+            miss_slot=[1],
+            miss_count=[1],
+            selection_width=1,
+            num_layers=1,
+        )
+        # Unit 1 of each chunk moves to unit 1 of the same chunk, verbatim.
+        for c in range(chunks):
+            base = c * chunk_stride + chunk
+            self.assertEqual(result[base : base + chunk], host[base : base + chunk])
+        # Unit 0 of each chunk was not selected.
+        for c in range(chunks):
+            base = c * chunk_stride
+            self.assertEqual(result[base : base + chunk], [0] * chunk)
+
+    def test_layers_use_their_own_buffer_offsets(self):
+        # A page concatenates two layers' buffers; cold and hot order differ.
+        unit, layers = 16, 2
+        page_stride = unit * layers
+        host = self._pattern(page_stride)
+        result = _introspection.sparse_unit_copy(
+            host_pool=host,
+            host_page_stride=page_stride,
+            page_table=[0],
+            device_pool_bytes=page_stride,
+            device_page_stride=page_stride,
+            cache_pages=[0],
+            src_buffer_offset=[0, unit],
+            dst_buffer_offset=[unit, 0],
+            num_chunks=1,
+            chunk_bytes=unit,
+            chunk_stride=0,
+            unit_stride=unit,
+            expansion=1,
+            miss_ordinal=[0, 0],
+            miss_slot=[0, 0],
+            miss_count=[1, 1],
+            selection_width=1,
+            num_layers=layers,
+        )
+        # Layer 0 reads at 0 and writes at `unit`; layer 1 does the reverse.
+        self.assertEqual(result[unit:], host[:unit])
+        self.assertEqual(result[:unit], host[unit:])
+
+    def test_a_layer_without_misses_copies_nothing(self):
+        unit = 16
+        host = self._pattern(unit)
+        result = _introspection.sparse_unit_copy(
+            host_pool=host,
+            host_page_stride=unit,
+            page_table=[0],
+            device_pool_bytes=unit,
+            device_page_stride=unit,
+            cache_pages=[0],
+            src_buffer_offset=[0],
+            dst_buffer_offset=[0],
+            num_chunks=1,
+            chunk_bytes=unit,
+            chunk_stride=0,
+            unit_stride=unit,
+            expansion=1,
+            miss_ordinal=[0],
+            miss_slot=[0],
+            miss_count=[0],
+            selection_width=1,
+            num_layers=1,
+        )
+        self.assertEqual(result, [0] * unit)
+
+    def test_an_unaligned_unit_still_copies(self):
+        # 20 bytes is not a multiple of 16, so the wide path must not be taken.
+        unit = 20
+        host = self._pattern(unit * 2)
+        result = _introspection.sparse_unit_copy(
+            host_pool=host,
+            host_page_stride=unit * 2,
+            page_table=[0],
+            device_pool_bytes=unit * 2,
+            device_page_stride=unit * 2,
+            cache_pages=[0],
+            src_buffer_offset=[0],
+            dst_buffer_offset=[0],
+            num_chunks=1,
+            chunk_bytes=unit,
+            chunk_stride=0,
+            unit_stride=unit,
+            expansion=2,
+            miss_ordinal=[1],
+            miss_slot=[1],
+            miss_count=[1],
+            selection_width=1,
+            num_layers=1,
+        )
+        self.assertEqual(result[unit:], host[unit:])
+
+
 class TestKVCacheManagerV2(unittest.TestCase):
     engine: FakeEngine
     cfg: KVCacheManagerConfig

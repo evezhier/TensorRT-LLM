@@ -65,6 +65,16 @@ public:
         std::vector<int32_t> const& lruOrder, int numLayers, int entriesPerLayer, std::vector<int32_t> const& selected,
         int selectionWidth, int historyUnits);
 
+    // White-box hook: run the sparse unit copy over caller-supplied pools, so the address
+    // arithmetic can be checked against a known byte pattern. Returns the destination pool
+    // after the copy. Synchronises.
+    static std::vector<uint8_t> sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
+        std::vector<int32_t> const& pageTable, size_t devicePoolBytes, uint64_t devicePageStride,
+        std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& srcBufferOffset,
+        std::vector<uint32_t> const& dstBufferOffset, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
+        uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal,
+        std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth, int numLayers);
+
     // White-box hook: minimum per-pool-group slot counts to support a BatchDesc.
     // Reaches StorageManager::computePoolGroupSlotsForBatch() (private) via friendship.
     static TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(KvCacheManager& manager, BatchDesc const& batch,

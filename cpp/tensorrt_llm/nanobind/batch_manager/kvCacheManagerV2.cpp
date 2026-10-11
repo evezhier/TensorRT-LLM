@@ -2161,6 +2161,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("resident_ordinal"), nb::arg("lru_order"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"));
+    mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),
+        nb::arg("host_page_stride"), nb::arg("page_table"), nb::arg("device_pool_bytes"), nb::arg("device_page_stride"),
+        nb::arg("cache_pages"), nb::arg("src_buffer_offset"), nb::arg("dst_buffer_offset"), nb::arg("num_chunks"),
+        nb::arg("chunk_bytes"), nb::arg("chunk_stride"), nb::arg("unit_stride"), nb::arg("expansion"),
+        nb::arg("miss_ordinal"), nb::arg("miss_slot"), nb::arg("miss_count"), nb::arg("selection_width"),
+        nb::arg("num_layers"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "is_commit_allowed",
         [](kv::KvCache const& kvCache) { return kvCache.commitState() == kv::KvCache::CommitState::ALLOWED; },

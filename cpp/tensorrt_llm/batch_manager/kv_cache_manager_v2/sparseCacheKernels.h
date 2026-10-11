@@ -82,6 +82,59 @@ struct SparseResolveArgs
 //! Largest entriesPerLayer this kernel can serve on `device`, given its shared memory limit.
 [[nodiscard]] int32_t sparseResolveMaxEntries(int32_t selectionWidth, CUdevice device);
 
+//! Byte layout of one selection unit inside a buffer, mirroring config.h's
+//! SelectionUnitLayout. Repeated here so this header stays free of the config types.
+struct SparseUnitLayout
+{
+    uint32_t numChunks = 1;
+    uint32_t chunkBytes = 0;
+    uint32_t chunkStride = 0;
+    uint32_t unitStride = 0;
+};
+
+//! Fill the entries the resolve allocated, copying each missed unit out of its
+//! device-mapped host page.
+//!
+//! The default codec relocates buffer bytes verbatim, so a unit has the same internal
+//! shape on both sides and one layout describes both; only the buffer's offset within a
+//! page and the unit's index differ. See "Fast path: a layout value" in
+//! SPARSE_ATTENTION_DESIGN.md.
+struct SparseUnitCopyArgs
+{
+    //! Pool holding the cold pages. Device-mapped host memory, so the kernel addresses it
+    //! directly and no host round trip is needed.
+    CUdeviceptr hostBase = 0;
+    uint64_t hostPageStride = 0;
+    //! [numBlocks] host page slot per block ordinal, i.e. a row of the page table.
+    int32_t const* pageTable = nullptr;
+    int32_t numBlocks = 0;
+
+    //! GPU pool holding this request's reserved cache pages.
+    CUdeviceptr deviceBase = 0;
+    uint64_t devicePageStride = 0;
+    //! [entriesPerLayer / expansion] GPU page slot per reserved page.
+    int32_t const* cachePages = nullptr;
+
+    //! [numLayers] offset of this layer's buffer within a cold page and within a cache
+    //! page. They differ: a cold page is a concatenation in codec order.
+    uint32_t const* srcBufferOffset = nullptr;
+    uint32_t const* dstBufferOffset = nullptr;
+
+    SparseUnitLayout layout;
+    //! Selection units per buffer, i.e. tokens_per_block / tokens_per_block_override.
+    int32_t expansion = 1;
+
+    //! The resolve's miss list.
+    int32_t const* missOrdinal = nullptr;
+    int32_t const* missSlot = nullptr;
+    int32_t const* missCount = nullptr;
+    int32_t selectionWidth = 0;
+    int32_t numLayers = 0;
+};
+
+//! Launch the copies. One CTA per potential miss; CTAs past a layer's miss count exit.
+void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream);
+
 //! Launch the resolve. One CTA per layer; enqueues and returns.
 //!
 //! Throws std::invalid_argument when the shape is inconsistent or needs more shared memory

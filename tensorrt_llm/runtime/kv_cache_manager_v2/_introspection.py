@@ -225,6 +225,54 @@ class SparseResolveResult(NamedTuple):
     status: int
 
 
+def sparse_unit_copy(
+    host_pool: bytes | list[int],
+    host_page_stride: int,
+    page_table: list[int],
+    device_pool_bytes: int,
+    device_page_stride: int,
+    cache_pages: list[int],
+    src_buffer_offset: list[int],
+    dst_buffer_offset: list[int],
+    num_chunks: int,
+    chunk_bytes: int,
+    chunk_stride: int,
+    unit_stride: int,
+    expansion: int,
+    miss_ordinal: list[int],
+    miss_slot: list[int],
+    miss_count: list[int],
+    selection_width: int,
+    num_layers: int,
+) -> list[int]:
+    """Fill cache entries from a caller-supplied source pool, returning the destination.
+
+    Exercises the copy's address arithmetic against a known byte pattern. Synchronises.
+    """
+    return list(
+        _cpp().sparse_unit_copy(
+            list(host_pool),
+            host_page_stride,
+            page_table,
+            device_pool_bytes,
+            device_page_stride,
+            cache_pages,
+            src_buffer_offset,
+            dst_buffer_offset,
+            num_chunks,
+            chunk_bytes,
+            chunk_stride,
+            unit_stride,
+            expansion,
+            miss_ordinal,
+            miss_slot,
+            miss_count,
+            selection_width,
+            num_layers,
+        )
+    )
+
+
 def sparse_resolve(
     resident_ordinal: list[int],
     lru_order: list[int],
