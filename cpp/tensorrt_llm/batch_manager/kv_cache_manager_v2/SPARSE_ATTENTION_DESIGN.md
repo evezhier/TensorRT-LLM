@@ -478,9 +478,9 @@ own layer, because the reservation covers a full selection width. Within a step 
 evict entries of layers already processed but never one a later kernel still needs, which
 LRU recency delivers — layer N's entries are most-recently-used when layer N+1 fetches.
 
-An entry is evictable only when **clean**. That predicate is what protects the block being
-written, so it is a correctness bit rather than a policy hint — but it is also the only one,
-and it is set once per block at commit.
+An entry is evictable only when its unit ordinal is **below the watermark**. That is what
+protects the block being written, and it is a correctness predicate rather than a policy
+hint — but it is derived, not stored: see *Unflushed entries carry no state*.
 
 ### Preconditions the caller owns
 

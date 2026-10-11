@@ -22,6 +22,8 @@
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/page.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
+#include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/storageManager.h"
 
 #include <utility>
@@ -109,6 +111,76 @@ std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache c
         return {};
     }
     return kvCache.mSparseCacheState[id].readResidentOrdinals();
+}
+
+namespace
+{
+
+//! Device buffer holding a copy of `values`, for the resolve probe below.
+CudaUniqPtr deviceCopy(std::vector<int32_t> const& values)
+{
+    CUdeviceptr ptr = 0;
+    cuCheck(cuMemAlloc(&ptr, sizeof(int32_t) * values.size()));
+    CudaUniqPtr owned{reinterpret_cast<std::byte*>(ptr)};
+    cuCheck(cuMemcpyHtoD(ptr, values.data(), sizeof(int32_t) * values.size()));
+    return owned;
+}
+
+std::vector<int32_t> readBack(CudaUniqPtr const& buffer, size_t count)
+{
+    std::vector<int32_t> out(count);
+    cuCheck(cuMemcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(buffer.get()), sizeof(int32_t) * count));
+    return out;
+}
+
+} // namespace
+
+KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
+    std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
+    int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth, int historyUnits)
+{
+    auto const entryCount = static_cast<size_t>(numLayers) * entriesPerLayer;
+    auto const selectionCount = static_cast<size_t>(numLayers) * selectionWidth;
+    if (residentOrdinal.size() != entryCount || lruOrder.size() != entryCount || selected.size() != selectionCount)
+    {
+        throw std::invalid_argument("sparseResolve: input sizes must match the declared shape");
+    }
+
+    auto resident = deviceCopy(residentOrdinal);
+    auto recency = deviceCopy(lruOrder);
+    auto selection = deviceCopy(selected);
+    auto outSlot = deviceCopy(std::vector<int32_t>(selectionCount, 0));
+    auto missOrdinal = deviceCopy(std::vector<int32_t>(selectionCount, 0));
+    auto missSlot = deviceCopy(std::vector<int32_t>(selectionCount, 0));
+    auto missCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
+    auto status = deviceCopy(std::vector<int32_t>(1, 0));
+
+    SparseResolveArgs args;
+    args.cache.residentOrdinal = reinterpret_cast<int32_t*>(resident.get());
+    args.cache.lruOrder = reinterpret_cast<int32_t*>(recency.get());
+    args.cache.numLayers = numLayers;
+    args.cache.entriesPerLayer = entriesPerLayer;
+    args.selected = reinterpret_cast<int32_t const*>(selection.get());
+    args.selectionWidth = selectionWidth;
+    args.historyUnits = historyUnits;
+    args.outSlot = reinterpret_cast<int32_t*>(outSlot.get());
+    args.missOrdinal = reinterpret_cast<int32_t*>(missOrdinal.get());
+    args.missSlot = reinterpret_cast<int32_t*>(missSlot.get());
+    args.missCount = reinterpret_cast<int32_t*>(missCount.get());
+    args.status = reinterpret_cast<int32_t*>(status.get());
+
+    launchSparseResolve(args, nullptr);
+    cuCheck(cuStreamSynchronize(nullptr));
+
+    SparseResolveProbe result;
+    result.residentOrdinal = readBack(resident, entryCount);
+    result.lruOrder = readBack(recency, entryCount);
+    result.outSlot = readBack(outSlot, selectionCount);
+    result.missOrdinal = readBack(missOrdinal, selectionCount);
+    result.missSlot = readBack(missSlot, selectionCount);
+    result.missCount = readBack(missCount, static_cast<size_t>(numLayers));
+    result.status = readBack(status, 1).front();
+    return result;
 }
 
 bool KvCacheIntrospection::allTreePagesDroppable(KvCacheManager& manager)

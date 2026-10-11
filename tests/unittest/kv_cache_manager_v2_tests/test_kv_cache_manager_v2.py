@@ -595,6 +595,102 @@ class TestSparseCacheReservation(unittest.TestCase):
             manager.shutdown()
 
 
+class TestSparseResolve(unittest.TestCase):
+    """The sparse resolve kernel: probe index, victim choice and recency rebuild."""
+
+    # SparseResolveStatus
+    OK = 0
+    OUT_OF_ENTRIES = 1
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @staticmethod
+    def _free(count: int) -> list[int]:
+        return [BAD_PAGE_INDEX] * count
+
+    def _resolve(
+        self,
+        resident: list[int],
+        selected: list[int],
+        *,
+        num_layers: int = 1,
+        lru: list[int] | None = None,
+        history_units: int = 1 << 20,
+    ):
+        entries = len(resident) // num_layers
+        width = len(selected) // num_layers
+        if lru is None:
+            lru = list(range(entries)) * num_layers
+        return _introspection.sparse_resolve(
+            resident, lru, num_layers, entries, selected, width, history_units
+        )
+
+    def test_an_empty_cache_misses_everything(self):
+        result = self._resolve(self._free(8), [5, 3, 7])
+        self.assertEqual(result.status, self.OK)
+        self.assertEqual(result.miss_count, [3])
+        # Every selection got a distinct entry, and the entries now hold those units.
+        self.assertEqual(len(set(result.out_slot)), 3)
+        for ordinal, slot in zip([5, 3, 7], result.out_slot):
+            self.assertEqual(result.resident_ordinal[slot], ordinal)
+
+    def test_resident_units_hit(self):
+        resident = [10, 11, 12] + self._free(5)
+        result = self._resolve(resident, [11, 10])
+        self.assertEqual(result.miss_count, [0])
+        self.assertEqual(result.out_slot, [1, 0])
+        # A hit leaves the resident set untouched.
+        self.assertEqual(result.resident_ordinal, resident)
+
+    def test_padding_resolves_to_no_slot(self):
+        result = self._resolve(self._free(8), [4, -1, -1])
+        self.assertEqual(result.miss_count, [1])
+        self.assertEqual(result.out_slot[1:], [-1, -1])
+
+    def test_hits_outrank_units_fetched_this_step(self):
+        # Entry 0 holds unit 10 and is selected; unit 99 is new.
+        resident = [10] + self._free(7)
+        result = self._resolve(resident, [10, 99])
+        fetched = result.out_slot[1]
+        self.assertEqual(result.lru_order[0], 0, "the hit should be most recently used")
+        self.assertEqual(result.lru_order[1], fetched, "the fetch ranks below the hit")
+
+    def test_victims_come_from_the_lru_tail(self):
+        # A full cache, with entry 2 placed last in recency so it is the victim.
+        resident = [10, 11, 12, 13]
+        lru = [0, 1, 3, 2]
+        result = self._resolve(resident, [99], lru=lru)
+        self.assertEqual(result.miss_count, [1])
+        self.assertEqual(result.out_slot, [2])
+        self.assertEqual(result.resident_ordinal[2], 99)
+        # The units that were not selected keep their data.
+        self.assertEqual([result.resident_ordinal[i] for i in (0, 1, 3)], [10, 11, 13])
+
+    def test_in_flight_entries_are_never_evicted(self):
+        # Unit 12 is at or above the watermark, so it holds the only copy of its data.
+        resident = [10, 11, 12, 13]
+        lru = [0, 1, 3, 2]  # entry 2 (unit 12) is least recently used
+        result = self._resolve(resident, [99], lru=lru, history_units=12)
+        self.assertEqual(result.status, self.OK)
+        self.assertEqual(result.resident_ordinal[2], 12, "an in-flight unit must survive")
+        self.assertEqual(result.resident_ordinal[result.out_slot[0]], 99)
+
+    def test_reports_out_of_entries_rather_than_evicting_in_flight_data(self):
+        # Every entry is in flight, so nothing can be given away.
+        result = self._resolve([10, 11, 12, 13], [99], history_units=10)
+        self.assertEqual(result.status, self.OUT_OF_ENTRIES)
+
+    def test_layers_resolve_independently(self):
+        # Layer 0 hits, layer 1 misses.
+        resident = [7, BAD_PAGE_INDEX] + self._free(2)
+        selected = [7, -1, 42, -1]
+        result = self._resolve(resident, selected, num_layers=2)
+        self.assertEqual(result.miss_count, [0, 1])
+        self.assertEqual(result.out_slot[0], 0)
+        self.assertEqual(result.resident_ordinal[2 + result.out_slot[2]], 42)
+
+
 class TestKVCacheManagerV2(unittest.TestCase):
     engine: FakeEngine
     cfg: KVCacheManagerConfig

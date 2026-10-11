@@ -47,6 +47,24 @@ public:
     // life cycle has no cache reserved.
     static std::vector<int32_t> sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId);
 
+    // White-box hook: run the sparse resolve kernel over caller-supplied state, so the
+    // probe index, victim choice and recency rebuild can be exercised without a request.
+    // Synchronises. Inputs are [layer][entry] and [layer][selectionWidth] row-major.
+    struct SparseResolveProbe
+    {
+        std::vector<int32_t> residentOrdinal; //!< [layer][entry] after the resolve
+        std::vector<int32_t> lruOrder;        //!< [layer][entry] after the resolve
+        std::vector<int32_t> outSlot;         //!< [layer][width] entry per selection
+        std::vector<int32_t> missOrdinal;     //!< [layer][width], first missCount valid
+        std::vector<int32_t> missSlot;        //!< [layer][width], first missCount valid
+        std::vector<int32_t> missCount;       //!< [layer]
+        int32_t status = 0;                   //!< SparseResolveStatus
+    };
+
+    static SparseResolveProbe sparseResolve(std::vector<int32_t> const& residentOrdinal,
+        std::vector<int32_t> const& lruOrder, int numLayers, int entriesPerLayer, std::vector<int32_t> const& selected,
+        int selectionWidth, int historyUnits);
+
     // White-box hook: minimum per-pool-group slot counts to support a BatchDesc.
     // Reaches StorageManager::computePoolGroupSlotsForBatch() (private) via friendship.
     static TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(KvCacheManager& manager, BatchDesc const& batch,

@@ -26,7 +26,7 @@ treat this as internal API rather than test-only scaffolding.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 
 
 def _cpp_introspection_module() -> Any | None:
@@ -211,6 +211,53 @@ def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     BAD_PAGE_INDEX marks a free entry. Empty when the life cycle reserves no cache.
     """
     return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
+
+
+class SparseResolveResult(NamedTuple):
+    """State and outputs of one sparse resolve launch."""
+
+    resident_ordinal: list[int]
+    lru_order: list[int]
+    out_slot: list[int]
+    miss_ordinal: list[int]
+    miss_slot: list[int]
+    miss_count: list[int]
+    status: int
+
+
+def sparse_resolve(
+    resident_ordinal: list[int],
+    lru_order: list[int],
+    num_layers: int,
+    entries_per_layer: int,
+    selected: list[int],
+    selection_width: int,
+    history_units: int,
+) -> SparseResolveResult:
+    """Run the sparse resolve kernel over caller-supplied cache state.
+
+    Inputs are row-major [layer][entry] and [layer][selection_width]; a negative
+    selection entry is padding. Units at or above ``history_units`` are in flight and
+    are never chosen as eviction victims. Synchronises.
+    """
+    resident, lru, out, miss_ord, miss_slot, miss_count, status = _cpp().sparse_resolve(
+        resident_ordinal,
+        lru_order,
+        num_layers,
+        entries_per_layer,
+        selected,
+        selection_width,
+        history_units,
+    )
+    return SparseResolveResult(
+        list(resident),
+        list(lru),
+        list(out),
+        list(miss_ord),
+        list(miss_slot),
+        list(miss_count),
+        int(status),
+    )
 
 
 def grains_for_slots(num_slots: int, slot_size_list: list[int], granularity: int) -> int:

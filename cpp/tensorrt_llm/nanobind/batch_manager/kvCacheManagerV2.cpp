@@ -2148,6 +2148,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def("sparse_cache_resident_ordinals", &kv::KvCacheIntrospection::sparseCacheResidentOrdinals,
         nb::arg("kv_cache"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
+        "sparse_resolve",
+        [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
+            int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth, int historyUnits)
+        {
+            auto r = kv::KvCacheIntrospection::sparseResolve(
+                residentOrdinal, lruOrder, numLayers, entriesPerLayer, selected, selectionWidth, historyUnits);
+            // No gil_scoped_release call guard: the tuple below is built from the lambda body,
+            // which the guard would have left running without the GIL.
+            return std::make_tuple(std::move(r.residentOrdinal), std::move(r.lruOrder), std::move(r.outSlot),
+                std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missCount), r.status);
+        },
+        nb::arg("resident_ordinal"), nb::arg("lru_order"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
+        nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"));
+    mIntrospection.def(
         "is_commit_allowed",
         [](kv::KvCache const& kvCache) { return kvCache.commitState() == kv::KvCache::CommitState::ALLOWED; },
         nb::arg("kv_cache"), nb::call_guard<nb::gil_scoped_release>());
