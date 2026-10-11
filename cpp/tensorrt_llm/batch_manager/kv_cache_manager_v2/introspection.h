@@ -58,6 +58,10 @@ public:
     // [max_batch][max_blocks_per_seq]. Synchronises.
     static std::vector<int32_t> batchPageTable(Batch const& batch, int layerGroupId);
 
+    // White-box hook: a Batch's published per-row watermarks as (history_length, capacity).
+    // Synchronises.
+    static std::pair<std::vector<int32_t>, std::vector<int32_t>> batchWatermarks(Batch const& batch);
+
     // White-box hook: run the sparse resolve kernel over caller-supplied state, so the
     // probe index, victim choice and recency rebuild can be exercised without a request.
     // Synchronises. Inputs are [layer][entry] and [layer][selectionWidth] row-major.

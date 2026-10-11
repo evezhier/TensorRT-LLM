@@ -2154,6 +2154,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def("batch_page_table", &kv::KvCacheIntrospection::batchPageTable, nb::arg("batch"),
         nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
+        "batch_watermarks",
+        [](kv::Batch const& batch)
+        {
+            auto r = kv::KvCacheIntrospection::batchWatermarks(batch);
+            return std::make_tuple(std::move(r.first), std::move(r.second));
+        },
+        nb::arg("batch"));
+    mIntrospection.def(
         "sparse_resolve",
         [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
             int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth, int historyUnits,
@@ -2457,6 +2465,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return nb::make_tuple(static_cast<intptr_t>(view.data), view.numRows, view.blocksPerRow);
             },
             nb::arg("layer_group_id"), "(address, num_rows, blocks_per_row) of one layer group's device page table.")
+        .def(
+            "watermarks",
+            [](kv::Batch const& self)
+            {
+                auto const view = self.watermarks();
+                return nb::make_tuple(
+                    static_cast<intptr_t>(view.historyLength), static_cast<intptr_t>(view.capacity), view.numRows);
+            },
+            "(history_length_address, capacity_address, num_rows) of the per-row watermarks, in "
+            "tokens. Published by the same transfer as the page tables, because the lengths bound "
+            "which entries of a row are valid: pairing one step's table with another step's "
+            "lengths would read past the end of a reused row.\n\n"
+            "num_blocks is history_length // tokens_per_block; the resolve works in units and "
+            "divides by unit_tokens instead. Publishing the source rather than the derived counts "
+            "keeps one truth.")
         .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
         .def_prop_ro("max_batch_size", &kv::Batch::maxBatchSize)
         .def_prop_ro("max_blocks_per_seq", &kv::Batch::maxBlocksPerSeq);

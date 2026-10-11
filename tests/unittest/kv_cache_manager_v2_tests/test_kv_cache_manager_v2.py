@@ -1291,6 +1291,67 @@ class TestBatch(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_watermarks_publish_with_the_page_table(self):
+        """One transfer carries both, so a kernel can never pair mismatched steps."""
+        manager = self._manager()
+        caches = []
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=3, max_blocks_per_seq=8)
+            lg_id = manager.get_layer_group_id(0)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                for _ in range(2):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    batch.add_kv_cache(cache)
+                    self.assertTrue(cache.resume(handle))
+
+                batch.resize([256, 384, None], [128, 256, None], handle)
+                history, capacity = _introspection.batch_watermarks(batch)
+                self.assertEqual(history, [128, 256, 0])
+                self.assertEqual(capacity, [256, 384, 0], "a free row reads as nothing eligible")
+
+                # num_blocks is derived, not published: history_length // tokens_per_block.
+                table = _introspection.batch_page_table(batch, lg_id)
+                for row, hist in enumerate(history):
+                    num_blocks = hist // 128
+                    valid = table[row * 8 : row * 8 + num_blocks]
+                    self.assertTrue(
+                        all(i != self.BAD for i in valid),
+                        f"row {row} must have {num_blocks} valid entries, got {valid}",
+                    )
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_a_removed_member_leaves_no_watermark_behind(self):
+        manager = self._manager()
+        cache = None
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                cache = manager.create_kv_cache()
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+                batch.resize([256], [128], handle)
+                self.assertEqual(_introspection.batch_watermarks(batch)[0], [128])
+
+                batch.remove_kv_cache(cache)
+                batch.publish(handle)
+                # Otherwise the row would still claim blocks the departed request owned.
+                history, capacity = _introspection.batch_watermarks(batch)
+                self.assertEqual((history, capacity), ([0], [0]))
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
     def test_batch_resize_needs_one_entry_per_row(self):
         manager = self._manager()
         try:

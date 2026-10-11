@@ -240,6 +240,15 @@ def batch_page_table(batch: Any, layer_group_id: int) -> list[int]:
     return list(_cpp().batch_page_table(batch, layer_group_id))
 
 
+def batch_watermarks(batch: Any) -> tuple[list[int], list[int]]:
+    """A Batch's published per-row (history_length, capacity), in tokens.
+
+    Reads the device copy, so it shows what the last publish() put there. Synchronises.
+    """
+    history, capacity = _cpp().batch_watermarks(batch)
+    return list(history), list(capacity)
+
+
 class SparseResolveResult(NamedTuple):
     """State and outputs of one sparse resolve launch."""
 

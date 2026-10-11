@@ -133,6 +133,16 @@ std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, in
     return out;
 }
 
+std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batchWatermarks(Batch const& batch)
+{
+    auto const view = batch.watermarks();
+    std::vector<int32_t> history(static_cast<size_t>(view.numRows));
+    std::vector<int32_t> capacity(static_cast<size_t>(view.numRows));
+    cuCheck(cuMemcpyDtoH(history.data(), view.historyLength, sizeof(int32_t) * history.size()));
+    cuCheck(cuMemcpyDtoH(capacity.data(), view.capacity, sizeof(int32_t) * capacity.size()));
+    return {std::move(history), std::move(capacity)};
+}
+
 std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};

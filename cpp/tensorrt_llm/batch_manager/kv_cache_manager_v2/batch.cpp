@@ -65,12 +65,17 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq)
     mNumLayerGroups = manager.storage().numLifeCycles();
     mRows.assign(static_cast<size_t>(mMaxBatchSize), nullptr);
 
-    auto const elements = _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
+    // Page tables and watermarks share one block, so one transfer publishes a consistent
+    // pair. Splitting them would let a kernel read one step's table beside another step's
+    // lengths, which is an out-of-range read rather than a stale answer.
+    auto const elements = _totalElements();
     mStaging = std::make_unique<HostMem>(sizeof(int32_t) * elements);
     auto* staging = reinterpret_cast<int32_t*>(mStaging->address());
     // A row that no member occupies must still read as "no such block" rather than as slot
     // zero, since the fetch has no other way to tell them apart.
-    std::fill(staging, staging + elements, kBadPageIndex.value());
+    std::fill(staging, staging + _historyOffset(), kBadPageIndex.value());
+    // Watermarks of a free row are zero: a request with nothing eligible.
+    std::fill(staging + _historyOffset(), staging + elements, 0);
 
     CUdeviceptr device = 0;
     cuCheck(cuMemAlloc(&device, sizeof(int32_t) * elements));
@@ -96,6 +101,34 @@ Batch::~Batch()
 size_t Batch::_rowElements() const noexcept
 {
     return static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
+}
+
+size_t Batch::_historyOffset() const noexcept
+{
+    return _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
+}
+
+size_t Batch::_capacityOffset() const noexcept
+{
+    return _historyOffset() + static_cast<size_t>(mMaxBatchSize);
+}
+
+size_t Batch::_totalElements() const noexcept
+{
+    return _capacityOffset() + static_cast<size_t>(mMaxBatchSize);
+}
+
+void Batch::_stageWatermarks()
+{
+    auto* base = reinterpret_cast<int32_t*>(mStaging->address());
+    auto* history = base + _historyOffset();
+    auto* capacity = base + _capacityOffset();
+    for (size_t row = 0; row < mRows.size(); ++row)
+    {
+        auto const* kvCache = mRows[row];
+        history[row] = kvCache == nullptr ? 0 : kvCache->historyLength();
+        capacity[row] = kvCache == nullptr ? 0 : kvCache->capacity();
+    }
 }
 
 int32_t* Batch::_stagingRow(LayerGroupId layerGroupId, int row) const
@@ -206,9 +239,13 @@ void Batch::publish(CUstream stream)
     // rows are free" rather than "the last of several copies finished".
     waitPublished();
 
+    // The members write their own page indices, but not their watermarks; collect those
+    // now so the single transfer below carries a matched pair.
+    _stageWatermarks();
+
     // Whole-table for now. Refreshing only the rows whose locks moved is an optimisation
     // the design allows for: it degrades into a slower step, never a wrong answer.
-    auto const bytes = sizeof(int32_t) * _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
+    auto const bytes = sizeof(int32_t) * _totalElements();
     cuCheck(cuMemcpyHtoDAsync(
         reinterpret_cast<CUdeviceptr>(mDevice.get()), reinterpret_cast<void*>(mStaging->address()), bytes, stream));
     mPublished = CachedCudaEvent{reinterpret_cast<CudaStream>(stream)};
@@ -236,6 +273,16 @@ PageTableView Batch::pageTable(LayerGroupId layerGroupId) const
         + sizeof(int32_t) * _rowElements() * static_cast<size_t>(layerGroupId.value());
     view.numRows = mMaxBatchSize;
     view.blocksPerRow = mMaxBlocksPerSeq;
+    return view;
+}
+
+WatermarkView Batch::watermarks() const
+{
+    auto const base = reinterpret_cast<CUdeviceptr>(mDevice.get());
+    WatermarkView view;
+    view.historyLength = base + sizeof(int32_t) * _historyOffset();
+    view.capacity = base + sizeof(int32_t) * _capacityOffset();
+    view.numRows = mMaxBatchSize;
     return view;
 }
 

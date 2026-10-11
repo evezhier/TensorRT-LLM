@@ -43,6 +43,24 @@ struct PageTableView
     int32_t blocksPerRow = 0;
 };
 
+//! Per-row watermarks, in tokens. Everything a step needs about how far a request has got
+//! derives from these two, at whatever granularity the consumer works in:
+//!
+//!     num_blocks     = historyLength / tokens_per_block     (valid page table entries)
+//!     history_units  = historyLength / unit_tokens          (selectable units)
+//!     capacity_units = capacity / unit_tokens               (the in-flight span's end)
+//!
+//! Publishing the source rather than the three derived counts keeps one truth; the divisors
+//! are per-layer-group constants a kernel already has.
+//!
+//! A free row reads zero, so it describes a request with nothing eligible.
+struct WatermarkView
+{
+    CUdeviceptr historyLength = 0;
+    CUdeviceptr capacity = 0;
+    int32_t numRows = 0;
+};
+
 // ---------------------------------------------------------------------------
 // Batch — the KvCaches stepped together, and their device-side mirror.
 //
@@ -115,6 +133,12 @@ public:
 
     [[nodiscard]] PageTableView pageTable(LayerGroupId layerGroupId) const;
 
+    //! Per-row history length and capacity, published by the same transfer as the page
+    //! tables. They have to travel together: the lengths bound which entries of a row are
+    //! valid, so a kernel pairing one step's table with another step's lengths would read
+    //! past the end of a row that has since been reused.
+    [[nodiscard]] WatermarkView watermarks() const;
+
     //! Row of a member, or -1.
     [[nodiscard]] int rowOf(KvCache const& kvCache) const;
 
@@ -144,6 +168,15 @@ private:
     [[nodiscard]] int32_t* _stagingRow(LayerGroupId layerGroupId, int row) const;
 
     [[nodiscard]] size_t _rowElements() const noexcept;
+
+    //! Element offset of the watermark regions within the staged block.
+    [[nodiscard]] size_t _historyOffset() const noexcept;
+    [[nodiscard]] size_t _capacityOffset() const noexcept;
+    [[nodiscard]] size_t _totalElements() const noexcept;
+
+    //! Refresh the staged watermarks from the members. Cheap, and it keeps KvCache ignorant
+    //! of the staging: only its page indices are written through setBasePageIndexBuf.
+    void _stageWatermarks();
 
     KvCacheManager* mManager = nullptr;
     int mMaxBatchSize = 0;
