@@ -765,9 +765,37 @@ class Batch:
     stale table.
     """
 
-    def __init__(self, manager: KVCacheManager) -> None: ...
-    def add_kv_cache(self, kv_cache: _KVCache) -> None: ...
-    def remove_kv_cache(self, kv_cache: _KVCache) -> None: ...
+    def __init__(
+        self,
+        manager: KVCacheManager,
+        max_batch_size: int = 0,
+        max_blocks_per_seq: int = 0,
+    ) -> None:
+        """Bound the device arrays, whose shape must not change between steps.
+
+        Neither can be grown later, so neither is inferred: zero derives it from the
+        manager's ``constraints``, which fails when none were declared. A pool-sizing hint
+        is a default, never a substitute for a batch bound.
+        """
+
+    def add_kv_cache(self, kv_cache: _KVCache) -> int:
+        """Take the lowest free row, returning it.
+
+        Raises if the batch is full, if the cache already belongs to a batch, or if its
+        beam width exceeds one -- only beam 0 is mirrored, so a wider request would have
+        every beam read beam 0's pages.
+        """
+
+    def remove_kv_cache(self, kv_cache: _KVCache) -> None:
+        """Free the cache's row, leaving a hole for reuse."""
+
+    def row_of(self, kv_cache: _KVCache) -> int:
+        """Row of a member, or ``-1``."""
+
+    @property
+    def max_batch_size(self) -> int: ...
+    @property
+    def max_blocks_per_seq(self) -> int: ...
     def resize(
         self,
         capacities: Sequence[int | None],
@@ -782,7 +810,7 @@ class Batch:
         """
 
     def publish(self, stream: CudaStream) -> None:
-        """Refresh the dirty rows of the device arrays, enqueuing on ``stream``.
+        """Copy the staged page indices and watermarks to the device, enqueuing on ``stream``.
 
         Page indices are published as stored -- level-relative, unscaled, and with
         ``BAD_PAGE_INDEX`` preserved rather than folded to a safe slot. A sparse table
@@ -791,8 +819,44 @@ class Batch:
         block offsets cannot serve here for that reason.
         """
 
+    def wait_published(self) -> None:
+        """Block until the last :meth:`publish` has finished reading the staging rows.
+
+        The copy is asynchronous and reads pinned memory, so it is still in flight when
+        :meth:`publish` returns. Every later host write to a member's page indices -- a
+        resize, a commit, a beam fork, an SWA recycle -- must be separated from it by this
+        call, or that write races the copy and publishes a torn table.
+
+        :meth:`resize` already does it, which is why driving a batched step through that
+        rather than through the members is the sanctioned path. For the operations with no
+        ``Batch`` equivalent the simple rule is to call this once at the top of a step: it
+        is idempotent and free once the copy has landed.
+        """
+
     def page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
-        """``int32[max_batch, max_blocks_per_seq]`` base page indices for one group."""
+        """``int32[max_batch, max_blocks_per_seq]`` base page indices for one group.
+
+        A DLPack array over memory the ``Batch`` owns; it keeps the ``Batch`` alive for as
+        long as the array exists. An unoccupied row reads as ``BAD_PAGE_INDEX`` throughout.
+        """
+
+    def history_lengths(self) -> DeviceArray:
+        """``int32[max_batch]`` per-row history length, in tokens.
+
+        Published by the same transfer as the page tables, because it bounds which entries
+        of a row are valid: pairing one step's table with another step's lengths would read
+        past the end of a row that may since have been reused.
+
+        The counts a consumer wants are all derived from this and :meth:`capacities`:
+        ``num_blocks`` is ``history_length // tokens_per_block``, while the sparse resolve
+        works in units and divides by ``unit_tokens`` instead. Publishing the source rather
+        than the three derived counts keeps one truth.
+
+        A free row reads zero -- a request with nothing eligible.
+        """
+
+    def capacities(self) -> DeviceArray:
+        """``int32[max_batch]`` per-row capacity, in tokens. See :meth:`history_lengths`."""
 
 class KVCacheManager:
     def __init__(

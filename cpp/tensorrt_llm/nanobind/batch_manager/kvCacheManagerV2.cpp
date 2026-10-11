@@ -345,6 +345,31 @@ static kv::KvCache::PriorityCb castPriorityCallback(kv::KvCacheManager const& ma
     };
 }
 
+//! Wrap device memory the caller does not own as a DLPack array, so torch.from_dlpack and
+//! friends can consume it. `owner` is kept alive for the array's lifetime, which is what
+//! stops the underlying allocation vanishing beneath it.
+using DeviceArray1D = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
+using DeviceArray2D = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
+
+static int currentCudaDevice()
+{
+    CUdevice device = 0;
+    kv::cuCheck(cuCtxGetDevice(&device));
+    return static_cast<int>(device);
+}
+
+static DeviceArray1D makeDeviceArray1D(CUdeviceptr data, int32_t count, nb::handle owner)
+{
+    return DeviceArray1D{reinterpret_cast<void*>(data), {static_cast<size_t>(count)}, owner, {}, nb::dtype<int32_t>(),
+        nb::device::cuda::value, currentCudaDevice()};
+}
+
+static DeviceArray2D makeDeviceArray2D(CUdeviceptr data, int32_t rows, int32_t cols, nb::handle owner)
+{
+    return DeviceArray2D{reinterpret_cast<void*>(data), {static_cast<size_t>(rows), static_cast<size_t>(cols)}, owner,
+        {}, nb::dtype<int32_t>(), nb::device::cuda::value, currentCudaDevice()};
+}
+
 static nb::tuple bufferIdTuple(kv::BufferId const& self)
 {
     return nb::make_tuple(self.layerId, self.role);
@@ -2458,27 +2483,40 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "complete and a no-op when nothing is in flight, so it is safe at the top of a step.")
         .def(
             "page_table",
-            [](kv::Batch const& self, int layerGroupId)
+            [](nb::object self, int layerGroupId)
             {
-                auto const view = self.pageTable(kv::LayerGroupId{layerGroupId});
-                return nb::make_tuple(static_cast<intptr_t>(view.data), view.numRows, view.blocksPerRow);
+                auto const& batch = nb::cast<kv::Batch const&>(self);
+                auto const view = batch.pageTable(kv::LayerGroupId{layerGroupId});
+                // The Batch owns the memory; self keeps it alive for the array's lifetime.
+                return makeDeviceArray2D(view.data, view.numRows, view.blocksPerRow, self);
             },
-            nb::arg("layer_group_id"), "(address, num_rows, blocks_per_row) of one layer group's device page table.")
+            nb::arg("layer_group_id"),
+            "int32[max_batch, max_blocks_per_seq] base page indices for one layer group, as a "
+            "DLPack array on the device.")
         .def(
-            "watermarks",
-            [](kv::Batch const& self)
+            "history_lengths",
+            [](nb::object self)
             {
-                auto const view = self.watermarks();
-                return nb::make_tuple(
-                    static_cast<intptr_t>(view.historyLength), static_cast<intptr_t>(view.capacity), view.numRows);
+                auto const& batch = nb::cast<kv::Batch const&>(self);
+                auto const view = batch.watermarks();
+                return makeDeviceArray1D(view.historyLength, view.numRows, self);
             },
-            "(history_length_address, capacity_address, num_rows) of the per-row watermarks, in "
-            "tokens. Published by the same transfer as the page tables, because the lengths bound "
-            "which entries of a row are valid: pairing one step's table with another step's "
-            "lengths would read past the end of a reused row.\n\n"
-            "num_blocks is history_length // tokens_per_block; the resolve works in units and "
-            "divides by unit_tokens instead. Publishing the source rather than the derived counts "
-            "keeps one truth.")
+            "int32[max_batch] per-row history length, in tokens.\n\n"
+            "Published by the same transfer as the page tables, because it bounds which entries of "
+            "a row are valid: pairing one step's table with another step's lengths would read past "
+            "the end of a reused row. num_blocks is history_length // tokens_per_block; the resolve "
+            "works in units and divides by unit_tokens instead. Publishing the source rather than "
+            "the derived counts keeps one truth.")
+        .def(
+            "capacities",
+            [](nb::object self)
+            {
+                auto const& batch = nb::cast<kv::Batch const&>(self);
+                auto const view = batch.watermarks();
+                return makeDeviceArray1D(view.capacity, view.numRows, self);
+            },
+            "int32[max_batch] per-row capacity, in tokens. Published with history_lengths().")
+
         .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
         .def_prop_ro("max_batch_size", &kv::Batch::maxBatchSize)
         .def_prop_ro("max_blocks_per_seq", &kv::Batch::maxBlocksPerSeq);

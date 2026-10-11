@@ -1118,6 +1118,36 @@ class TestBatch(unittest.TestCase):
             )
         )
 
+    def test_device_arrays_are_consumable_as_dlpack(self):
+        """The page table and watermarks are what a caller actually receives.
+
+        Imported lazily: the fast-mode path deliberately avoids loading the whole package.
+        """
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to consume a DLPack array")
+
+        manager = self._manager()
+        try:
+            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
+            lg_id = manager.get_layer_group_id(0)
+            table = torch.from_dlpack(batch.page_table(lg_id))
+            history = torch.from_dlpack(batch.history_lengths())
+            capacity = torch.from_dlpack(batch.capacities())
+
+            self.assertEqual(tuple(table.shape), (2, 4))
+            self.assertEqual(tuple(history.shape), (2,))
+            self.assertEqual(tuple(capacity.shape), (2,))
+            for arr in (table, history, capacity):
+                self.assertEqual(arr.dtype, torch.int32)
+                self.assertEqual(arr.device.type, "cuda")
+            # Unoccupied rows: absent blocks, and nothing eligible.
+            self.assertTrue(bool((table == BAD_PAGE_INDEX).all()))
+            self.assertTrue(bool((history == 0).all()))
+        finally:
+            manager.shutdown()
+
     def test_rows_are_slots_so_a_hole_is_reused(self):
         manager = self._manager()
         try:
