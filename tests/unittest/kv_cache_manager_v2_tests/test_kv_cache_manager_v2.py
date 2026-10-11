@@ -466,31 +466,31 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_the_input_bound_follows_from_the_cache_width(self):
-        sparse = self._manager(max_cached_units=4)
-        try:
-            cache = sparse.create_kv_cache()
-            # Four cells less a selection of two leaves two units in flight, and a unit is a
-            # whole 128-token block here.
-            self.assertEqual(cache.max_input_length, 256)
-            cache.close()
-        finally:
-            sparse.shutdown()
+    def test_the_input_bound_is_one_token_whatever_the_cache_width(self):
+        """A sparse request contributes one query token per step, so the gap is one token.
 
-        wider = self._manager(max_cached_units=6)
-        try:
-            cache = wider.create_kv_cache()
-            self.assertEqual(cache.max_input_length, 512, "surplus cells are in-flight headroom")
-            cache.close()
-        finally:
-            wider.shutdown()
+        The bound follows from the supported shape, not from how much spare room the
+        reservation has: widening the cache buys reuse, not a longer input.
+        """
+        for width in (4, 6):
+            manager = self._manager(max_cached_units=width)
+            try:
+                cache = manager.create_kv_cache()
+                try:
+                    self.assertEqual(cache.max_input_length, 1)
+                finally:
+                    cache.close()
+            finally:
+                manager.shutdown()
 
         dense = self._manager(max_cached_units=0)
         try:
             cache = dense.create_kv_cache()
-            # None: without a cache to hold in-flight blocks the bound describes nothing.
-            self.assertIsNone(cache.max_input_length)
-            cache.close()
+            try:
+                # None: without a cache to hold in-flight blocks the bound describes nothing.
+                self.assertIsNone(cache.max_input_length)
+            finally:
+                cache.close()
         finally:
             dense.shutdown()
 
@@ -518,17 +518,53 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_resize_rejects_a_gap_the_cache_cannot_pin(self):
+    def test_resize_rejects_more_than_one_token_in_flight(self):
+        """The guard that keeps prefill and speculative decoding out.
+
+        Either would give a request several query tokens in one step, which the fetch
+        cannot serve: it resolves one selection per request, and the units a whole step's
+        worth of query tokens wanted could not all be made resident at once.
+        """
         manager = self._manager(max_cached_units=4)
         try:
             cache = manager.create_kv_cache()
-            with TemporaryCudaStream([]) as stream:
-                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
-                # Within the derived bound of 256.
-                self.assertTrue(cache.resize(256, 0))
-                # Beyond it: those blocks could not all be held in flight at once.
-                with self.assertRaisesRegex(ValueError, "can hold in flight"):
-                    cache.resize(512, 0)
+            try:
+                with TemporaryCudaStream([]) as stream:
+                    self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                    # One token ahead of the watermark: an ordinary decode step.
+                    self.assertTrue(cache.resize(1, 0))
+                    # Two is already a step that writes two tokens.
+                    with self.assertRaisesRegex(ValueError, "can hold in flight"):
+                        cache.resize(3, 1)
+            finally:
+                cache.close()
+        finally:
+            manager.shutdown()
+
+    def test_a_bulk_history_jump_writes_nothing_back(self):
+        """How a resumed request arrives: its whole prompt becomes history in one step.
+
+        Nothing is written back, because nothing was ever in flight -- those units reached
+        their host pages directly rather than through a cell. The write-back must therefore
+        be bounded by the capacity the resize started from, not by how far history moved,
+        which is a span no reservation could cover.
+        """
+        manager = self._manager(max_cached_units=4)
+        try:
+            cache = manager.create_kv_cache()
+            try:
+                with TemporaryCudaStream([]) as stream:
+                    self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                    lc_id = manager.get_layer_group_id(0)
+                    # Far more blocks than the cache could hold in flight.
+                    self.assertTrue(cache.resize(4096, 4096))
+                    self.assertEqual(cache.history_length, 4096)
+                    self.assertEqual(
+                        _introspection.sparse_flush_counts(cache, lc_id),
+                        [-1],
+                        "no write-back should have run at all",
+                    )
+            finally:
                 cache.close()
         finally:
             manager.shutdown()
@@ -623,10 +659,18 @@ class TestSparseCacheReservation(unittest.TestCase):
                     [-1],
                     "no write-back should have run yet",
                 )
-                # tokens_per_block is 128 and the unit is a whole block, so this crosses two
-                # unit boundaries in one move.
-                cache.resize(256, 256)
-                self.assertEqual(cache.history_length, 256)
+                # tokens_per_block is 128 and the unit is a whole block. Reach the end of
+                # unit 0 with the last token still in flight, so that the next step's
+                # watermark move genuinely carries a unit from in-flight to history --
+                # which is the only way a write-back has anything to consider.
+                self.assertTrue(cache.resize(128, 127))
+                self.assertEqual(
+                    _introspection.sparse_flush_counts(cache, lc_id),
+                    [-1],
+                    "nothing has left the in-flight span yet",
+                )
+                self.assertTrue(cache.resize(129, 128))
+                self.assertEqual(cache.history_length, 128)
                 self.assertEqual(
                     _introspection.sparse_flush_counts(cache, lc_id),
                     [0],

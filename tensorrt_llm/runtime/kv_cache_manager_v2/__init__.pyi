@@ -590,13 +590,17 @@ class _KVCache:
         in-flight blocks describes nothing without a cache to hold them. :meth:`resize`
         rejects a gap wider than this.
 
-        Read-only, because it is a consequence rather than a choice. Every block above the
-        watermark is in flight -- its data lives only in a sparse cache cell until a flush
-        reaches it -- and the cache must also hold a whole selection. So whatever
-        :attr:`BufferConfig.max_cached_units` provides above the selection width is the
-        in-flight headroom, and this reports that headroom in tokens. Size it there.
+        **One token**, and read-only, because it is a consequence of the supported shape
+        rather than of how wide a cache is. A sparse request contributes exactly one query
+        token per step: :meth:`KVCacheManager.fetch_sparse_pages` resolves one selection
+        per request, while an attention kernel indexes its selection per query token, and
+        the two agree only at one token each. Prefill and speculative decoding give a
+        request several query tokens per step and are out of scope; this bound is the guard
+        that keeps them out.
 
-        The smallest bound across sparse life cycles, when several differ.
+        It follows that at most one unit is ever in flight, so essentially all of
+        :attr:`BufferConfig.max_cached_units` is available to the selection rather than
+        being reserved as headroom.
         """
 
     @property

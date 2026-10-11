@@ -1827,7 +1827,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "max_input_length", [](kv::KvCache const& self) { return self.maxInputLength(); },
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Bound on capacity - history_length, or None without a sparse fetch path.\n\n"
+            "One token, and read-only: a sparse request contributes exactly one query token "
+            "per step, because fetch_sparse_pages resolves one selection per request while an "
+            "attention kernel indexes its selection per query token. Prefill and speculative "
+            "decoding give a request several and are out of scope; this is the guard.")
         .def(
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
@@ -2670,8 +2675,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 if (static_cast<int>(selected.shape(0)) != batch.maxBatchSize())
                 {
                     throw std::invalid_argument(
-                        "fetch_sparse_pages: selected must carry one row per batch row, not one per query token; "
-                        "this is a decode-phase call and a request contributes a single selection to it");
+                        "fetch_sparse_pages: selected must carry one row per batch row, not one per query "
+                        "token. A request contributes a single selection per step; prefill and speculative "
+                        "decoding give it several and are out of scope");
                 }
                 if (out.shape(1) != buffers.size())
                 {
@@ -2697,8 +2703,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "not one layer group, because a layer's selection is computed from the previous "
             "layer's output. The whole layer, not a subset, because the resolve marks entries "
             "resident on behalf of every buffer at once.\n\n"
-            "selected is int32[batch, topk] unit ordinals, negative where padded, and must name "
-            "only units below the history watermark. out is int32[batch, len(buffers), topk], "
+            "selected is int32[batch, topk] unit ordinals, one row per request rather than per "
+            "query token, negative where padded, and must name only units below the history "
+            "watermark. out is int32[batch, len(buffers), topk], "
             "written in full in the expanded index space: entry k is the index holding "
             "selected[b][k], or BAD_PAGE_INDEX where that slot carries no selection. Compact, in "
             "the selection's own order, because that is the shape sparse attention kernels take.\n\n"

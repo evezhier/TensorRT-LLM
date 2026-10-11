@@ -200,8 +200,10 @@ int KvCacheManager::sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noe
     {
         return 0;
     }
-    // The +1 covers the partial unit at either end of a move.
-    return std::max(1, cells - sparseCacheSelectionWidth(lifeCycle)) + 1;
+    // A step advances capacity one token past history, and one token straddles at most one
+    // unit boundary, so at most one unit is ever in flight. That is the whole of the
+    // headroom: everything else the reservation holds is available to the selection.
+    return 1;
 }
 
 std::vector<BufferId> KvCacheManager::sparseBufferIds(LifeCycleId lifeCycle) const

@@ -1,10 +1,14 @@
 # Sparse attention in KVCacheManagerV2
 
-Status: implemented for the default codec. Storage and locking, the per-request reservation
-and device state, `Batch`, the resolve, copy, index and flush-list kernels, the write-back
-at `resize()` and `KVCacheManager.fetch_sparse_pages` are in place. Compression,
-`ISparseUnitGather` and kernel fusion remain future work, as marked below; so do multi-beam
-requests and life cycles whose sparse buffers span more than one pool.
+Status: implemented for the default codec, for the **decode instance of a disaggregated
+deployment**. Storage and locking, the per-request reservation and device state, `Batch`,
+the resolve, copy, index and flush-list kernels, the write-back at `resize()` and
+`KVCacheManager.fetch_sparse_pages` are in place.
+
+Out of scope, by decision rather than by omission: prefill, which a separate instance serves,
+and speculative decoding — see *Supported scope* below. Compression, `ISparseUnitGather` and
+kernel fusion remain future work, as marked below; so do multi-beam requests and life cycles
+whose sparse buffers span more than one pool.
 
 Read `AGENTS.md` in this directory first for the storage, locking and concurrency model
 this builds on.
@@ -143,8 +147,8 @@ keep this from being a general write-back cache:
 - **Unflushed entries are private.** Only finalized pages enter the radix tree, so an
   unflushed block has exactly one owner: no aliasing, no cross-request coherence, no
   concurrent writers.
-- **The unflushed set is bounded by the cache width**, not discovered — see `max_input_length`
-  below. Reservation covers it, so a fetch never meets a cache with nothing to evict.
+- **The unflushed set is at most one unit**, not discovered — see `max_input_length` below.
+  Reservation covers it, so a fetch never meets a cache with nothing to evict.
 
 Eviction eligibility is therefore one comparison against the watermark. There is no
 evict-an-unflushed-entry path to implement: such an entry is simply not a candidate, and
@@ -171,30 +175,31 @@ flight is above it — so the cache must hold a full selection *plus* every in-f
 once. That is the only constraint, and it is what makes the second population derivable
 rather than declared.
 
-The in-flight term exists because prefill and decode share one manager. An in-flight
-block's data lives only in its cache cell until the watermark passes it, so the cache must
-hold every block above the watermark — one or two in decode, but a whole chunk in prefill.
+An in-flight unit's data lives only in its cache cell until the watermark passes it, so the
+cache must hold every unit above the watermark. Within the supported scope that is **at most
+one**: a step advances capacity one token past history, and one token straddles at most one
+unit boundary.
 
-*Sizing*: two to four times the selection width is the usual starting point for the history
-half, but the surplus above the selection is also the in-flight headroom, so size for the
-larger of the two demands.
+*Sizing*: two to four times the selection width is the usual starting point. A cache only as
+wide as the selection retains nothing between steps, so what it holds above the selection is
+what survives to be hit next step — it is all reuse, not headroom.
 
 ### `max_input_length`
 
 A bound on `capacity - history_length`, i.e. on how far capacity may outrun the watermark.
-**Derived, not declared**:
+**One token**, and read-only.
 
-```
-headroom = slots * expansion - selection_width    cells not needed for a full selection
-bound    = headroom * unit_tokens
-```
+It is a property of the supported shape rather than of how wide a cache is. A sparse request
+contributes exactly one query token per step, because the fetch resolves one selection per
+request while an attention kernel indexes its selection per query token; the two agree only
+at one token each. This is the guard that keeps prefill and speculative decoding out — see
+*Supported scope* below.
 
-An earlier revision made this a per-request setter, with the reservation sized from it. That
-is a second knob that has to agree with the first: `max_cached_units` already fixes the
-memory, so a declared bound could only ever be a restatement of it — and one the caller
-could get wrong, discovering the mismatch at a `resize()` far from the configuration that
-caused it. Deriving it also recovers what rounding to whole slots leaves over, which a
-declared bound would strand.
+An earlier revision derived it from the reservation, as `(cells - selection_width) *
+unit_tokens`, which described what the cache *could* pin rather than what a step actually
+produces. Both readings reject the same accidents, but the derived one also admitted
+multi-token steps whenever the cache happened to be wide, which the fetch cannot serve at
+any width.
 
 The reservation therefore depends on configuration alone. It happens once at `resume()` and
 fails there if capacity is unavailable, so the fetch path never has to handle exhaustion.
@@ -528,32 +533,52 @@ first, then the selection. An in-flight unit differs in exactly one way — a mi
 its cell but never joins the copy list, because its host page holds nothing to fetch until
 the watermark passes it.
 
-### Prefill is not served by this cache
+### Supported scope: one query token per request
 
-The fetch is a decode-phase call: one selection per request, because the resolve makes
-units resident in that request's cache and residency is a property of the request.
-
-Sparse attention kernels index their selection by **query token** — trtllm-gen's
+The fetch is a decode-phase call. It resolves **one selection per request**, while a sparse
+attention kernel indexes its selection **per query token** — trtllm-gen's
 `ptrSparseMlaTopKLens` is `[numTokensQ]`, "where each tokenQ has a corresponding topK
-length" — and in a decode step a request contributes exactly one token, so the two agree.
-During prefill they do not: a chunk of N query tokens each choose their own units, whose
-union can reach N times the selection width. The reservation could then no longer cover a
-call, and a unit evicted to make room for a later query token would invalidate an index
-already returned for an earlier one. Taking one row per token instead of per request would
-make that reachable, not fix it.
+length". The two agree only when a request contributes one query token per step, so that is
+the supported shape, enforced by `max_input_length` and by `fetch_sparse_pages` requiring one
+selection row per batch row.
 
-This is a difference in kind from the implementations in this repository, not a gap in
+Excluded, deliberately:
+
+- **Prefill.** Served by a separate prefill instance under disaggregated serving, which needs
+  no sparsity here: it computes the prompt and hands over the KV cache.
+- **Speculative decoding and MTP.** Generation, but several query tokens per request per
+  step.
+
+Both are excluded for the same reason, and it is not the row count. The resolve makes units
+*resident* in a request's cache, which holds `max_cached_units`; residency is a property of
+the request, not of a query token. N query tokens each choosing their own units have a union
+of up to N times the selection width, so the reservation could no longer cover a call, and a
+unit evicted to make room for a later query token would invalidate an index already returned
+for an earlier one. Taking one row per token would make that reachable, not fix it.
+
+This is a difference in kind from the sparse implementations in this repository, not a gap in
 degree. Their sparse prefill is real — the context path reuses the generation kernel with
 per-token indices — but their indices point straight at a GPU-resident KV pool, and the
-in-chunk tokens are reached by writing K/V to the cache before attention and forcing a
-local window in as ordinary indices. There is nothing to stage, so no per-request cache is
-needed. Here history is on host, which is exactly what makes prefill hard.
+in-chunk tokens are reached by writing K/V to the cache before attention and forcing a local
+window in as ordinary indices. There is nothing to stage, so no per-request cache is needed.
+Here history is on host, which is exactly what makes prefill hard.
 
-Serving it would mean one of: leaving prefill dense over host memory; making the union of
-a chunk's selections resident in one pass and resolving each token against that, which
-bounds the problem only if the chunk is short or the selections overlap heavily; or
-treating the prefill chunk's own tokens as the always-attended region and sparsifying only
-the older history. Choosing between these is open work and not attempted here.
+### Arriving with a history: the bulk watermark jump
+
+A resumed request is the ordinary case under disaggregated serving, and it moves history from
+zero to the whole prompt in one `resize()`. Nothing is written back, because nothing was ever
+in flight: those units reached their host pages directly rather than through a cell.
+
+The write-back is therefore bounded by the capacity the resize started from, not by how far
+history travelled:
+
+```
+flush range = [old_history, min(new_history, old_capacity))    in units
+```
+
+Only a unit below the old capacity can have been in the cache at all. Without that clamp the
+range is the whole prompt, which no reservation could cover, and the resize fails on a
+write-back that had nothing to do.
 
 ### Capacity and eviction
 
@@ -636,11 +661,11 @@ on, so `max_cached_units` covers both:
 
 ```
 cache reservation = max_batch_size * N             (N in [2k, 4k])
-in-flight headroom = N - k                         what max_input_length reports
+in-flight headroom = 1 unit                        one query token per step
 ```
 
-with `max_batch_size` from `constraints`. Because the surplus above `k` is what bounds a
-request's input length, `N` has to satisfy whichever demand is larger: retention wants
+with `max_batch_size` from `constraints`. The surplus above `k` is retention, not headroom,
+so `N` is sized by one demand rather than two: retention wants
 `2k`–`4k`, and a prefill chunk wants enough cells to pin the whole chunk at once.
 
 ## Python surface
@@ -704,17 +729,21 @@ Recorded because each looks like an open question and is not:
   would produce a host value the kernel cannot use, costing an H2D per layer.
 - **Eviction never copies.** An entry is evictable only once flushed, so evicting is a
   free-list push. Flushes are triggered by the watermark alone, never by eviction pressure.
-- **Pinning is not a general scheme.** The pinned set is the in-flight blocks, private
-  because unflushed blocks are not in the radix tree, and bounded by `max_input_length`.
-  Ordering between the rest still comes from LRU recency alone.
+- **Pinning is not a general scheme.** The pinned set is the in-flight unit, private
+  because unflushed blocks are not in the radix tree, and bounded to one by
+  `max_input_length`. Ordering between the rest still comes from LRU recency alone.
 - **No stale-key invalidation.** Per-request cache scope makes it impossible.
 - **`tokens_per_block_override` is not a granularity lever.** See *One pool, one index
   space*.
 
 ## Resolved
 
-- **There is no decode-only assumption.** Prefill and decode share one manager under
-  in-flight batching, so in-flight blocks are cached too and `max_input_length` bounds them.
+- **This *is* decode-only, deliberately.** An earlier revision assumed prefill and decode
+  shared one manager, and sized the in-flight headroom for a whole prefill chunk. That was
+  wrong in kind, not in size: a sparse kernel indexes its selection per query token, and a
+  multi-token step's selections cannot all be made resident in one per-request cache. The
+  decode instance of a disaggregated deployment is the supported target; see *Supported
+  scope*.
 - **A selection unit never exceeds `tokens_per_block`.** Sub-page units are supported
   through `expansion`; a unit spanning several pages is rejected, which retires the
   questions of slot contiguity and k-at-a-time eviction.

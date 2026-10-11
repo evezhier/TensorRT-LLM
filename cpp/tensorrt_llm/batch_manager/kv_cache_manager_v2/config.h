@@ -156,10 +156,10 @@ struct BufferConfig
     //! Cells one buffer gets in a request's GPU cache, counting both populations: the
     //! history it caches and every unit still in flight. Sparse buffers only.
     //!
-    //! Two to four times numSelectedBlocks is the usual choice -- a cache only as wide as
-    //! the selection retains nothing between steps -- but the headroom above the selection
-    //! is also what bounds a request's input length, so size it for the larger of the two.
-    //! KvCache::maxInputLength() reports what a given value buys.
+    //! Two to four times numSelectedBlocks is the usual choice: a cache only as wide as the
+    //! selection retains nothing between steps, so what it holds above the selection is
+    //! what survives to be hit next step. Only one unit of it is ever in flight, because a
+    //! sparse request contributes one query token per step, so the rest is all reuse.
     int maxCachedUnits = 0;
 
     //! Where a selection unit's bytes sit. Leave unset for a buffer whose cold form is

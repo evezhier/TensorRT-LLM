@@ -397,21 +397,12 @@ int KvCache::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const
 
 std::optional<int> KvCache::maxInputLength() const
 {
-    std::optional<int> bound;
-    for (LifeCycleId lc{0}; lc < mSparseCacheState.size(); ++lc)
-    {
-        int const cells = _sparseCacheSubSlotsPerBuffer(lc) * mManager->sparseCacheExpansion(lc);
-        if (cells == 0)
-        {
-            continue;
-        }
-        // Whatever the reservation holds beyond a full selection is what can be in flight.
-        int const headroom = cells - mManager->sparseCacheSelectionWidth(lc);
-        int const unitTokens = mTokensPerBlock / mManager->sparseCacheExpansion(lc);
-        int const tokens = std::max(0, headroom) * unitTokens;
-        bound = bound.has_value() ? std::min(*bound, tokens) : tokens;
-    }
-    return bound;
+    // One token, not the reservation's spare width. A sparse request contributes exactly one
+    // query token per step, because the fetch resolves one selection per request while an
+    // attention kernel indexes its selection per query token; the two agree only at one
+    // token each. Prefill and speculative decoding break that and are out of scope, so the
+    // bound is a property of the supported shape rather than of how wide a cache is.
+    return _hasSparseCache() ? std::optional<int>{1} : std::nullopt;
 }
 
 void KvCache::activate()
@@ -1652,10 +1643,22 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     // the data, and the host page merely holds a copy nothing is allowed to read yet.
     for (LifeCycleId lc{0}; lc < mSparseCacheState.size(); ++lc)
     {
-        if (_sparseUnitsCrossed(lc, mHistoryLength, newHist) > 0)
+        if (_sparseUnitsCrossed(lc, mHistoryLength, newHist) == 0)
         {
-            int const unitTokens = mTokensPerBlock / mManager->sparseCacheExpansion(lc);
-            _flushSparseUnits(lc, mHistoryLength / unitTokens, newHist / unitTokens);
+            continue;
+        }
+        int const unitTokens = mTokensPerBlock / mManager->sparseCacheExpansion(lc);
+        // Only a unit that was in flight can hold its one copy in a cell, and in flight
+        // means below the capacity this resize started from. A unit at or above that was
+        // not in the cache at all, so history reaching it writes nothing back: this is the
+        // ordinary shape of a resumed request, whose history arrives in one step already
+        // written to its host pages. Clamping here is what bounds the move by the in-flight
+        // headroom rather than by how far the watermark travelled.
+        int const toUnits = std::min(newHist, mCapacity) / unitTokens;
+        int const fromUnits = mHistoryLength / unitTokens;
+        if (toUnits > fromUnits)
+        {
+            _flushSparseUnits(lc, fromUnits, toUnits);
         }
     }
 
