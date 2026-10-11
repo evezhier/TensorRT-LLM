@@ -819,7 +819,9 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[1, 0],
             src_buffer_offset=[0],
-            dst_buffer_offset=[0],
+            sub_slots_per_layer=1,
+            buffers_per_slot=1,
+            buffer_bytes=page_stride,
             num_chunks=1,
             chunk_bytes=unit,
             chunk_stride=0,
@@ -851,7 +853,9 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[0],
             src_buffer_offset=[0],
-            dst_buffer_offset=[0],
+            sub_slots_per_layer=1,
+            buffers_per_slot=1,
+            buffer_bytes=page_stride,
             num_chunks=chunks,
             chunk_bytes=chunk,
             chunk_stride=chunk_stride,
@@ -872,8 +876,8 @@ class TestSparseUnitCopy(unittest.TestCase):
             base = c * chunk_stride
             self.assertEqual(result[base : base + chunk], [0] * chunk)
 
-    def test_layers_use_their_own_buffer_offsets(self):
-        # A page concatenates two layers' buffers; cold and hot order differ.
+    def test_layers_land_in_their_own_sub_slot(self):
+        # A cold page concatenates two layers' buffers; the cache cell is derived.
         unit, layers = 16, 2
         page_stride = unit * layers
         host = self._pattern(page_stride)
@@ -884,8 +888,11 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_pool=[0] * (page_stride),
             device_page_stride=page_stride,
             cache_pages=[0],
-            src_buffer_offset=[0, unit],
-            dst_buffer_offset=[unit, 0],
+            # Deliberately crossed: layer 0's buffer is second in the cold page.
+            src_buffer_offset=[unit, 0],
+            sub_slots_per_layer=1,
+            buffers_per_slot=2,
+            buffer_bytes=unit,
             num_chunks=1,
             chunk_bytes=unit,
             chunk_stride=0,
@@ -897,9 +904,10 @@ class TestSparseUnitCopy(unittest.TestCase):
             selection_width=1,
             num_layers=layers,
         )
-        # Layer 0 reads at 0 and writes at `unit`; layer 1 does the reverse.
-        self.assertEqual(result[unit:], host[:unit])
+        # The cold offset is a lookup and the hot cell is arithmetic on the sub-slot, so
+        # layer 0 reads the second cold buffer into cell 0, and layer 1 the reverse.
         self.assertEqual(result[:unit], host[unit:])
+        self.assertEqual(result[unit:], host[:unit])
 
     def test_a_layer_without_misses_copies_nothing(self):
         unit = 16
@@ -912,7 +920,9 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=unit,
             cache_pages=[0],
             src_buffer_offset=[0],
-            dst_buffer_offset=[0],
+            sub_slots_per_layer=1,
+            buffers_per_slot=1,
+            buffer_bytes=unit,
             num_chunks=1,
             chunk_bytes=unit,
             chunk_stride=0,
@@ -938,7 +948,9 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=unit * 2,
             cache_pages=[0],
             src_buffer_offset=[0],
-            dst_buffer_offset=[0],
+            sub_slots_per_layer=1,
+            buffers_per_slot=1,
+            buffer_bytes=unit * 2,
             num_chunks=1,
             chunk_bytes=unit,
             chunk_stride=0,
@@ -1011,7 +1023,9 @@ class TestSparseFlush(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[0],
             src_buffer_offset=[0],
-            dst_buffer_offset=[0],
+            sub_slots_per_layer=1,
+            buffers_per_slot=1,
+            buffer_bytes=page_stride,
             num_chunks=1,
             chunk_bytes=unit,
             chunk_stride=0,
@@ -1049,7 +1063,9 @@ class TestSparseFlush(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[0],
             src_buffer_offset=[0],
-            dst_buffer_offset=[0],
+            sub_slots_per_layer=1,
+            buffers_per_slot=1,
+            buffer_bytes=page_stride,
             num_chunks=1,
             chunk_bytes=unit,
             chunk_stride=0,

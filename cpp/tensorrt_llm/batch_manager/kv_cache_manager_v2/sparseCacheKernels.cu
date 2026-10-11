@@ -398,25 +398,30 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     int32_t const slot = args.workSlot[index];
 
     // A unit ordinal names a unit within a block; a cache entry names a unit within a
-    // reserved page. Both divide by the same expansion.
+    // sub-slot. Both divide by the same expansion.
     int32_t const block = ordinal / args.expansion - args.pageTableBase;
     int32_t const srcUnit = ordinal % args.expansion;
-    int32_t const cachePage = slot / args.expansion;
     int32_t const dstUnit = slot % args.expansion;
     if (block < 0 || block >= args.numBlocks)
     {
         return;
     }
 
+    // Which cell of which reserved page an entry lands in is arithmetic on a flat sub-slot
+    // index, not a per-layer lookup: coalescing buys nothing when layers select different
+    // units, so the partition is ours to choose.
+    int32_t const subSlot = layer * args.subSlotsPerLayer + slot / args.expansion;
+    auto const cell = static_cast<uint64_t>(subSlot % args.buffersPerSlot);
+
     auto const hostPage = static_cast<uint64_t>(args.pageTable[block]);
-    auto const devicePage = static_cast<uint64_t>(args.cachePages[cachePage]);
+    auto const devicePage = static_cast<uint64_t>(args.cachePages[subSlot / args.buffersPerSlot]);
 
     // The cold side is reached by ordinal through the page table, the hot side by entry
     // index through the cache page list. Direction only chooses which one is read.
     auto* cold = reinterpret_cast<char*>(args.hostBase + hostPage * args.hostPageStride + args.hostBufferOffset[layer]
         + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
-    auto* hot = reinterpret_cast<char*>(args.deviceBase + devicePage * args.devicePageStride
-        + args.deviceBufferOffset[layer] + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
+    auto* hot = reinterpret_cast<char*>(args.deviceBase + devicePage * args.devicePageStride + cell * args.bufferBytes
+        + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
     bool const fetching = args.direction == SparseCopyDirection::kFetch;
     char const* src = fetching ? cold : hot;
     char* dst = fetching ? hot : cold;
@@ -503,10 +508,13 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
         throw std::invalid_argument("launchSparseUnitCopy: the unit layout must describe a non-empty unit");
     }
     if (args.pageTable == nullptr || args.cachePages == nullptr || args.hostBufferOffset == nullptr
-        || args.deviceBufferOffset == nullptr || args.workOrdinal == nullptr || args.workSlot == nullptr
-        || args.workCount == nullptr)
+        || args.workOrdinal == nullptr || args.workSlot == nullptr || args.workCount == nullptr)
     {
         throw std::invalid_argument("launchSparseUnitCopy: every device array must be provided");
+    }
+    if (args.buffersPerSlot <= 0 || args.subSlotsPerLayer <= 0 || args.bufferBytes == 0)
+    {
+        throw std::invalid_argument("launchSparseUnitCopy: the sub-slot geometry must be positive");
     }
 
     dim3 const grid(static_cast<unsigned>(args.workWidth), static_cast<unsigned>(args.numLayers));

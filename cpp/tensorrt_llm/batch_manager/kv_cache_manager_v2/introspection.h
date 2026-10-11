@@ -75,8 +75,8 @@ public:
     // after the copy. Synchronises.
     static std::vector<uint8_t> sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
         std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& devicePool, uint64_t devicePageStride,
-        std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& srcBufferOffset,
-        std::vector<uint32_t> const& dstBufferOffset, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
+        std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& srcBufferOffset, int subSlotsPerLayer,
+        int buffersPerSlot, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
         uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal,
         std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth, int numLayers,
         bool writeBack);

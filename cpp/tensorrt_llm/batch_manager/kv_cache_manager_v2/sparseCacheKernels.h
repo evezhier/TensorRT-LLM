@@ -151,13 +151,24 @@ struct SparseUnitCopyArgs
     //! GPU pool holding this request's reserved cache pages.
     CUdeviceptr deviceBase = 0;
     uint64_t devicePageStride = 0;
-    //! [entriesPerLayer / expansion] GPU page slot per reserved page.
+    //! [numPages] GPU page slot per reserved page.
     int32_t const* cachePages = nullptr;
 
-    //! [numLayers] offset of this layer's buffer within a cold page and within a cache
-    //! page. They differ: a cold page is a concatenation in codec order.
+    //! The reservation hands out whole coalesced slots, but the cache does not have to use
+    //! them that way: a slot is buffersPerSlot buffer-sized cells, and any layer's unit can
+    //! occupy any cell. Entries are therefore addressed through a flat sub-slot index,
+    //!
+    //!     subSlot = layer * subSlotsPerLayer + entry / expansion
+    //!
+    //! which decouples the per-layer partition from the page layout. Coalescing earns
+    //! nothing here because layers select different units, so nothing is shared.
+    int32_t subSlotsPerLayer = 0;
+    int32_t buffersPerSlot = 1;
+    uint64_t bufferBytes = 0;
+
+    //! [numLayers] offset of this layer's buffer within a cold page. Unlike the hot side
+    //! this is a lookup, not arithmetic: the cold layout is the codec's concat order.
     uint32_t const* hostBufferOffset = nullptr;
-    uint32_t const* deviceBufferOffset = nullptr;
 
     SparseCopyDirection direction = SparseCopyDirection::kFetch;
 
