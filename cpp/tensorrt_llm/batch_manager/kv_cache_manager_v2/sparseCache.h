@@ -35,7 +35,11 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // is identified by (layer, entry index) and resolved to a cell arithmetically, so nothing
 // ties a layer to a fixed position.
 //
-// Both arrays are laid out [layer][entry], row-major over entriesPerLayer.
+// The metadata is laid out [layer][entry]. It is per LAYER, not per buffer: every sparse
+// buffer of a layer selects the same units, so one resident set and one recency order serve
+// them all, and the entry index the resolve produces addresses each buffer's own cell. That
+// makes the agreement between a layer's buffers structural rather than a consequence of
+// their running identical logic on identical input.
 // ---------------------------------------------------------------------------
 struct SparseCacheView
 {
@@ -66,11 +70,22 @@ struct SparseCacheView
     int32_t maxFlushUnits = 0;
     int32_t maxFlushBlocks = 0;
 
-    //! [numLayers] byte offset of each buffer within a cold page. A lookup rather than
+    //! [numBuffers] byte offset of each buffer within a cold page. A lookup rather than
     //! arithmetic: the cold layout is the codec's concat order, not this cache's choice.
     uint32_t* hostBufferOffset = nullptr;
 
+    //! [numBuffers] the layer each buffer belongs to, i.e. which metadata row carries its
+    //! residency and its work list. The copy walks buffers but reads a list produced per
+    //! layer, so it needs the map to join the two. Non-decreasing, because the buffers of a
+    //! layer are consecutive, which is what lets a one-layer call name its buffers as a
+    //! range rather than a set.
+    int32_t* bufferLayer = nullptr;
+
+    //! Layers in this life cycle: the metadata's first dimension.
     int32_t numLayers = 0;
+    //! Sparse buffers in this life cycle, one per (layer, role). Cells and cold-page offsets
+    //! are per buffer, so this is the dimension the copy walks.
+    int32_t numBuffers = 0;
     int32_t entriesPerLayer = 0;
 
     [[nodiscard]] constexpr int32_t numEntries() const noexcept
@@ -86,11 +101,14 @@ struct SparseCacheView
 struct SparseCacheInit
 {
     int32_t numLayers = 0;
+    int32_t numBuffers = 0;
     int32_t entriesPerLayer = 0;
     //! GPU page slot per reserved page.
     std::vector<int32_t> cachePageSlots;
-    //! [numLayers] byte offset of each buffer within a cold page.
+    //! [numBuffers] byte offset of each buffer within a cold page.
     std::vector<uint32_t> hostBufferOffset;
+    //! [numBuffers] the layer each buffer belongs to, non-decreasing.
+    std::vector<int32_t> bufferLayer;
     //! Bounds on one watermark move, from the in-flight headroom the reservation leaves.
     int32_t maxFlushUnits = 0;
     int32_t maxFlushBlocks = 0;

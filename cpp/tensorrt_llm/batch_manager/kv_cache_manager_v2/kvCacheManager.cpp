@@ -146,6 +146,7 @@ void KvCacheManager::_computeSparseCacheShape()
     mSparseCacheExpansion = TypedVec<LifeCycleId, int>(numLc, 1);
     mSparseCacheBuffers = TypedVec<LifeCycleId, int>(numLc, 0);
     mSparseCacheSelection = TypedVec<LifeCycleId, int>(numLc, 0);
+    mSparseCacheLayers = TypedVec<LifeCycleId, int>(numLc, 0);
 
     for (auto const& layer : mConfig.layers)
     {
@@ -155,6 +156,7 @@ void KvCacheManager::_computeSparseCacheShape()
             continue;
         }
         LifeCycleId const lcId = mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock));
+        bool layerCounted = false;
         for (auto const& buf : attn->buffers)
         {
             if (!buf.isSparse || buf.maxCachedUnits <= 0)
@@ -165,8 +167,14 @@ void KvCacheManager::_computeSparseCacheShape()
             mSparseCacheMaxUnits[lcId] = std::max(mSparseCacheMaxUnits[lcId], buf.maxCachedUnits);
             mSparseCacheSelection[lcId] = std::max(mSparseCacheSelection[lcId], buf.numSelectedBlocks);
             mSparseCacheExpansion[lcId] = std::max(mSparseCacheExpansion[lcId], expansion);
-            // One more independent cache, and one more cell in a reserved slot.
+            // One more cell in a reserved slot.
             ++mSparseCacheBuffers[lcId];
+            if (!layerCounted)
+            {
+                // One more metadata row: the layer's buffers share it.
+                ++mSparseCacheLayers[lcId];
+                layerCounted = true;
+            }
         }
     }
 }

@@ -165,8 +165,10 @@ __device__ int32_t blockExclusiveSum(int32_t* flags, int32_t n, typename BlockSc
 __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArgs args, int32_t tableSize)
 {
     extern __shared__ unsigned char smem[];
-    int32_t const layer = static_cast<int32_t>(blockIdx.x);
-    int32_t const row = static_cast<int32_t>(blockIdx.y);
+    // One CTA per row: the call resolves a single layer, whose metadata row every sparse
+    // buffer of that layer shares.
+    int32_t const layer = args.layerInGroup;
+    int32_t const row = static_cast<int32_t>(blockIdx.x);
     SparseCacheView const view = args.views[row];
     if (view.residentOrdinal == nullptr)
     {
@@ -204,9 +206,10 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     // The view's own arrays belong to this row's allocation, so only the layer indexes them.
     int32_t* residentOrdinal = view.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
     int32_t* lruOrder = view.lruOrder + static_cast<ptrdiff_t>(layer) * entries;
-    // The batch-wide arrays carry a row stride on top.
-    auto const selectionBase = (static_cast<ptrdiff_t>(row) * args.numLayers + layer) * width;
-    auto const inFlightBase = (static_cast<ptrdiff_t>(row) * args.numLayers + layer) * args.maxInFlightUnits;
+    // The batch-wide arrays are indexed by row alone: the call is one layer, and its
+    // buffers share the single result.
+    auto const selectionBase = static_cast<ptrdiff_t>(row) * width;
+    auto const inFlightBase = static_cast<ptrdiff_t>(row) * args.maxInFlightUnits;
     int32_t const* selected = args.selected + selectionBase;
     int32_t* outSlot = args.outSlot + selectionBase;
     int32_t* missOrdinal = args.missOrdinal + selectionBase;
@@ -373,7 +376,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     }
     if (threadIdx.x == 0)
     {
-        args.missCount[static_cast<ptrdiff_t>(row) * args.numLayers + layer] = numCopy;
+        args.missCount[row] = numCopy;
     }
 }
 
@@ -402,17 +405,20 @@ __device__ inline void copyChunk(char* dst, char const* src, uint32_t bytes)
     }
 }
 
-//! One CTA per (layer, work item).
+//! One CTA per (buffer, work item).
 __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyArgs args)
 {
-    int32_t const layer = static_cast<int32_t>(blockIdx.y);
+    // The grid walks this call's buffers; the work list is indexed by their layer, which is
+    // shared whenever a layer has more than one buffer.
+    int32_t const buffer = args.bufferBase + static_cast<int32_t>(blockIdx.y);
+    int32_t const workRow = args.bufferLayer[buffer] - args.workRowBase;
     int32_t const j = static_cast<int32_t>(blockIdx.x);
-    if (j >= args.workCount[layer])
+    if (j >= args.workCount[workRow])
     {
         return;
     }
 
-    auto const index = static_cast<ptrdiff_t>(layer) * args.workWidth + j;
+    auto const index = static_cast<ptrdiff_t>(workRow) * args.workWidth + j;
     int32_t const ordinal = args.workOrdinal[index];
     int32_t const slot = args.workSlot[index];
 
@@ -429,7 +435,7 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     // Which cell of which reserved page an entry lands in is arithmetic on a flat sub-slot
     // index, not a per-layer lookup: coalescing buys nothing when layers select different
     // units, so the partition is ours to choose.
-    int32_t const subSlot = layer * args.subSlotsPerLayer + slot / args.expansion;
+    int32_t const subSlot = buffer * args.subSlotsPerBuffer + slot / args.expansion;
     auto const cell = static_cast<uint64_t>(subSlot % args.buffersPerSlot);
 
     auto const hostPage = static_cast<uint64_t>(args.pageTable[block]);
@@ -437,7 +443,7 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
 
     // The cold side is reached by ordinal through the page table, the hot side by entry
     // index through the cache page list. Direction only chooses which one is read.
-    auto* cold = reinterpret_cast<char*>(args.hostBase + hostPage * args.hostPageStride + args.hostBufferOffset[layer]
+    auto* cold = reinterpret_cast<char*>(args.hostBase + hostPage * args.hostPageStride + args.hostBufferOffset[buffer]
         + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
     auto* hot = reinterpret_cast<char*>(args.deviceBase + devicePage * args.devicePageStride + cell * args.bufferBytes
         + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
@@ -516,25 +522,30 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
 
 void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
 {
-    if (args.numLayers <= 0 || args.workWidth <= 0 || args.expansion <= 0)
+    if (args.numBuffers <= 0 || args.workWidth <= 0 || args.expansion <= 0)
     {
-        throw std::invalid_argument("launchSparseUnitCopy: layers, work width and expansion must be positive");
+        throw std::invalid_argument("launchSparseUnitCopy: buffers, work width and expansion must be positive");
+    }
+    if (args.bufferBase < 0 || args.workRowBase < 0)
+    {
+        throw std::invalid_argument("launchSparseUnitCopy: the buffer and work row bases must be non-negative");
     }
     if (args.layout.numChunks == 0 || args.layout.chunkBytes == 0)
     {
         throw std::invalid_argument("launchSparseUnitCopy: the unit layout must describe a non-empty unit");
     }
     if (args.pageTable == nullptr || args.cachePages == nullptr || args.hostBufferOffset == nullptr
-        || args.workOrdinal == nullptr || args.workSlot == nullptr || args.workCount == nullptr)
+        || args.bufferLayer == nullptr || args.workOrdinal == nullptr || args.workSlot == nullptr
+        || args.workCount == nullptr)
     {
         throw std::invalid_argument("launchSparseUnitCopy: every device array must be provided");
     }
-    if (args.buffersPerSlot <= 0 || args.subSlotsPerLayer <= 0 || args.bufferBytes == 0)
+    if (args.buffersPerSlot <= 0 || args.subSlotsPerBuffer <= 0 || args.bufferBytes == 0)
     {
         throw std::invalid_argument("launchSparseUnitCopy: the sub-slot geometry must be positive");
     }
 
-    dim3 const grid(static_cast<unsigned>(args.workWidth), static_cast<unsigned>(args.numLayers));
+    dim3 const grid(static_cast<unsigned>(args.workWidth), static_cast<unsigned>(args.numBuffers));
     sparseUnitCopyKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
@@ -565,6 +576,10 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     if (args.numLayers <= 0 || args.entriesPerLayer <= 0 || args.selectionWidth <= 0 || args.numRows <= 0)
     {
         throw std::invalid_argument("launchSparseResolve: rows, layers, entries and selection width must be positive");
+    }
+    if (args.layerInGroup < 0 || args.layerInGroup >= args.numLayers)
+    {
+        throw std::invalid_argument("launchSparseResolve: layerInGroup must name a layer of the group");
     }
     if (args.views == nullptr || args.selected == nullptr || args.outSlot == nullptr || args.missOrdinal == nullptr
         || args.missSlot == nullptr || args.missCount == nullptr || args.historyUnits == nullptr
@@ -597,8 +612,7 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
         TLLM_CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<void const*>(&sparseResolveKernel),
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)));
     }
-    dim3 const grid(static_cast<unsigned>(args.numLayers), static_cast<unsigned>(args.numRows));
-    sparseResolveKernel<<<grid, kThreads, shared, reinterpret_cast<cudaStream_t>(stream)>>>(args, tableSize);
+    sparseResolveKernel<<<args.numRows, kThreads, shared, reinterpret_cast<cudaStream_t>(stream)>>>(args, tableSize);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

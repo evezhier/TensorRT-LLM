@@ -527,6 +527,10 @@ private:
     //! Byte offset of each sparse buffer within a cold page, in SparseCacheView order.
     [[nodiscard]] std::vector<uint32_t> _sparseColdPageOffsets(LifeCycleId lifeCycle) const;
 
+    //! The metadata row each sparse buffer reads, in SparseCacheView order: a dense layer
+    //! index within the life cycle, counting only layers that contribute a cached buffer.
+    [[nodiscard]] std::vector<int32_t> _sparseBufferLayers(LifeCycleId lifeCycle) const;
+
     //! Write the cells holding units [fromUnits, toUnits) back to their host pages, on this
     //! request's stream. Enqueues and returns: stream order is what guarantees a later fetch
     //! reads the written-back page, and a copy that fails is a broken invariant, not a

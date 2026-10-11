@@ -251,23 +251,34 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     CudaUniqPtr viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
     cuCheck(cuMemcpyHtoD(viewPtr, views.data(), sizeof(SparseCacheView) * views.size()));
 
-    SparseResolveArgs args;
-    args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
-    args.numRows = numRows;
-    args.numLayers = numLayers;
-    args.entriesPerLayer = entriesPerLayer;
-    args.selected = reinterpret_cast<int32_t const*>(selection.get());
-    args.selectionWidth = selectionWidth;
-    args.historyUnits = reinterpret_cast<int32_t const*>(history.get());
-    args.capacityUnits = reinterpret_cast<int32_t const*>(capacity.get());
-    args.inFlightSlot = reinterpret_cast<int32_t*>(inFlight.get());
-    args.maxInFlightUnits = maxInFlightUnits;
-    args.outSlot = reinterpret_cast<int32_t*>(outSlot.get());
-    args.missOrdinal = reinterpret_cast<int32_t*>(missOrdinal.get());
-    args.missSlot = reinterpret_cast<int32_t*>(missSlot.get());
-    args.missCount = reinterpret_cast<int32_t*>(missCount.get());
+    // One launch per layer, as a step does: a layer's selection is not known until the
+    // previous layer has run. The arrays are therefore layer-major, so each launch sees a
+    // contiguous [row][...] slice of its own. Same stream, so the layers stay ordered.
+    for (int layer = 0; layer < numLayers; ++layer)
+    {
+        auto const selectionOffset = static_cast<size_t>(layer) * numRows * selectionWidth;
+        auto const countOffset = static_cast<size_t>(layer) * numRows;
 
-    launchSparseResolve(args, nullptr);
+        SparseResolveArgs args;
+        args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
+        args.numRows = numRows;
+        args.layerInGroup = layer;
+        args.numLayers = numLayers;
+        args.entriesPerLayer = entriesPerLayer;
+        args.selected = reinterpret_cast<int32_t const*>(selection.get()) + selectionOffset;
+        args.selectionWidth = selectionWidth;
+        args.historyUnits = reinterpret_cast<int32_t const*>(history.get());
+        args.capacityUnits = reinterpret_cast<int32_t const*>(capacity.get());
+        args.inFlightSlot
+            = reinterpret_cast<int32_t*>(inFlight.get()) + countOffset * static_cast<size_t>(maxInFlightUnits);
+        args.maxInFlightUnits = maxInFlightUnits;
+        args.outSlot = reinterpret_cast<int32_t*>(outSlot.get()) + selectionOffset;
+        args.missOrdinal = reinterpret_cast<int32_t*>(missOrdinal.get()) + selectionOffset;
+        args.missSlot = reinterpret_cast<int32_t*>(missSlot.get()) + selectionOffset;
+        args.missCount = reinterpret_cast<int32_t*>(missCount.get()) + countOffset;
+
+        launchSparseResolve(args, nullptr);
+    }
     cuCheck(cuStreamSynchronize(nullptr));
 
     SparseResolveProbe result;
@@ -283,10 +294,10 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
 
 std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
     std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& devicePool, uint64_t devicePageStride,
-    std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& coldBufferOffset, int subSlotsPerLayer,
+    std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& coldBufferOffset, int subSlotsPerBuffer,
     int buffersPerSlot, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
     uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
-    std::vector<int32_t> const& missCount, int selectionWidth, int numLayers, bool writeBack)
+    std::vector<int32_t> const& missCount, int selectionWidth, std::vector<int32_t> const& bufferLayer, bool writeBack)
 {
     CUdeviceptr hostPtr = 0;
     cuCheck(cuMemAlloc(&hostPtr, hostPool.size()));
@@ -304,6 +315,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     auto missSlotBuf = deviceCopy(missSlot);
     auto missCountBuf = deviceCopy(missCount);
     auto coldOffsets = deviceCopyU32(coldBufferOffset);
+    auto bufferLayerBuf = deviceCopy(bufferLayer);
 
     SparseUnitCopyArgs args;
     args.hostBase = hostPtr;
@@ -314,7 +326,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.devicePageStride = devicePageStride;
     args.cachePages = reinterpret_cast<int32_t const*>(pages.get());
     args.hostBufferOffset = reinterpret_cast<uint32_t const*>(coldOffsets.get());
-    args.subSlotsPerLayer = subSlotsPerLayer;
+    args.subSlotsPerBuffer = subSlotsPerBuffer;
     args.buffersPerSlot = buffersPerSlot;
     args.bufferBytes = bufferBytes;
     args.direction = writeBack ? SparseCopyDirection::kWriteBack : SparseCopyDirection::kFetch;
@@ -327,7 +339,8 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.workSlot = reinterpret_cast<int32_t const*>(missSlotBuf.get());
     args.workCount = reinterpret_cast<int32_t const*>(missCountBuf.get());
     args.workWidth = selectionWidth;
-    args.numLayers = numLayers;
+    args.bufferLayer = reinterpret_cast<int32_t const*>(bufferLayerBuf.get());
+    args.numBuffers = static_cast<int32_t>(bufferLayer.size());
 
     launchSparseUnitCopy(args, nullptr);
     cuCheck(cuStreamSynchronize(nullptr));

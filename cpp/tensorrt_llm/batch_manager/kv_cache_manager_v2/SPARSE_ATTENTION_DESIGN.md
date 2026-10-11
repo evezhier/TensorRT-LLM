@@ -474,7 +474,24 @@ lossless question the first stage does not need to answer.
 
 ## Fetch
 
-One call per layer group per step, on the caller's stream:
+One call per **layer** per step, on the caller's stream — not per layer group. A layer's
+selection is computed from the previous layer's output, so a step's selections are not all
+known at its start; the call has to be the unit the caller can actually fill.
+
+Within a layer, every sparse buffer shares the call. They select the same units, so they
+share one metadata row, and one resolve yields the entry list that addresses each buffer's
+own cell. Their agreement is structural rather than a consequence of running identical
+logic on identical input.
+
+Models that tie a run of consecutive layers to one selection still get a call each. That is
+deliberate: issuing them separately starts the first layer's copies as early as possible
+instead of waiting for the whole run, and the caller simply passes the same selection array
+to each call, so KVCM2 never has to know the layers are related. A caller that would rather
+have the single batched launch can express it in configuration, by declaring the tied
+layers' buffers as one `AttentionLayerConfig` with distinct roles — one metadata row, one
+call, the same cells.
+
+Each call then:
 
 1. read the selection: unit ordinals, uniform width, `-1` padded;
 2. build the probe index over the resident set;

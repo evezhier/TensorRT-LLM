@@ -872,7 +872,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[1, 0],
             cold_buffer_offset=[0],
-            sub_slots_per_layer=1,
+            sub_slots_per_buffer=1,
             buffers_per_slot=1,
             buffer_bytes=page_stride,
             num_chunks=1,
@@ -884,7 +884,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             miss_slot=[0],
             miss_count=[1],
             selection_width=1,
-            num_layers=1,
+            buffer_layer=list(range(1)),
         )
         # Entry 0 is page 0 of the cache, which is device page 1, unit 0.
         expected = host[unit : unit * 2]
@@ -906,7 +906,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[0],
             cold_buffer_offset=[0],
-            sub_slots_per_layer=1,
+            sub_slots_per_buffer=1,
             buffers_per_slot=1,
             buffer_bytes=page_stride,
             num_chunks=chunks,
@@ -918,7 +918,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             miss_slot=[1],
             miss_count=[1],
             selection_width=1,
-            num_layers=1,
+            buffer_layer=list(range(1)),
         )
         # Unit 1 of each chunk moves to unit 1 of the same chunk, verbatim.
         for c in range(chunks):
@@ -943,7 +943,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             cache_pages=[0],
             # Deliberately crossed: layer 0's buffer is second in the cold page.
             cold_buffer_offset=[unit, 0],
-            sub_slots_per_layer=1,
+            sub_slots_per_buffer=1,
             buffers_per_slot=2,
             buffer_bytes=unit,
             num_chunks=1,
@@ -955,7 +955,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             miss_slot=[0, 0],
             miss_count=[1, 1],
             selection_width=1,
-            num_layers=layers,
+            buffer_layer=list(range(layers)),
         )
         # The cold offset is a lookup and the hot cell is arithmetic on the sub-slot, so
         # layer 0 reads the second cold buffer into cell 0, and layer 1 the reverse.
@@ -973,7 +973,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=unit,
             cache_pages=[0],
             cold_buffer_offset=[0],
-            sub_slots_per_layer=1,
+            sub_slots_per_buffer=1,
             buffers_per_slot=1,
             buffer_bytes=unit,
             num_chunks=1,
@@ -985,7 +985,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             miss_slot=[0],
             miss_count=[0],
             selection_width=1,
-            num_layers=1,
+            buffer_layer=list(range(1)),
         )
         self.assertEqual(result, [0] * unit)
 
@@ -1001,7 +1001,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             device_page_stride=unit * 2,
             cache_pages=[0],
             cold_buffer_offset=[0],
-            sub_slots_per_layer=1,
+            sub_slots_per_buffer=1,
             buffers_per_slot=1,
             buffer_bytes=unit * 2,
             num_chunks=1,
@@ -1013,7 +1013,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             miss_slot=[1],
             miss_count=[1],
             selection_width=1,
-            num_layers=1,
+            buffer_layer=list(range(1)),
         )
         self.assertEqual(result[unit:], host[unit:])
 
@@ -1066,7 +1066,7 @@ class TestSparseFlush(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[0],
             cold_buffer_offset=[0],
-            sub_slots_per_layer=1,
+            sub_slots_per_buffer=1,
             buffers_per_slot=1,
             buffer_bytes=page_stride,
             num_chunks=1,
@@ -1078,7 +1078,7 @@ class TestSparseFlush(unittest.TestCase):
             miss_slot=[1],
             miss_count=[1],
             selection_width=1,
-            num_layers=1,
+            buffer_layer=list(range(1)),
         )
         hot = _introspection.sparse_unit_copy(
             host_pool=cold, device_pool=[0] * page_stride, write_back=False, **common
@@ -1106,7 +1106,7 @@ class TestSparseFlush(unittest.TestCase):
             device_page_stride=page_stride,
             cache_pages=[0],
             cold_buffer_offset=[0],
-            sub_slots_per_layer=1,
+            sub_slots_per_buffer=1,
             buffers_per_slot=1,
             buffer_bytes=page_stride,
             num_chunks=1,
@@ -1118,7 +1118,7 @@ class TestSparseFlush(unittest.TestCase):
             miss_slot=[1],
             miss_count=[1],
             selection_width=1,
-            num_layers=1,
+            buffer_layer=list(range(1)),
             write_back=True,
         )
         self.assertEqual(result[unit:], [0] * unit, "unit 1 was overwritten from the entry")

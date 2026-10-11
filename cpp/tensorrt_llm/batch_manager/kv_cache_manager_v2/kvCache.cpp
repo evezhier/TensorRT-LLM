@@ -267,6 +267,25 @@ std::vector<KvCache::SparseBufferRef> KvCache::_sparseBuffers(LifeCycleId lifeCy
     return refs;
 }
 
+std::vector<int32_t> KvCache::_sparseBufferLayers(LifeCycleId lifeCycle) const
+{
+    // _sparseBuffers walks layers outermost, so a change of layerId starts a new row and the
+    // result is non-decreasing, which is the grouping SparseCacheState checks for.
+    std::vector<int32_t> layers;
+    std::optional<LayerId> previous;
+    int32_t row = -1;
+    for (auto const& ref : _sparseBuffers(lifeCycle))
+    {
+        if (!previous.has_value() || ref.id.layerId != *previous)
+        {
+            previous = ref.id.layerId;
+            ++row;
+        }
+        layers.push_back(row);
+    }
+    return layers;
+}
+
 std::vector<uint32_t> KvCache::_sparseColdPageOffsets(LifeCycleId lifeCycle) const
 {
     auto& storage = mManager->storage();
@@ -330,9 +349,13 @@ SparseUnitCopyArgs KvCache::_sparseCopyArgs(LifeCycleId lifeCycle) const
     args.hostBufferOffset = view.hostBufferOffset;
     args.bufferBytes = first.size;
     args.buffersPerSlot = static_cast<int32_t>(hotSlotBytes / first.size);
-    args.subSlotsPerLayer = _sparseCacheSubSlotsPerBuffer(lifeCycle);
+    args.subSlotsPerBuffer = _sparseCacheSubSlotsPerBuffer(lifeCycle);
     args.expansion = mManager->sparseCacheExpansion(lifeCycle);
-    args.numLayers = view.numLayers;
+    args.bufferLayer = view.bufferLayer;
+    // Defaults to the whole life cycle; a one-layer fetch narrows them.
+    args.bufferBase = 0;
+    args.numBuffers = view.numBuffers;
+    args.workRowBase = 0;
 
     args.layout.numChunks = refs.front().layout.numChunks;
     args.layout.chunkBytes = refs.front().layout.chunkBytes;
@@ -356,7 +379,6 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
     auto const& state = mSparseCacheState[lifeCycle];
     TLLM_CHECK_DEBUG(!state.empty() && toUnits > fromUnits);
     auto const& view = state.view();
-    auto& storage = mManager->storage();
     auto const stream = reinterpret_cast<CUstream>(cudaStream());
     int const expansion = mManager->sparseCacheExpansion(lifeCycle);
 
@@ -623,10 +645,13 @@ bool KvCache::resume(std::optional<CUstream> stream)
                     cachePageSlots.push_back(static_cast<int32_t>(lock.slot().slotId().value()));
                 }
                 SparseCacheInit init;
-                init.numLayers = mManager->sparseCacheBufferCount(lc);
+                // Metadata rows are per layer; cells and cold-page offsets are per buffer.
+                init.numLayers = mManager->sparseCacheLayerCount(lc);
+                init.numBuffers = mManager->sparseCacheBufferCount(lc);
                 init.entriesPerLayer = entries;
                 init.cachePageSlots = std::move(cachePageSlots);
                 init.hostBufferOffset = _sparseColdPageOffsets(lc);
+                init.bufferLayer = _sparseBufferLayers(lc);
                 // A watermark move cannot cross more than the in-flight span it is draining.
                 int const expansion = mManager->sparseCacheExpansion(lc);
                 int const cells = _sparseCacheSubSlotsPerBuffer(lc) * expansion;

@@ -343,8 +343,18 @@ public:
         return lifeCycle < mSparseCacheExpansion.size() ? mSparseCacheExpansion[lifeCycle] : 1;
     }
 
-    //! Sparse buffers this life cycle has, one per (layer, role). Each is an independent
-    //! cache: layers select different units, so nothing is shared between them.
+    //! Layers this life cycle has that carry a sparse cache.
+    //!
+    //! The cache metadata is per layer rather than per buffer, because every sparse buffer
+    //! of a layer selects the same units: one resident set and one recency order serve them
+    //! all, and the entry index resolved from it addresses each buffer's own cell.
+    [[nodiscard]] int sparseCacheLayerCount(LifeCycleId lifeCycle) const noexcept
+    {
+        return lifeCycle < mSparseCacheLayers.size() ? mSparseCacheLayers[lifeCycle] : 0;
+    }
+
+    //! Sparse buffers this life cycle has, one per (layer, role). Cells and cold-page
+    //! offsets are per buffer, so this is what the copy walks.
     //!
     //! Because a life cycle's buffers of one size coalesce into that pool's slot, this is
     //! also the cells a reserved slot yields, which is what makes the cell count and the
@@ -480,6 +490,7 @@ private:
     TypedVec<LifeCycleId, int> mSparseCacheExpansion;
     TypedVec<LifeCycleId, int> mSparseCacheBuffers;
     TypedVec<LifeCycleId, int> mSparseCacheSelection;
+    TypedVec<LifeCycleId, int> mSparseCacheLayers;
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;

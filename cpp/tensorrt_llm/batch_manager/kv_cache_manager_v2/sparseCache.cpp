@@ -42,22 +42,39 @@ size_t alignedBytes(size_t bytes) noexcept
 SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
 {
     int32_t const numLayers = init.numLayers;
+    int32_t const numBuffers = init.numBuffers;
     int32_t const entriesPerLayer = init.entriesPerLayer;
     auto const& cachePageSlots = init.cachePageSlots;
-    if (numLayers <= 0 || entriesPerLayer <= 0)
+    if (numLayers <= 0 || numBuffers <= 0 || entriesPerLayer <= 0)
     {
-        throw std::invalid_argument("SparseCacheState requires a positive layer and entry count");
+        throw std::invalid_argument("SparseCacheState requires a positive layer, buffer and entry count");
     }
     if (cachePageSlots.empty())
     {
         throw std::invalid_argument("SparseCacheState requires at least one cache page");
     }
-    if (init.hostBufferOffset.size() != static_cast<size_t>(numLayers))
+    if (init.hostBufferOffset.size() != static_cast<size_t>(numBuffers))
     {
         throw std::invalid_argument("SparseCacheState requires one cold-page offset per buffer");
     }
+    if (init.bufferLayer.size() != static_cast<size_t>(numBuffers))
+    {
+        throw std::invalid_argument("SparseCacheState requires one layer index per buffer");
+    }
+    for (size_t i = 0; i < init.bufferLayer.size(); ++i)
+    {
+        if (init.bufferLayer[i] < 0 || init.bufferLayer[i] >= numLayers)
+        {
+            throw std::invalid_argument("SparseCacheState: a buffer's layer index is out of range");
+        }
+        if (i > 0 && init.bufferLayer[i] < init.bufferLayer[i - 1])
+        {
+            throw std::invalid_argument("SparseCacheState: buffers must be grouped by layer");
+        }
+    }
 
     mView.numLayers = numLayers;
+    mView.numBuffers = numBuffers;
     mView.entriesPerLayer = entriesPerLayer;
     mView.numPages = static_cast<int32_t>(cachePageSlots.size());
     mView.maxFlushUnits = std::max(init.maxFlushUnits, 1);
@@ -71,11 +88,14 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
     size_t const countBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(numLayers));
     size_t const rangeBytes = alignedBytes(sizeof(int32_t) * 2);
     size_t const sliceBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mView.maxFlushBlocks));
-    size_t const offsetBytes = alignedBytes(sizeof(uint32_t) * static_cast<size_t>(numLayers));
+    // Cold-page offsets and the layer map are per buffer; everything above is per layer.
+    size_t const offsetBytes = alignedBytes(sizeof(uint32_t) * static_cast<size_t>(numBuffers));
+    size_t const bufferLayerBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(numBuffers));
 
     CUdeviceptr base = 0;
     cuCheck(cuMemAlloc(&base,
-        ordinalBytes + lruBytes + pageBytes + 2 * flushListBytes + countBytes + rangeBytes + sliceBytes + offsetBytes));
+        ordinalBytes + lruBytes + pageBytes + 2 * flushListBytes + countBytes + rangeBytes + sliceBytes + offsetBytes
+            + bufferLayerBytes));
     mMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
 
     auto* bytes = reinterpret_cast<std::byte*>(base);
@@ -95,6 +115,7 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
     mView.flushRange = carve(rangeBytes);
     mView.flushPageSlice = carve(sliceBytes);
     mView.hostBufferOffset = reinterpret_cast<uint32_t*>(carve(offsetBytes));
+    mView.bufferLayer = carve(bufferLayerBytes);
     // -1 so that "no write-back has run" is distinguishable from "one ran and found
     // nothing to move", which is what lets a test tell the two apart.
     cuCheck(cuMemsetD32Async(
@@ -102,6 +123,9 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
     // Synchronous: both sources are the caller's and may go away on return.
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mView.hostBufferOffset), init.hostBufferOffset.data(),
         sizeof(uint32_t) * init.hostBufferOffset.size()));
+    // Synchronous for the same reason.
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mView.bufferLayer), init.bufferLayer.data(),
+        sizeof(int32_t) * init.bufferLayer.size()));
     // Synchronous: cachePageSlots belongs to the caller and may go away on return.
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mView.cachePages), cachePageSlots.data(),
         sizeof(int32_t) * cachePageSlots.size()));

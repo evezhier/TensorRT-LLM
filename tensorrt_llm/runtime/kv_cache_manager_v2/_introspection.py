@@ -278,7 +278,7 @@ def sparse_unit_copy(
     device_page_stride: int,
     cache_pages: list[int],
     cold_buffer_offset: list[int],
-    sub_slots_per_layer: int,
+    sub_slots_per_buffer: int,
     buffers_per_slot: int,
     buffer_bytes: int,
     num_chunks: int,
@@ -290,14 +290,16 @@ def sparse_unit_copy(
     miss_slot: list[int],
     miss_count: list[int],
     selection_width: int,
-    num_layers: int,
+    buffer_layer: list[int],
     write_back: bool = False,
 ) -> list[int]:
     """Move units between a caller-supplied cold pool and cache entries.
 
     Exercises the copy's address arithmetic against a known byte pattern. Returns the
     destination pool: the cache pool when fetching, the cold pool when writing back.
-    Synchronises.
+
+    ``buffer_layer`` maps each buffer to the work-list row it reads, so buffers of one
+    layer share a list; its length is the number of buffers copied. Synchronises.
     """
     return list(
         _cpp().sparse_unit_copy(
@@ -308,7 +310,7 @@ def sparse_unit_copy(
             device_page_stride,
             cache_pages,
             cold_buffer_offset,
-            sub_slots_per_layer,
+            sub_slots_per_buffer,
             buffers_per_slot,
             buffer_bytes,
             num_chunks,
@@ -320,7 +322,7 @@ def sparse_unit_copy(
             miss_slot,
             miss_count,
             selection_width,
-            num_layers,
+            buffer_layer,
             write_back,
         )
     )
@@ -372,9 +374,13 @@ def sparse_resolve(
 ) -> SparseResolveResult:
     """Run the sparse resolve kernel over caller-supplied cache state.
 
-    Inputs are row-major [layer][entry] and [layer][selection_width]; a negative
-    selection entry is padding. ``inactive_rows`` get a default view, standing in for a
-    row holding no reservation. Ordinals in ``[history_units, capacity_units)`` are in
+    Issues one launch per layer, as a step does: a layer's selection is not known until
+    the previous layer has run. Cache state is therefore [row][layer][entry], following
+    the view each row owns, while the selection and every output are [layer][row][width]
+    so that each launch sees a contiguous slice of its own.
+
+    A negative selection entry is padding. ``inactive_rows`` get a default view, standing
+    in for a row holding no reservation. Ordinals in ``[history_units, capacity_units)`` are in
     flight: they are made resident before the selection takes any victim, are never
     chosen as victims themselves, and never enter the miss list because their host pages
     hold nothing to fetch. Synchronises.

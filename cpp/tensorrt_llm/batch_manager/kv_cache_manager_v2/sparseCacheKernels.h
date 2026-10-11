@@ -38,12 +38,18 @@ inline constexpr int32_t kNoSparseSlot = -1;
 //! would be unreadable anyway -- the trap destroys the context, so no later copy back can
 //! succeed -- which is why there is none. A debug build names the condition before halting.
 
-//! One layer group's resolve across a batch: turn each row's selection of unit ordinals
-//! into cache entry indices, allocating entries for the units that are not resident.
+//! One layer's resolve across a batch: turn each row's selection of unit ordinals into
+//! cache entry indices, allocating entries for the units that are not resident.
 //!
-//! Layouts are [row][layer][...] row-major. Every array is device memory, and `numLayers`
-//! and `entriesPerLayer` are properties of the layer group, hence uniform across rows --
-//! which is what keeps one shared-memory size and one grid shape for the whole batch.
+//! The scope is one layer, not a layer group, because a layer's selection depends on the
+//! previous layer's output: they are not all known at the start of a step. Consecutive
+//! layers that happen to share a selection still get a call each, so the first layer's
+//! copies start as early as possible; the caller simply passes the same selection array
+//! again, and KVCM2 need not know they are related.
+//!
+//! One result serves every sparse buffer of the layer, since they select the same units
+//! and share one metadata row. Layouts are therefore [row][...], with no buffer dimension.
+//! Every array is device memory.
 struct SparseResolveArgs
 {
     //! [numRows] cache state per row, as Batch::sparseCacheViews() publishes it. A row with
@@ -51,16 +57,19 @@ struct SparseResolveArgs
     //! and is skipped.
     SparseCacheView const* views = nullptr;
     int32_t numRows = 0;
+    //! Which of the life cycle's layers this call resolves: the metadata row every sparse
+    //! buffer of that layer shares.
+    int32_t layerInGroup = 0;
     //! Shape shared by every row's view. Passed separately because the host needs them to
     //! size shared memory and the grid before any view can be read.
     int32_t numLayers = 0;
     int32_t entriesPerLayer = 0;
 
-    //! [numRows][numLayers][selectionWidth] unit ordinals, negative where the selection is padded.
-    //! Ordinals must be unique within a layer; duplicates would be resolved as separate
+    //! [numRows][selectionWidth] unit ordinals, negative where the selection is padded.
+    //! Ordinals must be unique within a row; duplicates would be resolved as separate
     //! misses and waste an entry each.
     int32_t const* selected = nullptr;
-    //! Selected units per layer, uniform across layers and requests so shapes stay static.
+    //! Selected units per row, uniform across requests so shapes stay static.
     int32_t selectionWidth = 0;
 
     //! [numRows] history_length / unit_tokens, and [numRows] capacity / unit_tokens.
@@ -74,11 +83,11 @@ struct SparseResolveArgs
     int32_t const* historyUnits = nullptr;
     int32_t const* capacityUnits = nullptr;
 
-    //! [numRows][numLayers][selectionWidth] entry index per selection, kNoSparseSlot where
-    //! padded or where the row holds no reservation.
+    //! [numRows][selectionWidth] entry index per selection, kNoSparseSlot where padded or
+    //! where the row holds no reservation. One list serves every buffer of the layer.
     int32_t* outSlot = nullptr;
 
-    //! [numRows][numLayers][maxInFlightUnits] entry index per in-flight unit, in ordinal order from
+    //! [numRows][maxInFlightUnits] entry index per in-flight unit, in ordinal order from
     //! historyUnits. Entries past the live count are left untouched. The model writes new
     //! KV through these, so they are resolved before the selection takes any victim.
     int32_t* inFlightSlot = nullptr;
@@ -86,13 +95,13 @@ struct SparseResolveArgs
     //! so the shape stays static while the live count varies.
     int32_t maxInFlightUnits = 0;
 
-    //! [numRows][numLayers][selectionWidth] the history units that were not resident, and
-    //! the entries given to them. The copy stage reads these; only the first
-    //! missCount[row][layer] are valid. An in-flight unit that misses is allocated an entry but never appears
+    //! [numRows][selectionWidth] the history units that were not resident, and the entries
+    //! given to them. The copy stage reads these for every buffer of the layer; only the
+    //! first missCount[row] are valid. An in-flight unit that misses is allocated an entry but never appears
     //! here: its host page holds nothing to fetch.
     int32_t* missOrdinal = nullptr;
     int32_t* missSlot = nullptr;
-    //! [numRows][numLayers] number of misses.
+    //! [numRows] number of misses.
     int32_t* missCount = nullptr;
 };
 
@@ -156,19 +165,20 @@ struct SparseUnitCopyArgs
     int32_t const* cachePages = nullptr;
 
     //! The reservation hands out whole coalesced slots, but the cache does not have to use
-    //! them that way: a slot is buffersPerSlot buffer-sized cells, and any layer's unit can
+    //! them that way: a slot is buffersPerSlot buffer-sized cells, and any buffer's unit can
     //! occupy any cell. Entries are therefore addressed through a flat sub-slot index,
     //!
-    //!     subSlot = layer * subSlotsPerLayer + entry / expansion
+    //!     subSlot = buffer * subSlotsPerBuffer + entry / expansion
     //!
-    //! which decouples the per-layer partition from the page layout. Coalescing earns
+    //! which decouples the per-buffer partition from the page layout. Coalescing earns
     //! nothing here because layers select different units, so nothing is shared.
-    int32_t subSlotsPerLayer = 0;
+    int32_t subSlotsPerBuffer = 0;
     int32_t buffersPerSlot = 1;
     uint64_t bufferBytes = 0;
 
-    //! [numLayers] offset of this layer's buffer within a cold page. Unlike the hot side
-    //! this is a lookup, not arithmetic: the cold layout is the codec's concat order.
+    //! [life cycle's buffers] offset of each buffer within a cold page, indexed by absolute
+    //! buffer index. Unlike the hot side this is a lookup, not arithmetic: the cold layout
+    //! is the codec's concat order.
     uint32_t const* hostBufferOffset = nullptr;
 
     SparseCopyDirection direction = SparseCopyDirection::kFetch;
@@ -177,16 +187,31 @@ struct SparseUnitCopyArgs
     //! Selection units per buffer, i.e. tokens_per_block / tokens_per_block_override.
     int32_t expansion = 1;
 
-    //! The work list: the resolve's misses when fetching, the flush list when writing
-    //! back. [numLayers][workWidth], of which the first workCount[layer] are valid.
+    //! The work list: the resolve's misses when fetching, the flush list when writing back.
+    //! [rows][workWidth], of which the first workCount[row] are valid.
+    //!
+    //! Its rows are layers, while the copy itself walks buffers, because a layer's buffers
+    //! select the same units and so share one list. Buffer b of this call reads row
+    //! `bufferLayer[bufferBase + b] - workRowBase`: a fetch resolves a single layer and
+    //! passes a one-row list, a write-back crosses the watermark for every layer at once and
+    //! passes them all.
     int32_t const* workOrdinal = nullptr;
     int32_t const* workSlot = nullptr;
     int32_t const* workCount = nullptr;
     int32_t workWidth = 0;
-    int32_t numLayers = 0;
+
+    //! [life cycle's buffers] buffer -> layer, as SparseCacheView publishes it.
+    int32_t const* bufferLayer = nullptr;
+    //! The buffers this call copies: `numBuffers` of them starting at `bufferBase`. They are
+    //! consecutive because buffers are grouped by layer.
+    int32_t bufferBase = 0;
+    int32_t numBuffers = 0;
+    //! Layer the work list's first row describes.
+    int32_t workRowBase = 0;
 };
 
-//! Launch the copies. One CTA per potential work item; CTAs past a layer's count exit.
+//! Launch the copies. One CTA per (buffer, potential work item); CTAs past the buffer's
+//! layer's count exit.
 void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream);
 
 //! Collect the entries holding units the watermark has just passed, so they can be written

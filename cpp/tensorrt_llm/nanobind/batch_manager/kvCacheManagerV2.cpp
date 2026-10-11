@@ -2207,10 +2207,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("max_in_flight_units"), nb::arg("inactive_rows"));
     mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),
         nb::arg("host_page_stride"), nb::arg("page_table"), nb::arg("device_pool"), nb::arg("device_page_stride"),
-        nb::arg("cache_pages"), nb::arg("cold_buffer_offset"), nb::arg("sub_slots_per_layer"),
+        nb::arg("cache_pages"), nb::arg("cold_buffer_offset"), nb::arg("sub_slots_per_buffer"),
         nb::arg("buffers_per_slot"), nb::arg("buffer_bytes"), nb::arg("num_chunks"), nb::arg("chunk_bytes"),
         nb::arg("chunk_stride"), nb::arg("unit_stride"), nb::arg("expansion"), nb::arg("miss_ordinal"),
-        nb::arg("miss_slot"), nb::arg("miss_count"), nb::arg("selection_width"), nb::arg("num_layers"),
+        nb::arg("miss_slot"), nb::arg("miss_count"), nb::arg("selection_width"), nb::arg("buffer_layer"),
         nb::arg("write_back") = false, nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "sparse_flush_list",
