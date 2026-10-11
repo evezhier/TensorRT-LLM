@@ -231,6 +231,15 @@ def sparse_flush_counts(kv_cache: Any, lc_id: int) -> list[int]:
     return list(_cpp().sparse_flush_counts(kv_cache, lc_id))
 
 
+def batch_page_table(batch: Any, layer_group_id: int) -> list[int]:
+    """A Batch's published device page table, row-major [max_batch][max_blocks_per_seq].
+
+    Reads the device copy, so it shows what the last publish() put there rather than what
+    the staging rows currently hold. Synchronises.
+    """
+    return list(_cpp().batch_page_table(batch, layer_group_id))
+
+
 class SparseResolveResult(NamedTuple):
     """State and outputs of one sparse resolve launch."""
 

@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/introspection.h"
 
+#include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
 
 #include "kv_cache_manager_v2/kvCache.h"
@@ -122,6 +123,14 @@ std::vector<int32_t> KvCacheIntrospection::sparseCachePages(KvCache const& kvCac
         return {};
     }
     return kvCache.mSparseCacheState[id].readCachePages();
+}
+
+std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, int layerGroupId)
+{
+    auto const view = batch.pageTable(LayerGroupId{layerGroupId});
+    std::vector<int32_t> out(static_cast<size_t>(view.numRows) * view.blocksPerRow);
+    cuCheck(cuMemcpyDtoH(out.data(), view.data, sizeof(int32_t) * out.size()));
+    return out;
 }
 
 std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCache, int lcId)

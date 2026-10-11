@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/kvCache.h"
+#include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
@@ -126,6 +127,11 @@ KvCache::~KvCache()
             // waiting on the GIL to run a Python callback. Drop the GIL first if we happen to
             // hold it.
             OptionalGilRelease const gilRelease;
+            // Before close(), so a Batch never holds a row pointing at a half-torn cache.
+            if (mBatch != nullptr)
+            {
+                mBatch->_detach(*this);
+            }
             close();
         });
 }

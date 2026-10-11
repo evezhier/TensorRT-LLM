@@ -54,6 +54,10 @@ public:
     // White-box hook: units the last write-back moved per buffer, -1 where none has run.
     static std::vector<int32_t> sparseFlushCounts(KvCache const& kvCache, int lcId);
 
+    // White-box hook: a Batch's published device page table for one layer group, row-major
+    // [max_batch][max_blocks_per_seq]. Synchronises.
+    static std::vector<int32_t> batchPageTable(Batch const& batch, int layerGroupId);
+
     // White-box hook: run the sparse resolve kernel over caller-supplied state, so the
     // probe index, victim choice and recency rebuild can be exercised without a request.
     // Synchronises. Inputs are [layer][entry] and [layer][selectionWidth] row-major.

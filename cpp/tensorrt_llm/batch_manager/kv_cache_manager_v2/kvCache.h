@@ -39,6 +39,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // Forward declarations.
+class Batch;
+
 class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
@@ -485,6 +487,7 @@ public:
 
 private:
     friend class KvCacheIntrospection;
+    friend class Batch;
     friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
@@ -701,6 +704,11 @@ private:
     using LifeCyclePageIndexBuffers = TypedVec<LifeCycleId, PageIndexBuf>;
     using BeamPageIndexBuffers = TypedVec<BeamIndex, LifeCyclePageIndexBuffers>;
     BeamPageIndexBuffers mBasePageIndices;
+
+    // Set while this cache is a Batch member; the Batch clears both on removal and the
+    // destructor detaches, so a dropped request cannot leave a row pointing at it.
+    Batch* mBatch = nullptr;
+    int mBatchRow = -1;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 

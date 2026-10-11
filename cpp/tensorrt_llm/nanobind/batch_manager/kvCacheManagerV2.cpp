@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 
+#include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
@@ -2150,6 +2151,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("sparse_flush_counts", &kv::KvCacheIntrospection::sparseFlushCounts, nb::arg("kv_cache"),
         nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("batch_page_table", &kv::KvCacheIntrospection::batchPageTable, nb::arg("batch"),
+        nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "sparse_resolve",
         [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
@@ -2389,6 +2392,57 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "this codec, so normal users do not need to call this factory. It is primarily provided to demonstrate how a "
         "native codec factory exposes an owning IKvCacheColdPageCodec object for transfer into KVCacheManager. Any "
         "KVCacheManager construction attempt consumes an explicitly supplied codec, including an attempt that fails.");
+
+    // ---- Batch -------------------------------------------------------------
+    nb::class_<kv::Batch>(m, "Batch")
+        .def(nb::init<kv::KvCacheManager&, int, int>(), nb::arg("manager"), nb::arg("max_batch_size") = 0,
+            nb::arg("max_blocks_per_seq") = 0, nb::keep_alive<1, 2>(),
+            "The KV caches stepped together, and their device-side page tables.\n\n"
+            "max_batch_size and max_blocks_per_seq bound device arrays whose shape must not change "
+            "between steps, so neither can be grown later. Zero derives them from the manager's "
+            "constraints, which fails when none were declared.")
+        .def("add_kv_cache", &kv::Batch::addKvCache, nb::arg("kv_cache"), nb::keep_alive<1, 2>(),
+            "Take the lowest free row, returning it. Raises when the batch is full or the cache "
+            "already belongs to a batch.")
+        .def("remove_kv_cache", &kv::Batch::removeKvCache, nb::arg("kv_cache"),
+            "Free the cache's row, leaving a hole for reuse.")
+        .def(
+            "publish",
+            [](kv::Batch& self, nb::object stream)
+            {
+                auto const handle
+                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                nb::gil_scoped_release rel;
+                self.publish(handle);
+            },
+            nb::arg("stream") = nb::none(),
+            "Copy the staged page indices to the device, enqueuing on the stream. What this adds "
+            "over the staging rows, which members keep current themselves, is a stream-ordered "
+            "snapshot: without it the host would be mutating a table a previously enqueued fetch "
+            "is still reading.\n\n"
+            "The copy is asynchronous and reads pinned memory, so it is still in flight on return. "
+            "Call wait_published() before any later host write to a member's page indices - a "
+            "resize, a commit, a beam fork, an SWA recycle - or that write races the copy.")
+        .def(
+            "wait_published",
+            [](kv::Batch& self)
+            {
+                nb::gil_scoped_release rel;
+                self.waitPublished();
+            },
+            "Block until the last publish() has finished reading the staging rows. Cheap once "
+            "complete and a no-op when nothing is in flight, so it is safe at the top of a step.")
+        .def(
+            "page_table",
+            [](kv::Batch const& self, int layerGroupId)
+            {
+                auto const view = self.pageTable(kv::LayerGroupId{layerGroupId});
+                return nb::make_tuple(static_cast<intptr_t>(view.data), view.numRows, view.blocksPerRow);
+            },
+            nb::arg("layer_group_id"), "(address, num_rows, blocks_per_row) of one layer group's device page table.")
+        .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
+        .def_prop_ro("max_batch_size", &kv::Batch::maxBatchSize)
+        .def_prop_ro("max_blocks_per_seq", &kv::Batch::maxBlocksPerSeq);
 
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")

@@ -38,6 +38,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DEFAULT_BEAM_INDEX,
         GPU_LEVEL,
         AttentionLayerConfig,
+        Batch,
         BatchDesc,
         BufferConfig,
         BufferId,
@@ -90,6 +91,7 @@ else:
         DEFAULT_BEAM_INDEX,
         GPU_LEVEL,
         AttentionLayerConfig,
+        Batch,
         BatchDesc,
         BufferConfig,
         BufferId,
@@ -1130,6 +1132,196 @@ class TestSparseFlush(unittest.TestCase):
         )
         self.assertEqual(result[unit:], [0] * unit, "unit 1 was overwritten from the entry")
         self.assertEqual(result[:unit], cold[:unit], "unit 0 was untouched")
+
+
+class TestBatch(unittest.TestCase):
+    """Row order and the device-side page table the sparse fetch reads."""
+
+    BAD = BAD_PAGE_INDEX
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @staticmethod
+    def _manager() -> KVCacheManager:
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=128,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096)])],
+            )
+        )
+
+    def test_rows_are_slots_so_a_hole_is_reused(self):
+        manager = self._manager()
+        try:
+            batch = Batch(manager, max_batch_size=3, max_blocks_per_seq=4)
+            first = manager.create_kv_cache()
+            second = manager.create_kv_cache()
+            third = manager.create_kv_cache()
+            self.assertEqual(batch.add_kv_cache(first), 0)
+            self.assertEqual(batch.add_kv_cache(second), 1)
+            self.assertEqual(batch.add_kv_cache(third), 2)
+
+            # Removing the middle member must not shift the ones after it: addresses and
+            # row indices have to survive a graph capture.
+            batch.remove_kv_cache(second)
+            self.assertEqual(batch.row_of(third), 2)
+            self.assertEqual(batch.row_of(second), -1)
+
+            fourth = manager.create_kv_cache()
+            self.assertEqual(batch.add_kv_cache(fourth), 1, "the hole is reused")
+
+            for cache in (first, third, fourth):
+                batch.remove_kv_cache(cache)
+            for cache in (first, second, third, fourth):
+                cache.close()
+        finally:
+            manager.shutdown()
+
+    def test_membership_is_exclusive(self):
+        manager = self._manager()
+        try:
+            one = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
+            two = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
+            cache = manager.create_kv_cache()
+            one.add_kv_cache(cache)
+            with self.assertRaisesRegex(Exception, "at most one Batch"):
+                two.add_kv_cache(cache)
+            one.remove_kv_cache(cache)
+            # Free to join another batch once released.
+            two.add_kv_cache(cache)
+            two.remove_kv_cache(cache)
+            cache.close()
+        finally:
+            manager.shutdown()
+
+    def test_a_full_batch_refuses_rather_than_growing(self):
+        manager = self._manager()
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            first = manager.create_kv_cache()
+            second = manager.create_kv_cache()
+            batch.add_kv_cache(first)
+            # Growing would move the device arrays, which a captured graph cannot tolerate.
+            with self.assertRaisesRegex(Exception, "full"):
+                batch.add_kv_cache(second)
+            batch.remove_kv_cache(first)
+            first.close()
+            second.close()
+        finally:
+            manager.shutdown()
+
+    def test_an_unoccupied_row_reads_as_absent(self):
+        manager = self._manager()
+        try:
+            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=3)
+            lg_id = manager.get_layer_group_id(0)
+            with TemporaryCudaStream([]) as stream:
+                batch.publish(cast(CudaStream, stream.handle))
+                table = _introspection.batch_page_table(batch, lg_id)
+            # Every cell is the sentinel, not slot zero: only the sentinel distinguishes
+            # an absent block from a real page.
+            self.assertEqual(table, [self.BAD] * 6)
+        finally:
+            manager.shutdown()
+
+    def test_publish_mirrors_a_members_page_indices(self):
+        manager = self._manager()
+        cache = None
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
+            lg_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+                cache.resize(256, 0)  # 128-token blocks, so two of them
+                batch.publish(handle)
+                table = _introspection.batch_page_table(batch, lg_id)
+
+                # The installed buffer is max_blocks_per_seq long, so the member reports
+                # that whole span: its blocks first, then the sentinel tail.
+                row = list(cache.get_base_page_indices(lg_id))
+                self.assertEqual(len(row), 4)
+                self.assertEqual(table[:4], row, "row 0 mirrors the member")
+                self.assertTrue(all(i != self.BAD for i in row[:2]), row)
+                self.assertEqual(row[2:], [self.BAD] * 2, "past the member's blocks")
+                # Row 1 is unoccupied and stays absent.
+                self.assertEqual(table[4:], [self.BAD] * 4)
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_wait_published_is_a_noop_when_nothing_is_in_flight(self):
+        manager = self._manager()
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            # Safe to call at the top of a step whether or not a publish happened.
+            batch.wait_published()
+            batch.wait_published()
+        finally:
+            manager.shutdown()
+
+    def test_a_republish_after_waiting_shows_the_new_indices(self):
+        """A republish after waiting must carry the change.
+
+        publish() copies asynchronously from pinned staging, so the host has to wait
+        before touching a member again.
+        """
+        manager = self._manager()
+        cache = None
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            lg_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+                cache.resize(256, 0)
+                batch.publish(handle)
+                first = _introspection.batch_page_table(batch, lg_id)
+                self.assertEqual(sum(1 for i in first if i != self.BAD), 2)
+
+                # The contract: wait before the resize, which writes the staging row the
+                # copy above is still reading.
+                batch.wait_published()
+                cache.resize(512, 0)
+                batch.publish(handle)
+                second = _introspection.batch_page_table(batch, lg_id)
+                self.assertEqual(sum(1 for i in second if i != self.BAD), 4, second)
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_a_removed_members_row_is_cleared(self):
+        manager = self._manager()
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            lg_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+                cache.resize(256, 0)
+                batch.remove_kv_cache(cache)
+                batch.publish(handle)
+                # Otherwise the row would still name pages the departed request owns.
+                self.assertEqual(_introspection.batch_page_table(batch, lg_id), [self.BAD] * 4)
+        finally:
+            cache.close()
+            manager.shutdown()
 
 
 class TestKVCacheManagerV2(unittest.TestCase):
