@@ -683,11 +683,6 @@ class TestSparseCacheReservation(unittest.TestCase):
 class TestSparseResolve(unittest.TestCase):
     """The sparse resolve kernel: probe index, victim choice and recency rebuild."""
 
-    # SparseResolveStatus
-    OK = 0
-    OUT_OF_ENTRIES = 1
-    IN_FLIGHT_OVERFLOW = 2
-
     def setUp(self) -> None:
         init_cuda_once()
 
@@ -724,7 +719,6 @@ class TestSparseResolve(unittest.TestCase):
 
     def test_an_empty_cache_misses_everything(self):
         result = self._resolve(self._free(8), [5, 3, 7])
-        self.assertEqual(result.status, self.OK)
         self.assertEqual(result.miss_count, [3])
         # Every selection got a distinct entry, and the entries now hold those units.
         self.assertEqual(len(set(result.out_slot)), 3)
@@ -768,14 +762,8 @@ class TestSparseResolve(unittest.TestCase):
         resident = [10, 11, 12, 13]
         lru = [0, 1, 3, 2]  # entry 2 (unit 12) is least recently used
         result = self._resolve(resident, [99], lru=lru, history_units=12)
-        self.assertEqual(result.status, self.OK)
         self.assertEqual(result.resident_ordinal[2], 12, "an in-flight unit must survive")
         self.assertEqual(result.resident_ordinal[result.out_slot[0]], 99)
-
-    def test_reports_out_of_entries_rather_than_evicting_in_flight_data(self):
-        # Every entry is in flight, so nothing can be given away.
-        result = self._resolve([10, 11, 12, 13], [99], history_units=10)
-        self.assertEqual(result.status, self.OUT_OF_ENTRIES)
 
     def test_in_flight_units_become_resident_without_a_fetch(self):
         # Units 10 and 11 are in flight: the model is about to write them, so they need
@@ -787,7 +775,6 @@ class TestSparseResolve(unittest.TestCase):
             capacity_units=12,
             max_in_flight_units=2,
         )
-        self.assertEqual(result.status, self.OK)
         self.assertEqual(result.miss_count, [0], "an in-flight unit is never fetched")
         slots = result.in_flight_slot
         self.assertEqual(len(set(slots)), 2, "each in-flight unit got its own entry")
@@ -817,23 +804,12 @@ class TestSparseResolve(unittest.TestCase):
             capacity_units=11,
             max_in_flight_units=1,
         )
-        self.assertEqual(result.status, self.OK)
         in_flight = result.in_flight_slot[0]
         selected = result.out_slot[0]
         self.assertNotEqual(in_flight, selected)
         self.assertEqual(result.resident_ordinal[in_flight], 10)
         self.assertEqual(result.resident_ordinal[selected], 5)
         self.assertEqual(result.miss_count, [1], "only the history unit is fetched")
-
-    def test_growing_past_the_derived_input_bound_is_reported(self):
-        result = self._resolve(
-            self._free(8),
-            [-1],
-            history_units=0,
-            capacity_units=5,
-            max_in_flight_units=2,
-        )
-        self.assertEqual(result.status, self.IN_FLIGHT_OVERFLOW)
 
     def test_layers_resolve_independently(self):
         # Layer 0 hits, layer 1 misses.
@@ -1020,8 +996,6 @@ class TestSparseUnitCopy(unittest.TestCase):
 class TestSparseFlush(unittest.TestCase):
     """Writing a unit back to its host page once the watermark passes it."""
 
-    FLUSH_OVERFLOW = 3
-
     def setUp(self) -> None:
         init_cuda_once()
 
@@ -1036,7 +1010,6 @@ class TestSparseFlush(unittest.TestCase):
             to_units=11,
             max_flush_units=4,
         )
-        self.assertEqual(result.status, 0)
         self.assertEqual(result.count, [1], "only unit 7 is in [5, 11)")
         self.assertEqual(result.ordinal[0], 7)
         self.assertEqual(result.slot[0], 1)
@@ -1056,13 +1029,6 @@ class TestSparseFlush(unittest.TestCase):
         )
         self.assertEqual(result.count, [1, 0])
         self.assertEqual(result.ordinal[0], 4)
-
-    def test_overflowing_the_flush_bound_is_reported(self):
-        resident = [0, 1, 2, 3]
-        result = _introspection.sparse_flush_list(
-            resident, num_layers=1, entries_per_layer=4, from_units=0, to_units=4, max_flush_units=2
-        )
-        self.assertEqual(result.status, self.FLUSH_OVERFLOW)
 
     def test_write_back_inverts_the_fetch(self):
         """Fetching a unit and writing it back must reproduce the cold page."""
@@ -1194,6 +1160,30 @@ class TestBatch(unittest.TestCase):
             two.remove_kv_cache(cache)
             cache.close()
         finally:
+            manager.shutdown()
+
+    def test_beam_search_is_refused_rather_than_half_mirrored(self):
+        """Only beam 0 is staged, so a wider request would have every beam read beam 0."""
+        # Partial commit forbids beam_width changes, so this manager disables it.
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=128,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096)])],
+                enable_partial_commit=False,
+            )
+        )
+        cache = None
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            cache = manager.create_kv_cache()
+            cache.beam_width = 2
+            with self.assertRaisesRegex(Exception, "beam"):
+                batch.add_kv_cache(cache)
+            self.assertEqual(batch.row_of(cache), -1, "a refused member takes no row")
+        finally:
+            if cache is not None:
+                cache.close()
             manager.shutdown()
 
     def test_a_full_batch_refuses_rather_than_growing(self):

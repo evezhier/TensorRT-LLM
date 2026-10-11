@@ -395,7 +395,6 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
     listArgs.outSlot = view.flushSlot;
     listArgs.outCount = view.flushCount;
     listArgs.maxFlushUnits = view.maxFlushUnits;
-    listArgs.status = view.status;
     launchSparseFlushList(listArgs, stream);
 
     SparseUnitCopyArgs copyArgs = _sparseCopyArgs(lifeCycle);

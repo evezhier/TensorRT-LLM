@@ -87,8 +87,9 @@ public:
     Batch(Batch const&) = delete;
     Batch& operator=(Batch const&) = delete;
 
-    //! Take the lowest free row. Throws when the batch is full or the cache already belongs
-    //! to a batch.
+    //! Take the lowest free row. Throws when the batch is full, the cache already belongs to
+    //! a batch, or its beam width exceeds one -- only beam 0 is mirrored, so a wider request
+    //! would have every beam read beam 0's pages.
     int addKvCache(KvCache& kvCache);
 
     //! Free the cache's row, leaving a hole. Throws when it is not a member.

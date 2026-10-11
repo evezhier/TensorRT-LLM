@@ -2172,8 +2172,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             // No gil_scoped_release call guard: the tuple below is built from the lambda body,
             // which the guard would have left running without the GIL.
             return std::make_tuple(std::move(r.residentOrdinal), std::move(r.lruOrder), std::move(r.outSlot),
-                std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missCount), std::move(r.inFlightSlot),
-                r.status);
+                std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missCount), std::move(r.inFlightSlot));
         },
         nb::arg("resident_ordinal"), nb::arg("lru_order"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
@@ -2192,7 +2191,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         {
             auto r = kv::KvCacheIntrospection::sparseFlushList(
                 residentOrdinal, numLayers, entriesPerLayer, fromUnits, toUnits, maxFlushUnits);
-            return std::make_tuple(std::move(r.ordinal), std::move(r.slot), std::move(r.count), r.status);
+            return std::make_tuple(std::move(r.ordinal), std::move(r.slot), std::move(r.count));
         },
         nb::arg("resident_ordinal"), nb::arg("num_layers"), nb::arg("entries_per_layer"), nb::arg("from_units"),
         nb::arg("to_units"), nb::arg("max_flush_units"));

@@ -145,6 +145,12 @@ int Batch::addKvCache(KvCache& kvCache)
     {
         throw LogicError("A KvCache belongs to at most one Batch");
     }
+    if (kvCache.beamWidth() != BeamIndex{1})
+    {
+        // Only beam 0 is mirrored below, so a wider request would publish one beam's pages
+        // and have every beam read them. Refusing beats a wrong answer nothing would notice.
+        throw LogicError("Batch does not support beam search yet; a member must have beam width 1");
+    }
     // setBasePageIndexBuf writes this row, so the last publish must be done reading it.
     waitPublished();
     auto const free = std::find(mRows.begin(), mRows.end(), nullptr);
@@ -159,6 +165,7 @@ int Batch::addKvCache(KvCache& kvCache)
     // its own afterwards.
     for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
     {
+        // Beam 0 only; addKvCache rejects anything wider.
         kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lg, _stagingRow(lg, row), mMaxBlocksPerSeq);
     }
 

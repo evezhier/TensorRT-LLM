@@ -74,7 +74,6 @@ public:
         std::vector<int32_t> missSlot;        //!< [layer][width], first missCount valid
         std::vector<int32_t> missCount;       //!< [layer]
         std::vector<int32_t> inFlightSlot;    //!< [layer][maxInFlightUnits]
-        int32_t status = 0;                   //!< SparseResolveStatus
     };
 
     static SparseResolveProbe sparseResolve(std::vector<int32_t> const& residentOrdinal,
@@ -99,7 +98,6 @@ public:
         std::vector<int32_t> ordinal; //!< [layer][maxFlushUnits]
         std::vector<int32_t> slot;    //!< [layer][maxFlushUnits]
         std::vector<int32_t> count;   //!< [layer]
-        int32_t status = 0;
     };
 
     static SparseFlushList sparseFlushList(std::vector<int32_t> const& residentOrdinal, int numLayers,

@@ -259,7 +259,6 @@ class SparseResolveResult(NamedTuple):
     miss_slot: list[int]
     miss_count: list[int]
     in_flight_slot: list[int]
-    status: int
 
 
 def sparse_unit_copy(
@@ -324,7 +323,6 @@ class SparseFlushList(NamedTuple):
     ordinal: list[int]
     slot: list[int]
     count: list[int]
-    status: int
 
 
 def sparse_flush_list(
@@ -340,7 +338,7 @@ def sparse_flush_list(
     These are the units the watermark has just made selectable, so they must reach their
     host pages before any later fetch can read them. Synchronises.
     """
-    ordinal, slot, count, status = _cpp().sparse_flush_list(
+    ordinal, slot, count = _cpp().sparse_flush_list(
         resident_ordinal,
         num_layers,
         entries_per_layer,
@@ -348,7 +346,7 @@ def sparse_flush_list(
         to_units,
         max_flush_units,
     )
-    return SparseFlushList(list(ordinal), list(slot), list(count), int(status))
+    return SparseFlushList(list(ordinal), list(slot), list(count))
 
 
 def sparse_resolve(
@@ -378,7 +376,6 @@ def sparse_resolve(
         miss_slot,
         miss_count,
         in_flight,
-        status,
     ) = _cpp().sparse_resolve(
         resident_ordinal,
         lru_order,
@@ -398,7 +395,6 @@ def sparse_resolve(
         list(miss_slot),
         list(miss_count),
         list(in_flight),
-        int(status),
     )
 
 

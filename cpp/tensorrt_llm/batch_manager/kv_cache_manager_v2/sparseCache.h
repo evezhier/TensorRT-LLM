@@ -56,14 +56,13 @@ struct SparseCacheView
 
     //! Scratch for one write-back: the units a watermark move crossed and the cells holding
     //! them, the watermark scalars the scan reads, the page slots of the blocks touched, and
-    //! a status word. Sized once, because a single move cannot cross more units than the
-    //! reservation's in-flight headroom.
+    //! Sized once, because a single move cannot cross more units than the reservation's
+    //! in-flight headroom.
     int32_t* flushOrdinal = nullptr;   //!< [numLayers][maxFlushUnits]
     int32_t* flushSlot = nullptr;      //!< [numLayers][maxFlushUnits]
     int32_t* flushCount = nullptr;     //!< [numLayers]
     int32_t* flushRange = nullptr;     //!< [2], the half-open unit range
     int32_t* flushPageSlice = nullptr; //!< [maxFlushBlocks]
-    int32_t* status = nullptr;         //!< [1] SparseResolveStatus
     int32_t maxFlushUnits = 0;
     int32_t maxFlushBlocks = 0;
 

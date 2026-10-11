@@ -21,6 +21,8 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 
+#include <cassert>
+
 #include <cub/cub.cuh>
 #include <cuda_runtime_api.h>
 
@@ -32,6 +34,22 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 namespace
 {
+
+//! Enforce a precondition that correct use cannot violate.
+//!
+//! There is no reporting channel: trapping destroys the context, so nothing survives to
+//! carry a status home, and the host checks that would catch these cases legitimately run
+//! before the launch. A debug build names the condition; a release build just halts, which
+//! still beats proceeding with indices that would be read as real.
+#define KVCM2_SPARSE_REQUIRE(cond)                                                                                     \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (!(cond))                                                                                                   \
+        {                                                                                                              \
+            assert(!"KVCM2 sparse invariant violated: " #cond);                                                        \
+            __trap();                                                                                                  \
+        }                                                                                                              \
+    } while (0)
 
 constexpr int kThreads = 256;
 constexpr int32_t kEmptyKey = -1;
@@ -156,14 +174,8 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     // graph must see the current value.
     int32_t const historyUnits = *args.historyUnits;
     int32_t const inFlight = *args.capacityUnits - historyUnits;
-    if (inFlight < 0 || inFlight > args.maxInFlightUnits)
-    {
-        if (threadIdx.x == 0)
-        {
-            atomicExch(args.status, static_cast<int32_t>(SparseResolveStatus::kInFlightOverflow));
-        }
-        return;
-    }
+    // resize() rejects a gap wider than the cache can pin, so this cannot hold.
+    KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= args.maxInFlightUnits);
     // The probe walks one virtual list: the in-flight units, which must be resident before
     // the selection takes any victim, then the selection itself.
     int32_t const required = inFlight + width;
@@ -268,14 +280,9 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
 
     // Victims come from the tail, least recently used first, so rank from the tail.
     int32_t const totalEvictable = blockExclusiveSum(scratch, entries, temp);
-    if (totalEvictable < numMiss)
-    {
-        if (threadIdx.x == 0)
-        {
-            atomicExch(args.status, static_cast<int32_t>(SparseResolveStatus::kOutOfEntries));
-        }
-        return;
-    }
+    // The reservation covers a full selection plus every in-flight unit, and the in-flight
+    // ones are resolved first, so there is always a cell for each remaining miss.
+    KVCM2_SPARSE_REQUIRE(totalEvictable >= numMiss);
     __syncthreads();
 
     for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
@@ -471,11 +478,9 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
 
     if (threadIdx.x == 0)
     {
-        if (count > args.maxFlushUnits)
-        {
-            atomicExch(args.status, static_cast<int32_t>(SparseResolveStatus::kFlushOverflow));
-            count = args.maxFlushUnits;
-        }
+        // A resident unit the watermark crossed must have been in flight before the move,
+        // so the crossed set is bounded by the in-flight headroom this was sized from.
+        KVCM2_SPARSE_REQUIRE(count <= args.maxFlushUnits);
         args.outCount[layer] = count;
     }
 }
@@ -489,7 +494,7 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
         throw std::invalid_argument("launchSparseFlushList: layers, entries and flush bound must be positive");
     }
     if (args.fromUnits == nullptr || args.toUnits == nullptr || args.outOrdinal == nullptr || args.outSlot == nullptr
-        || args.outCount == nullptr || args.status == nullptr)
+        || args.outCount == nullptr)
     {
         throw std::invalid_argument("launchSparseFlushList: every device array must be provided");
     }
@@ -550,8 +555,8 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
         throw std::invalid_argument("launchSparseResolve: layers, entries and selection width must be positive");
     }
     if (args.selected == nullptr || args.outSlot == nullptr || args.missOrdinal == nullptr || args.missSlot == nullptr
-        || args.missCount == nullptr || args.status == nullptr || args.historyUnits == nullptr
-        || args.capacityUnits == nullptr || (args.maxInFlightUnits > 0 && args.inFlightSlot == nullptr))
+        || args.missCount == nullptr || args.historyUnits == nullptr || args.capacityUnits == nullptr
+        || (args.maxInFlightUnits > 0 && args.inFlightSlot == nullptr))
     {
         throw std::invalid_argument("launchSparseResolve: every device array must be provided");
     }

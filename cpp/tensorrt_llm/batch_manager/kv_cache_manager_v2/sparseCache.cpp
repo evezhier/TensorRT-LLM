@@ -71,13 +71,11 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
     size_t const countBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(numLayers));
     size_t const rangeBytes = alignedBytes(sizeof(int32_t) * 2);
     size_t const sliceBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mView.maxFlushBlocks));
-    size_t const statusBytes = alignedBytes(sizeof(int32_t));
     size_t const offsetBytes = alignedBytes(sizeof(uint32_t) * static_cast<size_t>(numLayers));
 
     CUdeviceptr base = 0;
     cuCheck(cuMemAlloc(&base,
-        ordinalBytes + lruBytes + pageBytes + 2 * flushListBytes + countBytes + rangeBytes + sliceBytes + statusBytes
-            + offsetBytes));
+        ordinalBytes + lruBytes + pageBytes + 2 * flushListBytes + countBytes + rangeBytes + sliceBytes + offsetBytes));
     mMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
 
     auto* bytes = reinterpret_cast<std::byte*>(base);
@@ -96,9 +94,7 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
     mView.flushCount = carve(countBytes);
     mView.flushRange = carve(rangeBytes);
     mView.flushPageSlice = carve(sliceBytes);
-    mView.status = carve(statusBytes);
     mView.hostBufferOffset = reinterpret_cast<uint32_t*>(carve(offsetBytes));
-    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mView.status), 0U, 1, stream));
     // -1 so that "no write-back has run" is distinguishable from "one ran and found
     // nothing to move", which is what lets a test tell the two apart.
     cuCheck(cuMemsetD32Async(

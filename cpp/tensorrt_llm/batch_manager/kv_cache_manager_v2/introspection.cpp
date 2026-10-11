@@ -203,7 +203,6 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     auto missOrdinal = deviceCopy(std::vector<int32_t>(selectionCount, 0));
     auto missSlot = deviceCopy(std::vector<int32_t>(selectionCount, 0));
     auto missCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
-    auto status = deviceCopy(std::vector<int32_t>(1, 0));
     auto history = deviceCopy(std::vector<int32_t>(1, historyUnits));
     auto capacity = deviceCopy(std::vector<int32_t>(1, capacityUnits));
     auto const inFlightCount = static_cast<size_t>(numLayers) * static_cast<size_t>(std::max(maxInFlightUnits, 0));
@@ -224,7 +223,6 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     args.missOrdinal = reinterpret_cast<int32_t*>(missOrdinal.get());
     args.missSlot = reinterpret_cast<int32_t*>(missSlot.get());
     args.missCount = reinterpret_cast<int32_t*>(missCount.get());
-    args.status = reinterpret_cast<int32_t*>(status.get());
 
     launchSparseResolve(args, nullptr);
     cuCheck(cuStreamSynchronize(nullptr));
@@ -237,7 +235,6 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     result.missSlot = readBack(missSlot, selectionCount);
     result.missCount = readBack(missCount, static_cast<size_t>(numLayers));
     result.inFlightSlot = inFlightCount > 0 ? readBack(inFlight, inFlightCount) : std::vector<int32_t>{};
-    result.status = readBack(status, 1).front();
     return result;
 }
 
@@ -316,7 +313,6 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     auto outOrdinal = deviceCopy(std::vector<int32_t>(listCount, kNoSparseSlot));
     auto outSlot = deviceCopy(std::vector<int32_t>(listCount, kNoSparseSlot));
     auto outCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
-    auto status = deviceCopy(std::vector<int32_t>(1, 0));
 
     SparseFlushListArgs args;
     args.cache.residentOrdinal = reinterpret_cast<int32_t*>(resident.get());
@@ -328,7 +324,6 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     args.outSlot = reinterpret_cast<int32_t*>(outSlot.get());
     args.outCount = reinterpret_cast<int32_t*>(outCount.get());
     args.maxFlushUnits = maxFlushUnits;
-    args.status = reinterpret_cast<int32_t*>(status.get());
 
     launchSparseFlushList(args, nullptr);
     cuCheck(cuStreamSynchronize(nullptr));
@@ -337,7 +332,6 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     result.ordinal = readBack(outOrdinal, listCount);
     result.slot = readBack(outSlot, listCount);
     result.count = readBack(outCount, static_cast<size_t>(numLayers));
-    result.status = readBack(status, 1).front();
     return result;
 }
 

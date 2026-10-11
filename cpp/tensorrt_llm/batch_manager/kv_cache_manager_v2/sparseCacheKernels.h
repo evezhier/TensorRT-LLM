@@ -30,19 +30,13 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //! Written to an output slot that carries no selection, i.e. selection padding.
 inline constexpr int32_t kNoSparseSlot = -1;
 
-//! Status codes a resolve launch can report back through SparseResolveArgs::status.
-enum class SparseResolveStatus : int32_t
-{
-    kOk = 0,
-    //! More misses than evictable entries. Reservation is supposed to make this impossible;
-    //! it means the cache was sized below the selection width plus the in-flight span.
-    kOutOfEntries = 1,
-    //! capacityUnits - historyUnits exceeded maxInFlightUnits, i.e. the request grew past
-    //! the in-flight headroom its cache width leaves.
-    kInFlightOverflow = 2,
-    //! More units crossed the watermark in one move than maxFlushUnits allows for.
-    kFlushOverflow = 3,
-};
+//! These kernels enforce their preconditions by trapping, not by reporting.
+//!
+//! Each is unreachable unless KVCM2 itself is wrong: the reservation covers a full
+//! selection plus the in-flight span, and resize() rejects a gap wider than the cache can
+//! pin, so a violation is a logic error rather than a runtime condition. A status word
+//! would be unreadable anyway -- the trap destroys the context, so no later copy back can
+//! succeed -- which is why there is none. A debug build names the condition before halting.
 
 //! One layer group's resolve: turn a selection of unit ordinals into cache entry indices,
 //! allocating entries for the units that are not resident.
@@ -90,9 +84,6 @@ struct SparseResolveArgs
     int32_t* missSlot = nullptr;
     //! [numLayers] number of misses.
     int32_t* missCount = nullptr;
-
-    //! [1] SparseResolveStatus. The caller must clear it before the launch.
-    int32_t* status = nullptr;
 };
 
 //! Shared memory one CTA needs for `entriesPerLayer` entries and `selectionWidth` selections.
@@ -209,9 +200,6 @@ struct SparseFlushListArgs
     int32_t* outCount = nullptr;
     //! Bound on one watermark move, which cannot exceed the in-flight headroom.
     int32_t maxFlushUnits = 0;
-
-    //! [1] SparseResolveStatus. The caller must clear it before the launch.
-    int32_t* status = nullptr;
 };
 
 //! Launch the flush-list scan. One CTA per layer.
