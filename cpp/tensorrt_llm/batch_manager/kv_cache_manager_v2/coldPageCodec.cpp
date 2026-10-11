@@ -30,6 +30,21 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+DefaultColdPageLayout queryDefaultColdPageLayout(TypedVec<PoolIndex, size_t> const& poolSlotBytes)
+{
+    DefaultColdPageLayout layout;
+    layout.poolOffset.reserve(poolSlotBytes.size());
+    for (PoolIndex poolIndex{0}; poolIndex < poolSlotBytes.size(); ++poolIndex)
+    {
+        size_t const bytes = poolSlotBytes.at(poolIndex);
+        TLLM_CHECK(bytes > 0 && bytes <= std::numeric_limits<size_t>::max() - layout.coldPageBytes);
+        layout.poolOffset.push_back(layout.coldPageBytes);
+        layout.coldPageBytes += bytes;
+    }
+    return layout;
+}
+
 namespace
 {
 
@@ -155,15 +170,21 @@ private:
             TypedVec<PoolIndex, PoolCopyPlan> copyPlans;
             copyPlans.reserve(gpuDesc.pools.size());
 
-            size_t coldOffset = 0;
+            TypedVec<PoolIndex, size_t> poolSlotBytes;
+            poolSlotBytes.reserve(gpuDesc.pools.size());
             for (PoolIndex poolIndex{0}; poolIndex < gpuDesc.pools.size(); ++poolIndex)
             {
                 PoolDesc const& pool = gpuDesc.pools.at(poolIndex);
-                TLLM_CHECK(pool.poolIndex == poolIndex && pool.baseAddress != 0 && pool.slotBytes > 0
-                    && pool.slotBytes <= std::numeric_limits<size_t>::max() - coldOffset);
-                copyPlans.push_back(
-                    PoolCopyPlan{reinterpret_cast<std::byte*>(pool.baseAddress), pool.slotBytes, coldOffset});
-                coldOffset += pool.slotBytes;
+                TLLM_CHECK(pool.poolIndex == poolIndex && pool.baseAddress != 0 && pool.slotBytes > 0);
+                poolSlotBytes.push_back(pool.slotBytes);
+            }
+            auto const coldLayout = queryDefaultColdPageLayout(poolSlotBytes);
+            size_t const coldOffset = coldLayout.coldPageBytes;
+            for (PoolIndex poolIndex{0}; poolIndex < gpuDesc.pools.size(); ++poolIndex)
+            {
+                PoolDesc const& pool = gpuDesc.pools.at(poolIndex);
+                copyPlans.push_back(PoolCopyPlan{reinterpret_cast<std::byte*>(pool.baseAddress), pool.slotBytes,
+                    coldLayout.poolOffset.at(poolIndex)});
             }
 
             LayerGroupId batchingLayerGroupId = gpuDesc.slotDesc.variants.front().lifeCycleId;

@@ -75,6 +75,22 @@ static_assert(sizeof(PageIndexPair) == 8);
 static_assert(std::is_trivially_copyable_v<PageIndexPair>);
 
 //! Transforms KV pages between hot multi-pool and cold single-blob representations.
+//! Byte offset of each pool's slot within a cold page produced by the default codec, and
+//! the size of that page.
+//!
+//! The default codec concatenates hot pool slots in pool order, so a buffer's cold address
+//! is this offset plus its offset within its hot slot. Only the default codec has this
+//! property, which is why the query is a free function rather than a method on the codec
+//! interface: a codec that compresses or permutes has no such mapping to report.
+struct DefaultColdPageLayout
+{
+    TypedVec<PoolIndex, size_t> poolOffset;
+    size_t coldPageBytes = 0;
+};
+
+//! @param poolSlotBytes slot size of each pool in one hot pool group, in pool order.
+[[nodiscard]] DefaultColdPageLayout queryDefaultColdPageLayout(TypedVec<PoolIndex, size_t> const& poolSlotBytes);
+
 class IKvCacheColdPageCodec
 {
 public:
