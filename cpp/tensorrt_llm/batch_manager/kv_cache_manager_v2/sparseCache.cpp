@@ -38,26 +38,37 @@ size_t alignedBytes(size_t bytes) noexcept
 
 } // namespace
 
-SparseCacheState::SparseCacheState(int32_t numLayers, int32_t entriesPerLayer, CUstream stream)
+SparseCacheState::SparseCacheState(
+    int32_t numLayers, int32_t entriesPerLayer, std::vector<int32_t> const& cachePageSlots, CUstream stream)
 {
     if (numLayers <= 0 || entriesPerLayer <= 0)
     {
         throw std::invalid_argument("SparseCacheState requires a positive layer and entry count");
     }
+    if (cachePageSlots.empty())
+    {
+        throw std::invalid_argument("SparseCacheState requires at least one cache page");
+    }
 
     mView.numLayers = numLayers;
     mView.entriesPerLayer = entriesPerLayer;
+    mView.numPages = static_cast<int32_t>(cachePageSlots.size());
 
     size_t const ordinalBytes = alignedBytes(sizeof(int32_t) * mView.numEntries());
     size_t const lruBytes = alignedBytes(sizeof(int32_t) * mView.numEntries());
+    size_t const pageBytes = alignedBytes(sizeof(int32_t) * cachePageSlots.size());
 
     CUdeviceptr base = 0;
-    cuCheck(cuMemAlloc(&base, ordinalBytes + lruBytes));
+    cuCheck(cuMemAlloc(&base, ordinalBytes + lruBytes + pageBytes));
     mMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
 
     auto* bytes = reinterpret_cast<std::byte*>(base);
     mView.residentOrdinal = reinterpret_cast<int32_t*>(bytes);
     mView.lruOrder = reinterpret_cast<int32_t*>(bytes + ordinalBytes);
+    mView.cachePages = reinterpret_cast<int32_t*>(bytes + ordinalBytes + lruBytes);
+    // Synchronous: cachePageSlots belongs to the caller and may go away on return.
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mView.cachePages), cachePageSlots.data(),
+        sizeof(int32_t) * cachePageSlots.size()));
 
     // Every entry starts free. cuMemsetD32Async covers the ordinal sentinel; the recency order
     // is a per-layer identity permutation, so it is built on the host and copied rather than
@@ -74,6 +85,17 @@ SparseCacheState::SparseCacheState(int32_t numLayers, int32_t entriesPerLayer, C
     // Synchronous: `identity` is a stack temporary, so the copy must complete before return.
     cuCheck(cuMemcpyHtoD(
         reinterpret_cast<CUdeviceptr>(mView.lruOrder), identity.data(), sizeof(int32_t) * identity.size()));
+}
+
+std::vector<int32_t> SparseCacheState::readCachePages() const
+{
+    if (empty())
+    {
+        return {};
+    }
+    std::vector<int32_t> out(static_cast<size_t>(mView.numPages));
+    cuCheck(cuMemcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(mView.cachePages), sizeof(int32_t) * out.size()));
+    return out;
 }
 
 std::vector<int32_t> SparseCacheState::readResidentOrdinals() const

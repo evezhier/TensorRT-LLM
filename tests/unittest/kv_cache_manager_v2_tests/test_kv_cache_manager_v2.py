@@ -566,6 +566,39 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_cache_pages_name_the_reserved_slots(self):
+        manager = self._manager(max_cached_units=4)
+        try:
+            lc_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                pages = _introspection.sparse_cache_pages(cache, lc_id)
+                # One page per expansion-group of entries; see get_sparse_cache_expansion.
+                entries = manager.get_sparse_cache_max_units(0)
+                expansion = manager.get_sparse_cache_expansion(0)
+                self.assertEqual(len(pages), entries // expansion)
+                self.assertEqual(len(set(pages)), len(pages), "slots must be distinct")
+                self.assertTrue(all(p >= 0 for p in pages), pages)
+                cache.close()
+        finally:
+            manager.shutdown()
+
+    def test_cache_pages_are_dropped_with_the_reservation(self):
+        manager = self._manager(max_cached_units=4)
+        try:
+            lc_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                self.assertNotEqual(_introspection.sparse_cache_pages(cache, lc_id), [])
+                cache.suspend()
+                self.assertEqual(_introspection.sparse_cache_pages(cache, lc_id), [])
+                cache.close()
+        finally:
+            manager.shutdown()
+
     def test_unconfigured_life_cycle_has_no_cache_state(self):
         manager = self._manager(max_cached_units=0)
         try:

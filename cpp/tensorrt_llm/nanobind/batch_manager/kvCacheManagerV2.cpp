@@ -2147,6 +2147,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("sparse_cache_resident_ordinals", &kv::KvCacheIntrospection::sparseCacheResidentOrdinals,
         nb::arg("kv_cache"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("sparse_cache_pages", &kv::KvCacheIntrospection::sparseCachePages, nb::arg("kv_cache"),
+        nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "sparse_resolve",
         [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,

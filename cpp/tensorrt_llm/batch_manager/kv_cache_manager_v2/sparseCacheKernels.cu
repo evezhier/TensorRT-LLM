@@ -399,11 +399,11 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
 
     // A unit ordinal names a unit within a block; a cache entry names a unit within a
     // reserved page. Both divide by the same expansion.
-    int32_t const block = ordinal / args.expansion;
+    int32_t const block = ordinal / args.expansion - args.pageTableBase;
     int32_t const srcUnit = ordinal % args.expansion;
     int32_t const cachePage = slot / args.expansion;
     int32_t const dstUnit = slot % args.expansion;
-    if (block >= args.numBlocks)
+    if (block < 0 || block >= args.numBlocks)
     {
         return;
     }

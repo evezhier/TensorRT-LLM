@@ -438,8 +438,14 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 // Sized from the pages now held. Recreating on growth is safe only while
                 // nothing is cached; once entries hold data, growth must preserve them.
                 int const entries = static_cast<int>(mSparseCacheSlots[lc].size()) * mManager->sparseCacheExpansion(lc);
-                mSparseCacheState[lc] = SparseCacheState(
-                    mManager->sparseCacheBuffersPerPage(lc), entries, reinterpret_cast<CUstream>(cudaStream()));
+                std::vector<int32_t> cachePageSlots;
+                cachePageSlots.reserve(mSparseCacheSlots[lc].size());
+                for (auto const& lock : mSparseCacheSlots[lc])
+                {
+                    cachePageSlots.push_back(static_cast<int32_t>(lock.slot().slotId().value()));
+                }
+                mSparseCacheState[lc] = SparseCacheState(mManager->sparseCacheBuffersPerPage(lc), entries,
+                    cachePageSlots, reinterpret_cast<CUstream>(cudaStream()));
             }
 
             if (!tmpSlots[lc].empty())

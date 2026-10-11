@@ -114,6 +114,16 @@ std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache c
     return kvCache.mSparseCacheState[id].readResidentOrdinals();
 }
 
+std::vector<int32_t> KvCacheIntrospection::sparseCachePages(KvCache const& kvCache, int lcId)
+{
+    LifeCycleId const id{lcId};
+    if (id >= kvCache.mSparseCacheState.size())
+    {
+        return {};
+    }
+    return kvCache.mSparseCacheState[id].readCachePages();
+}
+
 namespace
 {
 

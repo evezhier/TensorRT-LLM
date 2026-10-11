@@ -139,9 +139,14 @@ struct SparseUnitCopyArgs
     //! directly and no host round trip is needed.
     CUdeviceptr hostBase = 0;
     uint64_t hostPageStride = 0;
-    //! [numBlocks] host page slot per block ordinal, i.e. a row of the page table.
+    //! [numBlocks] host page slot per block, indexed by block ordinal minus pageTableBase.
+    //!
+    //! A fetch passes the whole table and leaves the base at zero. A flush is host-initiated
+    //! and touches one contiguous span of blocks, so it passes just that slice rather than
+    //! requiring the full table to be device-resident.
     int32_t const* pageTable = nullptr;
     int32_t numBlocks = 0;
+    int32_t pageTableBase = 0;
 
     //! GPU pool holding this request's reserved cache pages.
     CUdeviceptr deviceBase = 0;

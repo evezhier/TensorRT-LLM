@@ -49,6 +49,11 @@ struct SparseCacheView
     //! Entry indices in recency order, most-recently-used first.
     int32_t* lruOrder = nullptr;
 
+    //! [numPages] GPU page slot per reserved cache page, so the copy can turn an entry
+    //! index into an address. Fixed for the life of the reservation.
+    int32_t* cachePages = nullptr;
+    int32_t numPages = 0;
+
     int32_t numLayers = 0;
     int32_t entriesPerLayer = 0;
 
@@ -70,11 +75,13 @@ class SparseCacheState
 public:
     SparseCacheState() = default;
 
-    //! Allocate and initialise state for `numLayers` layers of `entriesPerLayer` entries.
+    //! Allocate and initialise state for `numLayers` layers of `entriesPerLayer` entries,
+    //! backed by the GPU page slots in `cachePageSlots`.
     //!
     //! Entries start free: every ordinal is kBadBlockOrdinal and the recency order is the
     //! identity permutation. Initialisation is enqueued on `stream`.
-    SparseCacheState(int32_t numLayers, int32_t entriesPerLayer, CUstream stream);
+    SparseCacheState(
+        int32_t numLayers, int32_t entriesPerLayer, std::vector<int32_t> const& cachePageSlots, CUstream stream);
 
     [[nodiscard]] SparseCacheView const& view() const noexcept
     {
@@ -88,6 +95,9 @@ public:
 
     //! Copy the resident ordinals back to the host. Test and debug use only; synchronises.
     [[nodiscard]] std::vector<int32_t> readResidentOrdinals() const;
+
+    //! Copy the cache page slots back to the host. Test and debug use only; synchronises.
+    [[nodiscard]] std::vector<int32_t> readCachePages() const;
 
 private:
     CudaUniqPtr mMemory;

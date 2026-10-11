@@ -213,6 +213,14 @@ def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
 
 
+def sparse_cache_pages(kv_cache: Any, lc_id: int) -> list[int]:
+    """GPU page slots backing a life cycle's sparse cache entries.
+
+    Fixed for the life of the reservation; empty when none is held.
+    """
+    return list(_cpp().sparse_cache_pages(kv_cache, lc_id))
+
+
 class SparseResolveResult(NamedTuple):
     """State and outputs of one sparse resolve launch."""
 
