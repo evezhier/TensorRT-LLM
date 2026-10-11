@@ -166,14 +166,22 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
 {
     extern __shared__ unsigned char smem[];
     int32_t const layer = static_cast<int32_t>(blockIdx.x);
-    int32_t const entries = args.cache.entriesPerLayer;
+    int32_t const row = static_cast<int32_t>(blockIdx.y);
+    SparseCacheView const view = args.views[row];
+    if (view.residentOrdinal == nullptr)
+    {
+        // A free row, or a member that has suspended and given its reservation back. Its
+        // outputs keep whatever the caller initialised them to.
+        return;
+    }
+    int32_t const entries = view.entriesPerLayer;
     int32_t const width = args.selectionWidth;
     uint32_t const mask = static_cast<uint32_t>(tableSize) - 1U;
 
     // Both watermarks are read from device memory: they move every step, so a captured
     // graph must see the current value.
-    int32_t const historyUnits = *args.historyUnits;
-    int32_t const inFlight = *args.capacityUnits - historyUnits;
+    int32_t const historyUnits = args.historyUnits[row];
+    int32_t const inFlight = args.capacityUnits[row] - historyUnits;
     // resize() rejects a gap wider than the cache can pin, so this cannot hold.
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= args.maxInFlightUnits);
     // The probe walks one virtual list: the in-flight units, which must be resident before
@@ -193,13 +201,17 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     __shared__ int32_t numMiss;
     __shared__ int32_t numCopy;
 
-    int32_t* residentOrdinal = args.cache.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
-    int32_t* lruOrder = args.cache.lruOrder + static_cast<ptrdiff_t>(layer) * entries;
-    int32_t const* selected = args.selected + static_cast<ptrdiff_t>(layer) * width;
-    int32_t* outSlot = args.outSlot + static_cast<ptrdiff_t>(layer) * width;
-    int32_t* missOrdinal = args.missOrdinal + static_cast<ptrdiff_t>(layer) * width;
-    int32_t* missSlot = args.missSlot + static_cast<ptrdiff_t>(layer) * width;
-    int32_t* inFlightSlot = args.inFlightSlot + static_cast<ptrdiff_t>(layer) * args.maxInFlightUnits;
+    // The view's own arrays belong to this row's allocation, so only the layer indexes them.
+    int32_t* residentOrdinal = view.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
+    int32_t* lruOrder = view.lruOrder + static_cast<ptrdiff_t>(layer) * entries;
+    // The batch-wide arrays carry a row stride on top.
+    auto const selectionBase = (static_cast<ptrdiff_t>(row) * args.numLayers + layer) * width;
+    auto const inFlightBase = (static_cast<ptrdiff_t>(row) * args.numLayers + layer) * args.maxInFlightUnits;
+    int32_t const* selected = args.selected + selectionBase;
+    int32_t* outSlot = args.outSlot + selectionBase;
+    int32_t* missOrdinal = args.missOrdinal + selectionBase;
+    int32_t* missSlot = args.missSlot + selectionBase;
+    int32_t* inFlightSlot = args.inFlightSlot + inFlightBase;
 
     if (threadIdx.x == 0)
     {
@@ -361,7 +373,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     }
     if (threadIdx.x == 0)
     {
-        args.missCount[layer] = numCopy;
+        args.missCount[static_cast<ptrdiff_t>(row) * args.numLayers + layer] = numCopy;
     }
 }
 
@@ -550,13 +562,13 @@ int32_t sparseResolveMaxEntries(int32_t selectionWidth, int32_t maxInFlightUnits
 
 void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
 {
-    if (args.cache.numLayers <= 0 || args.cache.entriesPerLayer <= 0 || args.selectionWidth <= 0)
+    if (args.numLayers <= 0 || args.entriesPerLayer <= 0 || args.selectionWidth <= 0 || args.numRows <= 0)
     {
-        throw std::invalid_argument("launchSparseResolve: layers, entries and selection width must be positive");
+        throw std::invalid_argument("launchSparseResolve: rows, layers, entries and selection width must be positive");
     }
-    if (args.selected == nullptr || args.outSlot == nullptr || args.missOrdinal == nullptr || args.missSlot == nullptr
-        || args.missCount == nullptr || args.historyUnits == nullptr || args.capacityUnits == nullptr
-        || (args.maxInFlightUnits > 0 && args.inFlightSlot == nullptr))
+    if (args.views == nullptr || args.selected == nullptr || args.outSlot == nullptr || args.missOrdinal == nullptr
+        || args.missSlot == nullptr || args.missCount == nullptr || args.historyUnits == nullptr
+        || args.capacityUnits == nullptr || (args.maxInFlightUnits > 0 && args.inFlightSlot == nullptr))
     {
         throw std::invalid_argument("launchSparseResolve: every device array must be provided");
     }
@@ -565,9 +577,9 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
         throw std::invalid_argument("launchSparseResolve: maxInFlightUnits must not be negative");
     }
 
-    int32_t const tableSize = nextPow2(2 * args.cache.entriesPerLayer);
-    size_t const shared
-        = sparseResolveSharedBytes(args.cache.entriesPerLayer, args.selectionWidth, args.maxInFlightUnits);
+    // entriesPerLayer belongs to the layer group, so one size and one grid serve every row.
+    int32_t const tableSize = nextPow2(2 * args.entriesPerLayer);
+    size_t const shared = sparseResolveSharedBytes(args.entriesPerLayer, args.selectionWidth, args.maxInFlightUnits);
 
     CUdevice device = 0;
     cuCheck(cuCtxGetDevice(&device));
@@ -585,8 +597,8 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
         TLLM_CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<void const*>(&sparseResolveKernel),
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)));
     }
-    sparseResolveKernel<<<args.cache.numLayers, kThreads, shared, reinterpret_cast<cudaStream_t>(stream)>>>(
-        args, tableSize);
+    dim3 const grid(static_cast<unsigned>(args.numLayers), static_cast<unsigned>(args.numRows));
+    sparseResolveKernel<<<grid, kThreads, shared, reinterpret_cast<cudaStream_t>(stream)>>>(args, tableSize);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

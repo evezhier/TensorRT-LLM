@@ -202,12 +202,17 @@ std::vector<int32_t> readBack(CudaUniqPtr const& buffer, size_t count)
 
 KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
-    int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth, int historyUnits, int capacityUnits,
-    int maxInFlightUnits)
+    int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
+    std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
+    std::vector<int32_t> const& inactiveRows)
 {
-    auto const entryCount = static_cast<size_t>(numLayers) * entriesPerLayer;
-    auto const selectionCount = static_cast<size_t>(numLayers) * selectionWidth;
-    if (residentOrdinal.size() != entryCount || lruOrder.size() != entryCount || selected.size() != selectionCount)
+    auto const numRows = static_cast<int>(historyUnits.size());
+    auto const perRowEntries = static_cast<size_t>(numLayers) * entriesPerLayer;
+    auto const entryCount = perRowEntries * static_cast<size_t>(numRows);
+    auto const perRowSelection = static_cast<size_t>(numLayers) * selectionWidth;
+    auto const selectionCount = perRowSelection * static_cast<size_t>(numRows);
+    if (numRows == 0 || capacityUnits.size() != historyUnits.size() || residentOrdinal.size() != entryCount
+        || lruOrder.size() != entryCount || selected.size() != selectionCount)
     {
         throw std::invalid_argument("sparseResolve: input sizes must match the declared shape");
     }
@@ -218,17 +223,39 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     auto outSlot = deviceCopy(std::vector<int32_t>(selectionCount, 0));
     auto missOrdinal = deviceCopy(std::vector<int32_t>(selectionCount, 0));
     auto missSlot = deviceCopy(std::vector<int32_t>(selectionCount, 0));
-    auto missCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
-    auto history = deviceCopy(std::vector<int32_t>(1, historyUnits));
-    auto capacity = deviceCopy(std::vector<int32_t>(1, capacityUnits));
-    auto const inFlightCount = static_cast<size_t>(numLayers) * static_cast<size_t>(std::max(maxInFlightUnits, 0));
+    auto const countCount = static_cast<size_t>(numLayers) * static_cast<size_t>(numRows);
+    auto missCount = deviceCopy(std::vector<int32_t>(countCount, 0));
+    auto history = deviceCopy(historyUnits);
+    auto capacity = deviceCopy(capacityUnits);
+    auto const inFlightCount = countCount * static_cast<size_t>(std::max(maxInFlightUnits, 0));
     auto inFlight = deviceCopy(std::vector<int32_t>(std::max<size_t>(inFlightCount, 1), kNoSparseSlot));
 
+    // One view per row, each pointing at that row's slice of the two shared allocations.
+    // Mirrors what Batch stages: the handle is per row, the memory stays with the request.
+    std::vector<SparseCacheView> views(static_cast<size_t>(numRows));
+    for (int row = 0; row < numRows; ++row)
+    {
+        auto& view = views[static_cast<size_t>(row)];
+        if (std::find(inactiveRows.begin(), inactiveRows.end(), row) != inactiveRows.end())
+        {
+            // Left default: a row holding no reservation, which the kernel must skip.
+            continue;
+        }
+        view.residentOrdinal = reinterpret_cast<int32_t*>(resident.get()) + perRowEntries * row;
+        view.lruOrder = reinterpret_cast<int32_t*>(recency.get()) + perRowEntries * row;
+        view.numLayers = numLayers;
+        view.entriesPerLayer = entriesPerLayer;
+    }
+    CUdeviceptr viewPtr = 0;
+    cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView) * views.size()));
+    CudaUniqPtr viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
+    cuCheck(cuMemcpyHtoD(viewPtr, views.data(), sizeof(SparseCacheView) * views.size()));
+
     SparseResolveArgs args;
-    args.cache.residentOrdinal = reinterpret_cast<int32_t*>(resident.get());
-    args.cache.lruOrder = reinterpret_cast<int32_t*>(recency.get());
-    args.cache.numLayers = numLayers;
-    args.cache.entriesPerLayer = entriesPerLayer;
+    args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
+    args.numRows = numRows;
+    args.numLayers = numLayers;
+    args.entriesPerLayer = entriesPerLayer;
     args.selected = reinterpret_cast<int32_t const*>(selection.get());
     args.selectionWidth = selectionWidth;
     args.historyUnits = reinterpret_cast<int32_t const*>(history.get());
@@ -249,7 +276,7 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     result.outSlot = readBack(outSlot, selectionCount);
     result.missOrdinal = readBack(missOrdinal, selectionCount);
     result.missSlot = readBack(missSlot, selectionCount);
-    result.missCount = readBack(missCount, static_cast<size_t>(numLayers));
+    result.missCount = readBack(missCount, countCount);
     result.inFlightSlot = inFlightCount > 0 ? readBack(inFlight, inFlightCount) : std::vector<int32_t>{};
     return result;
 }

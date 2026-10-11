@@ -82,7 +82,8 @@ public:
 
     static SparseResolveProbe sparseResolve(std::vector<int32_t> const& residentOrdinal,
         std::vector<int32_t> const& lruOrder, int numLayers, int entriesPerLayer, std::vector<int32_t> const& selected,
-        int selectionWidth, int historyUnits, int capacityUnits, int maxInFlightUnits);
+        int selectionWidth, std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits,
+        int maxInFlightUnits, std::vector<int32_t> const& inactiveRows);
 
     // White-box hook: run the sparse unit copy over caller-supplied pools, so the address
     // arithmetic can be checked against a known byte pattern. Returns the destination pool

@@ -2191,11 +2191,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "sparse_resolve",
         [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
-            int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth, int historyUnits,
-            int capacityUnits, int maxInFlightUnits)
+            int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
+            std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
+            std::vector<int32_t> const& inactiveRows)
         {
             auto r = kv::KvCacheIntrospection::sparseResolve(residentOrdinal, lruOrder, numLayers, entriesPerLayer,
-                selected, selectionWidth, historyUnits, capacityUnits, maxInFlightUnits);
+                selected, selectionWidth, historyUnits, capacityUnits, maxInFlightUnits, inactiveRows);
             // No gil_scoped_release call guard: the tuple below is built from the lambda body,
             // which the guard would have left running without the GIL.
             return std::make_tuple(std::move(r.residentOrdinal), std::move(r.lruOrder), std::move(r.outSlot),
@@ -2203,7 +2204,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("resident_ordinal"), nb::arg("lru_order"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
-        nb::arg("max_in_flight_units"));
+        nb::arg("max_in_flight_units"), nb::arg("inactive_rows"));
     mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),
         nb::arg("host_page_stride"), nb::arg("page_table"), nb::arg("device_pool"), nb::arg("device_page_stride"),
         nb::arg("cache_pages"), nb::arg("cold_buffer_offset"), nb::arg("sub_slots_per_layer"),

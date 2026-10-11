@@ -700,11 +700,15 @@ class TestSparseResolve(unittest.TestCase):
         history_units: int = 1 << 20,
         capacity_units: int | None = None,
         max_in_flight_units: int = 0,
+        num_rows: int = 1,
+        inactive_rows: list[int] | None = None,
     ):
-        entries = len(resident) // num_layers
-        width = len(selected) // num_layers
+        entries = len(resident) // (num_layers * num_rows)
+        width = len(selected) // (num_layers * num_rows)
         if lru is None:
-            lru = list(range(entries)) * num_layers
+            lru = list(range(entries)) * num_layers * num_rows
+        history = [history_units] * num_rows
+        capacity = [history_units if capacity_units is None else capacity_units] * num_rows
         return _introspection.sparse_resolve(
             resident,
             lru,
@@ -712,9 +716,10 @@ class TestSparseResolve(unittest.TestCase):
             entries,
             selected,
             width,
-            history_units,
-            history_units if capacity_units is None else capacity_units,
+            history,
+            capacity,
             max_in_flight_units,
+            inactive_rows,
         )
 
     def test_an_empty_cache_misses_everything(self):
@@ -810,6 +815,26 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.resident_ordinal[in_flight], 10)
         self.assertEqual(result.resident_ordinal[selected], 5)
         self.assertEqual(result.miss_count, [1], "only the history unit is fetched")
+
+    def test_rows_resolve_independently(self):
+        """Each row reads its own cache, so one row's misses must not disturb another's."""
+        # Row 0 holds unit 7; row 1 is empty. Both select 7.
+        resident = [7, BAD_PAGE_INDEX] + [BAD_PAGE_INDEX, BAD_PAGE_INDEX]
+        result = self._resolve(resident, [7, 7], num_rows=2)
+        self.assertEqual(result.miss_count, [0, 1], "row 0 hits, row 1 fetches")
+        self.assertEqual(result.out_slot[0], 0, "row 0 reuses its own entry")
+        # Row 1's unit landed in row 1's own cache, leaving row 0 untouched.
+        self.assertEqual(result.resident_ordinal[:2], [7, BAD_PAGE_INDEX])
+        self.assertEqual(result.resident_ordinal[2 + result.out_slot[1]], 7)
+
+    def test_a_row_holding_no_reservation_is_skipped(self):
+        """A free row, or one that has suspended, stages a default view the kernel skips."""
+        resident = [BAD_PAGE_INDEX] * 4
+        result = self._resolve(resident, [5, 5], num_rows=2, inactive_rows=[1])
+        # Row 0 resolved; row 1 was left exactly as the caller initialised it.
+        self.assertEqual(result.miss_count[0], 1)
+        self.assertEqual(result.miss_count[1], 0, "an inactive row does no work")
+        self.assertEqual(result.resident_ordinal[2:], [BAD_PAGE_INDEX] * 2)
 
     def test_layers_resolve_independently(self):
         # Layer 0 hits, layer 1 misses.

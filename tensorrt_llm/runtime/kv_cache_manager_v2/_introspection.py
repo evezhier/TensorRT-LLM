@@ -365,18 +365,27 @@ def sparse_resolve(
     entries_per_layer: int,
     selected: list[int],
     selection_width: int,
-    history_units: int,
-    capacity_units: int = 0,
+    history_units: int | list[int],
+    capacity_units: int | list[int] = 0,
     max_in_flight_units: int = 0,
+    inactive_rows: list[int] | None = None,
 ) -> SparseResolveResult:
     """Run the sparse resolve kernel over caller-supplied cache state.
 
     Inputs are row-major [layer][entry] and [layer][selection_width]; a negative
-    selection entry is padding. Ordinals in ``[history_units, capacity_units)`` are in
+    selection entry is padding. ``inactive_rows`` get a default view, standing in for a
+    row holding no reservation. Ordinals in ``[history_units, capacity_units)`` are in
     flight: they are made resident before the selection takes any victim, are never
     chosen as victims themselves, and never enter the miss list because their host pages
     hold nothing to fetch. Synchronises.
     """
+    # One row unless the caller passes per-row lists; the kernel is batched either way.
+    history = [history_units] if isinstance(history_units, int) else list(history_units)
+    if isinstance(capacity_units, int):
+        capacity = [max(capacity_units, h) for h in history]
+    else:
+        capacity = list(capacity_units)
+
     (
         resident,
         lru,
@@ -392,9 +401,10 @@ def sparse_resolve(
         entries_per_layer,
         selected,
         selection_width,
-        history_units,
-        max(capacity_units, history_units),
+        history,
+        capacity,
         max_in_flight_units,
+        list(inactive_rows or []),
     )
     return SparseResolveResult(
         list(resident),

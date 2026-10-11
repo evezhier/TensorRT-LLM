@@ -38,25 +38,34 @@ inline constexpr int32_t kNoSparseSlot = -1;
 //! would be unreadable anyway -- the trap destroys the context, so no later copy back can
 //! succeed -- which is why there is none. A debug build names the condition before halting.
 
-//! One layer group's resolve: turn a selection of unit ordinals into cache entry indices,
-//! allocating entries for the units that are not resident.
+//! One layer group's resolve across a batch: turn each row's selection of unit ordinals
+//! into cache entry indices, allocating entries for the units that are not resident.
 //!
-//! Layouts are [layer][...] row-major, matching SparseCacheView. Every array is device memory.
+//! Layouts are [row][layer][...] row-major. Every array is device memory, and `numLayers`
+//! and `entriesPerLayer` are properties of the layer group, hence uniform across rows --
+//! which is what keeps one shared-memory size and one grid shape for the whole batch.
 struct SparseResolveArgs
 {
-    //! Resident set, recency order and shape. Updated in place.
-    SparseCacheView cache;
+    //! [numRows] cache state per row, as Batch::sparseCacheViews() publishes it. A row with
+    //! a null residentOrdinal holds no reservation -- free, or a member that has suspended --
+    //! and is skipped.
+    SparseCacheView const* views = nullptr;
+    int32_t numRows = 0;
+    //! Shape shared by every row's view. Passed separately because the host needs them to
+    //! size shared memory and the grid before any view can be read.
+    int32_t numLayers = 0;
+    int32_t entriesPerLayer = 0;
 
-    //! [numLayers][selectionWidth] unit ordinals, negative where the selection is padded.
+    //! [numRows][numLayers][selectionWidth] unit ordinals, negative where the selection is padded.
     //! Ordinals must be unique within a layer; duplicates would be resolved as separate
     //! misses and waste an entry each.
     int32_t const* selected = nullptr;
     //! Selected units per layer, uniform across layers and requests so shapes stay static.
     int32_t selectionWidth = 0;
 
-    //! [1] history_length / unit_tokens, and [1] capacity / unit_tokens. Device-resident
-    //! because both move every step: a captured graph must read the current value rather
-    //! than one baked in at capture.
+    //! [numRows] history_length / unit_tokens, and [numRows] capacity / unit_tokens.
+    //! Device-resident because both move every step: a captured graph must read the current
+    //! value rather than one baked in at capture.
     //!
     //! Ordinals below historyUnits are selectable history. Ordinals in
     //! [historyUnits, capacityUnits) are in flight: the entry holds the only copy of their
@@ -65,10 +74,11 @@ struct SparseResolveArgs
     int32_t const* historyUnits = nullptr;
     int32_t const* capacityUnits = nullptr;
 
-    //! [numLayers][selectionWidth] entry index per selection, kNoSparseSlot where padded.
+    //! [numRows][numLayers][selectionWidth] entry index per selection, kNoSparseSlot where
+    //! padded or where the row holds no reservation.
     int32_t* outSlot = nullptr;
 
-    //! [numLayers][maxInFlightUnits] entry index per in-flight unit, in ordinal order from
+    //! [numRows][numLayers][maxInFlightUnits] entry index per in-flight unit, in ordinal order from
     //! historyUnits. Entries past the live count are left untouched. The model writes new
     //! KV through these, so they are resolved before the selection takes any victim.
     int32_t* inFlightSlot = nullptr;
@@ -76,13 +86,13 @@ struct SparseResolveArgs
     //! so the shape stays static while the live count varies.
     int32_t maxInFlightUnits = 0;
 
-    //! [numLayers][selectionWidth] the history units that were not resident, and the
-    //! entries given to them. The copy stage reads these; only the first missCount[layer]
-    //! are valid. An in-flight unit that misses is allocated an entry but never appears
+    //! [numRows][numLayers][selectionWidth] the history units that were not resident, and
+    //! the entries given to them. The copy stage reads these; only the first
+    //! missCount[row][layer] are valid. An in-flight unit that misses is allocated an entry but never appears
     //! here: its host page holds nothing to fetch.
     int32_t* missOrdinal = nullptr;
     int32_t* missSlot = nullptr;
-    //! [numLayers] number of misses.
+    //! [numRows][numLayers] number of misses.
     int32_t* missCount = nullptr;
 };
 
