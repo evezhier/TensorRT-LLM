@@ -2407,6 +2407,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("remove_kv_cache", &kv::Batch::removeKvCache, nb::arg("kv_cache"),
             "Free the cache's row, leaving a hole for reuse.")
         .def(
+            "resize",
+            [](kv::Batch& self, std::vector<std::optional<int>> const& capacities,
+                std::vector<std::optional<int>> const& historyLengths, nb::object stream)
+            {
+                auto const handle
+                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                nb::gil_scoped_release rel;
+                return self.resize(capacities, historyLengths, handle);
+            },
+            nb::arg("capacities"), nb::arg("history_lengths"), nb::arg("stream") = nb::none(),
+            "Resize every member, then publish once.\n\n"
+            "The sanctioned way to advance a batched step: it waits on the previous publish "
+            "before touching anyone, so the staging hazard is closed without the caller "
+            "remembering wait_published(). One result per row, in row order, False for a free "
+            "row; a member that fails rolls itself back, so a batch can partially fail and the "
+            "table published afterwards describes the post-rollback state.")
+        .def(
             "publish",
             [](kv::Batch& self, nb::object stream)
             {

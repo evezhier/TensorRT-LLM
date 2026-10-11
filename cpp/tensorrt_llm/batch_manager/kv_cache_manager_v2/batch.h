@@ -26,6 +26,7 @@
 #include <cuda.h>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -74,6 +75,23 @@ public:
 
     //! Free the cache's row, leaving a hole. Throws when it is not a member.
     void removeKvCache(KvCache& kvCache);
+
+    //! Resize every member, then publish once.
+    //!
+    //! The sanctioned way to advance a batched step, and the reason it exists: it waits on
+    //! the previous publish before touching anyone, so the staging hazard is closed by
+    //! construction rather than by a caller remembering waitPublished(). Per-request
+    //! operations with no Batch equivalent -- commit(), a beam fork, an SWA recycle -- still
+    //! need that call, so the simple rule is to make it once at the top of a step.
+    //!
+    //! One result per row, in row order; false for a free row. A member that fails rolls
+    //! itself back, so a batch can partially fail and the table published afterwards
+    //! describes the post-rollback state.
+    //!
+    //! `capacities` and `historyLengths` are indexed by row, so both must be maxBatchSize
+    //! long. A nullopt leaves that dimension alone, matching KvCache::resize.
+    std::vector<bool> resize(std::vector<std::optional<int>> const& capacities,
+        std::vector<std::optional<int>> const& historyLengths, CUstream stream);
 
     //! Copy the staged page indices to the device, enqueuing on `stream`.
     //!

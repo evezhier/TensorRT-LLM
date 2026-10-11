@@ -173,6 +173,32 @@ void Batch::_detach(KvCache& kvCache) noexcept
     kvCache.mBatchRow = -1;
 }
 
+std::vector<bool> Batch::resize(std::vector<std::optional<int>> const& capacities,
+    std::vector<std::optional<int>> const& historyLengths, CUstream stream)
+{
+    if (capacities.size() != mRows.size() || historyLengths.size() != mRows.size())
+    {
+        throw std::invalid_argument("Batch::resize: one capacity and history length per row");
+    }
+    // Before the first member is touched, since each resize writes its staging row.
+    waitPublished();
+
+    std::vector<bool> results(mRows.size(), false);
+    for (size_t row = 0; row < mRows.size(); ++row)
+    {
+        auto* kvCache = mRows[row];
+        if (kvCache == nullptr)
+        {
+            continue;
+        }
+        results[row] = kvCache->resize(capacities[row], historyLengths[row]);
+    }
+    // Once, after every member has settled: a partial failure leaves the rolled-back state,
+    // which is what the table should describe.
+    publish(stream);
+    return results;
+}
+
 void Batch::publish(CUstream stream)
 {
     // A publish already in flight is reading the same staging rows this one will, and the

@@ -1258,6 +1258,51 @@ class TestBatch(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_batch_resize_advances_every_member_and_publishes(self):
+        manager = self._manager()
+        caches = []
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=3, max_blocks_per_seq=8)
+            lg_id = manager.get_layer_group_id(0)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                for _ in range(2):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    batch.add_kv_cache(cache)
+                    self.assertTrue(cache.resume(handle))
+
+                results = batch.resize([256, 384, None], [0, 0, None], handle)
+                # Row 2 is free, so it reports False rather than raising.
+                self.assertEqual(results, [True, True, False])
+                self.assertEqual(caches[0].capacity, 256)
+                self.assertEqual(caches[1].capacity, 384)
+
+                # Published as part of the resize, so no separate publish is needed.
+                table = _introspection.batch_page_table(batch, lg_id)
+                self.assertEqual(sum(1 for i in table[0:8] if i != self.BAD), 2)
+                self.assertEqual(sum(1 for i in table[8:16] if i != self.BAD), 3)
+                self.assertEqual(table[16:24], [self.BAD] * 8, "the free row stays absent")
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_batch_resize_needs_one_entry_per_row(self):
+        manager = self._manager()
+        try:
+            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                # Indexed by row, so a short list would silently misalign members.
+                with self.assertRaisesRegex(Exception, "per row"):
+                    batch.resize([128], [0], handle)
+        finally:
+            manager.shutdown()
+
     def test_wait_published_is_a_noop_when_nothing_is_in_flight(self):
         manager = self._manager()
         try:
