@@ -163,7 +163,7 @@ void KvCacheManager::_computeSparseCacheShape()
             int const expansion = mConfig.tokensPerBlock / buf.tokensPerBlockOverride.value_or(mConfig.tokensPerBlock);
             mSparseCacheMaxUnits[lcId] = std::max(mSparseCacheMaxUnits[lcId], buf.maxCachedUnits);
             mSparseCacheExpansion[lcId] = std::max(mSparseCacheExpansion[lcId], expansion);
-            // One more (layer, role) slice carried by every page of this life cycle.
+            // One more independent cache, and one more cell in a reserved slot.
             ++mSparseCacheBuffers[lcId];
         }
     }

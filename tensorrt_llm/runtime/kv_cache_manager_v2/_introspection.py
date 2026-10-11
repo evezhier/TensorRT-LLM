@@ -221,6 +221,15 @@ def sparse_cache_pages(kv_cache: Any, lc_id: int) -> list[int]:
     return list(_cpp().sparse_cache_pages(kv_cache, lc_id))
 
 
+def sparse_flush_counts(kv_cache: Any, lc_id: int) -> list[int]:
+    """Units the last write-back moved, per sparse buffer.
+
+    -1 where no write-back has run for that buffer, which distinguishes "never flushed"
+    from "flushed and found nothing resident".
+    """
+    return list(_cpp().sparse_flush_counts(kv_cache, lc_id))
+
+
 class SparseResolveResult(NamedTuple):
     """State and outputs of one sparse resolve launch."""
 

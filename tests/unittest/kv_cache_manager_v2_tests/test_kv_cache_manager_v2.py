@@ -433,6 +433,9 @@ class TestSparseCacheReservation(unittest.TestCase):
                                 is_sparse=True,
                                 num_selected_blocks=num_selected,
                                 max_cached_units=max_cached_units,
+                                # One contiguous run per unit; a cached buffer must say how
+                                # to find a unit inside itself.
+                                sparse_unit_layout=SelectionUnitLayout(1, 4096, 0, 4096),
                             )
                         ],
                     )
@@ -485,7 +488,7 @@ class TestSparseCacheReservation(unittest.TestCase):
         try:
             self.assertEqual(manager.get_sparse_cache_max_units(0), 4)
             self.assertEqual(manager.get_sparse_cache_expansion(0), 1)
-            self.assertEqual(manager.get_sparse_cache_buffers_per_page(0), 1)
+            self.assertEqual(manager.get_sparse_cache_buffer_count(0), 1)
         finally:
             manager.shutdown()
 
@@ -531,7 +534,7 @@ class TestSparseCacheReservation(unittest.TestCase):
         manager = self._manager(max_cached_units=4)
         try:
             lc_id = manager.get_layer_group_id(0)
-            buffers = manager.get_sparse_cache_buffers_per_page(0)
+            buffers = manager.get_sparse_cache_buffer_count(0)
             # max_input_length is 0 below, so the cache is the history population alone:
             # 4 units at expansion 1 is 4 pages, hence 4 entries per buffer.
             entries = manager.get_sparse_cache_max_units(0)
@@ -595,6 +598,55 @@ class TestSparseCacheReservation(unittest.TestCase):
                 self.assertNotEqual(_introspection.sparse_cache_pages(cache, lc_id), [])
                 cache.suspend()
                 self.assertEqual(_introspection.sparse_cache_pages(cache, lc_id), [])
+                cache.close()
+        finally:
+            manager.shutdown()
+
+    def test_the_watermark_can_cross_a_unit_boundary(self):
+        """resize() must take the long path and write back, not take the shortcut.
+
+        Nothing is resident until the fetch path is wired, so the write-back list comes
+        back empty; what this covers is that the shortcut declines, the addressing is
+        assembled without error, and the launches are accepted.
+        """
+        manager = self._manager(max_cached_units=4)
+        try:
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                cache.max_input_length = 256
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                lc_id = manager.get_layer_group_id(0)
+                self.assertEqual(
+                    _introspection.sparse_flush_counts(cache, lc_id),
+                    [-1],
+                    "no write-back should have run yet",
+                )
+                # tokens_per_block is 128 and the unit is a whole block, so this crosses two
+                # unit boundaries in one move.
+                cache.resize(256, 256)
+                self.assertEqual(cache.history_length, 256)
+                self.assertEqual(
+                    _introspection.sparse_flush_counts(cache, lc_id),
+                    [0],
+                    "a write-back ran and found nothing resident to move",
+                )
+                cache.close()
+        finally:
+            manager.shutdown()
+
+    def test_a_move_inside_one_unit_still_takes_the_shortcut(self):
+        manager = self._manager(max_cached_units=4)
+        try:
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                cache.max_input_length = 256
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                lc_id = manager.get_layer_group_id(0)
+                cache.resize(64, 64)
+                self.assertEqual(cache.history_length, 64)
+                # Still -1: no unit boundary was crossed, so there was nothing to write back
+                # and the shortcut was free to take the move.
+                self.assertEqual(_introspection.sparse_flush_counts(cache, lc_id), [-1])
                 cache.close()
         finally:
             manager.shutdown()

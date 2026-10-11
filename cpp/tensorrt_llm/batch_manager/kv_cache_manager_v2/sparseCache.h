@@ -54,6 +54,23 @@ struct SparseCacheView
     int32_t* cachePages = nullptr;
     int32_t numPages = 0;
 
+    //! Scratch for one write-back: the units a watermark move crossed and the cells holding
+    //! them, the watermark scalars the scan reads, the page slots of the blocks touched, and
+    //! a status word. Sized once, because a single move cannot cross more units than the
+    //! declared in-flight span.
+    int32_t* flushOrdinal = nullptr;   //!< [numLayers][maxFlushUnits]
+    int32_t* flushSlot = nullptr;      //!< [numLayers][maxFlushUnits]
+    int32_t* flushCount = nullptr;     //!< [numLayers]
+    int32_t* flushRange = nullptr;     //!< [2], the half-open unit range
+    int32_t* flushPageSlice = nullptr; //!< [maxFlushBlocks]
+    int32_t* status = nullptr;         //!< [1] SparseResolveStatus
+    int32_t maxFlushUnits = 0;
+    int32_t maxFlushBlocks = 0;
+
+    //! [numLayers] byte offset of each buffer within a cold page. A lookup rather than
+    //! arithmetic: the cold layout is the codec's concat order, not this cache's choice.
+    uint32_t* hostBufferOffset = nullptr;
+
     int32_t numLayers = 0;
     int32_t entriesPerLayer = 0;
 
@@ -64,9 +81,26 @@ struct SparseCacheView
 };
 
 // ---------------------------------------------------------------------------
+// SparseCacheInit — everything a request's cache state is built from, all of it
+// fixed for the life of the reservation.
+// ---------------------------------------------------------------------------
+struct SparseCacheInit
+{
+    int32_t numLayers = 0;
+    int32_t entriesPerLayer = 0;
+    //! GPU page slot per reserved page.
+    std::vector<int32_t> cachePageSlots;
+    //! [numLayers] byte offset of each buffer within a cold page.
+    std::vector<uint32_t> hostBufferOffset;
+    //! Bounds on one watermark move, from the declared max_input_length.
+    int32_t maxFlushUnits = 0;
+    int32_t maxFlushBlocks = 0;
+};
+
+// ---------------------------------------------------------------------------
 // SparseCacheState — owns the device memory behind a SparseCacheView.
 //
-// One allocation holds both arrays; view() hands out the carved pointers. Created
+// One allocation holds every array; view() hands out the carved pointers. Created
 // when a request reserves its cache pages and destroyed when it releases them, so the
 // metadata's lifetime matches the pages it describes.
 // ---------------------------------------------------------------------------
@@ -80,8 +114,7 @@ public:
     //!
     //! Entries start free: every ordinal is kBadBlockOrdinal and the recency order is the
     //! identity permutation. Initialisation is enqueued on `stream`.
-    SparseCacheState(
-        int32_t numLayers, int32_t entriesPerLayer, std::vector<int32_t> const& cachePageSlots, CUstream stream);
+    explicit SparseCacheState(SparseCacheInit const& init, CUstream stream);
 
     [[nodiscard]] SparseCacheView const& view() const noexcept
     {
@@ -95,6 +128,10 @@ public:
 
     //! Copy the resident ordinals back to the host. Test and debug use only; synchronises.
     [[nodiscard]] std::vector<int32_t> readResidentOrdinals() const;
+
+    //! Copy the per-buffer write-back counts back to the host, -1 where no write-back has
+    //! run. Test and debug use only; synchronises.
+    [[nodiscard]] std::vector<int32_t> readFlushCounts() const;
 
     //! Copy the cache page slots back to the host. Test and debug use only; synchronises.
     [[nodiscard]] std::vector<int32_t> readCachePages() const;

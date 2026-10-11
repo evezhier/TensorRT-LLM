@@ -124,6 +124,16 @@ std::vector<int32_t> KvCacheIntrospection::sparseCachePages(KvCache const& kvCac
     return kvCache.mSparseCacheState[id].readCachePages();
 }
 
+std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCache, int lcId)
+{
+    LifeCycleId const id{lcId};
+    if (id >= kvCache.mSparseCacheState.size())
+    {
+        return {};
+    }
+    return kvCache.mSparseCacheState[id].readFlushCounts();
+}
+
 namespace
 {
 

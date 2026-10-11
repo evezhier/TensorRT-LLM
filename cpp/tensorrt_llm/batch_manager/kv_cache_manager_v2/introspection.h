@@ -51,6 +51,9 @@ public:
     // Empty when the life cycle has no cache reserved.
     static std::vector<int32_t> sparseCachePages(KvCache const& kvCache, int lcId);
 
+    // White-box hook: units the last write-back moved per buffer, -1 where none has run.
+    static std::vector<int32_t> sparseFlushCounts(KvCache const& kvCache, int lcId);
+
     // White-box hook: run the sparse resolve kernel over caller-supplied state, so the
     // probe index, victim choice and recency rebuild can be exercised without a request.
     // Synchronises. Inputs are [layer][entry] and [layer][selectionWidth] row-major.

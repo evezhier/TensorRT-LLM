@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/sparseCache.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
@@ -495,7 +496,41 @@ private:
 
     // Cache pages this request needs for one life cycle: history entries plus one per
     // in-flight unit, converted to pages. Zero when the life cycle has no fetch path.
-    [[nodiscard]] int _sparseCachePages(LifeCycleId lifeCycle) const;
+    //! Cache cells one sparse buffer needs: the history it caches plus every in-flight
+    //! unit, which holds its only copy until a flush reaches it.
+    //!
+    //! This is also the number of slots to reserve. The two coincide because a life cycle's
+    //! buffers of one size coalesce into that pool's slot, so reserving this many slots
+    //! yields exactly this many cells per buffer.
+    [[nodiscard]] int _sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const;
+
+    //! Selection units the watermark crosses for this life cycle, zero when it caches
+    //! nothing. Non-zero means those cells hold the only copy of their data and must reach
+    //! their host pages before the move can be reported.
+    [[nodiscard]] int _sparseUnitsCrossed(LifeCycleId lifeCycle, int fromHistory, int toHistory) const;
+
+    //! Assemble the addressing shared by both copy directions: pool bases and strides, the
+    //! cold-page offsets, the sub-slot geometry and the unit layout. The work list and the
+    //! direction are the caller's to fill in.
+    [[nodiscard]] SparseUnitCopyArgs _sparseCopyArgs(LifeCycleId lifeCycle) const;
+
+    //! One sparse buffer of a life cycle, in the order SparseCacheView indexes them.
+    struct SparseBufferRef
+    {
+        BufferId id;
+        SelectionUnitLayout layout;
+    };
+
+    [[nodiscard]] std::vector<SparseBufferRef> _sparseBuffers(LifeCycleId lifeCycle) const;
+
+    //! Byte offset of each sparse buffer within a cold page, in SparseCacheView order.
+    [[nodiscard]] std::vector<uint32_t> _sparseColdPageOffsets(LifeCycleId lifeCycle) const;
+
+    //! Write the cells holding units [fromUnits, toUnits) back to their host pages, on this
+    //! request's stream. Enqueues and returns: stream order is what guarantees a later fetch
+    //! reads the written-back page, and a copy that fails is a broken invariant, not a
+    //! recoverable condition.
+    void _flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnits);
 
     // Whether any life cycle has a configured sparse fetch path, and so whether
     // max_input_length is required.

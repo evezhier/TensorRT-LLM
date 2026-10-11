@@ -186,6 +186,12 @@ struct BufferConfig
         {
             sparseUnitLayout->validate(size);
         }
+        else if (maxCachedUnits > 0)
+        {
+            // A cache with no way to locate a unit inside the buffer cannot be filled or
+            // written back, so reject it here rather than at the first fetch.
+            throw std::invalid_argument("BufferConfig: a cached sparse buffer needs a sparseUnitLayout");
+        }
     }
 };
 

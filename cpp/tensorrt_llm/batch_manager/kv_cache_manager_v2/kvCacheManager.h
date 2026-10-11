@@ -321,25 +321,37 @@ public:
     //! units. Zero when the life cycle is not sparse or its fetch path is unconfigured.
     //!
     //! This is the history population only. The in-flight population is bounded per request
-    //! by KvCache::maxInputLength(), so the page count is a property of the request, not of
+    //! by KvCache::maxInputLength(), so the reservation is a property of the request, not of
     //! the manager.
     [[nodiscard]] int sparseCacheMaxUnits(LifeCycleId lifeCycle) const noexcept
     {
         return lifeCycle < mSparseCacheMaxUnits.size() ? mSparseCacheMaxUnits[lifeCycle] : 0;
     }
 
-    //! Selection units carried by one page of this life cycle, i.e. tokens_per_block divided
-    //! by the unit's token count. One when the unit is a whole page.
+    //! Selection units carried by one buffer of this life cycle, i.e. tokens_per_block
+    //! divided by the unit's token count. One when the unit is a whole block.
     [[nodiscard]] int sparseCacheExpansion(LifeCycleId lifeCycle) const noexcept
     {
         return lifeCycle < mSparseCacheExpansion.size() ? mSparseCacheExpansion[lifeCycle] : 1;
     }
 
-    //! Sparse buffers carried by one page of this life cycle: the (layer, role) slices a
-    //! reserved page yields, and so the number of independent caches it feeds.
-    [[nodiscard]] int sparseCacheBuffersPerPage(LifeCycleId lifeCycle) const noexcept
+    //! Sparse buffers this life cycle has, one per (layer, role). Each is an independent
+    //! cache: layers select different units, so nothing is shared between them.
+    //!
+    //! Because a life cycle's buffers of one size coalesce into that pool's slot, this is
+    //! also the cells a reserved slot yields, which is what makes the cell count and the
+    //! cache count the same number.
+    [[nodiscard]] int sparseCacheBufferCount(LifeCycleId lifeCycle) const noexcept
     {
         return lifeCycle < mSparseCacheBuffers.size() ? mSparseCacheBuffers[lifeCycle] : 0;
+    }
+
+    //! Storage attributes of one buffer: its pool, its offset within that pool's slot, its
+    //! expanded size and its expansion. Forwarded because StorageManager keeps the table
+    //! private and this manager is its friend.
+    [[nodiscard]] BufferAttr const& bufferAttr(LayerId layerId, DataRole const& role) const
+    {
+        return mStorage->getBufferAttr(layerId, role);
     }
 
     LifeCycleRegistry const& lifeCycles() const noexcept

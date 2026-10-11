@@ -2149,6 +2149,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("kv_cache"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("sparse_cache_pages", &kv::KvCacheIntrospection::sparseCachePages, nb::arg("kv_cache"),
         nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("sparse_flush_counts", &kv::KvCacheIntrospection::sparseFlushCounts, nb::arg("kv_cache"),
+        nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "sparse_resolve",
         [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
@@ -2702,9 +2704,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return self.sparseCacheExpansion(self.getLayerGroupId(layerId)); },
             nb::arg("layer_id"), "Selection units carried by one page; one when a unit is a whole page.")
         .def(
-            "get_sparse_cache_buffers_per_page",
+            "get_sparse_cache_buffer_count",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
-            { return self.sparseCacheBuffersPerPage(self.getLayerGroupId(layerId)); },
+            { return self.sparseCacheBufferCount(self.getLayerGroupId(layerId)); },
             nb::arg("layer_id"),
             "Sparse buffers carried by one page of this layer's life cycle, i.e. the number of "
             "independent caches a reserved page feeds.")
