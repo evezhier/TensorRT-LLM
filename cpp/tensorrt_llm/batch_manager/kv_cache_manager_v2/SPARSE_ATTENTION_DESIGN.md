@@ -1,14 +1,21 @@
 # Sparse attention in KVCacheManagerV2
 
-Status: implemented for the default codec, for the **decode instance of a disaggregated
-deployment**. Storage and locking, the per-request reservation and device state, `Batch`,
-the resolve, copy, index and flush-list kernels, the write-back at `resize()` and
-`KVCacheManager.fetch_sparse_pages` are in place.
+Target: the **decode instance of a disaggregated deployment**, default codec.
+
+This document describes one design. Where the code has not caught up, the text says so
+inline and *Migration state* below tracks it; everything else is in place.
+
+**Implemented**: the resolve, copy, index and flush-list kernels; `Batch`; the per-request
+reservation and device state; the write-back at `resize()`; `KVCacheManager.fetch_sparse_pages`.
+
+**Pending** (see *Migration state*): sparse history currently resides at a dedicated cold
+level rather than on a host-backed hot pool group, and the GPU cache is reserved from
+storage slots rather than its own arena. The four steps that close the gap are listed there.
 
 Out of scope, by decision rather than by omission: prefill, which a separate instance serves,
-and speculative decoding — see *Supported scope* below. Compression, `ISparseUnitGather` and
-kernel fusion remain future work, as marked below; so do multi-beam requests and life cycles
-whose sparse buffers span more than one pool.
+and speculative decoding — see *Supported scope*. Kernel fusion remains future work; so do
+multi-beam requests and life cycles whose sparse buffers span more than one pool.
+`ISparseUnitGather` is retired — see *Extraction interface*.
 
 Read `AGENTS.md` in this directory first for the storage, locking and concurrency model
 this builds on.
@@ -67,16 +74,20 @@ entry and the selection unit is already a page.
 
 ## Shape of the design
 
-1. **Storage tiers are unchanged.** No new tier or medium. Level 0 is GPU; level 1 must be
-   `HOST_MEM` for a deployment using sparse buffers.
-2. **`BufferConfig.is_sparse` is a per-buffer flag** and changes where a page locks.
-   A sparse buffer requires a lifecycle of its own. Sparse buffers of the same size still
-   coalesce with each other.
-3. **Every page of a sparse buffer locks at level 1**, regardless of what it holds. Lock
-   location is a property of the buffer, not of the block.
-4. **All GPU residency is the per-request cache.** A sparse buffer has no separately
-   managed GPU pages: both the block being written and the history a step selects occupy
-   cache entries, drawn from the same reservation and replaced by the same LRU.
+1. **No new tier or medium.** What varies is the *memory kind of a pool group*: a sparse
+   life cycle's level-0 pool group is backed by host memory, a dense one by GPU memory.
+   Level 1 stays an ordinary codec target for both.
+2. **`BufferConfig.is_sparse` is a per-buffer flag** and selects that backing. A sparse
+   buffer requires a lifecycle of its own. Sparse buffers of the same size still coalesce
+   with each other.
+3. **Every page of a sparse buffer locks at level 0**, like every other page. Sparse pages
+   are ordinary hot pages — coalesced, addressed by page index, reachable through
+   `get_mem_pool_base_address`, and visible to the transceiver — that happen to live in
+   host memory.
+4. **All GPU residency is the per-request cache**, which is a dedicated arena rather than a
+   storage tier. A sparse buffer has no separately managed GPU pages: both the block being
+   written and the history a step selects occupy cache cells, drawn from the same lease and
+   replaced by the same LRU.
 5. **The host page is authoritative once the watermark passes the block.** A block is
    flushed to its host page by the `resize()` that raises `history_length` past it, after
    which its cache entry is evictable. Before that it holds the only copy and is pinned.
@@ -93,10 +104,10 @@ int old = kvc->updateBasePageIndex(
     mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, slotIdToPageIndexValue(pg.slotId()));
 ```
 
-so `getBasePageIndices()` reports level-1 slot ids with no change, and because every page
-of a sparse buffer locks there, the table is **uniform**: every entry is a level-1 slot id.
-Nothing resolves against the GPU pool, and no caller has to know which rule applies to
-which ordinal.
+so `getBasePageIndices()` reports hot slot ids with no change, and because every page of a
+sparse buffer locks there, the table is **uniform**: every entry is a level-0 slot id, as
+for a dense buffer. Nothing resolves against the cache arena, and no caller has to know
+which rule applies to which ordinal.
 
 A block's data reaches its host page by a **flush**: a copy on the owning `KvCache`'s
 stream that does **not** evict the GPU entry, which stays cached and merely stops being
@@ -158,16 +169,16 @@ the reservation guarantees enough candidates remain.
 
 Two separate reservations, easily confused.
 
-**Host tier.** Every block of the sequence has a locked host page, so the count is
-`divUp(capacity, tokens_per_block)` — the existing per-sequence locking logic, unchanged.
-Only the level differs. This is the payoff of uniform locking: nothing new to size, and no
-notion of "history pages" distinct from the rest.
+**Hot pages.** Every block of the sequence has a locked hot page, so the count is
+`divUp(capacity, tokens_per_block)` — the existing per-sequence locking logic, entirely
+unchanged. Only the backing medium differs. This is the payoff of uniform locking: nothing
+new to size, and no notion of "history pages" distinct from the rest.
 
-**GPU tier.** `max_cached_units` is the whole cache, counting both populations:
+**Cache cells.** `max_cached_units` is the whole cache, counting both populations:
 
 ```
-cells  = max_cached_units                         one buffer's cells
-slots  = divUp(cells, expansion)                  what the reservation takes
+cells = max_cached_units                          one buffer's cells
+lease = num_buffers * divUp(cells, expansion)     contiguous cells a request takes
 ```
 
 The two populations are disjoint — the selection is below the watermark, everything in
@@ -201,30 +212,37 @@ produces. Both readings reject the same accidents, but the derived one also admi
 multi-token steps whenever the cache happened to be wide, which the fetch cannot serve at
 any width.
 
-The reservation therefore depends on configuration alone. It happens once at `resume()` and
-fails there if capacity is unavailable, so the fetch path never has to handle exhaustion.
+The lease therefore depends on configuration alone. It is taken once at `resume()` and
+fails there if the arena is full, so the fetch path never has to handle exhaustion. Because
+every request of a life cycle needs exactly the same number of cells, the arena is a
+fixed-size-block free list rather than a general allocator.
 
 `resize()` still checks the gap against this bound. It is the host-side counterpart of the
 resolve kernel's in-flight overflow report: one catches a request outgrowing its cache
 before the step, the other if it somehow reaches the device.
 
-### Why per-request slots give per-layer caches for free
+### Why the cache is a flat array of cells
 
-A reserved slot is `buffers_per_slot` buffer-sized cells, and a cell can hold any layer's
-unit. Entries resolve through a flat sub-slot index, so the per-layer partition is a free
-choice rather than a consequence of the page layout — see *One pool, one index space*.
-Coalescing earns nothing inside the cache, because layers select different units and so
-share nothing.
+A lease is one contiguous run of buffer-sized cells, and an entry resolves to one by
+arithmetic alone:
 
-The consequence is that a cache entry is not a page. One reserved slot may hold different
-layers' data for entirely different ordinals, so an entry is `(layer, entry index)`. This
-breaks an assumption that runs through KVCM2 — that a page is both the unit of allocation
-*and* the unit of identity — and code reasoning about "the block this page holds" has no
-answer for a sparse cache slot.
+```
+cell    = buffer * divUp(max_cached_units, expansion) + entry / expansion
+address = lease_base + cell * buffer_bytes
+unit    = entry % expansion                       which unit within the cell
+```
 
-When the selection unit is smaller than a page, each cell holds `expansion` units, so a
-reservation of N slots gives `N * buffers_per_slot * expansion` units in total. An entry is
-`(layer, entry index)`, resolved to a cell by the sub-slot arithmetic above.
+No page table, no slot indirection, no coalescing. Coalescing earns nothing inside the
+cache because different layers select different units, so a slot's cells would never be
+filled together; the cache took whole coalesced slots only while it drew them from the
+storage allocator, which deals in slots. A dedicated arena has no such constraint, and
+dropping it removes a page lookup from both the copy and the index kernel.
+
+The consequence worth stating is that **a cache cell is not a page**. It holds one buffer's
+unit, identified by `(buffer, entry index)` rather than by a block ordinal. This breaks an
+assumption that runs through KVCM2 — that a page is both the unit of allocation *and* the
+unit of identity — which is precisely why the cache is not a storage tier: it would have to
+answer "which block does this page hold", and it has no answer.
 
 ## Device-side cache
 
@@ -364,23 +382,24 @@ until the codec's `configure()` runs *during* construction. A cold-page offset c
 supplied there. It is also the only part the model integration knows — the internal shape of
 its own buffer.
 
-KVCM2 supplies the rest, which is why **the fast path requires the default codec**. That
-codec's cold page is a direct concatenation of buffers, so KVCM2 knows each buffer's offset
-within it; the hot-slot offset comes from `BufferAttr` as usual. No query of the codec, and
-no downcast, is needed.
-
-Because the default codec relocates buffer bytes verbatim, a buffer's cold layout equals its
-hot layout, and a device cache slot's buffer has the same structure as any hot buffer —
-`expansion` unit positions. The copy is therefore symmetric, one set of strides on both
-sides, differing only in unit index:
+KVCM2 supplies the rest, and **this is independent of the codec**. Both sides of the copy
+are hot-layout: the source is a hot page, whose buffer sits at `BufferAttr::offset` within
+its slot, and the destination is a cache cell holding one buffer's worth of the same
+structure. The copy is therefore symmetric, one set of strides on both sides, differing only
+in unit index:
 
 ```
-src = coldPageBase + coldBufferOffset + c*chunkStride + srcUnit*unitStride
-dst = hotSlotBase  + hotBufferOffset  + c*chunkStride + dstUnit*unitStride
+src = hotSlotBase  + bufferOffset + c*chunkStride + srcUnit*unitStride
+dst = cellBase                    + c*chunkStride + dstUnit*unitStride
 ```
 
 The destination stays in natural layout rather than being repacked, so the attention kernel
 sees exactly what it sees for an ordinary page.
+
+That the codec does not enter here is the point of putting sparse history on the hot tier.
+An earlier revision read *cold* pages, whose layout is the codec's concat order rather than
+KVCM2's, which coupled the fetch to the codec and made compression unreachable — see
+*Migration state*.
 
 | cold layout | numChunks | chunkBytes | chunkStride |
 | --- | --- | --- | --- |
@@ -395,33 +414,21 @@ to that without redesign.
 Worth asserting at configuration: `numChunks * chunkBytes == BufferConfig.size`, which is
 already per-unit (`expandedSize = buf.size * exp`).
 
-### Fallback: the gather interface
+### The gather interface, and why there isn't one
 
-Not part of the first implementation — see *Staging* below. Sketched here because it shapes
-the descriptor path's boundary.
+Earlier revisions planned an `ISparseUnitGather` — a per-buffer, stream-taking device call
+that would extract a unit from a representation arithmetic could not address. It existed for
+exactly one reason: the fetch read cold pages, so a codec that compressed or permuted them
+put the unit somewhere a layout value could not describe.
 
-A layout can only express data *movement* between two arithmetic-addressable layouts. A
-custom codec, a variable-length or compressed cold representation, dequantisation, or
-permutation all need code, and that code runs at step time on a stream — so unlike the
-layout, it is genuinely an interface:
+Reading hot pages removes the reason. The hot representation is KVCM2's own, always in
+ordinary slot layout, and a codec by construction only transforms data on its way *out* of
+that tier. A compressed level 1 is therefore invisible to the fetch, and no plugin boundary
+is needed on this path at all.
 
-```cpp
-class ISparseUnitGather {
-public:
-    virtual ~ISparseUnitGather();
-    virtual bool gather(/* miss list, cold base, hot base, */ CUstream stream) noexcept = 0;
-};
-```
-
-Registered per sparse buffer alongside the optional layout. The resolution rule is checkable
-at configuration: a layout present selects the fast path; absent, a gatherer is required;
-neither is a configuration error.
-
-The two deliberately share no base class. They have almost nothing in common — the layout is
-inert data, the gather is a stream-taking device call — and a shared base would turn the one
-useful composition, a single implementation serving descriptors for most buffers and a gather
-for one, into a diamond needing virtual inheritance. If a shared `configure()` later proves
-necessary, adding a base is a small internal refactor; neither type crosses an ABI boundary.
+This also retires the LTO-IR/nvJitLink fusion work that existed only to inline such a
+gatherer back into the resolve. The extension point is gone rather than deferred, which is
+worth more than the code it would have taken to build.
 
 ### Kernel structure
 
@@ -434,49 +441,20 @@ forced: the resolve writes a miss list the copy consumes, which is what lets the
 copies be issued before the recency bookkeeping. Fusing them would be a local optimisation,
 not an interface change.
 
-The gather path is **two kernels**: KVCM2's kernel resolves selections, updates LRU and
-allocates slots, writing a miss list to a device array; the implementation's kernel performs
-extraction and copy. This is the same shape as `encode(pairs, stream)` and needs no new
-machinery.
+There is no second path to fuse with, so the structure is final rather than a first stage.
 
-Fusing *the gather path* is feasible later, and the mechanism matters:
+## Compression
 
-- A `__device__` **function pointer will not work** across the boundary. Device function
-  pointers are module-scoped, so a pointer obtained from a separately compiled `.so`
-  cannot be called from a kernel in another module. Only same-binary device linking
-  (`-rdc=true`) would permit it, which defeats the plugin model.
-- The route that does work is returning the extraction function as **LTO-IR**, compiling
-  KVCM2's kernel to LTO-IR too, and linking with **nvJitLink** for real inlining. There is
-  in-tree precedent for runtime compilation in
-  `kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/` (`nvrtcWrapper`,
-  `compileEngine`, `cubinObj`) with module loading via `common/cudaDriverWrapper`.
-- Compile at configuration, cache by (layout, arch), never per step.
+Compressing history is attractive — it is the bulk of the footprint, written once and read
+rarely — and with sparse history on the hot tier it needs **nothing sparse-specific**. A
+codec already transforms pages crossing the hot boundary; a sparse life cycle's pages now
+cross it like any other, so level 1 can hold a compressed form and the existing
+`IKvCacheColdPageCodec` does the work.
 
-Fusion may never be needed. It applies only to compressed or otherwise non-addressable cold
-representations, which are the minority; the design is graph-capturable, so on replay a
-second launch costs well under a microsecond against a millisecond-scale step whose copies
-dominate.
+The fetch is unaffected: it reads hot pages, which are never the compressed form.
 
-## Staging
-
-The three mechanisms above are deliberately ordered so each stage is useful alone and none
-blocks the next:
-
-| stage | delivers | needed when |
-| --- | --- | --- |
-| 1 | descriptor path, no plugin interface at all | always — the flush is a verbatim copy, so cold layout equals hot layout |
-| 2 | `ISparseUnitGather`, an extraction launch owned by the implementation | compression, or any other non-arithmetic cold representation |
-| 3 | LTO-IR + nvJitLink to fuse stage 2's extraction in | stage 2's extra launch measurably costs something |
-
-Stage 1 needs no extension point, so the first implementation carries no plugin machinery,
-no registration, and no dispatch. `ISparseUnitGather` is introduced only alongside the first
-codec that requires it, which is also the first point at which its shape can be validated
-against a real consumer rather than guessed.
-
-Compressing history on the way to host belongs to stage 2. It is attractive — history is
-the bulk of the footprint and is written once and read rarely — but it breaks the identity
-between cold and hot layout that the descriptor path depends on, and raises a lossy-versus-
-lossless question the first stage does not need to answer.
+What remains is the question the codec has always posed and this design does not answer:
+whether a lossy codec is acceptable for KV history, and under what accuracy budget.
 
 ## Fetch
 
@@ -602,16 +580,24 @@ page has no valid contents yet, so the result is stale data rather than unrelate
 A debug check against the flushed state can catch it; silence would be a wrong answer, not
 corruption.
 
-## One pool, one index space
+## One arena, one index space
 
-The sparse pool's GPU tier holds nothing but cache entries — selected history and the block
-being written alike. That is what lets the fetch emit a **single** index list covering both,
-and therefore why existing attention kernels need no change: a kernel still indexes one page
-table by ordinal against one pool base.
+The cache arena holds nothing but cells — selected history and the unit being written alike.
+That is what lets the fetch emit a **single** index list covering both, and therefore why
+existing attention kernels need no change: a kernel still indexes one list against one base.
 
-Indices are unit-granular. With `E` units per page and `N_b` buffers per page, layer L's
-unit u of page p is at `(p * N_b + L) * E + u` — the expanded index space
-`PageIndexConverter` already produces.
+Indices are unit-granular, and over the arena rather than over a pool:
+
+```
+index = cell * expansion + unit
+      = (lease_base_cell + buffer * cells_per_buffer + entry / expansion) * expansion
+        + entry % expansion
+```
+
+`get_mem_pool_base_address` for a sparse buffer therefore reports the **arena's** base, not
+the hot pool's. The consumer's side is unchanged — one base, one index list, the expanded
+index space `PageIndexConverter` already produces — but the allocation that base names is
+the cache, which is the only GPU-resident copy a kernel can read.
 
 Note that `tokens_per_block_override` is only an index-conversion mechanism: it yields
 `expansion = tokens_per_block / tokens_per_block_override` and scales `BufferConfig.size`
@@ -693,11 +679,11 @@ Slot release is already level-aware: `Page::~Page()` releases with the page's ow
 `cacheLevel`, and the `kHotLevel` in `ScratchSlotLock::unlock()` is correct, since SWA
 prefill scratch is GPU-only by definition.
 
-- **`_lockHeldBlocks`**, the OOM rollback for `resize`, calls `batchedLockToGpu`. A sparse
-  resize failing partway would re-lock pages at level 0, leaving the page table holding
-  level-0 indices in a table everything else assumes is level-1. Failure path only, so it
-  survives happy-path testing. *(Addressed: `StaleBackup` now records the page's lock level
-  and `batchedLockPages` restores it.)*
+- **`_lockHeldBlocks`'s level hazard is gone.** The OOM rollback for `resize` calls
+  `batchedLockToGpu`, which re-locks at level 0. That used to corrupt a sparse page table,
+  whose entries were level-1 ids — a failure-path-only bug that survives happy-path testing.
+  With sparse pages locking at level 0 like every other page there is nothing to mismatch.
+  The `StaleBackup` lock-level plumbing added for it is now redundant and can go.
 - **`_unlockStaleBlocks` is not the flush hook.** It exists for SWA blocks outside the
   window, whose content is *dead*; sparse history is live and will be read. Same trigger and
   range arithmetic, different disposition — routing sparse layers through it drops the data
@@ -721,92 +707,42 @@ Also: the host pool is far larger than the GPU pool, so a page index must be wid
 bits before multiplying by the page stride. MSA already does this
 (`triton_sparse_decode.py`); QSA and XQA should be audited.
 
-## Planned: hot-tier residency and an external GPU cache
+## Migration state
 
-**Not yet implemented.** Everything above describes the code as it stands, in which sparse
-history *resides* at `kSparseHistoryLevel` and the fetch reads cold pages directly. This
-section records the architecture that replaces it, and why.
+The design above is the target. The code is partway there, and this section is the only
+place that distinguishes the two; everything else describes the target as settled.
 
-### Why the present layout cannot be compressed
+**Where the code differs today.** Sparse history resides at a dedicated cold level
+(`kSparseHistoryLevel`) rather than on a host-backed hot pool group, the fetch reads cold
+pages through `queryDefaultColdPageLayout`'s concat order, and cache cells are coalesced
+slots reserved from `StorageManager` and addressed through `SparseCacheView::cachePages`.
 
-The codec is not the level 0 -> level 1 transform. It is the **hot <-> cold** transform:
-`StorageManager::migrate` computes `srcIsHot = srcLevel == kHotLevel`, and when source and
-destination are on the same side of that boundary it performs a plain byte copy with no
-codec at all. Sparse history is locked at level 1 and never migrates, so it never crosses
-the boundary, so the codec never runs on it.
+**Why it is moving.** The codec is not the level 0 -> level 1 transform; it is the
+**hot <-> cold** transform. `StorageManager::migrate` computes
+`srcIsHot = srcLevel == kHotLevel` and performs a plain byte copy when source and
+destination are on the same side, invoking the codec only across that boundary. History
+locked at a cold level never crosses it, so no codec ever runs on it — compression was not
+deferred, it was unreachable. Two cold levels would not help for the same reason.
 
-Compression of sparse history is therefore not merely deferred by the cold-page layout
-coupling described under *Extraction interface*. It is unreachable: there is no path on
-which a codec would be invoked. The same reasoning retires the idea of compressing between
-two cold levels.
+**Steps.** Each ends with the suite green; the cache must be rehomed before the pool group
+flips, or it silently reserves host memory and stops being a GPU cache.
 
-### The replacement
+| # | step | state |
+| --- | --- | --- |
+| 1 | Cells come from a dedicated GPU arena owned by `KvCacheManager`, leased per request. Sub-slot addressing and `cachePages` collapse to flat cell arithmetic | pending |
+| 2 | Sparse life cycle's level-0 pool group is host-backed; `residencyLevel`'s sparse branch and `kSparseHistoryLevel` retire | pending |
+| 3 | Fetch reads hot pages at `BufferAttr::offset`; `_sparseColdPageOffsets` and `hostBufferOffset` go | pending |
+| 4 | Compression, through the existing codec, with nothing sparse-specific | pending |
 
-- A sparse life cycle's **hot pool group is backed by host memory**, device-mapped as the
-  cold tier is today. Its pages are ordinary hot pages: locked at `kHotLevel`, coalesced,
-  addressed by page index, reachable through `get_mem_pool_base_address`.
-- Memory kind therefore varies **per pool group within a level**, which costs less than it
-  sounds: `CacheLevelStorage` already holds `PoolGroupBase` pointers and `GpuPoolGroup` /
-  `HostPoolGroup` already exist. Only the factory is tier-uniform.
-- Host-backed hot capacity is **reported as GPU** in statistics and quota. Functionally it
-  behaves as GPU residency: real GPU memory caches it, and kernels only ever address it
-  through that cache.
-- The **GPU cache moves out of `StorageManager`**, though it stays inside `KvCacheManager`.
-  It owns its own device allocation rather than reserving slots from a hot pool group, which
-  is what lets that pool group become host memory without the cache following it there.
-  `fetch_sparse_pages`, `Batch` and the per-request state stay where they are.
-- `kSparseHistoryLevel` and `residencyLevel`'s sparse branch retire. Level 1 becomes an
-  ordinary codec target.
+Step 1 must *delete* sub-slot addressing rather than adapt it. It exists only because the
+storage allocator deals in coalesced slots; carrying it forward into an arena that has no
+slots would preserve a workaround for a constraint that no longer exists.
 
-### What it buys
-
-- **Compression works generically.** Level 0 -> level 1 is the codec boundary for sparse
-  buffers exactly as for dense ones. Nothing sparse-specific is involved.
-- **`ISparseUnitGather` is retired before being built.** It exists only because the fetch
-  reads codec-formatted cold pages. Reading uncompressed hot pages instead removes the
-  reason for it.
-- **The cold-page layout coupling goes.** The fetch's source becomes
-  `slotAddress(kHotLevel, ...) + BufferAttr::offset` -- arithmetic this package owns --
-  rather than `queryDefaultColdPageLayout`'s concat order, which belongs to the codec. With
-  it go `_sparseColdPageOffsets`, `SparseCacheView::hostBufferOffset` and the per-buffer
-  offset upload.
-- **Cell addressing collapses to flat arithmetic.** A dedicated allocation can hand a
-  request one contiguous run of `numBuffers * subSlotsPerBuffer` cells, so a cell's address
-  is `base + subSlot * bufferBytes`. The page indirection goes: `SparseCacheView::cachePages`,
-  `buffersPerSlot` and the slot-to-page lookup in both the copy and the index kernel all
-  collapse. Coalesced slots were never a good fit here -- the reservation handed out whole
-  slots only because that is what the storage allocator deals in.
-
-  The index this emits is then `subSlot * expansion + unit` against the cache's own base, so
-  `get_mem_pool_base_address` for a sparse buffer must report that base rather than the hot
-  pool's. The consumer still indexes one base by one index list; which allocation the base
-  names is what changes.
-
-- **The transceiver needs no changes.** It works on hot, coalesced pages; those stay a
-  single ordinary pool group per life cycle and merely become host memory. Keeping the GPU
-  cache *outside* the tier is what preserves that: a second pool group inside the hot tier
-  would have made "the hot pool of this life cycle" ambiguous, which is the invariant both
-  the transceiver and `get_mem_pool_base_address` rest on.
-
-### Order of work
-
-The cache must be rehomed **before** the hot pool group flips to host; otherwise it silently
-reserves host memory and stops being a GPU cache.
-
-1. Move the GPU cache off `StorageManager`'s slot reservation onto its own device
-   allocation, still owned by `KvCacheManager`. Behaviour unchanged.
-2. Back the sparse hot pool group with host memory; delete `residencyLevel`'s sparse branch.
-3. Point the fetch's source at hot pages in ordinary slot layout; delete the cold-page
-   offset machinery.
-4. Compression, now generic.
-
-### Hazard to check at step 2
-
-Moving sparse pages to the hot level makes them eligible for demotion and eviction for the
-first time. A page demoted while the GPU cache holds a cell copied from it leaves that cell
-valid -- it is a snapshot -- but a later fetch of the same unit would read a page that has
-since been encoded. `PageLock` is expected to prevent this, since a live request holds its
-pages, but it must be verified rather than assumed.
+**Hazard to verify at step 2.** Moving sparse pages to the hot level makes them eligible for
+demotion and eviction for the first time. A page encoded while the cache holds a cell copied
+from it leaves that cell valid — it is a snapshot — but a later fetch of the same unit would
+read a page that has since been encoded. `PageLock` is expected to prevent this, since a live
+request holds its pages, but it must be verified rather than assumed.
 
 ## Settled by construction
 
