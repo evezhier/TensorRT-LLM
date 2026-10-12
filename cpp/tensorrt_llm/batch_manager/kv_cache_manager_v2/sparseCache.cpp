@@ -39,67 +39,140 @@ size_t alignedBytes(size_t bytes) noexcept
 
 } // namespace
 
-SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
+namespace
 {
-    int32_t const numLayers = init.numLayers;
-    int32_t const numBuffers = init.numBuffers;
-    int32_t const entriesPerLayer = init.entriesPerLayer;
-    auto const& cachePageSlots = init.cachePageSlots;
-    if (numLayers <= 0 || numBuffers <= 0 || entriesPerLayer <= 0)
+
+//! Per-lease metadata, in carve order. Arrays shared by every lease of a life cycle --
+//! the buffer maps and the recency template -- live on the arena instead, so a resume
+//! enqueues only the resets that differ per request.
+struct LeaseLayout
+{
+    size_t ordinal = 0;
+    size_t lru = 0;
+    size_t flushList = 0;
+    size_t count = 0;
+    size_t range = 0;
+    size_t slice = 0;
+    size_t view = 0;
+
+    [[nodiscard]] size_t total() const noexcept
     {
-        throw std::invalid_argument("SparseCacheState requires a positive layer, buffer and entry count");
+        return ordinal + lru + 2 * flushList + count + range + slice + view;
     }
-    if (cachePageSlots.empty())
+};
+
+LeaseLayout leaseLayout(SparseCacheInit const& shape, int32_t maxFlushUnits, int32_t maxFlushBlocks)
+{
+    auto const entries = static_cast<size_t>(shape.numLayers) * shape.entriesPerLayer;
+    LeaseLayout out;
+    out.ordinal = alignedBytes(sizeof(int32_t) * entries);
+    out.lru = alignedBytes(sizeof(int32_t) * entries);
+    out.flushList = alignedBytes(sizeof(int32_t) * static_cast<size_t>(shape.numLayers) * maxFlushUnits);
+    out.count = alignedBytes(sizeof(int32_t) * static_cast<size_t>(shape.numLayers));
+    out.range = alignedBytes(sizeof(int32_t) * 2);
+    out.slice = alignedBytes(sizeof(int32_t) * static_cast<size_t>(maxFlushBlocks));
+    out.view = alignedBytes(sizeof(SparseCacheView));
+    return out;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// SparseCellArena
+// ---------------------------------------------------------------------------
+
+SparseCellArena::SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBytes, int maxLeases)
+    : mShape(shape)
+    , mBufferBytes(bufferBytes)
+{
+    if (shape.numLayers <= 0 || shape.numBuffers <= 0 || shape.entriesPerLayer <= 0 || shape.cellsPerBuffer <= 0)
     {
-        throw std::invalid_argument("SparseCacheState requires at least one cache page");
+        throw std::invalid_argument("SparseCellArena requires a positive layer, buffer, entry and cell count");
     }
-    if (init.hostBufferOffset.size() != static_cast<size_t>(numBuffers))
+    if (bufferBytes == 0 || maxLeases <= 0)
     {
-        throw std::invalid_argument("SparseCacheState requires one cold-page offset per buffer");
+        throw std::invalid_argument("SparseCellArena requires a positive cell size and lease count");
     }
-    if (init.bufferLayer.size() != static_cast<size_t>(numBuffers))
+    if (shape.hostBufferOffset.size() != static_cast<size_t>(shape.numBuffers))
     {
-        throw std::invalid_argument("SparseCacheState requires one layer index per buffer");
+        throw std::invalid_argument("SparseCellArena requires one cold-page offset per buffer");
     }
-    for (size_t i = 0; i < init.bufferLayer.size(); ++i)
+    if (shape.bufferLayer.size() != static_cast<size_t>(shape.numBuffers))
     {
-        if (init.bufferLayer[i] < 0 || init.bufferLayer[i] >= numLayers)
+        throw std::invalid_argument("SparseCellArena requires one layer index per buffer");
+    }
+    for (size_t i = 0; i < shape.bufferLayer.size(); ++i)
+    {
+        if (shape.bufferLayer[i] < 0 || shape.bufferLayer[i] >= shape.numLayers)
         {
-            throw std::invalid_argument("SparseCacheState: a buffer's layer index is out of range");
+            throw std::invalid_argument("SparseCellArena: a buffer's layer index is out of range");
         }
-        if (i > 0 && init.bufferLayer[i] < init.bufferLayer[i - 1])
+        if (i > 0 && shape.bufferLayer[i] < shape.bufferLayer[i - 1])
         {
-            throw std::invalid_argument("SparseCacheState: buffers must be grouped by layer");
+            throw std::invalid_argument("SparseCellArena: buffers must be grouped by layer");
         }
     }
 
-    mView.numLayers = numLayers;
-    mView.numBuffers = numBuffers;
-    mView.entriesPerLayer = entriesPerLayer;
-    mView.numPages = static_cast<int32_t>(cachePageSlots.size());
-    mView.maxFlushUnits = std::max(init.maxFlushUnits, 1);
-    mView.maxFlushBlocks = std::max(init.maxFlushBlocks, 1);
+    mShape.maxFlushUnits = std::max(shape.maxFlushUnits, 1);
+    mShape.maxFlushBlocks = std::max(shape.maxFlushBlocks, 1);
+    mCellsPerLease = shape.numBuffers * shape.cellsPerBuffer;
 
-    auto const flushEntries = static_cast<size_t>(numLayers) * mView.maxFlushUnits;
-    size_t const ordinalBytes = alignedBytes(sizeof(int32_t) * mView.numEntries());
-    size_t const lruBytes = alignedBytes(sizeof(int32_t) * mView.numEntries());
-    size_t const pageBytes = alignedBytes(sizeof(int32_t) * cachePageSlots.size());
-    size_t const flushListBytes = alignedBytes(sizeof(int32_t) * flushEntries);
-    size_t const countBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(numLayers));
-    size_t const rangeBytes = alignedBytes(sizeof(int32_t) * 2);
-    size_t const sliceBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mView.maxFlushBlocks));
-    // Cold-page offsets and the layer map are per buffer; everything above is per layer.
-    size_t const offsetBytes = alignedBytes(sizeof(uint32_t) * static_cast<size_t>(numBuffers));
-    size_t const bufferLayerBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(numBuffers));
-    size_t const viewBytes = alignedBytes(sizeof(SparseCacheView));
+    auto const layout = leaseLayout(mShape, mShape.maxFlushUnits, mShape.maxFlushBlocks);
+    mMetadataBytes = layout.total();
+
+    auto const entries = static_cast<size_t>(mShape.numLayers) * mShape.entriesPerLayer;
+    size_t const cellBytes = static_cast<size_t>(maxLeases) * mCellsPerLease * bufferBytes;
+    size_t const offsetBytes = alignedBytes(sizeof(uint32_t) * static_cast<size_t>(mShape.numBuffers));
+    size_t const layerBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numBuffers));
+    size_t const identityBytes = alignedBytes(sizeof(int32_t) * entries);
+    size_t const sharedBytes = offsetBytes + layerBytes + identityBytes;
 
     CUdeviceptr base = 0;
-    cuCheck(cuMemAlloc(&base,
-        ordinalBytes + lruBytes + pageBytes + 2 * flushListBytes + countBytes + rangeBytes + sliceBytes + offsetBytes
-            + bufferLayerBytes + viewBytes));
+    cuCheck(cuMemAlloc(&base, alignedBytes(cellBytes) + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes));
     mMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
 
-    auto* bytes = reinterpret_cast<std::byte*>(base);
+    // Cells first, so a cell index is relative to the arena base -- which is what the fetch
+    // reports and what get_mem_pool_base_address returns for a sparse buffer.
+    mCellBase = base;
+    auto* shared = reinterpret_cast<std::byte*>(base) + alignedBytes(cellBytes);
+    mSharedOffset = reinterpret_cast<uint32_t*>(shared);
+    mSharedLayer = reinterpret_cast<int32_t*>(shared + offsetBytes);
+    mIdentity = reinterpret_cast<int32_t*>(shared + offsetBytes + layerBytes);
+    mMetadataBase = shared + sharedBytes;
+
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedOffset), mShape.hostBufferOffset.data(),
+        sizeof(uint32_t) * mShape.hostBufferOffset.size()));
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedLayer), mShape.bufferLayer.data(),
+        sizeof(int32_t) * mShape.bufferLayer.size()));
+
+    // The recency order every lease starts from: a per-layer identity permutation. Built once
+    // here so a resume is a device-to-device copy rather than a host transfer.
+    std::vector<int32_t> identity(entries);
+    for (int32_t layer = 0; layer < mShape.numLayers; ++layer)
+    {
+        auto const begin = identity.begin() + static_cast<ptrdiff_t>(layer) * mShape.entriesPerLayer;
+        std::iota(begin, begin + mShape.entriesPerLayer, 0);
+    }
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mIdentity), identity.data(), sizeof(int32_t) * identity.size()));
+
+    mFree.reserve(static_cast<size_t>(maxLeases));
+    for (int i = maxLeases - 1; i >= 0; --i)
+    {
+        mFree.push_back(i);
+    }
+}
+
+std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
+{
+    if (empty() || mFree.empty())
+    {
+        return std::nullopt;
+    }
+    int const index = mFree.back();
+    mFree.pop_back();
+
+    auto const layout = leaseLayout(mShape, mShape.maxFlushUnits, mShape.maxFlushBlocks);
+    auto* bytes = mMetadataBase + static_cast<size_t>(index) * mMetadataBytes;
     size_t carved = 0;
     auto carve = [&](size_t size)
     {
@@ -107,52 +180,99 @@ SparseCacheState::SparseCacheState(SparseCacheInit const& init, CUstream stream)
         carved += size;
         return ptr;
     };
-    mView.residentOrdinal = carve(ordinalBytes);
-    mView.lruOrder = carve(lruBytes);
-    mView.cachePages = carve(pageBytes);
-    mView.flushOrdinal = carve(flushListBytes);
-    mView.flushSlot = carve(flushListBytes);
-    mView.flushCount = carve(countBytes);
-    mView.flushRange = carve(rangeBytes);
-    mView.flushPageSlice = carve(sliceBytes);
-    mView.hostBufferOffset = reinterpret_cast<uint32_t*>(carve(offsetBytes));
-    mView.bufferLayer = carve(bufferLayerBytes);
-    mDeviceView = reinterpret_cast<SparseCacheView*>(carve(viewBytes));
-    // -1 so that "no write-back has run" is distinguishable from "one ran and found
-    // nothing to move", which is what lets a test tell the two apart.
+
+    SparseCacheLease lease;
+    lease.mArena = this;
+    lease.mIndex = index;
+
+    auto& view = lease.mView;
+    view.numLayers = mShape.numLayers;
+    view.numBuffers = mShape.numBuffers;
+    view.entriesPerLayer = mShape.entriesPerLayer;
+    view.maxFlushUnits = mShape.maxFlushUnits;
+    view.maxFlushBlocks = mShape.maxFlushBlocks;
+    view.baseCell = index * mCellsPerLease;
+    view.hostBufferOffset = mSharedOffset;
+    view.bufferLayer = mSharedLayer;
+    view.residentOrdinal = carve(layout.ordinal);
+    view.lruOrder = carve(layout.lru);
+    view.flushOrdinal = carve(layout.flushList);
+    view.flushSlot = carve(layout.flushList);
+    view.flushCount = carve(layout.count);
+    view.flushRange = carve(layout.range);
+    view.flushPageSlice = carve(layout.slice);
+    lease.mDeviceView = reinterpret_cast<SparseCacheView*>(bytes + carved);
+
+    auto const entries = static_cast<size_t>(view.numEntries());
+    // Every entry starts free.
+    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(view.residentOrdinal),
+        static_cast<unsigned int>(kBadBlockOrdinal.value()), entries, stream));
+    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(view.lruOrder), reinterpret_cast<CUdeviceptr>(mIdentity),
+        sizeof(int32_t) * entries, stream));
+    // -1 so that "no write-back has run" is distinguishable from "one ran and found nothing
+    // to move", which is what lets a test tell the two apart.
     cuCheck(cuMemsetD32Async(
-        reinterpret_cast<CUdeviceptr>(mView.flushCount), 0xFFFFFFFFU, static_cast<size_t>(numLayers), stream));
-    // Synchronous: both sources are the caller's and may go away on return.
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mView.hostBufferOffset), init.hostBufferOffset.data(),
-        sizeof(uint32_t) * init.hostBufferOffset.size()));
-    // Synchronous for the same reason.
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mView.bufferLayer), init.bufferLayer.data(),
-        sizeof(int32_t) * init.bufferLayer.size()));
-    // Synchronous: cachePageSlots belongs to the caller and may go away on return.
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mView.cachePages), cachePageSlots.data(),
-        sizeof(int32_t) * cachePageSlots.size()));
-
-    // Every entry starts free. cuMemsetD32Async covers the ordinal sentinel; the recency order
-    // is a per-layer identity permutation, so it is built on the host and copied rather than
-    // written by a kernel this package would otherwise not need.
-    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mView.residentOrdinal),
-        static_cast<unsigned int>(kBadBlockOrdinal.value()), mView.numEntries(), stream));
-
-    std::vector<int32_t> identity(mView.numEntries());
-    for (int32_t layer = 0; layer < numLayers; ++layer)
-    {
-        auto const begin = identity.begin() + static_cast<ptrdiff_t>(layer) * entriesPerLayer;
-        std::iota(begin, begin + entriesPerLayer, 0);
-    }
-    // Synchronous: `identity` is a stack temporary, so the copy must complete before return.
-    cuCheck(cuMemcpyHtoD(
-        reinterpret_cast<CUdeviceptr>(mView.lruOrder), identity.data(), sizeof(int32_t) * identity.size()));
-
+        reinterpret_cast<CUdeviceptr>(view.flushCount), 0xFFFFFFFFU, static_cast<size_t>(view.numLayers), stream));
     // Last, so that it captures the carved pointers rather than a half-built view.
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mDeviceView), &mView, sizeof(SparseCacheView)));
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(lease.mDeviceView), &view, sizeof(SparseCacheView)));
+    return lease;
 }
 
-std::vector<int32_t> SparseCacheState::readFlushCounts() const
+void SparseCellArena::_release(int index) noexcept
+{
+    if (index >= 0)
+    {
+        mFree.push_back(index);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SparseCacheLease
+// ---------------------------------------------------------------------------
+
+SparseCacheLease::~SparseCacheLease()
+{
+    release();
+}
+
+SparseCacheLease::SparseCacheLease(SparseCacheLease&& other) noexcept
+    : mArena(other.mArena)
+    , mIndex(other.mIndex)
+    , mView(other.mView)
+    , mDeviceView(other.mDeviceView)
+{
+    other.mArena = nullptr;
+    other.mIndex = -1;
+}
+
+SparseCacheLease& SparseCacheLease::operator=(SparseCacheLease&& other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        mArena = other.mArena;
+        mIndex = other.mIndex;
+        mView = other.mView;
+        mDeviceView = other.mDeviceView;
+        other.mArena = nullptr;
+        other.mIndex = -1;
+    }
+    return *this;
+}
+
+void SparseCacheLease::release() noexcept
+{
+    if (mArena != nullptr)
+    {
+        mArena->_release(mIndex);
+        mArena = nullptr;
+        mIndex = -1;
+        mView = SparseCacheView{};
+        mDeviceView = nullptr;
+    }
+}
+
+std::vector<int32_t> SparseCacheLease::readFlushCounts() const
 {
     if (empty())
     {
@@ -163,18 +283,7 @@ std::vector<int32_t> SparseCacheState::readFlushCounts() const
     return out;
 }
 
-std::vector<int32_t> SparseCacheState::readCachePages() const
-{
-    if (empty())
-    {
-        return {};
-    }
-    std::vector<int32_t> out(static_cast<size_t>(mView.numPages));
-    cuCheck(cuMemcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(mView.cachePages), sizeof(int32_t) * out.size()));
-    return out;
-}
-
-std::vector<int32_t> SparseCacheState::readResidentOrdinals() const
+std::vector<int32_t> SparseCacheLease::readResidentOrdinals() const
 {
     if (empty())
     {

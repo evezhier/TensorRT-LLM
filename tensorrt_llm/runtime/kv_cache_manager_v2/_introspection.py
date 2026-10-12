@@ -214,12 +214,13 @@ def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
 
 
-def sparse_cache_pages(kv_cache: Any, lc_id: int) -> list[int]:
-    """GPU page slots backing a life cycle's sparse cache entries.
+def sparse_cache_base_cell(kv_cache: Any, lc_id: int) -> int:
+    """First cell of this request's lease on the life cycle's arena, or -1 if it holds none.
 
-    Fixed for the life of the reservation; empty when none is held.
+    Identifies the lease the way the page list used to identify the reservation, now that a
+    lease is one contiguous run of cells rather than scattered slots.
     """
-    return list(_cpp().sparse_cache_pages(kv_cache, lc_id))
+    return int(_cpp().sparse_cache_base_cell(kv_cache, lc_id))
 
 
 def sparse_flush_counts(kv_cache: Any, lc_id: int) -> list[int]:
@@ -274,12 +275,10 @@ def sparse_unit_copy(
     host_pool: bytes | list[int],
     host_page_stride: int,
     page_table: list[int],
-    device_pool: bytes | list[int],
-    device_page_stride: int,
-    cache_pages: list[int],
+    device_arena: bytes | list[int],
+    base_cell: int,
     cold_buffer_offset: list[int],
-    sub_slots_per_buffer: int,
-    buffers_per_slot: int,
+    cells_per_buffer: int,
     buffer_bytes: int,
     num_chunks: int,
     chunk_bytes: int,
@@ -306,12 +305,10 @@ def sparse_unit_copy(
             list(host_pool),
             host_page_stride,
             page_table,
-            list(device_pool),
-            device_page_stride,
-            cache_pages,
+            list(device_arena),
+            base_cell,
             cold_buffer_offset,
-            sub_slots_per_buffer,
-            buffers_per_slot,
+            cells_per_buffer,
             buffer_bytes,
             num_chunks,
             chunk_bytes,

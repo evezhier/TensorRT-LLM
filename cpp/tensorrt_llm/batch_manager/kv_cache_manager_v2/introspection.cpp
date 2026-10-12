@@ -108,21 +108,21 @@ TypedVec<PoolGroupIndex, SlotCount> KvCacheIntrospection::computeSlotsForBatch(K
 std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};
-    if (id >= kvCache.mSparseCacheState.size())
+    if (id >= kvCache.mSparseCache.size())
     {
         return {};
     }
-    return kvCache.mSparseCacheState[id].readResidentOrdinals();
+    return kvCache.mSparseCache[id].readResidentOrdinals();
 }
 
-std::vector<int32_t> KvCacheIntrospection::sparseCachePages(KvCache const& kvCache, int lcId)
+int KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};
-    if (id >= kvCache.mSparseCacheState.size())
+    if (id >= kvCache.mSparseCache.size() || kvCache.mSparseCache[id].empty())
     {
-        return {};
+        return -1;
     }
-    return kvCache.mSparseCacheState[id].readCachePages();
+    return kvCache.mSparseCache[id].view().baseCell;
 }
 
 std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, int layerGroupId)
@@ -162,11 +162,11 @@ std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batc
 std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};
-    if (id >= kvCache.mSparseCacheState.size())
+    if (id >= kvCache.mSparseCache.size())
     {
         return {};
     }
-    return kvCache.mSparseCacheState[id].readFlushCounts();
+    return kvCache.mSparseCache[id].readFlushCounts();
 }
 
 namespace
@@ -295,10 +295,10 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
 }
 
 std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
-    std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& devicePool, uint64_t devicePageStride,
-    std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& coldBufferOffset, int subSlotsPerBuffer,
-    int buffersPerSlot, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
-    uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
+    std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& deviceArena, int baseCell,
+    std::vector<uint32_t> const& coldBufferOffset, int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks,
+    uint32_t chunkBytes, uint32_t chunkStride, uint32_t unitStride, int expansion,
+    std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
     std::vector<int32_t> const& missCount, int selectionWidth, std::vector<int32_t> const& bufferLayer, bool writeBack)
 {
     CUdeviceptr hostPtr = 0;
@@ -307,24 +307,23 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     cuCheck(cuMemcpyHtoD(hostPtr, hostPool.data(), hostPool.size()));
 
     CUdeviceptr devicePtr = 0;
-    cuCheck(cuMemAlloc(&devicePtr, devicePool.size()));
+    cuCheck(cuMemAlloc(&devicePtr, deviceArena.size()));
     CudaUniqPtr destination{reinterpret_cast<std::byte*>(devicePtr)};
-    cuCheck(cuMemcpyHtoD(devicePtr, devicePool.data(), devicePool.size()));
+    cuCheck(cuMemcpyHtoD(devicePtr, deviceArena.data(), deviceArena.size()));
 
     auto table = deviceCopy(pageTable);
-    auto pages = deviceCopy(cachePages);
     auto missOrd = deviceCopy(missOrdinal);
     auto missSlotBuf = deviceCopy(missSlot);
     auto missCountBuf = deviceCopy(missCount);
     auto coldOffsets = deviceCopyU32(coldBufferOffset);
     auto bufferLayerBuf = deviceCopy(bufferLayer);
 
-    // The kernel reads the reservation and the per-buffer maps through a view, so the hook
+    // The kernel reads the lease and the per-buffer maps through a view, so the hook
     // assembles one standing in for a single request's cache state.
     SparseCacheView view;
     // Non-null only to mark the row live; the copy itself never reads the metadata arrays.
-    view.residentOrdinal = reinterpret_cast<int32_t*>(pages.get());
-    view.cachePages = reinterpret_cast<int32_t*>(pages.get());
+    view.residentOrdinal = reinterpret_cast<int32_t*>(table.get());
+    view.baseCell = baseCell;
     view.hostBufferOffset = reinterpret_cast<uint32_t*>(coldOffsets.get());
     view.bufferLayer = reinterpret_cast<int32_t*>(bufferLayerBuf.get());
     CUdeviceptr viewPtr = 0;
@@ -341,9 +340,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.pageTableStride = static_cast<int32_t>(pageTable.size());
     args.numBlocks = static_cast<int32_t>(pageTable.size());
     args.deviceBase = devicePtr;
-    args.devicePageStride = devicePageStride;
-    args.subSlotsPerBuffer = subSlotsPerBuffer;
-    args.buffersPerSlot = buffersPerSlot;
+    args.cellsPerBuffer = cellsPerBuffer;
     args.bufferBytes = bufferBytes;
     args.direction = writeBack ? SparseCopyDirection::kWriteBack : SparseCopyDirection::kFetch;
     args.layout.numChunks = numChunks;
@@ -364,7 +361,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
 
     // Write-back moves into the cold pool, so that is the side worth returning.
     CUdeviceptr const result = writeBack ? hostPtr : devicePtr;
-    size_t const resultBytes = writeBack ? hostPool.size() : devicePool.size();
+    size_t const resultBytes = writeBack ? hostPool.size() : deviceArena.size();
     std::vector<uint8_t> out(resultBytes);
     cuCheck(cuMemcpyDtoH(out.data(), result, resultBytes));
     return out;

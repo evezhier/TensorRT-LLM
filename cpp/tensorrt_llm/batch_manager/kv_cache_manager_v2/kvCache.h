@@ -524,13 +524,6 @@ private:
 
     [[nodiscard]] std::vector<SparseBufferRef> _sparseBuffers(LifeCycleId lifeCycle) const;
 
-    //! Byte offset of each sparse buffer within a cold page, in SparseCacheView order.
-    [[nodiscard]] std::vector<uint32_t> _sparseColdPageOffsets(LifeCycleId lifeCycle) const;
-
-    //! The metadata row each sparse buffer reads, in SparseCacheView order: a dense layer
-    //! index within the life cycle, counting only layers that contribute a cached buffer.
-    [[nodiscard]] std::vector<int32_t> _sparseBufferLayers(LifeCycleId lifeCycle) const;
-
     //! Write the cells holding units [fromUnits, toUnits) back to their host pages, on this
     //! request's stream. Enqueues and returns: stream order is what guarantees a later fetch
     //! reads the written-back page, and a copy that fails is a broken invariant, not a
@@ -741,14 +734,15 @@ private:
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
 
-    // Pages backing this request's sparse history cache, by life cycle. Reserved at
-    // resume(), released at suspend() and close(). Empty unless a sparse buffer of that
+    // This request's lease on its sparse cache cells, by life cycle, together with the
+    // device-resident residency, recency and write-back scratch describing them. Taken at
+    // resume(), returned at suspend() and close(). Empty unless a sparse buffer of that
     // life cycle has its fetch path configured.
-    TypedVec<LifeCycleId, std::vector<SparseCacheSlotLock>> mSparseCacheSlots;
-
-    // Device-resident residency, recency and write-back scratch for those pages. Created
-    // with them and destroyed with them, so the metadata never outlives what it describes.
-    TypedVec<LifeCycleId, SparseCacheState> mSparseCacheState;
+    //
+    // One member rather than two: the cells and the metadata that describes them have the
+    // same lifetime by construction, and with a flat arena the lease is a base index rather
+    // than a list of scattered slots.
+    TypedVec<LifeCycleId, SparseCacheLease> mSparseCache;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

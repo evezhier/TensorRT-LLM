@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/movingAverage.h"
+#include "kv_cache_manager_v2/sparseCache.h"
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/poison.h"
@@ -417,6 +418,24 @@ public:
     //! into and which work list to read.
     [[nodiscard]] SparseUnitCopyArgs sparseCopyTemplate(LifeCycleId lifeCycle) const;
 
+    //! Byte offset of each sparse buffer within a cold page, in cache order.
+    [[nodiscard]] std::vector<uint32_t> sparseColdPageOffsets(LifeCycleId lifeCycle) const;
+
+    //! The metadata row each sparse buffer reads, in cache order: a dense layer index
+    //! within the life cycle, counting only layers that contribute a cached buffer.
+    [[nodiscard]] std::vector<int32_t> sparseBufferLayers(LifeCycleId lifeCycle) const;
+
+    //! This life cycle's arena of GPU cells, from which a request takes its lease at
+    //! resume(). Empty when the life cycle has no sparse fetch path configured.
+    //!
+    //! Owned here rather than by StorageManager: the cells must stay GPU-resident while the
+    //! life cycle's hot pool group becomes host memory, and a cell is not a page, so it has
+    //! no answer to the question every storage slot must answer -- which block it holds.
+    [[nodiscard]] SparseCellArena& sparseArena(LifeCycleId lifeCycle)
+    {
+        return mSparseArenas[lifeCycle];
+    }
+
     //! Storage attributes of one buffer: its pool, its offset within that pool's slot, its
     //! expanded size and its expansion. Forwarded because StorageManager keeps the table
     //! private and this manager is its friend.
@@ -529,6 +548,7 @@ private:
 
     // Fill the sparse cache shape tables from the configured buffers. Called once at construction.
     void _computeSparseCacheShape();
+    void _buildSparseArenas();
     void _updateIterationPeakNumBlocks();
 
     // Current per-pool-group utilization ratios for the hot and cold representations.
@@ -544,6 +564,7 @@ private:
     TypedVec<LifeCycleId, int> mSparseCacheBuffers;
     TypedVec<LifeCycleId, int> mSparseCacheSelection;
     TypedVec<LifeCycleId, int> mSparseCacheLayers;
+    TypedVec<LifeCycleId, SparseCellArena> mSparseArenas;
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;

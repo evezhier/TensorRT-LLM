@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/stagingBuffer.h"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -53,10 +54,10 @@ struct SparseCacheView
     //! Entry indices in recency order, most-recently-used first.
     int32_t* lruOrder = nullptr;
 
-    //! [numPages] GPU page slot per reserved cache page, so the copy can turn an entry
-    //! index into an address. Fixed for the life of the reservation.
-    int32_t* cachePages = nullptr;
-    int32_t numPages = 0;
+    //! First cell of this request's lease, in cells from the arena's base. A cell address is
+    //! arithmetic from here -- see "Why the cache is a flat array of cells" in
+    //! SPARSE_ATTENTION_DESIGN.md -- so there is no page table to consult.
+    int32_t baseCell = 0;
 
     //! Scratch for one write-back: the units a watermark move crossed and the cells holding
     //! them, the watermark scalars the scan reads, the page slots of the blocks touched, and
@@ -103,8 +104,9 @@ struct SparseCacheInit
     int32_t numLayers = 0;
     int32_t numBuffers = 0;
     int32_t entriesPerLayer = 0;
-    //! GPU page slot per reserved page.
-    std::vector<int32_t> cachePageSlots;
+    //! Cells one buffer gets, i.e. entriesPerLayer / expansion. A lease is this many cells
+    //! per buffer, laid out buffer-major.
+    int32_t cellsPerBuffer = 0;
     //! [numBuffers] byte offset of each buffer within a cold page.
     std::vector<uint32_t> hostBufferOffset;
     //! [numBuffers] the layer each buffer belongs to, non-decreasing.
@@ -115,23 +117,29 @@ struct SparseCacheInit
 };
 
 // ---------------------------------------------------------------------------
-// SparseCacheState — owns the device memory behind a SparseCacheView.
+// SparseCacheLease — one request's cells and the metadata describing them.
 //
-// One allocation holds every array; view() hands out the carved pointers. Created
-// when a request reserves its cache pages and destroyed when it releases them, so the
-// metadata's lifetime matches the pages it describes.
+// Taken at resume() and returned at suspend() or close(). Move-only and RAII: the arena's
+// free list is restored by the destructor, so a request dropped on any path -- including a
+// poisoned teardown -- cannot leak its cells.
 // ---------------------------------------------------------------------------
-class SparseCacheState
+class SparseCellArena;
+
+class SparseCacheLease
 {
 public:
-    SparseCacheState() = default;
+    SparseCacheLease() = default;
+    ~SparseCacheLease();
 
-    //! Allocate and initialise state for `numLayers` layers of `entriesPerLayer` entries,
-    //! backed by the GPU page slots in `cachePageSlots`.
-    //!
-    //! Entries start free: every ordinal is kBadBlockOrdinal and the recency order is the
-    //! identity permutation. Initialisation is enqueued on `stream`.
-    explicit SparseCacheState(SparseCacheInit const& init, CUstream stream);
+    SparseCacheLease(SparseCacheLease&& other) noexcept;
+    SparseCacheLease& operator=(SparseCacheLease&& other) noexcept;
+    SparseCacheLease(SparseCacheLease const&) = delete;
+    SparseCacheLease& operator=(SparseCacheLease const&) = delete;
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return mArena == nullptr;
+    }
 
     [[nodiscard]] SparseCacheView const& view() const noexcept
     {
@@ -140,34 +148,113 @@ public:
 
     //! A device copy of view(), as a one-row array.
     //!
-    //! The copy kernel reads its per-row state through a view array, so that a batched
-    //! fetch can serve rows whose metadata lives in different requests' allocations. A
-    //! single-request write-back takes the same path with one row rather than a second
-    //! addressing mode. Fixed for the life of the reservation, like everything it names.
+    //! The copy kernel reads its per-row state through a view array, so that a batched fetch
+    //! can serve rows whose metadata belongs to different requests. A single-request
+    //! write-back takes the same path with one row rather than a second addressing mode.
     [[nodiscard]] SparseCacheView const* deviceView() const noexcept
     {
         return mDeviceView;
     }
+
+    //! Return the cells early. Idempotent; the destructor does the same.
+    void release() noexcept;
+
+    //! Copy the resident ordinals back to the host. Test and debug use only; synchronises.
+    [[nodiscard]] std::vector<int32_t> readResidentOrdinals() const;
+
+    //! Copy the per-layer write-back counts back to the host, -1 where no write-back has
+    //! run. Test and debug use only; synchronises.
+    [[nodiscard]] std::vector<int32_t> readFlushCounts() const;
+
+private:
+    friend class SparseCellArena;
+
+    SparseCellArena* mArena = nullptr;
+    int mIndex = -1;
+    SparseCacheView mView;
+    SparseCacheView* mDeviceView = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// SparseCellArena — one life cycle's GPU cells, and the metadata that describes them.
+//
+// A dedicated allocation rather than storage slots. That is what lets the life cycle's hot
+// pool group be host memory without the cache following it there, and it frees the cache
+// from the allocator's coalesced-slot granularity: every request of a life cycle needs
+// exactly the same number of cells, so this is a fixed-size-block free list.
+//
+// One block holds the cells of every lease followed by their metadata. Cells come first so
+// that a cell index is relative to the arena's base, which is what the fetch reports and
+// what get_mem_pool_base_address returns for a sparse buffer.
+// ---------------------------------------------------------------------------
+class SparseCellArena
+{
+public:
+    SparseCellArena() = default;
+
+    //! @param shape       per-request metadata and cell geometry, fixed by configuration.
+    //! @param bufferBytes one cell, i.e. one buffer's expanded size.
+    //! @param maxLeases   concurrent requests this life cycle can serve.
+    SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBytes, int maxLeases);
+
+    ~SparseCellArena() = default;
+    SparseCellArena(SparseCellArena&&) noexcept = default;
+    SparseCellArena& operator=(SparseCellArena&&) noexcept = default;
+    SparseCellArena(SparseCellArena const&) = delete;
+    SparseCellArena& operator=(SparseCellArena const&) = delete;
 
     [[nodiscard]] bool empty() const noexcept
     {
         return mMemory == nullptr;
     }
 
-    //! Copy the resident ordinals back to the host. Test and debug use only; synchronises.
-    [[nodiscard]] std::vector<int32_t> readResidentOrdinals() const;
+    //! Base of the cell region. Indices the fetch emits are relative to this.
+    [[nodiscard]] CUdeviceptr base() const noexcept
+    {
+        return mCellBase;
+    }
 
-    //! Copy the per-buffer write-back counts back to the host, -1 where no write-back has
-    //! run. Test and debug use only; synchronises.
-    [[nodiscard]] std::vector<int32_t> readFlushCounts() const;
+    [[nodiscard]] uint64_t bufferBytes() const noexcept
+    {
+        return mBufferBytes;
+    }
 
-    //! Copy the cache page slots back to the host. Test and debug use only; synchronises.
-    [[nodiscard]] std::vector<int32_t> readCachePages() const;
+    [[nodiscard]] int cellsPerLease() const noexcept
+    {
+        return mCellsPerLease;
+    }
+
+    [[nodiscard]] int freeLeases() const noexcept
+    {
+        return static_cast<int>(mFree.size());
+    }
+
+    //! Take a lease, enqueuing its metadata reset on `stream`. nullopt when the arena is
+    //! full, which a resume reports as a failed reservation rather than throwing.
+    //!
+    //! Entries start free: every ordinal is kBadBlockOrdinal and the recency order is the
+    //! identity permutation.
+    [[nodiscard]] std::optional<SparseCacheLease> acquire(CUstream stream);
 
 private:
+    friend class SparseCacheLease;
+
+    void _release(int index) noexcept;
+
     CudaUniqPtr mMemory;
-    SparseCacheView mView;
-    SparseCacheView* mDeviceView = nullptr;
+    SparseCacheInit mShape;
+    uint64_t mBufferBytes = 0;
+    int mCellsPerLease = 0;
+    size_t mMetadataBytes = 0;
+    CUdeviceptr mCellBase = 0;
+    std::byte* mMetadataBase = nullptr;
+
+    //! Shared by every lease of the life cycle, so a resume copies neither.
+    uint32_t* mSharedOffset = nullptr;
+    int32_t* mSharedLayer = nullptr;
+    int32_t* mIdentity = nullptr;
+
+    std::vector<int> mFree;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

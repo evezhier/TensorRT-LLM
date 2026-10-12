@@ -713,9 +713,9 @@ The design above is the target. The code is partway there, and this section is t
 place that distinguishes the two; everything else describes the target as settled.
 
 **Where the code differs today.** Sparse history resides at a dedicated cold level
-(`kSparseHistoryLevel`) rather than on a host-backed hot pool group, the fetch reads cold
-pages through `queryDefaultColdPageLayout`'s concat order, and cache cells are coalesced
-slots reserved from `StorageManager` and addressed through `SparseCacheView::cachePages`.
+(`kSparseHistoryLevel`) rather than on a host-backed hot pool group, and the fetch reads cold
+pages through `queryDefaultColdPageLayout`'s concat order. Cells already come from a
+dedicated arena.
 
 **Why it is moving.** The codec is not the level 0 -> level 1 transform; it is the
 **hot <-> cold** transform. `StorageManager::migrate` computes
@@ -729,14 +729,21 @@ flips, or it silently reserves host memory and stops being a GPU cache.
 
 | # | step | state |
 | --- | --- | --- |
-| 1 | Cells come from a dedicated GPU arena owned by `KvCacheManager`, leased per request. Sub-slot addressing and `cachePages` collapse to flat cell arithmetic | pending |
+| 1 | Cells come from a dedicated GPU arena owned by `KvCacheManager`, leased per request. Sub-slot addressing and `cachePages` collapse to flat cell arithmetic | **done** |
 | 2 | Sparse life cycle's level-0 pool group is host-backed; `residencyLevel`'s sparse branch and `kSparseHistoryLevel` retire | pending |
 | 3 | Fetch reads hot pages at `BufferAttr::offset`; `_sparseColdPageOffsets` and `hostBufferOffset` go | pending |
 | 4 | Compression, through the existing codec, with nothing sparse-specific | pending |
 
-Step 1 must *delete* sub-slot addressing rather than adapt it. It exists only because the
-storage allocator deals in coalesced slots; carrying it forward into an arena that has no
-slots would preserve a workaround for a constraint that no longer exists.
+Step 1 deleted sub-slot addressing rather than adapting it: it existed only because the
+storage allocator deals in coalesced slots, and carrying it into an arena that has none would
+have preserved a workaround for a constraint that no longer exists. `SparseCacheView` lost
+`cachePages` and `numPages` and gained `baseCell`; the copy and index kernels each lost a page
+lookup; and the arena pre-allocates the per-request metadata, so a resume no longer pairs a
+device allocation with a free.
+
+The arena is sized from `constraints`, which already declares the batch shape `Batch` derives
+its rows from. That makes the cells a static reservation rather than an on-demand draw on the
+shared pool -- a change in kind, and the one the *Sizing* section assumed all along.
 
 **Hazard to verify at step 2.** Moving sparse pages to the hot level makes them eligible for
 demotion and eviction for the first time. A page encoded while the cache holds a cell copied

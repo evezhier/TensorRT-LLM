@@ -174,21 +174,18 @@ struct SparseUnitCopyArgs
     int32_t numBlocks = 0;
     int32_t pageTableBase = 0;
 
-    //! GPU pool holding the reserved cache pages. One pool for every row: the reservation
-    //! differs per request, the pool it comes from does not.
+    //! Base of the cell arena. One arena for every row: the lease differs per request, the
+    //! arena it comes from does not.
     CUdeviceptr deviceBase = 0;
-    uint64_t devicePageStride = 0;
 
-    //! The reservation hands out whole coalesced slots, but the cache does not have to use
-    //! them that way: a slot is buffersPerSlot buffer-sized cells, and any buffer's unit can
-    //! occupy any cell. Entries are therefore addressed through a flat sub-slot index,
+    //! A lease is one contiguous run of buffer-sized cells, so an entry is addressed by
+    //! arithmetic alone:
     //!
-    //!     subSlot = buffer * subSlotsPerBuffer + entry / expansion
+    //!     cell = views[row].baseCell + buffer * cellsPerBuffer + entry / expansion
     //!
-    //! which decouples the per-buffer partition from the page layout. Coalescing earns
-    //! nothing here because layers select different units, so nothing is shared.
-    int32_t subSlotsPerBuffer = 0;
-    int32_t buffersPerSlot = 1;
+    //! No page table and no slot indirection. Coalescing would earn nothing here because
+    //! different layers select different units, so a slot's cells would never fill together.
+    int32_t cellsPerBuffer = 0;
     uint64_t bufferBytes = 0;
 
     SparseCopyDirection direction = SparseCopyDirection::kFetch;
@@ -266,8 +263,7 @@ struct SparseOutIndexArgs
     int32_t bufferBase = 0;
     int32_t numBuffers = 0;
 
-    int32_t subSlotsPerBuffer = 0;
-    int32_t buffersPerSlot = 1;
+    int32_t cellsPerBuffer = 0;
     int32_t expansion = 1;
 };
 

@@ -443,22 +443,19 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
         return;
     }
 
-    // Which cell of which reserved page an entry lands in is arithmetic on a flat sub-slot
-    // index, not a per-layer lookup: coalescing buys nothing when layers select different
-    // units, so the partition is ours to choose.
-    int32_t const subSlot = buffer * args.subSlotsPerBuffer + slot / args.expansion;
-    auto const cell = static_cast<uint64_t>(subSlot % args.buffersPerSlot);
+    // A cell is reached by arithmetic from the lease's base: the arena hands out a
+    // contiguous run, so there is no page to look up.
+    auto const cell = static_cast<uint64_t>(view.baseCell + buffer * args.cellsPerBuffer + slot / args.expansion);
 
     auto const hostPage
         = static_cast<uint64_t>(args.pageTable[static_cast<ptrdiff_t>(row) * args.pageTableStride + block]);
-    auto const devicePage = static_cast<uint64_t>(view.cachePages[subSlot / args.buffersPerSlot]);
 
     // The cold side is reached by ordinal through the page table, the hot side by entry
     // index through the cache page list. Direction only chooses which one is read.
     auto* cold = reinterpret_cast<char*>(args.hostBase + hostPage * args.hostPageStride + view.hostBufferOffset[buffer]
         + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
-    auto* hot = reinterpret_cast<char*>(args.deviceBase + devicePage * args.devicePageStride + cell * args.bufferBytes
-        + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
+    auto* hot = reinterpret_cast<char*>(
+        args.deviceBase + cell * args.bufferBytes + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
     bool const fetching = args.direction == SparseCopyDirection::kFetch;
     char const* src = fetching ? cold : hot;
     char* dst = fetching ? hot : cold;
@@ -494,10 +491,8 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
             continue;
         }
 
-        int32_t const subSlot = buffer * args.subSlotsPerBuffer + slot / args.expansion;
-        auto const page = view.cachePages[subSlot / args.buffersPerSlot];
-        int32_t const cell = subSlot % args.buffersPerSlot;
-        out[i] = (page * args.buffersPerSlot + cell) * args.expansion + slot % args.expansion;
+        int32_t const cell = view.baseCell + buffer * args.cellsPerBuffer + slot / args.expansion;
+        out[i] = cell * args.expansion + slot % args.expansion;
     }
 }
 
@@ -558,9 +553,9 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseOutIndices: every device array must be provided");
     }
-    if (args.buffersPerSlot <= 0 || args.subSlotsPerBuffer <= 0 || args.expansion <= 0 || args.bufferBase < 0)
+    if (args.cellsPerBuffer <= 0 || args.expansion <= 0 || args.bufferBase < 0)
     {
-        throw std::invalid_argument("launchSparseOutIndices: the sub-slot geometry must be positive");
+        throw std::invalid_argument("launchSparseOutIndices: the cell geometry must be positive");
     }
 
     dim3 const grid(static_cast<unsigned>(args.numBuffers), static_cast<unsigned>(args.numRows));
@@ -605,9 +600,9 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseUnitCopy: every device array must be provided");
     }
-    if (args.buffersPerSlot <= 0 || args.subSlotsPerBuffer <= 0 || args.bufferBytes == 0)
+    if (args.cellsPerBuffer <= 0 || args.bufferBytes == 0)
     {
-        throw std::invalid_argument("launchSparseUnitCopy: the sub-slot geometry must be positive");
+        throw std::invalid_argument("launchSparseUnitCopy: the cell geometry must be positive");
     }
 
     dim3 const grid(static_cast<unsigned>(args.workWidth), static_cast<unsigned>(args.numBuffers),

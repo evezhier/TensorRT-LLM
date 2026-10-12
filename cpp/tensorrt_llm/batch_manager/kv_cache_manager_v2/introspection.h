@@ -47,9 +47,10 @@ public:
     // life cycle has no cache reserved.
     static std::vector<int32_t> sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId);
 
-    // White-box hook: the GPU page slots backing a life cycle's sparse cache entries.
-    // Empty when the life cycle has no cache reserved.
-    static std::vector<int32_t> sparseCachePages(KvCache const& kvCache, int lcId);
+    // White-box hook: the first cell of this request's lease on the life cycle's arena, or
+    // -1 when it holds none. Identifies the lease the way the page list used to identify
+    // the reservation, now that a lease is one contiguous run rather than scattered slots.
+    static int sparseCacheBaseCell(KvCache const& kvCache, int lcId);
 
     // White-box hook: units the last write-back moved per buffer, -1 where none has run.
     static std::vector<int32_t> sparseFlushCounts(KvCache const& kvCache, int lcId);
@@ -89,12 +90,12 @@ public:
     // arithmetic can be checked against a known byte pattern. Returns the destination pool
     // after the copy. Synchronises.
     static std::vector<uint8_t> sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
-        std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& devicePool, uint64_t devicePageStride,
-        std::vector<int32_t> const& cachePages, std::vector<uint32_t> const& coldBufferOffset, int subSlotsPerBuffer,
-        int buffersPerSlot, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
-        uint32_t unitStride, int expansion, std::vector<int32_t> const& missOrdinal,
-        std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
-        std::vector<int32_t> const& bufferLayer, bool writeBack);
+        std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& deviceArena, int baseCell,
+        std::vector<uint32_t> const& coldBufferOffset, int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks,
+        uint32_t chunkBytes, uint32_t chunkStride, uint32_t unitStride, int expansion,
+        std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
+        std::vector<int32_t> const& missCount, int selectionWidth, std::vector<int32_t> const& bufferLayer,
+        bool writeBack);
 
     // White-box hook: the entries holding units a watermark move has just passed.
     // Synchronises.

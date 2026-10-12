@@ -221,9 +221,8 @@ void Batch::_stageRowState()
             auto& slot = views[static_cast<size_t>(lg.value()) * mRows.size() + row];
             // A free row, or a member holding no reservation for this group, leaves the
             // default view: null pointers the kernel reads as "nothing to resolve here".
-            slot = kvCache == nullptr || lg >= kvCache->mSparseCacheState.size()
-                ? SparseCacheView{}
-                : kvCache->mSparseCacheState[lg].view();
+            slot = kvCache == nullptr || lg >= kvCache->mSparseCache.size() ? SparseCacheView{}
+                                                                            : kvCache->mSparseCache[lg].view();
         }
     }
 }

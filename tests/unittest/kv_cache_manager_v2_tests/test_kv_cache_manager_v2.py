@@ -407,6 +407,11 @@ class TestSparseBufferConfig(unittest.TestCase):
             KVCacheManagerConfig(
                 tokens_per_block=4,
                 cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+                # The cache arena is reserved up front, so a sparse deployment must say
+                # how many requests run together.
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+                ],
                 layers=[layer],
             )
 
@@ -427,6 +432,11 @@ class TestSparseCacheReservation(unittest.TestCase):
             KVCacheManagerConfig(
                 tokens_per_block=128,
                 cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                # The cache arena is reserved up front, so a sparse deployment must say
+                # how many requests run together.
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+                ],
                 layers=[
                     AttentionLayerConfig(
                         0,
@@ -503,13 +513,19 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_the_reservation_is_the_declared_cache_width(self):
-        # Differential against an unconfigured manager, so the extra slots are the
-        # reservation and nothing else. max_cached_units counts both populations, so the
-        # reservation follows from configuration alone and no per-request input enters it.
+    def test_the_cache_does_not_draw_on_the_storage_pool(self):
+        """Cells come from the life cycle's own arena, so a resume costs the pool nothing.
+
+        This is what lets the hot pool group become host memory without the cache following
+        it there -- the two are no longer the same allocation.
+        """
         baseline = self._free_delta_across_resume(0)
-        self.assertEqual(self._free_delta_across_resume(4) - baseline, 4)
-        self.assertEqual(self._free_delta_across_resume(6) - baseline, 6)
+        for width in (4, 6):
+            self.assertEqual(
+                self._free_delta_across_resume(width),
+                baseline,
+                "a wider cache must not consume more storage slots",
+            )
 
     def test_unconfigured_fetch_path_reserves_nothing(self):
         manager = self._manager(max_cached_units=0)
@@ -608,35 +624,49 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_cache_pages_name_the_reserved_slots(self):
+    def test_leases_are_distinct_and_within_the_arena(self):
+        """Two live requests must not be handed the same cells."""
         manager = self._manager(max_cached_units=4)
+        caches = []
         try:
             lc_id = manager.get_layer_group_id(0)
-            cache = manager.create_kv_cache()
-            with TemporaryCudaStream([]) as stream:
-                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
-                pages = _introspection.sparse_cache_pages(cache, lc_id)
-                # One page per expansion-group of entries; see get_sparse_cache_expansion.
-                entries = manager.get_sparse_cache_max_units(0)
-                expansion = manager.get_sparse_cache_expansion(0)
-                self.assertEqual(len(pages), entries // expansion)
-                self.assertEqual(len(set(pages)), len(pages), "slots must be distinct")
-                self.assertTrue(all(p >= 0 for p in pages), pages)
-                cache.close()
-        finally:
-            manager.shutdown()
-
-    def test_cache_pages_are_dropped_with_the_reservation(self):
-        manager = self._manager(max_cached_units=4)
-        try:
-            lc_id = manager.get_layer_group_id(0)
-            cache = manager.create_kv_cache()
+            cells_per_lease = manager.get_sparse_cache_buffer_count(0) * (
+                manager.get_sparse_cache_max_units(0) // manager.get_sparse_cache_expansion(0)
+            )
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                self.assertTrue(cache.resume(handle))
-                self.assertNotEqual(_introspection.sparse_cache_pages(cache, lc_id), [])
-                cache.suspend()
-                self.assertEqual(_introspection.sparse_cache_pages(cache, lc_id), [])
+                for _ in range(2):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(handle))
+                bases = [_introspection.sparse_cache_base_cell(c, lc_id) for c in caches]
+                self.assertTrue(all(b >= 0 for b in bases), bases)
+                self.assertEqual(len(set(bases)), len(bases), "leases must not overlap")
+                for base in bases:
+                    self.assertEqual(
+                        base % cells_per_lease, 0, "a lease starts on a block boundary"
+                    )
+        finally:
+            for cache in caches:
+                cache.close()
+            manager.shutdown()
+
+    def test_a_lease_is_returned_with_the_reservation(self):
+        manager = self._manager(max_cached_units=4)
+        try:
+            lc_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            try:
+                with TemporaryCudaStream([]) as stream:
+                    handle = cast(CudaStream, stream.handle)
+                    self.assertTrue(cache.resume(handle))
+                    self.assertGreaterEqual(_introspection.sparse_cache_base_cell(cache, lc_id), 0)
+                    cache.suspend()
+                    self.assertEqual(_introspection.sparse_cache_base_cell(cache, lc_id), -1)
+                    # Returned rather than leaked: the same cells are available again.
+                    self.assertTrue(cache.resume(handle))
+                    self.assertGreaterEqual(_introspection.sparse_cache_base_cell(cache, lc_id), 0)
+            finally:
                 cache.close()
         finally:
             manager.shutdown()
@@ -704,22 +734,6 @@ class TestSparseCacheReservation(unittest.TestCase):
             with TemporaryCudaStream([]) as stream:
                 self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
                 self.assertEqual(_introspection.sparse_cache_resident_ordinals(cache, lc_id), [])
-                cache.close()
-        finally:
-            manager.shutdown()
-
-    def test_pages_are_released_on_suspend_and_retaken_on_resume(self):
-        manager = self._manager(max_cached_units=4)
-        try:
-            cache = manager.create_kv_cache()
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                self.assertTrue(cache.resume(handle))
-                resumed = self._free(manager)
-                cache.suspend()
-                self.assertGreaterEqual(self._free(manager) - resumed, 4)
-                self.assertTrue(cache.resume(handle))
-                self.assertEqual(self._free(manager), resumed)
                 cache.close()
         finally:
             manager.shutdown()
@@ -913,12 +927,12 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=page_stride,
             page_table=page_table,
-            device_pool=[0] * (page_stride * 2),
-            device_page_stride=page_stride,
-            cache_pages=[1, 0],
+            device_arena=[0] * (page_stride * 2),
+            # A non-zero lease base: entry 0 belongs to the second cell of the arena, which
+            # is what every request past the first gets.
+            base_cell=1,
             cold_buffer_offset=[0],
-            sub_slots_per_buffer=1,
-            buffers_per_slot=1,
+            cells_per_buffer=1,
             buffer_bytes=page_stride,
             num_chunks=1,
             chunk_bytes=unit,
@@ -931,7 +945,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             selection_width=1,
             buffer_layer=list(range(1)),
         )
-        # Entry 0 is page 0 of the cache, which is device page 1, unit 0.
+        # Entry 0 of a lease based at cell 1 is the arena's cell 1, unit 0.
         expected = host[unit : unit * 2]
         self.assertEqual(result[page_stride : page_stride + unit], expected)
         # Nothing else was written.
@@ -947,12 +961,10 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=page_stride,
             page_table=[0],
-            device_pool=[0] * (page_stride),
-            device_page_stride=page_stride,
-            cache_pages=[0],
+            device_arena=[0] * (page_stride),
+            base_cell=0,
             cold_buffer_offset=[0],
-            sub_slots_per_buffer=1,
-            buffers_per_slot=1,
+            cells_per_buffer=1,
             buffer_bytes=page_stride,
             num_chunks=chunks,
             chunk_bytes=chunk,
@@ -983,13 +995,11 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=page_stride,
             page_table=[0],
-            device_pool=[0] * (page_stride),
-            device_page_stride=page_stride,
-            cache_pages=[0],
+            device_arena=[0] * (page_stride),
+            base_cell=0,
             # Deliberately crossed: layer 0's buffer is second in the cold page.
             cold_buffer_offset=[unit, 0],
-            sub_slots_per_buffer=1,
-            buffers_per_slot=2,
+            cells_per_buffer=1,
             buffer_bytes=unit,
             num_chunks=1,
             chunk_bytes=unit,
@@ -1014,12 +1024,10 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=unit,
             page_table=[0],
-            device_pool=[0] * (unit),
-            device_page_stride=unit,
-            cache_pages=[0],
+            device_arena=[0] * (unit),
+            base_cell=0,
             cold_buffer_offset=[0],
-            sub_slots_per_buffer=1,
-            buffers_per_slot=1,
+            cells_per_buffer=1,
             buffer_bytes=unit,
             num_chunks=1,
             chunk_bytes=unit,
@@ -1042,12 +1050,10 @@ class TestSparseUnitCopy(unittest.TestCase):
             host_pool=host,
             host_page_stride=unit * 2,
             page_table=[0],
-            device_pool=[0] * (unit * 2),
-            device_page_stride=unit * 2,
-            cache_pages=[0],
+            device_arena=[0] * (unit * 2),
+            base_cell=0,
             cold_buffer_offset=[0],
-            sub_slots_per_buffer=1,
-            buffers_per_slot=1,
+            cells_per_buffer=1,
             buffer_bytes=unit * 2,
             num_chunks=1,
             chunk_bytes=unit,
@@ -1079,6 +1085,11 @@ class TestSparseFetch(unittest.TestCase):
             KVCacheManagerConfig(
                 tokens_per_block=cls.TOKENS_PER_BLOCK,
                 cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                # The cache arena is reserved up front, so a sparse deployment must say
+                # how many requests run together.
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+                ],
                 layers=[
                     AttentionLayerConfig(
                         0,
@@ -1322,11 +1333,9 @@ class TestSparseFlush(unittest.TestCase):
         common = dict(
             host_page_stride=page_stride,
             page_table=[0],
-            device_page_stride=page_stride,
-            cache_pages=[0],
+            base_cell=0,
             cold_buffer_offset=[0],
-            sub_slots_per_buffer=1,
-            buffers_per_slot=1,
+            cells_per_buffer=1,
             buffer_bytes=page_stride,
             num_chunks=1,
             chunk_bytes=unit,
@@ -1340,13 +1349,13 @@ class TestSparseFlush(unittest.TestCase):
             buffer_layer=list(range(1)),
         )
         hot = _introspection.sparse_unit_copy(
-            host_pool=cold, device_pool=[0] * page_stride, write_back=False, **common
+            host_pool=cold, device_arena=[0] * page_stride, write_back=False, **common
         )
         self.assertEqual(hot[unit:], cold[unit:], "the fetch landed the unit")
 
         # Write that same entry back over a blanked cold page; the unit must return.
         restored = _introspection.sparse_unit_copy(
-            host_pool=[0] * page_stride, device_pool=hot, write_back=True, **common
+            host_pool=[0] * page_stride, device_arena=hot, write_back=True, **common
         )
         self.assertEqual(restored[unit:], cold[unit:], "the write-back restored the unit")
         self.assertEqual(restored[:unit], [0] * unit, "only the listed unit moved")
@@ -1361,12 +1370,10 @@ class TestSparseFlush(unittest.TestCase):
             host_pool=cold,
             host_page_stride=page_stride,
             page_table=[0],
-            device_pool=[0] * (page_stride),
-            device_page_stride=page_stride,
-            cache_pages=[0],
+            device_arena=[0] * (page_stride),
+            base_cell=0,
             cold_buffer_offset=[0],
-            sub_slots_per_buffer=1,
-            buffers_per_slot=1,
+            cells_per_buffer=1,
             buffer_bytes=page_stride,
             num_chunks=1,
             chunk_bytes=unit,
@@ -1442,6 +1449,11 @@ class TestBatch(unittest.TestCase):
             KVCacheManagerConfig(
                 tokens_per_block=128,
                 cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                # The cache arena is reserved up front, so a sparse deployment must say
+                # how many requests run together.
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+                ],
                 layers=[
                     AttentionLayerConfig(
                         0,

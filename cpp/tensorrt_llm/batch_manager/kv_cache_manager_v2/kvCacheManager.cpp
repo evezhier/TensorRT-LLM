@@ -128,6 +128,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
         mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
 
     _computeSparseCacheShape();
+    _buildSparseArenas();
 
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();
@@ -228,6 +229,84 @@ std::vector<BufferId> KvCacheManager::sparseBufferIds(LifeCycleId lifeCycle) con
     return ids;
 }
 
+std::vector<int32_t> KvCacheManager::sparseBufferLayers(LifeCycleId lifeCycle) const
+{
+    // sparseBufferIds walks layers outermost, so a change of layerId starts a new row and
+    // the result is non-decreasing, which is the grouping SparseCellArena checks for.
+    std::vector<int32_t> layers;
+    std::optional<LayerId> previous;
+    int32_t row = -1;
+    for (auto const& id : sparseBufferIds(lifeCycle))
+    {
+        if (!previous.has_value() || id.layerId != *previous)
+        {
+            previous = id.layerId;
+            ++row;
+        }
+        layers.push_back(row);
+    }
+    return layers;
+}
+
+std::vector<uint32_t> KvCacheManager::sparseColdPageOffsets(LifeCycleId lifeCycle) const
+{
+    PoolGroupIndex const hotPg = mStorage->getPoolGroupIndex(kHotLevel, lifeCycle);
+    // The cold page concatenates the hot pools in pool order, and the default codec moves
+    // slot bytes verbatim, so a buffer sits at its pool's offset plus its offset in the slot.
+    auto const coldLayout = queryDefaultColdPageLayout(mStorage->slotSize(hotPg));
+
+    std::vector<uint32_t> offsets;
+    for (auto const& id : sparseBufferIds(lifeCycle))
+    {
+        auto const attr = bufferAttr(id.layerId, id.role);
+        offsets.push_back(static_cast<uint32_t>(coldLayout.poolOffset.at(attr.poolIndex) + attr.offset));
+    }
+    return offsets;
+}
+
+void KvCacheManager::_buildSparseArenas()
+{
+    LifeCycleId const numLc = mStorage->numLifeCycles();
+    mSparseArenas = TypedVec<LifeCycleId, SparseCellArena>(numLc);
+
+    // Concurrent requests the arena must serve. `constraints` is the existing declaration of
+    // the batch shape, and the one Batch already derives its rows from, so a sparse
+    // deployment sizes both from one place.
+    int maxLeases = 0;
+    for (auto const& desc : mConfig.constraints)
+    {
+        maxLeases = std::max(maxLeases, static_cast<int>(desc.kvCaches.size()));
+    }
+
+    for (LifeCycleId lcId{0}; lcId < numLc; ++lcId)
+    {
+        if (sparseCacheMaxUnits(lcId) <= 0)
+        {
+            continue;
+        }
+        if (maxLeases <= 0)
+        {
+            throw std::invalid_argument(
+                "A sparse buffer needs `constraints` to declare how many requests run together; "
+                "the cache arena is reserved up front and cannot be sized without it");
+        }
+        auto const ids = sparseBufferIds(lcId);
+        TLLM_CHECK(!ids.empty());
+        auto const first = bufferAttr(ids.front().layerId, ids.front().role);
+
+        SparseCacheInit shape;
+        shape.numLayers = sparseCacheLayerCount(lcId);
+        shape.numBuffers = sparseCacheBufferCount(lcId);
+        shape.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lcId);
+        shape.entriesPerLayer = shape.cellsPerBuffer * sparseCacheExpansion(lcId);
+        shape.hostBufferOffset = sparseColdPageOffsets(lcId);
+        shape.bufferLayer = sparseBufferLayers(lcId);
+        shape.maxFlushUnits = sparseCacheMaxInFlightUnits(lcId);
+        shape.maxFlushBlocks = divUp(shape.maxFlushUnits, sparseCacheExpansion(lcId)) + 1;
+        mSparseArenas[lcId] = SparseCellArena(shape, first.size, maxLeases);
+    }
+}
+
 SparseUnitCopyArgs KvCacheManager::sparseCopyTemplate(LifeCycleId lifeCycle) const
 {
     auto const ids = sparseBufferIds(lifeCycle);
@@ -265,11 +344,11 @@ SparseUnitCopyArgs KvCacheManager::sparseCopyTemplate(LifeCycleId lifeCycle) con
     args.hostBase = static_cast<CUdeviceptr>(
         std::get<MemAddress>(mStorage->slotAddress(kSparseHistoryLevel, coldPg, SlotId{0}, PoolIndex{0})));
     args.hostPageStride = coldSlotBytes;
-    args.deviceBase = static_cast<CUdeviceptr>(mStorage->getMemPoolBaseAddress(hotPg, first.poolIndex));
-    args.devicePageStride = hotSlotBytes;
+    // The hot side is the cache arena, not a storage pool: a cell is the only GPU-resident
+    // copy a kernel can read, and the arena is where cells live.
+    args.deviceBase = mSparseArenas[lifeCycle].base();
     args.bufferBytes = first.size;
-    args.buffersPerSlot = static_cast<int32_t>(hotSlotBytes / first.size);
-    args.subSlotsPerBuffer = sparseCacheSubSlotsPerBuffer(lifeCycle);
+    args.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lifeCycle);
     args.expansion = sparseCacheExpansion(lifeCycle);
     args.layout.numChunks = layouts.front().numChunks;
     args.layout.chunkBytes = layouts.front().chunkBytes;
@@ -412,8 +491,7 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     indices.out = out;
     indices.bufferBase = bufferBase;
     indices.numBuffers = numBuffers;
-    indices.subSlotsPerBuffer = copy.subSlotsPerBuffer;
-    indices.buffersPerSlot = copy.buffersPerSlot;
+    indices.cellsPerBuffer = copy.cellsPerBuffer;
     indices.expansion = expansion;
     launchSparseOutIndices(indices, stream);
 }

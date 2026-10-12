@@ -96,8 +96,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
     mScratchSlots.resize(manager.storage().numLifeCycles());
-    mSparseCacheSlots.resize(manager.storage().numLifeCycles());
-    mSparseCacheState.resize(manager.storage().numLifeCycles());
+    mSparseCache.resize(manager.storage().numLifeCycles());
 
     TLLM_CHECK_WITH_INFO(!(manager.textOnly() && textOnly == std::optional<bool>{false}),
         "text_only=false is not allowed when the manager is configured text_only=true");
@@ -267,42 +266,6 @@ std::vector<KvCache::SparseBufferRef> KvCache::_sparseBuffers(LifeCycleId lifeCy
     return refs;
 }
 
-std::vector<int32_t> KvCache::_sparseBufferLayers(LifeCycleId lifeCycle) const
-{
-    // _sparseBuffers walks layers outermost, so a change of layerId starts a new row and the
-    // result is non-decreasing, which is the grouping SparseCacheState checks for.
-    std::vector<int32_t> layers;
-    std::optional<LayerId> previous;
-    int32_t row = -1;
-    for (auto const& ref : _sparseBuffers(lifeCycle))
-    {
-        if (!previous.has_value() || ref.id.layerId != *previous)
-        {
-            previous = ref.id.layerId;
-            ++row;
-        }
-        layers.push_back(row);
-    }
-    return layers;
-}
-
-std::vector<uint32_t> KvCache::_sparseColdPageOffsets(LifeCycleId lifeCycle) const
-{
-    auto& storage = mManager->storage();
-    PoolGroupIndex const hotPg = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
-    // The cold page concatenates the hot pools in pool order, and the default codec moves
-    // slot bytes verbatim, so a buffer sits at its pool's offset plus its offset in the slot.
-    auto const coldLayout = queryDefaultColdPageLayout(storage.slotSize(hotPg));
-
-    std::vector<uint32_t> offsets;
-    for (auto const& ref : _sparseBuffers(lifeCycle))
-    {
-        auto const attr = mManager->bufferAttr(ref.id.layerId, ref.id.role);
-        offsets.push_back(static_cast<uint32_t>(coldLayout.poolOffset.at(attr.poolIndex) + attr.offset));
-    }
-    return offsets;
-}
-
 SparseUnitCopyArgs KvCache::_sparseCopyArgs(LifeCycleId lifeCycle) const
 {
     // The pools and the layout are the manager's, since they follow from configuration.
@@ -310,7 +273,7 @@ SparseUnitCopyArgs KvCache::_sparseCopyArgs(LifeCycleId lifeCycle) const
     // write-back uses.
     SparseUnitCopyArgs args = mManager->sparseCopyTemplate(lifeCycle);
 
-    auto const& state = mSparseCacheState[lifeCycle];
+    auto const& state = mSparseCache[lifeCycle];
     auto const& view = state.view();
     // One row: a write-back is per request. A batched fetch passes the batch's view array.
     args.views = state.deviceView();
@@ -324,7 +287,7 @@ SparseUnitCopyArgs KvCache::_sparseCopyArgs(LifeCycleId lifeCycle) const
 
 int KvCache::_sparseUnitsCrossed(LifeCycleId lifeCycle, int fromHistory, int toHistory) const
 {
-    if (lifeCycle >= mSparseCacheState.size() || mSparseCacheState[lifeCycle].empty())
+    if (lifeCycle >= mSparseCache.size() || mSparseCache[lifeCycle].empty())
     {
         return 0;
     }
@@ -334,7 +297,7 @@ int KvCache::_sparseUnitsCrossed(LifeCycleId lifeCycle, int fromHistory, int toH
 
 void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnits)
 {
-    auto const& state = mSparseCacheState[lifeCycle];
+    auto const& state = mSparseCache[lifeCycle];
     TLLM_CHECK_DEBUG(!state.empty() && toUnits > fromUnits);
     auto const& view = state.view();
     auto const stream = reinterpret_cast<CUstream>(cudaStream());
@@ -508,41 +471,36 @@ bool KvCache::resume(std::optional<CUstream> stream)
         numSlotsNeeded[lc] += scratchDeltaCounts[lc];
     }
 
-    // Pages backing this request's sparse cache. Released at suspend() along with the rest
-    // of the reservation, so a later resume takes them afresh. Zero for every life cycle
-    // whose fetch path is unconfigured, which keeps non-sparse deployments untouched.
-    // These are GPU pages whatever the life cycle's residency level is: the cache is what
+    // Cells backing this request's sparse cache, leased from the life cycle's arena.
+    // Returned at suspend() along with the rest of the reservation, so a later resume takes
+    // a lease afresh. Skipped for every life cycle whose fetch path is unconfigured, which
+    // keeps non-sparse deployments untouched.
+    //
+    // The arena is GPU memory whatever the life cycle's pages are made of: the cache is what
     // makes host-resident sparse history reachable by the attention kernels.
-    TypedVec<LifeCycleId, SlotCount> sparseCacheDelta(numLc, 0);
+    TypedVec<LifeCycleId, SparseCacheLease> leases(numLc);
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
-        int const want = _sparseCacheSubSlotsPerBuffer(lc);
-        int const have = static_cast<int>(mSparseCacheSlots[lc].size());
-        sparseCacheDelta[lc] = std::max(0, want - have);
+        auto& arena = mManager->sparseArena(lc);
+        if (arena.empty() || !mSparseCache[lc].empty())
+        {
+            continue;
+        }
+        auto lease = arena.acquire(reinterpret_cast<CUstream>(cudaStream()));
+        if (!lease.has_value())
+        {
+            // The arena is full: more concurrent requests than `constraints` declared.
+            return false;
+        }
+        leases[lc] = std::move(*lease);
     }
 
-    // Only allocate if any slots are needed.
+    // Only allocate if any slots are needed. The leases above are already held; a failure
+    // below drops them, which returns their cells through the lease destructor.
     bool const anyResident
         = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
-    bool const anySparseCache
-        = std::any_of(sparseCacheDelta.begin(), sparseCacheDelta.end(), [](SlotCount n) { return n > 0; });
-    if (anyResident || anySparseCache)
     {
         TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots(numLc);
-        TypedVec<LifeCycleId, std::vector<Slot>> sparseCacheSlots(numLc);
-        // The two allocations draw on different pools, so the first must be handed back if
-        // the second cannot be satisfied.
-        auto releaseSparseCache = FuncGuard(
-            [&]()
-            {
-                for (LifeCycleId lc{0}; lc < numLc; ++lc)
-                {
-                    for (auto& slot : sparseCacheSlots[lc])
-                    {
-                        storageMgr.releaseSlot(lc, kHotLevel, std::move(slot));
-                    }
-                }
-            });
         try
         {
             MigrationRecorder const migrationRecorder
@@ -550,10 +508,6 @@ bool KvCache::resume(std::optional<CUstream> stream)
                       CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
             DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
             { _recordDroppedPages(pages, cacheLevel); };
-            if (anySparseCache)
-            {
-                sparseCacheSlots = storageMgr.newSlots(kHotLevel, sparseCacheDelta, migrationRecorder, dropRecorder);
-            }
             if (anyResident)
             {
                 tmpSlots = storageMgr.newResidentSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
@@ -563,41 +517,14 @@ bool KvCache::resume(std::optional<CUstream> stream)
         {
             return false;
         }
-        releaseSparseCache.cancel();
 
         // Separate deferred vs scratch slots, and collect scratch ready events.
         std::vector<CUevent> scratchReadyEvents;
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
-            for (auto& slot : sparseCacheSlots[lc])
+            if (!leases[lc].empty())
             {
-                mSparseCacheSlots[lc].emplace_back(std::move(slot), *this, lc, kHotLevel, /*skipWait=*/true);
-                scratchReadyEvents.push_back(mSparseCacheSlots[lc].back().slot().readyEvent.handle());
-            }
-            if (sparseCacheDelta[lc] > 0)
-            {
-                // Sized from the pages now held. Recreating on growth is safe only while
-                // nothing is cached; once entries hold data, growth must preserve them.
-                int const entries = static_cast<int>(mSparseCacheSlots[lc].size()) * mManager->sparseCacheExpansion(lc);
-                std::vector<int32_t> cachePageSlots;
-                cachePageSlots.reserve(mSparseCacheSlots[lc].size());
-                for (auto const& lock : mSparseCacheSlots[lc])
-                {
-                    cachePageSlots.push_back(static_cast<int32_t>(lock.slot().slotId().value()));
-                }
-                SparseCacheInit init;
-                // Metadata rows are per layer; cells and cold-page offsets are per buffer.
-                init.numLayers = mManager->sparseCacheLayerCount(lc);
-                init.numBuffers = mManager->sparseCacheBufferCount(lc);
-                init.entriesPerLayer = entries;
-                init.cachePageSlots = std::move(cachePageSlots);
-                init.hostBufferOffset = _sparseColdPageOffsets(lc);
-                init.bufferLayer = _sparseBufferLayers(lc);
-                // A watermark move cannot cross more than the in-flight span it is draining.
-                int const expansion = mManager->sparseCacheExpansion(lc);
-                init.maxFlushUnits = mManager->sparseCacheMaxInFlightUnits(lc);
-                init.maxFlushBlocks = divUp(init.maxFlushUnits, expansion) + 1;
-                mSparseCacheState[lc] = SparseCacheState(init, reinterpret_cast<CUstream>(cudaStream()));
+                mSparseCache[lc] = std::move(leases[lc]);
             }
 
             if (!tmpSlots[lc].empty())
@@ -1641,7 +1568,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     // stream, so a later fetch reading those pages is ordered after it. A copy enqueued for a
     // resize that then fails is harmless -- the unit stays in flight, its cell still holds
     // the data, and the host page merely holds a copy nothing is allowed to read yet.
-    for (LifeCycleId lc{0}; lc < mSparseCacheState.size(); ++lc)
+    for (LifeCycleId lc{0}; lc < mSparseCache.size(); ++lc)
     {
         if (_sparseUnitsCrossed(lc, mHistoryLength, newHist) == 0)
         {
@@ -3325,14 +3252,8 @@ void KvCache::_freeReservedGpuSlots()
             lock.unlock();
         lcSlots.clear();
     }
-    for (auto& lcSlots : mSparseCacheSlots)
-    {
-        for (auto& lock : lcSlots)
-            lock.unlock();
-        lcSlots.clear();
-    }
-    for (auto& state : mSparseCacheState)
-        state = SparseCacheState{};
+    for (auto& lease : mSparseCache)
+        lease.release();
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
