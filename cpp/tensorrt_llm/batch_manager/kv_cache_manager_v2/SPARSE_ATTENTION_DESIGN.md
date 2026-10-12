@@ -721,6 +721,93 @@ Also: the host pool is far larger than the GPU pool, so a page index must be wid
 bits before multiplying by the page stride. MSA already does this
 (`triton_sparse_decode.py`); QSA and XQA should be audited.
 
+## Planned: hot-tier residency and an external GPU cache
+
+**Not yet implemented.** Everything above describes the code as it stands, in which sparse
+history *resides* at `kSparseHistoryLevel` and the fetch reads cold pages directly. This
+section records the architecture that replaces it, and why.
+
+### Why the present layout cannot be compressed
+
+The codec is not the level 0 -> level 1 transform. It is the **hot <-> cold** transform:
+`StorageManager::migrate` computes `srcIsHot = srcLevel == kHotLevel`, and when source and
+destination are on the same side of that boundary it performs a plain byte copy with no
+codec at all. Sparse history is locked at level 1 and never migrates, so it never crosses
+the boundary, so the codec never runs on it.
+
+Compression of sparse history is therefore not merely deferred by the cold-page layout
+coupling described under *Extraction interface*. It is unreachable: there is no path on
+which a codec would be invoked. The same reasoning retires the idea of compressing between
+two cold levels.
+
+### The replacement
+
+- A sparse life cycle's **hot pool group is backed by host memory**, device-mapped as the
+  cold tier is today. Its pages are ordinary hot pages: locked at `kHotLevel`, coalesced,
+  addressed by page index, reachable through `get_mem_pool_base_address`.
+- Memory kind therefore varies **per pool group within a level**, which costs less than it
+  sounds: `CacheLevelStorage` already holds `PoolGroupBase` pointers and `GpuPoolGroup` /
+  `HostPoolGroup` already exist. Only the factory is tier-uniform.
+- Host-backed hot capacity is **reported as GPU** in statistics and quota. Functionally it
+  behaves as GPU residency: real GPU memory caches it, and kernels only ever address it
+  through that cache.
+- The **GPU cache moves out of `StorageManager`**, though it stays inside `KvCacheManager`.
+  It owns its own device allocation rather than reserving slots from a hot pool group, which
+  is what lets that pool group become host memory without the cache following it there.
+  `fetch_sparse_pages`, `Batch` and the per-request state stay where they are.
+- `kSparseHistoryLevel` and `residencyLevel`'s sparse branch retire. Level 1 becomes an
+  ordinary codec target.
+
+### What it buys
+
+- **Compression works generically.** Level 0 -> level 1 is the codec boundary for sparse
+  buffers exactly as for dense ones. Nothing sparse-specific is involved.
+- **`ISparseUnitGather` is retired before being built.** It exists only because the fetch
+  reads codec-formatted cold pages. Reading uncompressed hot pages instead removes the
+  reason for it.
+- **The cold-page layout coupling goes.** The fetch's source becomes
+  `slotAddress(kHotLevel, ...) + BufferAttr::offset` -- arithmetic this package owns --
+  rather than `queryDefaultColdPageLayout`'s concat order, which belongs to the codec. With
+  it go `_sparseColdPageOffsets`, `SparseCacheView::hostBufferOffset` and the per-buffer
+  offset upload.
+- **Cell addressing collapses to flat arithmetic.** A dedicated allocation can hand a
+  request one contiguous run of `numBuffers * subSlotsPerBuffer` cells, so a cell's address
+  is `base + subSlot * bufferBytes`. The page indirection goes: `SparseCacheView::cachePages`,
+  `buffersPerSlot` and the slot-to-page lookup in both the copy and the index kernel all
+  collapse. Coalesced slots were never a good fit here -- the reservation handed out whole
+  slots only because that is what the storage allocator deals in.
+
+  The index this emits is then `subSlot * expansion + unit` against the cache's own base, so
+  `get_mem_pool_base_address` for a sparse buffer must report that base rather than the hot
+  pool's. The consumer still indexes one base by one index list; which allocation the base
+  names is what changes.
+
+- **The transceiver needs no changes.** It works on hot, coalesced pages; those stay a
+  single ordinary pool group per life cycle and merely become host memory. Keeping the GPU
+  cache *outside* the tier is what preserves that: a second pool group inside the hot tier
+  would have made "the hot pool of this life cycle" ambiguous, which is the invariant both
+  the transceiver and `get_mem_pool_base_address` rest on.
+
+### Order of work
+
+The cache must be rehomed **before** the hot pool group flips to host; otherwise it silently
+reserves host memory and stops being a GPU cache.
+
+1. Move the GPU cache off `StorageManager`'s slot reservation onto its own device
+   allocation, still owned by `KvCacheManager`. Behaviour unchanged.
+2. Back the sparse hot pool group with host memory; delete `residencyLevel`'s sparse branch.
+3. Point the fetch's source at hot pages in ordinary slot layout; delete the cold-page
+   offset machinery.
+4. Compression, now generic.
+
+### Hazard to check at step 2
+
+Moving sparse pages to the hot level makes them eligible for demotion and eviction for the
+first time. A page demoted while the GPU cache holds a cell copied from it leaves that cell
+valid -- it is a snapshot -- but a later fetch of the same unit would read a page that has
+since been encoded. `PageLock` is expected to prevent this, since a live request holds its
+pages, but it must be verified rather than assumed.
+
 ## Settled by construction
 
 Recorded because each looks like an open question and is not:
