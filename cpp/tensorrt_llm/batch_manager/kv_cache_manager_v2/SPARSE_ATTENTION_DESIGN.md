@@ -806,11 +806,24 @@ against real hot pages. The kernels are covered by white-box hooks against synth
 and the integration tests assert residency and index shape rather than content, so a wrong
 base address on the page side would not be caught.
 
-**Hazard still to verify.** Moving sparse pages to the hot level makes them eligible for
-demotion and eviction for the first time. A page encoded while the cache holds a cell copied
-from it leaves that cell valid — it is a snapshot — but a later fetch of the same unit would
-read a page that has since been encoded. `PageLock` is expected to prevent this, since a live
-request holds its pages, but it must be verified rather than assumed.
+**A cell can never outlive its page's lock.** Moving sparse pages to the hot level made them
+eligible for demotion for the first time, which raised the question of whether a page could be
+encoded while the cache still held a cell copied from it. It cannot:
+
+- An `ACTIVE` request locks the pages it requires (`AGENTS.md`, *Per-request cache*), and
+  `LOCKED` forbids eviction outright (*Page status*).
+- Eviction is the only route to migration, and migration across the hot boundary is the only
+  thing that invokes the codec.
+- The lease and the locks share a lifetime: taken at `resume()`, released together in
+  `_freeReservedGpuSlots()`. A cell therefore exists only while its page is locked.
+
+`commit()` does downgrade a lock to a holder, but only for a page it is discarding in favour
+of an existing tree page -- not one the request goes on to read.
+
+The one configuration where a live request holds unlocked pages is a **sparse layer with a
+sliding window**, where `_unlockStaleBlocks` unlocks out-of-window blocks. A stale unit is
+neither selectable nor within a flush range, so the argument still holds, but it holds by two
+inferences rather than one and deserves a test rather than a paragraph.
 
 ## Settled by construction
 
