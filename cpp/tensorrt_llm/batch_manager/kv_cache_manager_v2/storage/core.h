@@ -565,10 +565,15 @@ public:
 
     // Static version: compute slot counts from quota, slot size lists, ratio, granularity, and min_slots.
     // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
+    //! `offQuota` names pool groups not drawn from this level's quota -- a sparse life
+    //! cycle's host-backed hot pages. They take their constraint floor instead.
     static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::set<PoolGroupIndex> const& offQuota = {});
+
+    //! Pool groups whose medium differs from this level's declared tier.
+    [[nodiscard]] std::set<PoolGroupIndex> offQuotaPoolGroups() const;
 
     // Distribute grains among pools within a pool group.
     // Returns {num_slots, grains_consumed}.

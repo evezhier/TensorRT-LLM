@@ -337,12 +337,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     mLevels.reserve(config.cacheTiers.size());
 
-    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
-
     // A sparse life cycle's hot pages are host memory: its history is too large for device
     // memory and is read through the sparse cache rather than directly. Pool group formation
     // keys on `isSparse` (storage/config.cpp), so a group is uniformly sparse or dense and
     // the backing is well defined per group.
+    //
+    // Computed before the slot counts because those groups are sized from their constraint
+    // floor rather than from the GPU quota, which measures a resource they do not consume.
     std::set<PoolGroupIndex> hostBackedHot;
     {
         auto const& hotGrouping = lifeCycleGrouping(kHotLevel);
@@ -355,6 +356,9 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             }
         }
     }
+
+    auto gpuSlotCounts
+        = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots, hostBackedHot);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get(), hostBackedHot);
 
@@ -1711,7 +1715,8 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         : lvlStorage.totalQuota();
     auto const minSlots
         = level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
-    size_t minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
+    size_t minQuota = minQuotaForLevel(
+        lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots, lvlStorage.offQuotaPoolGroups());
     if (quota < minQuota)
     {
         throw std::invalid_argument("Quota " + std::to_string(quota)
@@ -2045,14 +2050,15 @@ TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    std::set<PoolGroupIndex> const& offQuota) const
 {
     CacheTier tier = cacheTierOf(tierConfig);
     size_t quota = cacheTierQuota(tierConfig);
     size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
                                                     : CacheLevelManager::cacheTierGranularity(tier, quota);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
-    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
+    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots, offQuota), roundUp(quota, granularity));
+    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots, offQuota);
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,11 +2066,17 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
 // ---------------------------------------------------------------------------
 
 size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    std::set<PoolGroupIndex> const& offQuota) const
 {
     size_t total = 0;
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
+        // Not drawn from this level's quota, so its floor is not a demand on it.
+        if (offQuota.count(pgIdx) != 0)
+        {
+            continue;
+        }
         for (auto slotSize : slotSizeLists[pgIdx])
         {
             total += roundUp(slotCountToSizeT(minSlots[pgIdx]) * slotSize, granularity);

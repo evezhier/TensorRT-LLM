@@ -757,13 +757,35 @@ The arena is sized from `constraints`, which already declares the batch shape `B
 its rows from. That makes the cells a static reservation rather than an on-demand draw on the
 shared pool -- a change in kind, and the one the *Sizing* section assumed all along.
 
-**Open: the hot level has one quota for two media.** `computeSlotCountForLevel` divides the
-`GpuCacheTierConfig` quota among the hot level's pool groups by ratio, and a host-backed
-group now draws from that same budget. Three consequences, none yet addressed: sparse
-history is capped at a GPU-sized number, which is the opposite of the point; the GPU bytes
-budgeted to it are never allocated on the device, so the GPU is under-used; and the adaptive
-ratio logic trades GPU bytes against host bytes as though they were fungible. The host-backed
-portion needs a budget of its own before this is deployable.
+### Sizing a host-backed pool group
+
+It is **off-quota**: excluded from the level's byte budget, and sized from its constraint
+floor instead.
+
+A level's quota measures one medium. Once a hot pool group is host memory it consumes none
+of the device bytes that quota counts, so drawing it from there would cap sparse history at a
+GPU-sized number -- the opposite of the point -- while leaving those device bytes unallocated.
+Attributing it to a *host tier's* quota instead was considered and rejected: `cacheTiers` is
+a positional list, so "the host tier" may be several or none, and a hot pool group's size
+would then change when someone added or removed a cold tier that has nothing to do with it.
+
+The floor is the right size because it already says what the deployment declared:
+`computePoolGroupMinSlotsFromConstraints` derives it from `constraints`' capacity and scales
+it by `1/maxUtilForResume`, so a deployment running at its declared shape does not trip the
+resume guard. Sparse history then tracks declared context length rather than device memory.
+
+`CacheLevelStorage::offQuotaPoolGroups()` identifies them by the only thing that matters --
+a pool group whose medium differs from its level's declared tier -- so construction and the
+adaptive path (`adjustCacheLevel` -> `computeSlotCountList`) get the same answer without
+either being told. That mattered: excluding only at construction would have let the first
+runtime rebalance undo it.
+
+**Deferred: headroom above the floor.** Extra host pages buy cross-request reuse retention,
+since sparse pages sit in the radix tree like any other. Floor-only holds a request's pages
+while it lives and reclaims them after, retaining nothing for a later prefix match. For a
+disagg decode instance that is a mild loss -- KV arrives by transfer, not recomputation --
+and shared system prompts are the case that would notice. A knob belongs here if measurement
+shows it matters, not before.
 
 **Open: coverage.** No test asserts bytes end to end through a fetch *and* a write-back
 against real hot pages. The kernels are covered by white-box hooks against synthetic pools,

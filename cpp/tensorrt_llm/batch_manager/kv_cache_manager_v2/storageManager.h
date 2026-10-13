@@ -374,11 +374,15 @@ private:
         TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
         TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
+    //! `offQuota` names pool groups sized from their constraint floor rather than from
+    //! this level's quota -- a sparse life cycle's host-backed hot pages.
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        std::set<PoolGroupIndex> const& offQuota = {}) const;
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        std::set<PoolGroupIndex> const& offQuota = {}) const;
 
     // Internal helpers.
     // Register the slot descriptors for the next cache level and derive its slot-size table.

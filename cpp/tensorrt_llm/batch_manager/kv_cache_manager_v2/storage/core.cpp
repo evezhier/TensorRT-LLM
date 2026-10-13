@@ -832,7 +832,7 @@ size_t CacheLevelStorage::grainsForSlots(
 TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size_t quota,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& sizeLists,
     TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-    TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::set<PoolGroupIndex> const& offQuota)
 {
     PoolGroupIndex numPg = sizeLists.size();
     TLLM_CHECK_DEBUG(ratioList.size() == numPg);
@@ -851,8 +851,21 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
 
     TypedVec<PoolGroupIndex, SlotCount> slotCntList(numPg, 0);
     size_t remainingGrains = totalGrains;
-    std::vector<PoolGroupIndex> activePgs(toSizeT(numPg));
-    std::iota(activePgs.begin(), activePgs.end(), PoolGroupIndex{0});
+    std::vector<PoolGroupIndex> activePgs;
+    activePgs.reserve(toSizeT(numPg));
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        // A pool group whose medium is not this tier's draws on a different resource, so it
+        // takes its constraint floor and its grains are never subtracted from this budget.
+        // Pinning rather than ratio-sharing is right because the floor already expresses
+        // what the declared constraints need, scaled for the resume guard.
+        if (offQuota.count(pgIdx) != 0)
+        {
+            slotCntList[pgIdx] = minSlots[pgIdx];
+            continue;
+        }
+        activePgs.push_back(pgIdx);
+    }
 
     // Iteratively peel off constrained PGs until all active PGs are
     // unconstrained:
@@ -965,7 +978,23 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::computeSlotCountList(
 {
     size_t q = quota.value_or(totalQuota());
     TLLM_CHECK_DEBUG(ratioList.size() == mPoolGroups.size());
-    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
+    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots, offQuotaPoolGroups());
+}
+
+std::set<PoolGroupIndex> CacheLevelStorage::offQuotaPoolGroups() const
+{
+    // Groups whose medium differs from the level's declared tier: a sparse life cycle's
+    // host-backed hot pages. The level's quota measures device bytes, which these do not
+    // consume, so they must not be sized from it -- nor inflate the minimum it has to meet.
+    std::set<PoolGroupIndex> out;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
+    {
+        if (mPoolGroups[pgIdx]->cacheTier() != cacheTier())
+        {
+            out.insert(pgIdx);
+        }
+    }
+    return out;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

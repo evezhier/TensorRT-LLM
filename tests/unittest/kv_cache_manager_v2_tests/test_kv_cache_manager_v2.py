@@ -624,6 +624,65 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    @staticmethod
+    def _hot_slots(manager: KVCacheManager) -> int:
+        return sum(s.total for s in manager.get_storage_statistics(CacheLevel(0)))
+
+    @classmethod
+    def _sized_manager(cls, gpu_mb: int, capacity: int) -> KVCacheManager:
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=128,
+                cache_tiers=[GpuCacheTierConfig(gpu_mb << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=capacity, history_length=0)] * 4)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig(
+                                "key",
+                                4096,
+                                is_sparse=True,
+                                num_selected_blocks=2,
+                                max_cached_units=4,
+                                sparse_unit_layout=SelectionUnitLayout(1, 4096, 0, 4096),
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+
+    def test_host_backed_pages_are_not_sized_by_the_gpu_quota(self):
+        """A level's quota measures one medium, and these pages are not made of it.
+
+        Drawing them from the GPU budget would cap sparse history at a device-sized number,
+        which is the opposite of what putting history on host is for.
+        """
+        wide = self._sized_manager(gpu_mb=64, capacity=8192)
+        try:
+            narrow = self._sized_manager(gpu_mb=16, capacity=8192)
+            try:
+                self.assertEqual(self._hot_slots(wide), self._hot_slots(narrow))
+            finally:
+                narrow.shutdown()
+        finally:
+            wide.shutdown()
+
+    def test_host_backed_pages_scale_with_the_declared_capacity(self):
+        """What they do track: the context length the constraints declared."""
+        small = self._sized_manager(gpu_mb=64, capacity=8192)
+        try:
+            large = self._sized_manager(gpu_mb=64, capacity=32768)
+            try:
+                self.assertGreater(self._hot_slots(large), self._hot_slots(small))
+            finally:
+                large.shutdown()
+        finally:
+            small.shutdown()
+
     def test_the_arena_and_the_pages_have_different_bases(self):
         """Two allocations, two accessors.
 
