@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -54,6 +55,31 @@ KVCacheManagerConfig makeGpuTieredConfig()
 {
     auto config = makeTieredConfig();
     config.cacheTiers[1] = GpuCacheTierConfig{4 << 20};
+    return config;
+}
+
+//! One sparse attention layer, over a hot tier and a cold tier.
+//!
+//! The hot pool group is host-backed because the layer is sparse; the cold tier is an
+//! ordinary codec target, which is the whole point of the arrangement.
+KVCacheManagerConfig makeSparseTieredConfig()
+{
+    KVCacheManagerConfig config;
+    config.tokensPerBlock = 4;
+    config.cacheTiers.emplace_back(GpuCacheTierConfig{4 << 20});
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    AttentionLayerConfig layer;
+    layer.layerId = 0;
+    BufferConfig buffer{"key", 2 << 20, std::nullopt};
+    buffer.isSparse = true;
+    buffer.numSelectedBlocks = 1;
+    buffer.maxCachedUnits = 2;
+    buffer.sparseUnitLayout = SelectionUnitLayout{1, 2 << 20, 0, 2 << 20};
+    layer.buffers.push_back(std::move(buffer));
+    config.layers.emplace_back(std::move(layer));
+    BatchDesc constraint;
+    constraint.kvCaches.assign(2, KVCacheDesc{/*capacity=*/16, /*historyLength=*/0});
+    config.constraints.push_back(std::move(constraint));
     return config;
 }
 
@@ -227,6 +253,59 @@ public:
     {
         return false;
     }
+};
+
+//! Records which life cycles were encoded and decoded, without interfering.
+//!
+//! Compression lives behind this interface, so "can sparse history be compressed" reduces
+//! to "does a sparse life cycle's page reach the codec at all". Before sparse history moved
+//! to the hot tier it could not: the codec runs on the hot/cold boundary, and that history
+//! was locked on the cold side and never crossed.
+class RecordingColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    bool configure(PoolGroupDesc const*, PoolGroupIndex) noexcept override
+    {
+        return true;
+    }
+
+    size_t queryColdPageBytes(LayerGroupId) const noexcept override
+    {
+        return 2 << 20;
+    }
+
+    PageIndexLocation queryPageIndexLocation(LayerGroupId) const noexcept override
+    {
+        return PageIndexLocation::kHost;
+    }
+
+    bool encode(LayerGroupId lg, void*, PageIndexPair const*, size_t pages, cudaStream_t) noexcept override
+    {
+        mEncoded[lg.value()] += pages;
+        return true;
+    }
+
+    bool decode(LayerGroupId lg, void const*, PageIndexPair const*, size_t pages, cudaStream_t) noexcept override
+    {
+        mDecoded[lg.value()] += pages;
+        return true;
+    }
+
+    size_t encoded(LayerGroupId lg) const
+    {
+        auto const it = mEncoded.find(lg.value());
+        return it == mEncoded.end() ? 0 : it->second;
+    }
+
+    size_t decoded(LayerGroupId lg) const
+    {
+        auto const it = mDecoded.find(lg.value());
+        return it == mDecoded.end() ? 0 : it->second;
+    }
+
+private:
+    std::map<int, size_t> mEncoded;
+    std::map<int, size_t> mDecoded;
 };
 
 class AsyncRejectingColdPageCodec final : public IKvCacheColdPageCodec
@@ -709,6 +788,43 @@ TEST(KvCacheManagerV2ColdPageTest, RecursiveFallenPageMergeResortsByPriority)
     EXPECT_EQ(middlePriorityPage->cacheLevel, firstColdLevel);
     EXPECT_EQ(highestPriorityPage->cacheLevel, lastColdLevel);
     EXPECT_EQ(lowestPriorityPage->cacheLevel, kHotLevel);
+}
+
+TEST(KvCacheManagerV2ColdPageTest, SparseHistoryPassesThroughTheCodec)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto codec = std::make_unique<RecordingColdPageCodec>();
+    auto* codecPtr = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeSparseTieredConfig(), nullptr, std::move(codec));
+    auto& storage = manager->storage();
+    LifeCycleId const lifeCycle{0};
+    LayerGroupId const layerGroup{lifeCycle.value()};
+    CacheLevel const coldLevel{1};
+    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
+
+    // The arrangement this test is about: the life cycle's *hot* pool group is host memory.
+    // Without this the test would pass for a dense life cycle too, and prove nothing.
+    PoolGroupIndex const hotPg = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
+    ASSERT_EQ(storage.cacheTier(kHotLevel, hotPg), CacheTier::HOST_MEM)
+        << "a sparse life cycle's hot pages must be host memory";
+
+    // A hot page of the sparse life cycle. Host-backed, but an ordinary hot page: locked at
+    // the hot level and migratable like any other.
+    auto hotSlots = storage.newSlots(kHotLevel, oneSlot);
+    auto page = makeCommittedPage(*manager, storage, kHotLevel, hotSlots[lifeCycle].front());
+    storage.excludeFromEviction(*page);
+    EXPECT_EQ(codecPtr->encoded(layerGroup), 0U);
+
+    // Out of the hot tier: crossing the boundary is what invokes the codec.
+    storage.batchedMigrate(coldLevel, {page}, {});
+    EXPECT_EQ(page->cacheLevel, coldLevel);
+    EXPECT_EQ(codecPtr->encoded(layerGroup), 1U) << "sparse history must reach the codec on demotion";
+
+    // And back, which is the decode half.
+    storage.batchedMigrate(kHotLevel, {page}, {});
+    EXPECT_EQ(page->cacheLevel, kHotLevel);
+    EXPECT_EQ(codecPtr->decoded(layerGroup), 1U) << "sparse history must reach the codec on promotion";
+    page->readyEvent.synchronize();
 }
 
 } // namespace

@@ -1,6 +1,6 @@
 # Sparse attention in KVCacheManagerV2
 
-Target: the **decode instance of a disaggregated deployment**, default codec.
+Target: the **decode instance of a disaggregated deployment**.
 
 This document describes one design. Where the code has not caught up, the text says so
 inline and *Migration state* below tracks it; everything else is in place.
@@ -453,8 +453,17 @@ cross it like any other, so level 1 can hold a compressed form and the existing
 
 The fetch is unaffected: it reads hot pages, which are never the compressed form.
 
-What remains is the question the codec has always posed and this design does not answer:
-whether a lossy codec is acceptable for KV history, and under what accuracy budget.
+`SparseHistoryPassesThroughTheCodec` pins this: a sparse life cycle's page is encoded on
+demotion and decoded on promotion, with the test first asserting that the life cycle's hot
+pool group really is `HOST_MEM` so that it cannot pass by accidentally describing a dense
+one. Nothing in the fetch path is involved, which is the point -- it reads hot pages, which
+are never the compressed form.
+
+No compressing codec ships here, and none is needed to make the claim: compression lives
+behind `IKvCacheColdPageCodec`, so "can sparse history be compressed" reduces to "does a
+sparse page reach the codec", and it now does. What remains is the question the codec has
+always posed and this design does not answer: whether a lossy codec is acceptable for KV
+history, and under what accuracy budget.
 
 ## Fetch
 
@@ -739,7 +748,7 @@ deferred, it was unreachable. Two cold levels would not have helped, for the sam
 | 1 | Cells from a dedicated GPU arena, leased per request; flat cell arithmetic | **done** |
 | 2 | Sparse hot pool group backed by host memory; `residencyLevel` sparse branch retired | **done** |
 | 3 | Fetch reads hot pages at `BufferAttr::offset`; cold-page offset machinery gone | **done** |
-| 4 | Compression, through the existing codec, with nothing sparse-specific | pending |
+| 4 | Compression, through the existing codec, with nothing sparse-specific | **reachable** |
 
 A sparse deployment now places no requirement on its cold tiers: history is on a host-backed
 *hot* pool group, so level 1 may be host, disk, or absent. An earlier revision required level
