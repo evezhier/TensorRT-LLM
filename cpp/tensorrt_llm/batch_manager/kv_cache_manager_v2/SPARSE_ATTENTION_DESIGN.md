@@ -741,6 +741,10 @@ deferred, it was unreachable. Two cold levels would not have helped, for the sam
 | 3 | Fetch reads hot pages at `BufferAttr::offset`; cold-page offset machinery gone | **done** |
 | 4 | Compression, through the existing codec, with nothing sparse-specific | pending |
 
+A sparse deployment now places no requirement on its cold tiers: history is on a host-backed
+*hot* pool group, so level 1 may be host, disk, or absent. An earlier revision required level
+1 to be `HOST_MEM`, which was where sparse history then resided; that validation is gone.
+
 Memory kind is a property of the **pool group**, not the level: `PoolGroupBase::cacheTier()`
 is virtual, `GpuCacheLevelStorage` builds a `HostPoolGroup` for the indices it is told are
 host-backed, and `migrate` dispatches the copy engine on `cacheTier(level, poolGroup)`. This
@@ -802,10 +806,14 @@ taken, and raising it is a one-constant change.
 With no on-quota groups at all -- every attention layer sparse -- there is no ratio to take,
 and the bound stands in for one.
 
-**Open: coverage.** No test asserts bytes end to end through a fetch *and* a write-back
-against real hot pages. The kernels are covered by white-box hooks against synthetic pools,
-and the integration tests assert residency and index shape rather than content, so a wrong
-base address on the page side would not be caught.
+**Coverage of the data path.** `TestSparseDataPath` asserts the bytes themselves on both
+sides of the copy: a pattern written to a hot page must appear in the cell the fetch names,
+and a pattern written to a cell must appear in its hot page once the watermark passes it.
+
+This was worth building rather than arguing about. Offsetting the page base by one slot and
+re-running showed **57 other sparse tests still passing** -- residency, index shape and
+counts are all insensitive to which allocation the copy reads, which is exactly the mistake
+the move to the hot tier could have introduced.
 
 **A cell can never outlive its page's lock.** Moving sparse pages to the hot level made them
 eligible for demotion for the first time, which raised the question of whether a page could be

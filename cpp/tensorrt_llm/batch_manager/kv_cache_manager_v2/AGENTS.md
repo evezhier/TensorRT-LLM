@@ -225,6 +225,23 @@ Eviction controller
   Keep allocation granularity, stream ordering, and source/destination lifetime
   valid through asynchronous copies.
 
+## Testing a change here
+
+The Python suite (`tests/unittest/kv_cache_manager_v2_tests/`) does **not** build this
+package's C++ tests, so a green Python run says nothing about whether they still compile:
+it loads a prebuilt `.so` and never sees the headers. Removing a symbol the C++ tests use
+therefore breaks them silently. Build and run them too:
+
+```bash
+cd cpp/build
+for t in kvCacheManagerV2ConfigTest kvCacheManagerV2ColdPageTest \
+         kvCacheManagerV2ColdPageCopyTest kvCacheManagerV2TypedIndexTest \
+         kvCacheManagerV2HostMemTest kvCacheManagerV2StatsTest \
+         kvCacheManagerV2ConcurrencyTest kvCacheManagerV2DigestPoolTest; do
+  cmake --build . --target "$t" -j"$(nproc)" || echo "$t: BUILD FAIL"
+done
+```
+
 ## Interfaces, bindings, and build
 
 - `TokenSpan` is non-owning. The caller retains its backing storage for the full
