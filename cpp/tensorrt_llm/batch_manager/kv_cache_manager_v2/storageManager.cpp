@@ -103,13 +103,14 @@ PoolGroupIndex LifeCyclePoolGroupMapping::numPoolGroups() const noexcept
 
 CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
     CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator,
+    std::set<PoolGroupIndex> const& hostBacked)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
-    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator);
+    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, hostBacked);
 }
 
 size_t CacheLevelManager::cacheTierGranularity(CacheTier tier, size_t quota)
@@ -337,8 +338,25 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mLevels.reserve(config.cacheTiers.size());
 
     auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
+
+    // A sparse life cycle's hot pages are host memory: its history is too large for device
+    // memory and is read through the sparse cache rather than directly. Pool group formation
+    // keys on `isSparse` (storage/config.cpp), so a group is uniformly sparse or dense and
+    // the backing is well defined per group.
+    std::set<PoolGroupIndex> hostBackedHot;
+    {
+        auto const& hotGrouping = lifeCycleGrouping(kHotLevel);
+        for (LifeCycleId lcId{0}; lcId < mLifeCycles.size(); ++lcId)
+        {
+            auto const* attention = std::get_if<AttnLifeCycle>(&mLifeCycles[lcId]);
+            if (attention != nullptr && attention->isSparse)
+            {
+                hostBackedHot.insert(hotGrouping[lcId]);
+            }
+        }
+    }
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get());
+        gpuSlotCounts, mGpuPhysMemAllocator.get(), hostBackedHot);
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -642,8 +660,11 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
     PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
     PoolGroupIndex const dstPgIdx = getPoolGroupIndex(dstLevel, batchingLayerGroupId);
-    CacheTier const srcTier = cacheTier(srcLevel);
-    CacheTier const dstTier = cacheTier(dstLevel);
+    // Per pool group, not per level: a sparse life cycle's hot pool group is host memory, so
+    // a migration out of it is host-to-host rather than device-to-host, and the copy engine
+    // must be told which.
+    CacheTier const srcTier = cacheTier(srcLevel, srcPgIdx);
+    CacheTier const dstTier = cacheTier(dstLevel, dstPgIdx);
     bool const srcIsHot = srcLevel == kHotLevel;
     bool const dstIsHot = dstLevel == kHotLevel;
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
@@ -787,6 +808,11 @@ void StorageManager::copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, Ca
 CacheTier StorageManager::cacheTier(CacheLevel level) const
 {
     return mLevels.at(level).cacheTier;
+}
+
+CacheTier StorageManager::cacheTier(CacheLevel level, PoolGroupIndex pgIdx) const
+{
+    return mLevels.at(level).storage->cacheTier(pgIdx);
 }
 
 void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
@@ -1411,12 +1437,10 @@ LifeCycle const& StorageManager::getLifeCycle(LifeCycleId lc) const
 
 CacheLevel StorageManager::residencyLevel(LifeCycleId lc) const
 {
-    auto const* attention = std::get_if<AttnLifeCycle>(&getLifeCycle(lc));
-    if (attention != nullptr && attention->isSparse && kSparseHistoryLevel < numCacheLevels()
-        && cacheTier(kSparseHistoryLevel) == CacheTier::HOST_MEM)
-    {
-        return kSparseHistoryLevel;
-    }
+    // Every life cycle resides at the hot level, sparse or not. A sparse one's hot pool
+    // group is host memory, which is a property of the allocation rather than of the level,
+    // so nothing here has to know about it.
+    (void) lc;
     return kHotLevel;
 }
 

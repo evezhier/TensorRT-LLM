@@ -71,9 +71,9 @@ struct SparseCacheView
     int32_t maxFlushUnits = 0;
     int32_t maxFlushBlocks = 0;
 
-    //! [numBuffers] byte offset of each buffer within a cold page. A lookup rather than
-    //! arithmetic: the cold layout is the codec's concat order, not this cache's choice.
-    uint32_t* hostBufferOffset = nullptr;
+    //! [numBuffers] byte offset of each buffer within its hot slot. A lookup only because
+    //! the kernel walks buffers; the value is BufferAttr's own offset, so no codec enters.
+    uint32_t* pageBufferOffset = nullptr;
 
     //! [numBuffers] the layer each buffer belongs to, i.e. which metadata row carries its
     //! residency and its work list. The copy walks buffers but reads a list produced per
@@ -108,7 +108,7 @@ struct SparseCacheInit
     //! per buffer, laid out buffer-major.
     int32_t cellsPerBuffer = 0;
     //! [numBuffers] byte offset of each buffer within a cold page.
-    std::vector<uint32_t> hostBufferOffset;
+    std::vector<uint32_t> pageBufferOffset;
     //! [numBuffers] the layer each buffer belongs to, non-decreasing.
     std::vector<int32_t> bufferLayer;
     //! Bounds on one watermark move, from the in-flight headroom the reservation leaves.

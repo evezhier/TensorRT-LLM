@@ -418,8 +418,8 @@ public:
     //! into and which work list to read.
     [[nodiscard]] SparseUnitCopyArgs sparseCopyTemplate(LifeCycleId lifeCycle) const;
 
-    //! Byte offset of each sparse buffer within a cold page, in cache order.
-    [[nodiscard]] std::vector<uint32_t> sparseColdPageOffsets(LifeCycleId lifeCycle) const;
+    //! Byte offset of each sparse buffer within its hot slot, in cache order.
+    [[nodiscard]] std::vector<uint32_t> sparsePageBufferOffsets(LifeCycleId lifeCycle) const;
 
     //! The metadata row each sparse buffer reads, in cache order: a dense layer index
     //! within the life cycle, counting only layers that contribute a cached buffer.

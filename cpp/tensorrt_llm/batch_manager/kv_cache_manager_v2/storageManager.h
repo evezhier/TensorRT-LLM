@@ -32,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -99,8 +100,8 @@ class CacheLevelManager
 public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-        PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
+        std::set<PoolGroupIndex> const& hostBacked = {});
 
     // Compute pool size granularity for a given cache tier and quota.
     static size_t cacheTierGranularity(CacheTier tier, size_t quota);
@@ -311,6 +312,11 @@ public:
 
     // Cache tier for a given level.
     CacheTier cacheTier(CacheLevel level) const;
+
+    //! What one pool group's memory actually is. Differs from cacheTier(level) only at the
+    //! hot level, where a sparse life cycle's pool group is host memory. Migration dispatches
+    //! on this, since it chooses the copy direction.
+    CacheTier cacheTier(CacheLevel level, PoolGroupIndex pgIdx) const;
 
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over

@@ -324,7 +324,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     // Non-null only to mark the row live; the copy itself never reads the metadata arrays.
     view.residentOrdinal = reinterpret_cast<int32_t*>(table.get());
     view.baseCell = baseCell;
-    view.hostBufferOffset = reinterpret_cast<uint32_t*>(coldOffsets.get());
+    view.pageBufferOffset = reinterpret_cast<uint32_t*>(coldOffsets.get());
     view.bufferLayer = reinterpret_cast<int32_t*>(bufferLayerBuf.get());
     CUdeviceptr viewPtr = 0;
     cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView)));

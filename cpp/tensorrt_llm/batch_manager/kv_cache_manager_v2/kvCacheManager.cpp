@@ -248,18 +248,14 @@ std::vector<int32_t> KvCacheManager::sparseBufferLayers(LifeCycleId lifeCycle) c
     return layers;
 }
 
-std::vector<uint32_t> KvCacheManager::sparseColdPageOffsets(LifeCycleId lifeCycle) const
+std::vector<uint32_t> KvCacheManager::sparsePageBufferOffsets(LifeCycleId lifeCycle) const
 {
-    PoolGroupIndex const hotPg = mStorage->getPoolGroupIndex(kHotLevel, lifeCycle);
-    // The cold page concatenates the hot pools in pool order, and the default codec moves
-    // slot bytes verbatim, so a buffer sits at its pool's offset plus its offset in the slot.
-    auto const coldLayout = queryDefaultColdPageLayout(mStorage->slotSize(hotPg));
-
+    // Where a buffer sits inside its hot slot -- arithmetic this package owns, rather than
+    // the codec's concat order. The fetch reads hot pages, so the codec never enters.
     std::vector<uint32_t> offsets;
     for (auto const& id : sparseBufferIds(lifeCycle))
     {
-        auto const attr = bufferAttr(id.layerId, id.role);
-        offsets.push_back(static_cast<uint32_t>(coldLayout.poolOffset.at(attr.poolIndex) + attr.offset));
+        offsets.push_back(static_cast<uint32_t>(bufferAttr(id.layerId, id.role).offset));
     }
     return offsets;
 }
@@ -299,7 +295,7 @@ void KvCacheManager::_buildSparseArenas()
         shape.numBuffers = sparseCacheBufferCount(lcId);
         shape.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lcId);
         shape.entriesPerLayer = shape.cellsPerBuffer * sparseCacheExpansion(lcId);
-        shape.hostBufferOffset = sparseColdPageOffsets(lcId);
+        shape.pageBufferOffset = sparsePageBufferOffsets(lcId);
         shape.bufferLayer = sparseBufferLayers(lcId);
         shape.maxFlushUnits = sparseCacheMaxInFlightUnits(lcId);
         shape.maxFlushBlocks = divUp(shape.maxFlushUnits, sparseCacheExpansion(lcId)) + 1;
@@ -334,16 +330,15 @@ SparseUnitCopyArgs KvCacheManager::sparseCopyTemplate(LifeCycleId lifeCycle) con
     }
 
     PoolGroupIndex const hotPg = mStorage->getPoolGroupIndex(kHotLevel, lifeCycle);
-    PoolGroupIndex const coldPg = mStorage->getPoolGroupIndex(kSparseHistoryLevel, lifeCycle);
     auto const hotSlotBytes = mStorage->slotSize(hotPg).at(first.poolIndex);
-    auto const coldSlotBytes = mStorage->slotSize(coldPg).at(PoolIndex{0});
 
     SparseUnitCopyArgs args;
-    // The cold tier is one pool of whole cold pages, so slot 0 of pool 0 is its base. The
-    // host tier is registered device-mapped, so the kernel can address it directly.
-    args.hostBase = static_cast<CUdeviceptr>(
-        std::get<MemAddress>(mStorage->slotAddress(kSparseHistoryLevel, coldPg, SlotId{0}, PoolIndex{0})));
-    args.hostPageStride = coldSlotBytes;
+    // The page side is the life cycle's own hot pool, in ordinary slot layout. It is host
+    // memory, registered device-mapped, so the kernel addresses it directly; but its layout
+    // is KVCM2's rather than a codec's, which is what keeps the fetch independent of
+    // whatever a codec does on the way to level 1.
+    args.hostBase = static_cast<CUdeviceptr>(mStorage->getMemPoolBaseAddress(hotPg, first.poolIndex));
+    args.hostPageStride = hotSlotBytes;
     // The hot side is the cache arena, not a storage pool: a cell is the only GPU-resident
     // copy a kernel can read, and the arena is where cells live.
     args.deviceBase = mSparseArenas[lifeCycle].base();

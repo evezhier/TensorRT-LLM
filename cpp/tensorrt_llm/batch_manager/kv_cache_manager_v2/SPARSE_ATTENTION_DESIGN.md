@@ -721,40 +721,56 @@ bits before multiplying by the page stride. MSA already does this
 The design above is the target. The code is partway there, and this section is the only
 place that distinguishes the two; everything else describes the target as settled.
 
-**Where the code differs today.** Sparse history resides at a dedicated cold level
-(`kSparseHistoryLevel`) rather than on a host-backed hot pool group, and the fetch reads cold
-pages through `queryDefaultColdPageLayout`'s concat order. Cells already come from a
-dedicated arena.
+**Where the code stands.** Steps 1 to 3 are done: cells come from a per-life-cycle arena,
+a sparse life cycle's hot pool group is host memory, `residencyLevel`'s sparse branch and
+`kSparseHistoryLevel` are gone, and the fetch reads hot pages at `BufferAttr::offset`.
+Compression (step 4) is unblocked but not turned on.
 
-**Why it is moving.** The codec is not the level 0 -> level 1 transform; it is the
+**Why it moved.** The codec is not the level 0 -> level 1 transform; it is the
 **hot <-> cold** transform. `StorageManager::migrate` computes
 `srcIsHot = srcLevel == kHotLevel` and performs a plain byte copy when source and
 destination are on the same side, invoking the codec only across that boundary. History
-locked at a cold level never crosses it, so no codec ever runs on it — compression was not
-deferred, it was unreachable. Two cold levels would not help for the same reason.
-
-**Steps.** Each ends with the suite green; the cache must be rehomed before the pool group
-flips, or it silently reserves host memory and stops being a GPU cache.
+locked at a cold level never crossed it, so no codec ever ran on it -- compression was not
+deferred, it was unreachable. Two cold levels would not have helped, for the same reason.
 
 | # | step | state |
 | --- | --- | --- |
-| 1 | Cells come from a dedicated GPU arena owned by `KvCacheManager`, leased per request. Sub-slot addressing and `cachePages` collapse to flat cell arithmetic | **done** |
-| 2 | Sparse life cycle's level-0 pool group is host-backed; `residencyLevel`'s sparse branch and `kSparseHistoryLevel` retire | pending |
-| 3 | Fetch reads hot pages at `BufferAttr::offset`; `_sparseColdPageOffsets` and `hostBufferOffset` go | pending |
+| 1 | Cells from a dedicated GPU arena, leased per request; flat cell arithmetic | **done** |
+| 2 | Sparse hot pool group backed by host memory; `residencyLevel` sparse branch retired | **done** |
+| 3 | Fetch reads hot pages at `BufferAttr::offset`; cold-page offset machinery gone | **done** |
 | 4 | Compression, through the existing codec, with nothing sparse-specific | pending |
 
+Memory kind is a property of the **pool group**, not the level: `PoolGroupBase::cacheTier()`
+is virtual, `GpuCacheLevelStorage` builds a `HostPoolGroup` for the indices it is told are
+host-backed, and `migrate` dispatches the copy engine on `cacheTier(level, poolGroup)`. This
+is well defined because pool-group formation already keys on `isSparse`
+(`storage/config.cpp`), so a group is uniformly sparse or dense.
+
 Step 1 deleted sub-slot addressing rather than adapting it: it existed only because the
-storage allocator deals in coalesced slots, and carrying it into an arena that has none would
-have preserved a workaround for a constraint that no longer exists. `SparseCacheView` lost
-`cachePages` and `numPages` and gained `baseCell`; the copy and index kernels each lost a page
-lookup; and the arena pre-allocates the per-request metadata, so a resume no longer pairs a
-device allocation with a free.
+storage allocator deals in coalesced slots, and carrying it into an arena that has none
+would have preserved a workaround for a constraint that no longer exists. `SparseCacheView`
+lost `cachePages` and `numPages` and gained `baseCell`; the copy and index kernels each lost
+a page lookup; and the arena pre-allocates the per-request metadata, so a resume no longer
+pairs a device allocation with a free.
 
 The arena is sized from `constraints`, which already declares the batch shape `Batch` derives
 its rows from. That makes the cells a static reservation rather than an on-demand draw on the
 shared pool -- a change in kind, and the one the *Sizing* section assumed all along.
 
-**Hazard to verify at step 2.** Moving sparse pages to the hot level makes them eligible for
+**Open: the hot level has one quota for two media.** `computeSlotCountForLevel` divides the
+`GpuCacheTierConfig` quota among the hot level's pool groups by ratio, and a host-backed
+group now draws from that same budget. Three consequences, none yet addressed: sparse
+history is capped at a GPU-sized number, which is the opposite of the point; the GPU bytes
+budgeted to it are never allocated on the device, so the GPU is under-used; and the adaptive
+ratio logic trades GPU bytes against host bytes as though they were fungible. The host-backed
+portion needs a budget of its own before this is deployable.
+
+**Open: coverage.** No test asserts bytes end to end through a fetch *and* a write-back
+against real hot pages. The kernels are covered by white-box hooks against synthetic pools,
+and the integration tests assert residency and index shape rather than content, so a wrong
+base address on the page side would not be caught.
+
+**Hazard still to verify.** Moving sparse pages to the hot level makes them eligible for
 demotion and eviction for the first time. A page encoded while the cache holds a cell copied
 from it leaves that cell valid — it is a snapshot — but a later fetch of the same unit would
 read a page that has since been encoded. `PageLock` is expected to prevent this, since a live

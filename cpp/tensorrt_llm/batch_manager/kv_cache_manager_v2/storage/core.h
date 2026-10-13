@@ -29,6 +29,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -327,6 +328,14 @@ public:
     explicit PoolGroupBase(SlotCount numSlots);
     virtual ~PoolGroupBase();
 
+    //! What this pool group's memory actually is.
+    //!
+    //! A property of the pool group rather than of its level, because a sparse life cycle's
+    //! hot pool group is host memory while a dense one at the same level is device memory.
+    //! Pool groups never mix the two: formation keys on `isSparse`, so a group is uniformly
+    //! one or the other.
+    [[nodiscard]] virtual CacheTier cacheTier() const noexcept = 0;
+
     PoolIndex numPools() const noexcept
     {
         return mPools.size();
@@ -396,6 +405,11 @@ class GpuPoolGroup : public PoolGroupBase
 public:
     GpuPoolGroup(
         SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
+    }
 };
 
 class HostPoolGroup : public PoolGroupBase
@@ -404,12 +418,22 @@ public:
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
 
     [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
 };
 
 class DiskPoolGroup : public PoolGroupBase
 {
 public:
     DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::DISK;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -422,6 +446,13 @@ public:
     virtual ~CacheLevelStorage() = default;
 
     virtual CacheTier cacheTier() const noexcept = 0;
+
+    //! What one pool group's memory actually is. Differs from cacheTier() only at the hot
+    //! level, where a sparse life cycle's pool group is host memory.
+    [[nodiscard]] CacheTier cacheTier(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->cacheTier();
+    }
 
     PoolGroupIndex numPoolGroups() const noexcept
     {
@@ -555,8 +586,13 @@ protected:
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
+    //! `hostBacked` names the pool groups to allocate from host memory instead. They are
+    //! the sparse life cycles': their history is too large for device memory and is read
+    //! through the sparse cache rather than directly, so they live on the hot level as
+    //! ordinary pages that merely happen to be host-resident.
     GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
+        std::set<PoolGroupIndex> const& hostBacked = {});
 
     CacheTier cacheTier() const noexcept override
     {
@@ -612,6 +648,6 @@ private:
 // Factory: create appropriate CacheLevelStorage for a given tier config.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, std::set<PoolGroupIndex> const& hostBacked = {});
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -640,13 +640,22 @@ TypedVec<PoolIndex, Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx
 // ---------------------------------------------------------------------------
 
 GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
+    std::set<PoolGroupIndex> const& hostBacked)
     : mPhysMemAllocator(physMemAllocator)
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
+        if (hostBacked.count(pgIdx) != 0)
+        {
+            // A sparse life cycle's pages: ordinary hot pages in host memory, device-mapped
+            // so the sparse cache can fill from them without a host round trip.
+            mPoolGroups.push_back(
+                std::make_unique<HostPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList()));
+            continue;
+        }
         mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
             slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator));
     }
@@ -691,7 +700,7 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator)
+    PooledPhysMemAllocator* gpuPhysMemAllocator, std::set<PoolGroupIndex> const& hostBacked)
 {
     TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(
@@ -700,7 +709,8 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             using T = std::decay_t<decltype(cfg)>;
             if constexpr (std::is_same_v<T, GpuCacheTierConfig>)
             {
-                return std::make_unique<GpuCacheLevelStorage>(slotDescList, slotCountList, *gpuPhysMemAllocator);
+                return std::make_unique<GpuCacheLevelStorage>(
+                    slotDescList, slotCountList, *gpuPhysMemAllocator, hostBacked);
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {

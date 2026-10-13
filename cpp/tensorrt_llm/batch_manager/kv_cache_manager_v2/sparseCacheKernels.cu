@@ -452,7 +452,7 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
 
     // The cold side is reached by ordinal through the page table, the hot side by entry
     // index through the cache page list. Direction only chooses which one is read.
-    auto* cold = reinterpret_cast<char*>(args.hostBase + hostPage * args.hostPageStride + view.hostBufferOffset[buffer]
+    auto* cold = reinterpret_cast<char*>(args.hostBase + hostPage * args.hostPageStride + view.pageBufferOffset[buffer]
         + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
     auto* hot = reinterpret_cast<char*>(
         args.deviceBase + cell * args.bufferBytes + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);

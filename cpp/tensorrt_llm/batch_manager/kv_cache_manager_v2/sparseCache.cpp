@@ -93,7 +93,7 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBy
     {
         throw std::invalid_argument("SparseCellArena requires a positive cell size and lease count");
     }
-    if (shape.hostBufferOffset.size() != static_cast<size_t>(shape.numBuffers))
+    if (shape.pageBufferOffset.size() != static_cast<size_t>(shape.numBuffers))
     {
         throw std::invalid_argument("SparseCellArena requires one cold-page offset per buffer");
     }
@@ -140,8 +140,8 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBy
     mIdentity = reinterpret_cast<int32_t*>(shared + offsetBytes + layerBytes);
     mMetadataBase = shared + sharedBytes;
 
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedOffset), mShape.hostBufferOffset.data(),
-        sizeof(uint32_t) * mShape.hostBufferOffset.size()));
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedOffset), mShape.pageBufferOffset.data(),
+        sizeof(uint32_t) * mShape.pageBufferOffset.size()));
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedLayer), mShape.bufferLayer.data(),
         sizeof(int32_t) * mShape.bufferLayer.size()));
 
@@ -192,7 +192,7 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     view.maxFlushUnits = mShape.maxFlushUnits;
     view.maxFlushBlocks = mShape.maxFlushBlocks;
     view.baseCell = index * mCellsPerLease;
-    view.hostBufferOffset = mSharedOffset;
+    view.pageBufferOffset = mSharedOffset;
     view.bufferLayer = mSharedLayer;
     view.residentOrdinal = carve(layout.ordinal);
     view.lruOrder = carve(layout.lru);
