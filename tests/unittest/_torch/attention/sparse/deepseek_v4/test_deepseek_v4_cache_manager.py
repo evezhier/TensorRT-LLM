@@ -42,6 +42,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_q
 )
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    CUDA_GRAPH_DUMMY_REQUEST_ID,
     BlockReusePolicy,
     KVCacheManagerV2,
 )
@@ -60,7 +61,10 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
+    AttentionLayerConfig,
     BatchDesc,
+    BufferConfig,
+    BufferId,
     GpuCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
@@ -78,18 +82,49 @@ _RequestCache = Dict[
 
 
 class _SparseRuntime:
-    """Test double for the declared APIs; no sparse transfer implementation."""
+    """Expose native buffer configuration without allocating a cache manager."""
 
-    def __init__(self):
+    def __init__(self, tokens_per_block=128):
         self.groups = {41: 13, 19: 13, 42: 9, 20: 9, 43: 5, 21: 5, 7: 14}
         self.sparse = {41, 19}
-        self.converters = {
-            41: SimpleNamespace(scale=5, expansion=1, layer_offset=17),
-            19: SimpleNamespace(scale=5, expansion=1, layer_offset=23),
-        }
-        self.pool_bases = {41: 100000, 19: 100000}
-        self.calls = []
-        self.uploads = []
+        self.expansions = {41: tokens_per_block // 4, 19: tokens_per_block // 4}
+        self.pool_indices = {}
+        self.layers = {}
+        for layer_id in (41, 19):
+            self.configure_buffers(layer_id, [(DeepseekV4AttentionType.COMPRESS.role, 0)])
+
+    def configure_buffers(self, layer_id, roles_and_pools):
+        self.layers[layer_id] = AttentionLayerConfig(
+            layer_id=layer_id,
+            buffers=[
+                BufferConfig(
+                    role=role,
+                    size=1024,
+                    tokens_per_block_override=4,
+                    is_sparse=True,
+                    num_selected_blocks=8,
+                    max_cached_units=16,
+                )
+                for role, _ in roles_and_pools
+            ],
+        )
+        for role, pool in roles_and_pools:
+            self.pool_indices[BufferId(layer_id, role)] = pool
+
+    @property
+    def init_config(self):
+        return SimpleNamespace(layers=list(self.layers.values()))
+
+    @property
+    def pool_group_descs(self):
+        count = max(self.pool_indices.values()) + 1
+        coalesced = [SimpleNamespace(buffer_ids=[]) for _ in range(count)]
+        # Storage's buffer order need not be declaration order. The adapter
+        # must use this only to locate the pool, then preserve declaration order.
+        for buffer_id, pool in reversed(list(self.pool_indices.items())):
+            coalesced[pool].buffer_ids.append(buffer_id)
+        variant = SimpleNamespace(coalesced_buffers=coalesced)
+        return [SimpleNamespace(slot_desc=SimpleNamespace(variants=[variant]))]
 
     def is_sparse(self, layer_id, role):
         return layer_id in self.sparse
@@ -97,34 +132,18 @@ class _SparseRuntime:
     def get_layer_group_id(self, layer_id):
         return self.groups[layer_id]
 
-    def get_page_index_converter(self, layer_id, role):
-        return self.converters[layer_id]
-
-    def get_mem_pool_base_address(self, layer_id, role, index_mode):
-        if index_mode == PageIndexMode.SHARED:
-            return self.pool_bases[layer_id] + self.converters[layer_id].layer_offset * 4096
-        assert index_mode == PageIndexMode.PER_LAYER
-        return self.pool_bases[layer_id]
-
-    def get_page_index_upper_bound(self, layer_id, role):
-        return 320 - self.converters[layer_id].layer_offset
-
-    def copy_base_page_indices_to_device(self, kv_caches, layer_group_id, out, stream):
-        assert stream == torch.cuda.current_stream().cuda_stream
-        assert out.shape[0] == len(kv_caches)
-        self.calls.append(
-            ([cache.id for cache in kv_caches], layer_group_id, out.data_ptr(), stream)
-        )
-        table = torch.full(out.shape, -1, dtype=torch.int32, pin_memory=True)
-        for row, cache in enumerate(kv_caches):
-            table[row, : cache.num_blocks] = torch.tensor(cache.pages, dtype=torch.int32)
-        self.uploads.append(table)  # Keep each immutable pinned source alive through its upload.
-        out.copy_(table, non_blocking=True)
+    def get_sparse_cache_expansion(self, layer_id):
+        return self.expansions[layer_id]
 
 
 def _manager(tokens_per_block=128):
     manager = object.__new__(DeepseekV4CacheManager)
     manager._enable_kv_cache_offload = True
+    manager._sparse_batch = None
+    manager._sparse_batch_members = {}
+    manager._sparse_batch_prepared = False
+    manager.max_batch_size = 4
+    manager._sparse_offload_topk = 8
     manager.max_beam_width = 1
     manager.max_draft_len = 0
     manager.max_total_draft_tokens = 0
@@ -147,7 +166,7 @@ def _manager(tokens_per_block=128):
         (4, DeepseekV4AttentionType.SWA): 21,
         (3, DeepseekV4AttentionType.COMPRESS): 7,
     }
-    manager.impl = _SparseRuntime()
+    manager.impl = _SparseRuntime(tokens_per_block)
     manager.kv_cache_map = {
         10: SimpleNamespace(id=10, history_length=tokens_per_block - 1, pages=[0, 9, -1]),
         20: SimpleNamespace(id=20, history_length=tokens_per_block, pages=[0, 0, 12]),
@@ -161,44 +180,64 @@ def _manager(tokens_per_block=128):
 
 
 @pytest.mark.cpu_only
-def test_sparse_offload_descriptors_use_runtime_ids():
-    manager = _manager()
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+def test_sparse_offload_descriptors_use_runtime_ids(tokens_per_block):
+    manager = _manager(tokens_per_block)
     descriptors = manager.get_sparse_offload_descriptors()
     assert list(descriptors) == [2, 4]
-    assert [d.buffer_id.layer_id for d in descriptors.values()] == [41, 19]
+    assert [d.buffer_ids[0].layer_id for d in descriptors.values()] == [41, 19]
     for descriptor in descriptors.values():
-        assert descriptor.buffer_id.role == DeepseekV4AttentionType.COMPRESS.role
+        assert descriptor.buffer_ids[0].role == DeepseekV4AttentionType.COMPRESS.role
         assert descriptor.group_id == 13
-        assert descriptor.page_scale == 5
+        assert descriptor.unit_tokens == 4
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "invalid",
-    ["group", "scale", "pool", "expansion", "ordinary", "not_sparse", "nvfp4", "footer", "api"],
+    ["expansion", "ordinary_group", "not_sparse", "unconfigured", "width", "mixed", "footer"],
 )
 def test_sparse_offload_rejects_incompatible_layout(invalid):
     manager = _manager()
-    if invalid == "group":
-        manager.impl.groups[19] = 100
-    elif invalid == "scale":
-        manager.impl.converters[19].scale = 3
-    elif invalid == "pool":
-        manager.impl.pool_bases[19] += 128
-    elif invalid == "expansion":
-        manager.impl.converters[41].expansion = 2
-    elif invalid == "ordinary":
+    if invalid == "expansion":
+        manager.impl.expansions[41] = 1
+    elif invalid == "ordinary_group":
         manager.impl.groups[42] = 13
     elif invalid == "not_sparse":
         manager.impl.sparse.remove(41)
-    elif invalid == "nvfp4":
-        manager._use_nvfp4_compress = True
     elif invalid == "footer":
         manager.use_fp8_ds_mla = True
     else:
-        manager.impl = SimpleNamespace()
+        config = manager.impl.layers[41]
+        buffers = config.buffers
+        if invalid == "unconfigured":
+            buffers[0].max_cached_units = 0
+        elif invalid == "width":
+            buffers[0].num_selected_blocks += 1
+        else:
+            buffers.append(BufferConfig(role="ordinary", size=16))
+        config.buffers = buffers
     with pytest.raises((ValueError, NotImplementedError)):
         manager.get_sparse_offload_descriptors()
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_descriptors_include_all_roles_in_native_order():
+    manager = _manager()
+    manager._use_nvfp4_compress = True
+    main_role = DeepseekV4AttentionType.COMPRESS.role
+    scale_role = deepseek_v4_cache.COMPRESS_BLOCK_SCALE_ROLE
+    manager.impl.configure_buffers(
+        41, [(main_role, 1), (scale_role, 0), ("scale_padding", 0), ("data_padding", 1)]
+    )
+    descriptor = manager.get_sparse_offload_descriptors()[2]
+    assert [buffer.role for buffer in descriptor.buffer_ids] == [
+        scale_role,
+        "scale_padding",
+        main_role,
+        "data_padding",
+    ]
+    assert all(buffer.layer_id == 41 for buffer in descriptor.buffer_ids)
 
 
 class _HistoryCache:
@@ -307,19 +346,13 @@ def test_history_update_rejects_failures_and_skips_inactive(context: bool, probl
 
 
 @pytest.mark.cpu_only
-def test_descriptor_uses_common_pool_origin_and_layer_relative_bound() -> None:
+def test_sparse_descriptors_allow_different_groups_and_pool_geometry() -> None:
     manager = _manager()
+    manager.impl.groups[19] = 100
+    manager.impl.configure_buffers(19, [(DeepseekV4AttentionType.COMPRESS.role, 1)])
     descriptors = manager.get_sparse_offload_descriptors()
-    first, second = descriptors[2], descriptors[4]
-    assert first.page_index_upper_bound == 303
-    assert second.page_index_upper_bound == 297
-    role = first.buffer_id.role
-    assert manager.impl.get_mem_pool_base_address(
-        41, role, PageIndexMode.SHARED
-    ) != manager.impl.get_mem_pool_base_address(19, role, PageIndexMode.SHARED)
-    manager.impl.get_page_index_upper_bound = Mock(return_value=0)
-    with pytest.raises(ValueError, match="physical-page bound"):
-        manager.get_sparse_offload_descriptors()
+    assert descriptors[2].group_id == 13
+    assert descriptors[4].group_id == 100
 
 
 @pytest.mark.cpu_only
@@ -331,16 +364,318 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
     manager = _manager()
     manager._enable_kv_cache_offload = enabled
     batch = SimpleNamespace(
-        context_requests=[SimpleNamespace(is_first_context_chunk=first, is_last_context_chunk=last)]
+        context_requests=[
+            SimpleNamespace(
+                py_request_id=20, is_first_context_chunk=first, is_last_context_chunk=last
+            )
+        ],
+        generation_requests=[],
     )
-    with patch.object(KVCacheManagerV2, "prepare_resources") as prepare:
+    with (
+        patch.object(KVCacheManagerV2, "prepare_resources") as prepare,
+        patch.object(manager, "_prepare_sparse_batch") as publish,
+    ):
         if enabled and not (first and last):
             with pytest.raises(NotImplementedError, match="chunked prefill"):
                 manager.prepare_resources(batch)
             prepare.assert_not_called()
+            publish.assert_not_called()
         else:
             manager.prepare_resources(batch)
             prepare.assert_called_once_with(batch)
+            if enabled:
+                publish.assert_called_once_with([20])
+            else:
+                publish.assert_not_called()
+
+
+class _SchedulingBatch:
+    """Model native Batch's exclusive page-index ownership and published snapshots."""
+
+    def __init__(self, manager, max_batch_size, max_blocks_per_seq):
+        self.max_batch_size = max_batch_size
+        self.max_blocks_per_seq = max_blocks_per_seq
+        self.rows = [None] * max_batch_size
+        self.snapshots = []
+        self.upload_pending = False
+
+    def add_kv_cache(self, cache):
+        assert not self.upload_pending
+        assert cache.page_index_owner == "runtime"
+        row = self.rows.index(None)
+        self.rows[row] = cache
+        cache.page_index_owner = "batch"
+        return row
+
+    def remove_kv_cache(self, cache):
+        assert not self.upload_pending
+        assert cache.page_index_owner == "batch"
+        self.rows[self.rows.index(cache)] = None
+        cache.page_index_owner = "cache"
+
+    def publish(self, stream):
+        assert not self.upload_pending
+        self.snapshots.append(
+            [
+                (cache.id, cache.history_length, cache.capacity, tuple(cache.pages))
+                if cache is not None
+                else (None, 0, 0, (BAD_PAGE_INDEX,) * self.max_blocks_per_seq)
+                for cache in self.rows
+            ]
+        )
+        self.upload_pending = True
+
+    def wait_published(self):
+        self.upload_pending = False
+
+
+@pytest.fixture
+def sparse_scheduling_case():
+    manager, cache, request, _ = _history_case()
+    manager.max_batch_size = 4
+    cache.page_index_owner = "runtime"
+    second = _HistoryCache(manager.tokens_per_block, manager._stream.cuda_stream)
+    second.id = 10
+    second.history_length = manager.tokens_per_block
+    second.page_index_owner = "runtime"
+    manager.kv_cache_map[10] = second
+    request.is_first_context_chunk = request.is_last_context_chunk = True
+    other_request = SimpleNamespace(py_request_id=10)
+    scheduled = SimpleNamespace(context_requests=[], generation_requests=[request, other_request])
+
+    def restore(request_id, request_cache):
+        assert request_cache.page_index_owner == "cache"
+        request_cache.page_index_owner = "runtime"
+
+    with (
+        patch.object(deepseek_v4_cache, "Batch", side_effect=_SchedulingBatch) as create_batch,
+        patch.object(KVCacheManagerV2, "prepare_resources"),
+        patch.object(manager, "_set_page_index_bufs", side_effect=restore) as restore_buffers,
+        patch("torch.cuda.current_stream", return_value=Mock(cuda_stream=23)) as current_stream,
+        patch("torch.cuda.is_current_stream_capturing", return_value=False) as capturing,
+    ):
+        yield SimpleNamespace(
+            manager=manager,
+            cache=cache,
+            request=request,
+            scheduled=scheduled,
+            create_batch=create_batch,
+            restore_buffers=restore_buffers,
+            current_stream=current_stream,
+            capturing=capturing,
+        )
+
+
+@pytest.mark.cpu_only
+def test_sparse_batch_publishes_schedule_and_reuses_allocation(sparse_scheduling_case):
+    case = sparse_scheduling_case
+    manager = case.manager
+    manager.prepare_resources(case.scheduled)
+    batch = manager.get_sparse_batch([20, 10, CUDA_GRAPH_DUMMY_REQUEST_ID])
+    assert [row[0] for row in batch.snapshots[-1]] == [20, 10, None, None]
+    assert batch.snapshots[-1][0][1:] == (0, 384, (0, 7, 8))
+    assert batch.snapshots[-1][1][1:] == (128, 384, (0, 7, 8))
+    assert batch.snapshots[-1][2] == (None, 0, 0, (-1,) * manager.max_blocks_per_seq)
+    case.current_stream.return_value.wait_stream.assert_called_with(manager._stream)
+
+    case.scheduled.generation_requests.reverse()
+    manager.prepare_resources(case.scheduled)
+    assert manager.get_sparse_batch([10, 20]) is batch
+    assert [row[0] for row in batch.snapshots[-1]] == [10, 20, None, None]
+    case.create_batch.assert_called_once_with(manager.impl, max_batch_size=4, max_blocks_per_seq=6)
+    assert case.restore_buffers.call_count == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("warmup", [False, True])
+def test_sparse_batch_metadata_joins_scheduler_or_prepares_warmup(sparse_scheduling_case, warmup):
+    case = sparse_scheduling_case
+    if not warmup:
+        case.manager.prepare_resources(case.scheduled)
+    case.manager.prepare_sparse_batch([20, 10, CUDA_GRAPH_DUMMY_REQUEST_ID])
+    batch = case.manager.get_sparse_batch([20, 10])
+    case.manager.prepare_sparse_batch([20, 10])
+    assert len(batch.snapshots) == 1
+    assert [row[0] for row in batch.snapshots[-1]] == [20, 10, None, None]
+    case.current_stream.return_value.wait_stream.assert_called_with(case.manager._stream)
+    with pytest.raises(ValueError, match="request order"):
+        case.manager.prepare_sparse_batch([10, 20])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dummy_count", [0, 1, 4])
+def test_sparse_batch_clears_rows_for_empty_or_padded_schedule(sparse_scheduling_case, dummy_count):
+    case = sparse_scheduling_case
+    case.manager.prepare_resources(case.scheduled)
+    case.scheduled.generation_requests = [
+        SimpleNamespace(py_request_id=CUDA_GRAPH_DUMMY_REQUEST_ID)
+    ] * dummy_count
+    case.manager.prepare_resources(case.scheduled)
+    batch = case.manager.get_sparse_batch([CUDA_GRAPH_DUMMY_REQUEST_ID] * dummy_count)
+    assert all(row == (None, 0, 0, (-1,) * 6) for row in batch.snapshots[-1])
+    assert all(cache.page_index_owner == "runtime" for cache in case.manager.kv_cache_map.values())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "missing",
+        "inactive",
+        "beam",
+        "stream",
+        "history",
+        "blocks",
+        "duplicate",
+        "padding",
+        "size",
+        "capture",
+    ],
+)
+def test_sparse_batch_rejects_invalid_schedule_before_binding(sparse_scheduling_case, problem):
+    case = sparse_scheduling_case
+    if problem == "missing":
+        del case.manager.kv_cache_map[20]
+    elif problem == "inactive":
+        case.cache.is_active = False
+    elif problem == "beam":
+        case.cache.beam_width = 2
+    elif problem == "stream":
+        case.cache.cuda_stream += 1
+    elif problem == "history":
+        case.cache.history_length = case.cache.capacity + 1
+    elif problem == "blocks":
+        case.cache.num_blocks = case.manager.max_blocks_per_seq + 1
+    elif problem == "duplicate":
+        case.scheduled.generation_requests = [case.request, case.request]
+    elif problem == "padding":
+        case.scheduled.generation_requests.insert(
+            0, SimpleNamespace(py_request_id=CUDA_GRAPH_DUMMY_REQUEST_ID)
+        )
+    elif problem == "size":
+        case.manager.max_batch_size = 1
+    else:
+        case.capturing.return_value = True
+    with pytest.raises((ValueError, RuntimeError)):
+        case.manager.prepare_resources(case.scheduled)
+    case.create_batch.assert_not_called()
+    case.restore_buffers.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "request_ids", [[10, 20], [20], [20, 10, 30], [20, -1, 10], [20, 10] + [-1] * 3]
+)
+def test_sparse_batch_checks_consumer_row_order(sparse_scheduling_case, request_ids):
+    case = sparse_scheduling_case
+    case.manager.prepare_resources(case.scheduled)
+    with pytest.raises(ValueError, match="request order"):
+        case.manager.get_sparse_batch(request_ids)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failure", ["add", "publish"])
+def test_sparse_batch_restores_ownership_after_publication_failure(sparse_scheduling_case, failure):
+    case = sparse_scheduling_case
+    case.manager.prepare_resources(case.scheduled)
+    batch = case.manager.get_sparse_batch([20, 10])
+    case.manager._release_sparse_batch()
+    if failure == "add":
+        add = batch.add_kv_cache
+
+        def fail_second(cache):
+            if cache.id == 10:
+                raise RuntimeError("injected add failure")
+            return add(cache)
+
+        batch.add_kv_cache = fail_second
+    else:
+        batch.publish = Mock(side_effect=RuntimeError("injected publish failure"))
+    with pytest.raises(RuntimeError, match="injected"):
+        case.manager.prepare_resources(case.scheduled)
+    assert batch.rows == [None] * 4
+    assert all(cache.page_index_owner == "runtime" for cache in case.manager.kv_cache_map.values())
+    with pytest.raises(RuntimeError, match="must be prepared"):
+        case.manager.get_sparse_batch([20, 10])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "update_context_resources",
+        "update_resources",
+        "suspend_request",
+        "free_resources",
+        "release_index_slot",
+        "shutdown",
+    ],
+)
+def test_sparse_batch_detaches_before_cache_lifecycle_mutations(sparse_scheduling_case, operation):
+    case = sparse_scheduling_case
+    manager = case.manager
+    manager.prepare_resources(case.scheduled)
+    batch = manager.get_sparse_batch([20, 10])
+
+    def mutate(*args):
+        assert batch.rows == [None] * 4
+        assert all(cache.page_index_owner == "runtime" for cache in manager.kv_cache_map.values())
+
+    with patch.object(KVCacheManagerV2, operation, side_effect=mutate) as parent:
+        if operation.startswith("update_"):
+            getattr(manager, operation)(case.scheduled)
+        elif operation == "release_index_slot":
+            manager.release_index_slot(20)
+        elif operation == "shutdown":
+            manager.shutdown()
+        else:
+            getattr(manager, operation)(case.request)
+        parent.assert_called_once()
+    with pytest.raises(RuntimeError, match="must be prepared"):
+        manager.get_sparse_batch([20, 10])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("context", [False, True])
+def test_sparse_batch_publishes_updated_history_on_next_step(sparse_scheduling_case, context):
+    case = sparse_scheduling_case
+    manager, cache, request = case.manager, case.cache, case.request
+    cache.history_length, cache.capacity = 7, 8
+    request.context_current_position = 8
+    request.max_beam_num_tokens = 9  # The sampled output token does not yet have KV.
+    case.scheduled.context_requests = [request] if context else []
+    case.scheduled.generation_requests = [] if context else [request]
+    manager.prepare_resources(case.scheduled)
+    batch = manager.get_sparse_batch([20])
+    assert batch.snapshots[-1][0][1:3] == (7, 8)
+
+    if context:
+        manager.update_context_resources(case.scheduled)
+    else:
+        manager.update_resources(case.scheduled)
+    assert cache.history_length == cache.capacity == 8
+    assert cache.page_index_owner == "runtime"
+    assert not batch.upload_pending
+
+    # Scheduling reserves the next input token after the completed history update.
+    assert cache.resize(9, None)
+    case.scheduled.context_requests = []
+    case.scheduled.generation_requests = [request]
+    manager.prepare_resources(case.scheduled)
+    assert manager.get_sparse_batch([20]) is batch
+    assert batch.snapshots[-1][0][1:3] == (8, 9)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("offload", [False, True])
+def test_sparse_batch_not_allocated_without_local_sparse_layers(sparse_scheduling_case, offload):
+    case = sparse_scheduling_case
+    case.manager._enable_kv_cache_offload = offload
+    if offload:
+        case.manager.pp_layers = [3]
+    case.manager.prepare_resources(case.scheduled)
+    case.create_batch.assert_not_called()
+    case.current_stream.assert_not_called()
 
 
 def _cache_config_case(
