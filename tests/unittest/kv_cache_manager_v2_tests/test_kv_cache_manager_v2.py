@@ -325,23 +325,21 @@ class TestSparseBufferConfig(unittest.TestCase):
         buffer.is_sparse = False
         self.assertTrue(copied.is_sparse)
 
-    def test_rejects_mixed_sparse_buffer_sizes_at_construction(self):
-        """The quantised shape, refused where a deployment can still act on it.
+    def test_the_quantised_shape_gives_each_pool_its_own_arena_region(self):
+        """Data and block scales differ in size, so they land in pools of their own.
 
-        Pools partition a life cycle's buffers by size and the copy addresses one pool with
-        one set of strides, so mixed sizes are unsupported. The point of catching it here is
-        that it used to surface at the first fetch -- after the deployment had constructed,
-        resumed requests and begun serving.
+        The arena mirrors the hot pool group, so an index the fetch emits is relative to the
+        region of the buffer it was emitted for -- which is why the base address is per
+        buffer rather than per life cycle.
         """
         init_cuda_once()
-        layout = SelectionUnitLayout(1, 4096, 0, 4096)
         data = BufferConfig(
             "key",
             4096,
             is_sparse=True,
             num_selected_blocks=2,
             max_cached_units=4,
-            sparse_unit_layout=layout,
+            sparse_unit_layout=SelectionUnitLayout(1, 4096, 0, 4096),
         )
         scales = BufferConfig(
             "key_scale",
@@ -357,8 +355,15 @@ class TestSparseBufferConfig(unittest.TestCase):
             constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=1024, history_length=0)] * 2)],
             layers=[AttentionLayerConfig(0, [data, scales])],
         )
-        with self.assertRaisesRegex(ValueError, "same size"):
-            KVCacheManager(config)
+        manager = KVCacheManager(config)
+        try:
+            bases = {
+                role: int(manager.get_sparse_cache_base_address(LayerId(0), role))
+                for role in ("key", "key_scale")
+            }
+            self.assertEqual(len(set(bases.values())), 2, bases)
+        finally:
+            manager.shutdown()
 
     def test_sparse_sizing_defaults_and_roundtrip(self):
         plain = BufferConfig("key", 4096)
@@ -1610,6 +1615,190 @@ class TestSparseDataPath(unittest.TestCase):
                 pages = [int(x) for x in cache.get_base_page_indices(lg)]
                 landed = ctypes.string_at(pool + pages[0] * stride, self.BUF)
                 self.assertEqual(landed, pattern, "the write-back did not reach the hot page")
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+
+class TestSparseQuantisedDataPath(unittest.TestCase):
+    """The quantised shape end to end: one layer, two buffers, two pools.
+
+    Every other sparse data-path test runs a life cycle whose buffers are alike, so one pool
+    serves them all and a single set of strides is right by accident. Here the data and its
+    block scales differ in size, so they sit in pools -- and arena regions -- of their own,
+    and the fetch is one launch per pool. A copy that used the wrong pool's cell size, slot
+    stride or region base would read or write the wrong bytes, which is what this reads back.
+    """
+
+    TPB = 128
+    DATA = 4096
+    SCALE = 128
+    SELECTED = 2
+    CELLS = 4
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @classmethod
+    def _manager(cls) -> KVCacheManager:
+        def buffer(role: str, size: int) -> BufferConfig:
+            return BufferConfig(
+                role,
+                size,
+                is_sparse=True,
+                num_selected_blocks=cls.SELECTED,
+                max_cached_units=cls.CELLS,
+                sparse_unit_layout=SelectionUnitLayout(1, size, 0, size),
+            )
+
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=cls.TPB,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0, [buffer("key", cls.DATA), buffer("key_scale", cls.SCALE)]
+                    )
+                ],
+            )
+        )
+
+    def _deps(self):
+        try:
+            import ctypes
+
+            import cuda.bindings.runtime as cudart
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch and the CUDA bindings are needed to address raw memory")
+        return ctypes, cudart, torch
+
+    @staticmethod
+    def _pattern(size: int, seed: int) -> bytes:
+        return bytes((i * seed + 13) % 251 for i in range(size))
+
+    def test_each_buffer_is_fetched_into_its_own_pool_region(self):
+        ctypes, cudart, torch = self._deps()
+        manager = self._manager()
+        cache = None
+        roles = (("key", self.DATA, 7), ("key_scale", self.SCALE, 23))
+        try:
+            lg = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resize(4 * self.TPB, 4 * self.TPB))
+
+                # Paint one block's hot page in each pool with a pattern of its own, so a
+                # copy that crossed pools reads bytes that cannot pass for the right ones.
+                ordinal = 1
+                pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                patterns = {}
+                for role, size, seed in roles:
+                    patterns[role] = self._pattern(size, seed)
+                    pool = int(manager.get_mem_pool_base_address(LayerId(0), role))
+                    stride = manager.get_page_stride(LayerId(0), role)
+                    ctypes.memmove(pool + pages[ordinal] * stride, patterns[role], size)
+
+                batch.publish(handle)
+                selected = torch.tensor([[ordinal, -1]], dtype=torch.int32, device="cuda")
+                out = torch.full((1, 2, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
+                manager.fetch_sparse_pages(
+                    batch,
+                    [BufferId(0, "key"), BufferId(0, "key_scale")],
+                    selected,
+                    out,
+                    handle,
+                )
+                torch.cuda.synchronize()
+
+                for row, (role, size, _) in enumerate(roles):
+                    index = int(out[0][row][0])
+                    self.assertNotEqual(index, BAD_PAGE_INDEX, role)
+                    arena = int(manager.get_sparse_cache_base_address(LayerId(0), role))
+                    got = bytearray(size)
+                    sink = (ctypes.c_ubyte * size).from_buffer(got)
+                    (err,) = cudart.cudaMemcpy(
+                        ctypes.addressof(sink),
+                        arena + index * size,
+                        size,
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                    )
+                    self.assertEqual(int(err), 0, role)
+                    self.assertEqual(
+                        bytes(got), patterns[role], f"{role}'s cell does not hold its page"
+                    )
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_each_buffer_is_written_back_to_its_own_hot_page(self):
+        ctypes, cudart, torch = self._deps()
+        manager = self._manager()
+        cache = None
+        roles = (("key", self.DATA, 31), ("key_scale", self.SCALE, 37))
+        try:
+            lg = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                # Capacity one token past a watermark that has not reached unit 0, so unit 0
+                # is in flight and the resolve pins a cell for it in both pools.
+                self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
+                batch.publish(handle)
+                selected = torch.tensor([[-1, -1]], dtype=torch.int32, device="cuda")
+                out = torch.full((1, 2, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
+                manager.fetch_sparse_pages(
+                    batch,
+                    [BufferId(0, "key"), BufferId(0, "key_scale")],
+                    selected,
+                    out,
+                    handle,
+                )
+                torch.cuda.synchronize()
+
+                resident = _introspection.sparse_cache_resident_ordinals(cache, lg)
+                self.assertIn(0, resident, "the in-flight unit must hold a cell")
+                entry = resident.index(0)
+
+                patterns = {}
+                for pool_index, (role, size, seed) in enumerate(roles):
+                    patterns[role] = self._pattern(size, seed)
+                    arena = int(manager.get_sparse_cache_base_address(LayerId(0), role))
+                    cell = _introspection.sparse_cache_base_cell(cache, lg, pool_index) + entry
+                    source = (ctypes.c_ubyte * size).from_buffer(bytearray(patterns[role]))
+                    (err,) = cudart.cudaMemcpy(
+                        arena + cell * size,
+                        ctypes.addressof(source),
+                        size,
+                        cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                    )
+                    self.assertEqual(int(err), 0, role)
+
+                batch.wait_published()
+                # The watermark crosses unit 0, so both pools' cells are written back.
+                self.assertTrue(cache.resize(self.TPB + 1, self.TPB))
+                torch.cuda.synchronize()
+
+                pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                for role, size, _ in roles:
+                    pool = int(manager.get_mem_pool_base_address(LayerId(0), role))
+                    stride = manager.get_page_stride(LayerId(0), role)
+                    landed = ctypes.string_at(pool + pages[0] * stride, size)
+                    self.assertEqual(landed, patterns[role], f"{role}'s write-back went astray")
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:

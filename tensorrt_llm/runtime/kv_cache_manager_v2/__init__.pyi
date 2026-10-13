@@ -769,10 +769,9 @@ class Batch:
 
     Membership is exclusive -- a ``_KVCache`` belongs to at most one ``Batch``.
 
-    A member marks its row dirty whenever its locks change: a committed block, a beam
-    fork, an SWA recycle, a ``history_length`` advance. Publication then refreshes only
-    dirty rows, so mutating a member directly costs a republish rather than producing a
-    stale table.
+    :meth:`publish` restages every row. Mutating a member directly therefore costs a
+    republish rather than producing a stale table; refreshing only the rows whose locks
+    changed is a planned refinement, and a cost rather than a correctness question.
     """
 
     def __init__(
@@ -911,8 +910,10 @@ class KVCacheManager:
         That meaning does not change when a buffer is sparse; the arena is a second
         allocation, so it gets a second accessor rather than overloading the first.
 
-        Every buffer of a life cycle shares one arena, because a cell index is absolute
-        within it.
+        Role-dependent: the arena mirrors the life cycle's hot pool group, so buffers of
+        different sizes -- data and its block scales, say -- sit in regions of their own, and
+        an index is relative to the region of the buffer it was fetched for. Buffers sharing
+        a pool share a region, and the index already carries which of them it belongs to.
         """
     def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
         """Whether this buffer was declared ``BufferConfig.is_sparse``.

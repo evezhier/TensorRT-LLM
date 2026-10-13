@@ -2179,7 +2179,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def("sparse_cache_resident_ordinals", &kv::KvCacheIntrospection::sparseCacheResidentOrdinals,
         nb::arg("kv_cache"), nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("sparse_cache_base_cell", &kv::KvCacheIntrospection::sparseCacheBaseCell, nb::arg("kv_cache"),
-        nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("lc_id"), nb::arg("pool") = 0, nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("sparse_flush_counts", &kv::KvCacheIntrospection::sparseFlushCounts, nb::arg("kv_cache"),
         nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("batch_page_table", &kv::KvCacheIntrospection::batchPageTable, nb::arg("batch"),

@@ -513,7 +513,7 @@ private:
     //! Assemble the addressing shared by both copy directions: the pool and arena bases,
     //! the per-buffer page offsets, the cell geometry and the unit layout. The work list and
     //! the direction are the caller's to fill in.
-    [[nodiscard]] SparseUnitCopyArgs _sparseCopyArgs(LifeCycleId lifeCycle) const;
+    [[nodiscard]] std::vector<SparseUnitCopyArgs> _sparseCopyArgs(LifeCycleId lifeCycle) const;
 
     //! One sparse buffer of a life cycle, in the order SparseCacheView indexes them.
     struct SparseBufferRef

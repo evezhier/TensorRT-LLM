@@ -214,13 +214,14 @@ def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
 
 
-def sparse_cache_base_cell(kv_cache: Any, lc_id: int) -> int:
-    """First cell of this request's lease on the life cycle's arena, or -1 if it holds none.
+def sparse_cache_base_cell(kv_cache: Any, lc_id: int, pool: int = 0) -> int:
+    """First cell of this request's lease in one pool's arena region, or -1 if it holds none.
 
     Identifies the lease the way the page list used to identify the reservation, now that a
-    lease is one contiguous run of cells rather than scattered slots.
+    lease is one contiguous run of cells rather than scattered slots. Per pool, because the
+    arena mirrors the hot pool group: buffers of different sizes sit in regions of their own.
     """
-    return int(_cpp().sparse_cache_base_cell(kv_cache, lc_id))
+    return int(_cpp().sparse_cache_base_cell(kv_cache, lc_id, pool))
 
 
 def sparse_flush_counts(kv_cache: Any, lc_id: int) -> list[int]:

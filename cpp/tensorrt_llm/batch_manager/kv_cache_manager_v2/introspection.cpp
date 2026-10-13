@@ -28,6 +28,7 @@
 #include "kv_cache_manager_v2/storageManager.h"
 
 #include <algorithm>
+#include <numeric>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -115,14 +116,17 @@ std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache c
     return kvCache.mSparseCache[id].readResidentOrdinals();
 }
 
-int KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId)
+int KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool)
 {
     LifeCycleId const id{lcId};
     if (id >= kvCache.mSparseCache.size() || kvCache.mSparseCache[id].empty())
     {
         return -1;
     }
-    return kvCache.mSparseCache[id].view().baseCell;
+    // Relative to the pool's own arena region, which is what getSparseCacheBaseAddress
+    // reports for a buffer drawing on it.
+    auto const& arena = kvCache.mManager->mSparseArenas[id];
+    return kvCache.mSparseCache[id].view().leaseIndex * arena.cellsPerLease(PoolIndex{pool});
 }
 
 std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, int layerGroupId)
@@ -323,9 +327,15 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     SparseCacheView view;
     // Non-null only to mark the row live; the copy itself never reads the metadata arrays.
     view.residentOrdinal = reinterpret_cast<int32_t*>(table.get());
-    view.baseCell = baseCell;
+    // The probe drives one pool, so a lease of one cell and a buffer-slot identity reproduce
+    // the address the production path computes from a lease index and a pool slot.
+    view.leaseIndex = baseCell;
     view.pageBufferOffset = reinterpret_cast<uint32_t*>(coldOffsets.get());
     view.bufferLayer = reinterpret_cast<int32_t*>(bufferLayerBuf.get());
+    std::vector<int32_t> slotInPool(bufferLayer.size());
+    std::iota(slotInPool.begin(), slotInPool.end(), 0);
+    auto slotInPoolBuf = deviceCopy(slotInPool);
+    view.bufferSlotInPool = reinterpret_cast<int32_t*>(slotInPoolBuf.get());
     CUdeviceptr viewPtr = 0;
     cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView)));
     CudaUniqPtr viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
@@ -341,6 +351,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.numBlocks = static_cast<int32_t>(pageTable.size());
     args.deviceBase = devicePtr;
     args.cellsPerBuffer = cellsPerBuffer;
+    args.cellsPerLease = 1;
     args.bufferBytes = bufferBytes;
     args.direction = writeBack ? SparseCopyDirection::kWriteBack : SparseCopyDirection::kFetch;
     args.layout.numChunks = numChunks;

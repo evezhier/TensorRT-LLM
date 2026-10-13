@@ -19,9 +19,11 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
+#include "kv_cache_manager_v2/storage/config.h"
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -54,10 +56,11 @@ struct SparseCacheView
     //! Entry indices in recency order, most-recently-used first.
     int32_t* lruOrder = nullptr;
 
-    //! First cell of this request's lease, in cells from the arena's base. A cell address is
-    //! arithmetic from here -- see "Why the cache is a flat array of cells" in
-    //! SPARSE_ATTENTION_DESIGN.md -- so there is no page table to consult.
-    int32_t baseCell = 0;
+    //! This request's lease on the arena. A cell address is arithmetic from here -- see
+    //! "Why the cache is a flat array of cells" in SPARSE_ATTENTION_DESIGN.md -- so there is
+    //! no page table to consult. The lease is an index rather than a cell offset because a
+    //! pool's region has its own cells-per-lease, which the copy supplies per launch.
+    int32_t leaseIndex = 0;
 
     //! Scratch for one write-back: the units a watermark move crossed and the cells holding
     //! them, the watermark scalars the scan reads, the page slots of the blocks touched, and
@@ -74,6 +77,10 @@ struct SparseCacheView
     //! [numBuffers] byte offset of each buffer within its hot slot. A lookup only because
     //! the kernel walks buffers; the value is BufferAttr's own offset, so no codec enters.
     uint32_t* pageBufferOffset = nullptr;
+
+    //! [numBuffers] each buffer's index among those sharing its pool: where its cells sit
+    //! inside that pool's arena region.
+    int32_t* bufferSlotInPool = nullptr;
 
     //! [numBuffers] the layer each buffer belongs to, i.e. which metadata row carries its
     //! residency and its work list. The copy walks buffers but reads a list produced per
@@ -111,6 +118,10 @@ struct SparseCacheInit
     std::vector<uint32_t> pageBufferOffset;
     //! [numBuffers] the layer each buffer belongs to, non-decreasing.
     std::vector<int32_t> bufferLayer;
+    //! [numBuffers] each buffer's index among those sharing its pool.
+    std::vector<int32_t> bufferSlotInPool;
+    //! One entry per pool of the life cycle: cell size, and buffers drawing on it.
+    std::vector<std::pair<uint64_t, int32_t>> pools;
     //! Bounds on one watermark move, from the in-flight headroom the reservation leaves.
     int32_t maxFlushUnits = 0;
     int32_t maxFlushBlocks = 0;
@@ -192,10 +203,13 @@ class SparseCellArena
 public:
     SparseCellArena() = default;
 
-    //! @param shape       per-request metadata and cell geometry, fixed by configuration.
-    //! @param bufferBytes one cell, i.e. one buffer's expanded size.
-    //! @param maxLeases   concurrent requests this life cycle can serve.
-    SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBytes, int maxLeases);
+    //! @param shape     per-request metadata and cell geometry, fixed by configuration,
+    //!                   including one entry per pool of the life cycle.
+    //! @param maxLeases  concurrent requests this life cycle can serve.
+    //!
+    //! One region per pool, mirroring the hot pool group: pools partition the life cycle's
+    //! buffers by size, and a cell is one buffer, so cells cannot be uniform across them.
+    SparseCellArena(SparseCacheInit const& shape, int maxLeases);
 
     ~SparseCellArena() = default;
     SparseCellArena(SparseCellArena&&) noexcept = default;
@@ -208,20 +222,27 @@ public:
         return mMemory == nullptr;
     }
 
-    //! Base of the cell region. Indices the fetch emits are relative to this.
-    [[nodiscard]] CUdeviceptr base() const noexcept
+    //! Base of one pool's cell region. Indices the fetch emits for a buffer are relative to
+    //! its pool's base, which is what get_sparse_cache_base_address reports for that buffer.
+    [[nodiscard]] PoolIndex numPools() const noexcept
     {
-        return mCellBase;
+        return mPoolBase.size();
     }
 
-    [[nodiscard]] uint64_t bufferBytes() const noexcept
+    [[nodiscard]] CUdeviceptr base(PoolIndex pool) const
     {
-        return mBufferBytes;
+        return mPoolBase.at(pool);
     }
 
-    [[nodiscard]] int cellsPerLease() const noexcept
+    [[nodiscard]] uint64_t bufferBytes(PoolIndex pool) const
     {
-        return mCellsPerLease;
+        return mShape.pools.at(static_cast<size_t>(pool.value())).first;
+    }
+
+    //! Cells one lease takes in this pool's region: its buffers times the cells each gets.
+    [[nodiscard]] int cellsPerLease(PoolIndex pool) const
+    {
+        return mShape.pools.at(static_cast<size_t>(pool.value())).second * mShape.cellsPerBuffer;
     }
 
     [[nodiscard]] int freeLeases() const noexcept
@@ -243,15 +264,14 @@ private:
 
     CudaUniqPtr mMemory;
     SparseCacheInit mShape;
-    uint64_t mBufferBytes = 0;
-    int mCellsPerLease = 0;
     size_t mMetadataBytes = 0;
-    CUdeviceptr mCellBase = 0;
+    TypedVec<PoolIndex, CUdeviceptr> mPoolBase;
     std::byte* mMetadataBase = nullptr;
 
     //! Shared by every lease of the life cycle, so a resume copies neither.
     uint32_t* mSharedOffset = nullptr;
     int32_t* mSharedLayer = nullptr;
+    int32_t* mSharedSlotInPool = nullptr;
     int32_t* mIdentity = nullptr;
 
     std::vector<int> mFree;

@@ -99,6 +99,23 @@ struct PageIndexConverter
     std::vector<int> operator()(int baseIndex) const;
 };
 
+//! One sparse buffer of a life cycle, with everything the cache derives from it.
+//!
+//! Ordered layers-outermost, then by pool within a layer, so that both a layer's buffers and
+//! a (layer, pool) run are consecutive. The fetch needs the first, because it resolves one
+//! layer; the copy needs the second, because a pool fixes a cell's size, the slot stride it
+//! is read from, and the unit layout, so one launch serves one pool.
+struct SparseBufferPlan
+{
+    BufferId id;
+    PoolIndex poolIndex{0};  //!< Which hot pool holds its bytes; pools partition by size.
+    size_t size = 0;         //!< One cell.
+    uint32_t pageOffset = 0; //!< Its offset within its hot slot.
+    SelectionUnitLayout layout;
+    int32_t layerRow = 0;    //!< Metadata row: the dense index of its layer in the group.
+    int32_t slotInPool = 0;  //!< Its index among the life cycle's buffers sharing its pool.
+};
+
 class Batch;
 
 // ---------------------------------------------------------------------------
@@ -406,27 +423,29 @@ public:
     //! the write-back's flush list are bounded by the same headroom.
     [[nodiscard]] int sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept;
 
-    //! This life cycle's sparse buffers, in the order the cache numbers them: layers
-    //! outermost, so a layer's buffers are consecutive.
-    [[nodiscard]] std::vector<BufferId> sparseBufferIds(LifeCycleId lifeCycle) const;
+    //! This life cycle's sparse buffers, in the order the cache numbers them.
+    [[nodiscard]] std::vector<SparseBufferPlan> sparseBufferPlan(LifeCycleId lifeCycle) const;
 
-    //! Their selection unit layouts, in the same order.
-    [[nodiscard]] std::vector<SelectionUnitLayout> sparseUnitLayouts(LifeCycleId lifeCycle) const;
+    //! Just their ids, in the same order.
+    [[nodiscard]] std::vector<BufferId> sparseBufferIds(LifeCycleId lifeCycle) const;
 
     //! Everything a sparse copy needs that follows from configuration alone: the two pools,
     //! the unit layout and the cell geometry. A caller fills in whose cache it is copying
     //! into and which work list to read.
-    [[nodiscard]] SparseUnitCopyArgs sparseCopyTemplate(LifeCycleId lifeCycle) const;
+    //!
+    //! One entry per maximal run of consecutive buffers sharing a hot pool, because a pool
+    //! fixes a cell's size, the slot stride it is read from and the unit layout. Buffers are
+    //! ordered (layer, pool), so a life cycle whose sparse buffers are alike yields a single
+    //! run, and the quantised shape -- data and block scales in pools of their own -- yields
+    //! one per layer and pool. A caller that wants only some buffers clips each run to them.
+    [[nodiscard]] std::vector<SparseUnitCopyArgs> sparseCopyTemplates(LifeCycleId lifeCycle) const;
 
-    //! Byte offset of each sparse buffer within its hot slot, in cache order.
-    [[nodiscard]] std::vector<uint32_t> sparsePageBufferOffsets(LifeCycleId lifeCycle) const;
-
-    //! The metadata row each sparse buffer reads, in cache order: a dense layer index
-    //! within the life cycle, counting only layers that contribute a cached buffer.
-    [[nodiscard]] std::vector<int32_t> sparseBufferLayers(LifeCycleId lifeCycle) const;
-
-    //! Base of the sparse cache arena backing this buffer, for a consumer reading units the
-    //! fetch resolved. Throws when the buffer has no sparse fetch path.
+    //! Base of the sparse cache arena region backing this buffer, for a consumer reading
+    //! units the fetch resolved. Throws when the buffer has no sparse fetch path.
+    //!
+    //! Role-dependent: the arena mirrors the hot pool group, so buffers of different sizes
+    //! sit in regions of their own and an index the fetch emits is relative to the region of
+    //! the buffer it was emitted for.
     //!
     //! Distinct from getMemPoolBaseAddress, which names the buffer's *pages* for every
     //! buffer alike -- that is what the transceiver and the KV transfer path address, and it

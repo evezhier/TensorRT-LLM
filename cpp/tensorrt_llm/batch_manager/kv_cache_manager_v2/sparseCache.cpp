@@ -81,17 +81,16 @@ LeaseLayout leaseLayout(SparseCacheInit const& shape, int32_t maxFlushUnits, int
 // SparseCellArena
 // ---------------------------------------------------------------------------
 
-SparseCellArena::SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBytes, int maxLeases)
+SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     : mShape(shape)
-    , mBufferBytes(bufferBytes)
 {
     if (shape.numLayers <= 0 || shape.numBuffers <= 0 || shape.entriesPerLayer <= 0 || shape.cellsPerBuffer <= 0)
     {
         throw std::invalid_argument("SparseCellArena requires a positive layer, buffer, entry and cell count");
     }
-    if (bufferBytes == 0 || maxLeases <= 0)
+    if (shape.pools.empty() || maxLeases <= 0)
     {
-        throw std::invalid_argument("SparseCellArena requires a positive cell size and lease count");
+        throw std::invalid_argument("SparseCellArena requires at least one pool and a positive lease count");
     }
     if (shape.pageBufferOffset.size() != static_cast<size_t>(shape.numBuffers))
     {
@@ -100,6 +99,10 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBy
     if (shape.bufferLayer.size() != static_cast<size_t>(shape.numBuffers))
     {
         throw std::invalid_argument("SparseCellArena requires one layer index per buffer");
+    }
+    if (shape.bufferSlotInPool.size() != static_cast<size_t>(shape.numBuffers))
+    {
+        throw std::invalid_argument("SparseCellArena requires one pool slot per buffer");
     }
     for (size_t i = 0; i < shape.bufferLayer.size(); ++i)
     {
@@ -112,38 +115,58 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBy
             throw std::invalid_argument("SparseCellArena: buffers must be grouped by layer");
         }
     }
+    for (auto const& [cellBytes, buffers] : shape.pools)
+    {
+        if (cellBytes == 0 || buffers <= 0)
+        {
+            throw std::invalid_argument("SparseCellArena requires a positive cell size and buffer count per pool");
+        }
+    }
 
     mShape.maxFlushUnits = std::max(shape.maxFlushUnits, 1);
     mShape.maxFlushBlocks = std::max(shape.maxFlushBlocks, 1);
-    mCellsPerLease = shape.numBuffers * shape.cellsPerBuffer;
 
     auto const layout = leaseLayout(mShape, mShape.maxFlushUnits, mShape.maxFlushBlocks);
     mMetadataBytes = layout.total();
 
+    // One region per pool, each aligned so that a buffer's cell indices stay relative to its own
+    // pool's base -- which is what get_sparse_cache_base_address reports for that buffer.
+    std::vector<size_t> regionOffset;
+    size_t cellBytes = 0;
+    for (auto const& [bytes, buffers] : mShape.pools)
+    {
+        regionOffset.push_back(cellBytes);
+        cellBytes += alignedBytes(static_cast<size_t>(maxLeases) * buffers * mShape.cellsPerBuffer * bytes);
+    }
+
     auto const entries = static_cast<size_t>(mShape.numLayers) * mShape.entriesPerLayer;
-    size_t const cellBytes = static_cast<size_t>(maxLeases) * mCellsPerLease * bufferBytes;
     size_t const offsetBytes = alignedBytes(sizeof(uint32_t) * static_cast<size_t>(mShape.numBuffers));
     size_t const layerBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numBuffers));
+    size_t const slotBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numBuffers));
     size_t const identityBytes = alignedBytes(sizeof(int32_t) * entries);
-    size_t const sharedBytes = offsetBytes + layerBytes + identityBytes;
+    size_t const sharedBytes = offsetBytes + layerBytes + slotBytes + identityBytes;
 
     CUdeviceptr base = 0;
-    cuCheck(cuMemAlloc(&base, alignedBytes(cellBytes) + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes));
+    cuCheck(cuMemAlloc(&base, cellBytes + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes));
     mMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
 
-    // Cells first, so a cell index is relative to the arena base -- which is what the fetch
-    // reports and what get_mem_pool_base_address returns for a sparse buffer.
-    mCellBase = base;
-    auto* shared = reinterpret_cast<std::byte*>(base) + alignedBytes(cellBytes);
+    for (auto offset : regionOffset)
+    {
+        mPoolBase.push_back(base + offset);
+    }
+    auto* shared = reinterpret_cast<std::byte*>(base) + cellBytes;
     mSharedOffset = reinterpret_cast<uint32_t*>(shared);
     mSharedLayer = reinterpret_cast<int32_t*>(shared + offsetBytes);
-    mIdentity = reinterpret_cast<int32_t*>(shared + offsetBytes + layerBytes);
+    mSharedSlotInPool = reinterpret_cast<int32_t*>(shared + offsetBytes + layerBytes);
+    mIdentity = reinterpret_cast<int32_t*>(shared + offsetBytes + layerBytes + slotBytes);
     mMetadataBase = shared + sharedBytes;
 
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedOffset), mShape.pageBufferOffset.data(),
         sizeof(uint32_t) * mShape.pageBufferOffset.size()));
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedLayer), mShape.bufferLayer.data(),
         sizeof(int32_t) * mShape.bufferLayer.size()));
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedSlotInPool), mShape.bufferSlotInPool.data(),
+        sizeof(int32_t) * mShape.bufferSlotInPool.size()));
 
     // The recency order every lease starts from: a per-layer identity permutation. Built once
     // here so a resume is a device-to-device copy rather than a host transfer.
@@ -191,9 +214,10 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     view.entriesPerLayer = mShape.entriesPerLayer;
     view.maxFlushUnits = mShape.maxFlushUnits;
     view.maxFlushBlocks = mShape.maxFlushBlocks;
-    view.baseCell = index * mCellsPerLease;
+    view.leaseIndex = index;
     view.pageBufferOffset = mSharedOffset;
     view.bufferLayer = mSharedLayer;
+    view.bufferSlotInPool = mSharedSlotInPool;
     view.residentOrdinal = carve(layout.ordinal);
     view.lruOrder = carve(layout.lru);
     view.flushOrdinal = carve(layout.flushList);

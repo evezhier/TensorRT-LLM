@@ -8,14 +8,11 @@ inline and *Migration state* below tracks it; everything else is in place.
 **Implemented**: the resolve, copy, index and flush-list kernels; `Batch`; the per-request
 reservation and device state; the write-back at `resize()`; `KVCacheManager.fetch_sparse_pages`.
 
-**Pending** (see *Migration state*): sparse history currently resides at a dedicated cold
-level rather than on a host-backed hot pool group, and the GPU cache is reserved from
-storage slots rather than its own arena. The four steps that close the gap are listed there.
+**Pending** (see *Migration state*): compression is reachable but not turned on.
 
 Out of scope, by decision rather than by omission: prefill, which a separate instance serves,
 and speculative decoding — see *Supported scope*. Kernel fusion remains future work; so do
-multi-beam requests and life cycles whose sparse buffers span more than one pool.
-`ISparseUnitGather` is retired — see *Extraction interface*.
+multi-beam requests. `ISparseUnitGather` is retired — see *Extraction interface*.
 
 Read `AGENTS.md` in this directory first for the storage, locking and concurrency model
 this builds on.
@@ -595,20 +592,24 @@ The cache arena holds nothing but cells — selected history and the unit being 
 That is what lets the fetch emit a **single** index list covering both, and therefore why
 existing attention kernels need no change: a kernel still indexes one list against one base.
 
-Indices are unit-granular, and over the arena rather than over a pool:
+Indices are unit-granular, and over the buffer's **arena region** — one per hot pool, see
+*Sparse buffers across more than one pool*:
 
 ```
 index = cell * expansion + unit
-      = (lease_base_cell + buffer * cells_per_buffer + entry / expansion) * expansion
-        + entry % expansion
+      = (lease * cells_per_lease + slot_in_pool * cells_per_buffer + entry / expansion)
+        * expansion + entry % expansion
 ```
+
+where `slot_in_pool` is the buffer's index among those of the life cycle sharing its pool,
+and `cells_per_lease` is that pool's buffers times `cells_per_buffer`.
 
 A sparse buffer therefore has **two** base addresses, answering different questions:
 
 | accessor | names | consumer |
 | --- | --- | --- |
 | `get_mem_pool_base_address` | the buffer's pages, hot tier | transceiver, KV transfer, anything addressing blocks |
-| `get_sparse_cache_base_address` | the cache arena | the attention kernel, against the fetch's index list |
+| `get_sparse_cache_base_address` | the cache arena region of the buffer's pool | the attention kernel, against the fetch's index list |
 
 `get_mem_pool_base_address` keeps meaning "this buffer's pages" for every buffer, sparse or
 dense, which is what lets the transceiver work unchanged on hot, coalesced pages. The arena
@@ -729,35 +730,38 @@ Also: the host pool is far larger than the GPU pool, so a page index must be wid
 bits before multiplying by the page stride. MSA already does this
 (`triton_sparse_decode.py`); QSA and XQA should be audited.
 
-## Planned: sparse buffers across more than one pool
+## Sparse buffers across more than one pool
 
-**Not implemented.** A life cycle's sparse buffers must currently agree on size, which the
-manager's constructor enforces. That excludes the **quantised shape**, where block scales are
-a separate, smaller `DataRole` — a real configuration rather than an exotic one, so this is
-the limitation most likely to matter.
+A life cycle's sparse buffers need not agree on size. The **quantised shape** — block scales
+as a separate, smaller `DataRole` — works, which matters because it is a real configuration
+rather than an exotic one.
 
 Pools partition a life cycle's buffers by size, and the copy addresses one pool with one set
-of strides: `bufferBytes`, the hot slot stride, and the unit layout are all per pool. The
-refusal is checked at construction rather than at the first fetch, because a deployment that
-only learns at a fetch has already resumed requests and begun serving.
+of strides: `bufferBytes`, the hot slot stride and the unit layout are all per pool. The
+design follows from making the arena **mirror the hot pool group** rather than inventing a
+layout of its own:
 
-The shape of the fix, which the existing structure mostly accommodates:
+- **One region per pool**, sized `maxLeases * buffersInPool * cellsPerBuffer * cellBytes`.
+  A lease is an index rather than a cell offset, because a pool's cells-per-lease is its own.
+- **Buffers ordered `(layer, pool)`.** A layer's buffers stay consecutive, which the fetch
+  needs to name them as a range; and within a layer a pool's buffers are consecutive too,
+  which the copy needs for the same reason. `bufferLayer` stays non-decreasing.
+- **One launch per maximal run of consecutive buffers sharing a pool.** When the buffers are
+  alike that is a single run spanning the whole life cycle, so the uniform case pays nothing
+  for the general one; the quantised shape yields one run per layer and pool. The fetch
+  clips each run to the layer it resolved; the write-back takes them whole, because its work
+  list is per layer and a run already spans as many layers as share its pool.
+- **`get_sparse_cache_base_address` is role-dependent**, naming the region of the buffer's
+  pool. It already took a role.
 
-- **One launch per `(layer, pool)`.** The fetch is already per layer, so grouping its buffers
-  by pool gives a second, inner dimension — typically two launches, data and scales. Every
-  per-pool quantity stays a launch scalar, so the kernels keep their current shape.
-- **Order buffers by `(layer, pool, role)`.** A layer's buffers must stay consecutive for the
-  fetch's `bufferBase`/`numBuffers` range, and a pool's buffers within a layer must be
-  consecutive for the same reason. Ordering on both keys satisfies both, and leaves
-  `bufferLayer` non-decreasing.
-- **Arena regions per buffer**, each `maxLeases * cellsPerBuffer * size`, rather than one run
-  of uniform cells. A lease is then an index, and buffer *b*'s cell *c* is at
-  `region(b) + (lease * cellsPerBuffer + c) * size(b)`. Regions of one `(layer, pool)` group
-  are contiguous and equally sized, so a launch needs only a group base and a stride.
-- **`get_sparse_cache_base_address` becomes role-dependent**, returning that buffer's region.
-  It already takes a role and ignores it.
+Every per-pool quantity is a launch scalar — `deviceBase`, `bufferBytes`, `cellsPerLease`,
+`layout` — so the kernels keep their shape. What they gained is `bufferSlotInPool`, a
+per-buffer map alongside `bufferLayer` and `pageBufferOffset`, replacing the assumption that
+a buffer's position among *all* the life cycle's buffers is also its position in its pool.
 
-The index a fetch emits stays `cell * expansion + unit`, relative to the buffer's own region.
+Buffers sharing a pool must still share a selection unit layout. A pool fixes a cell's size
+but not how its units are strided within it, and the copy walks a run with one set of
+strides; the check is per run rather than per life cycle.
 
 ## Migration state
 
@@ -796,7 +800,7 @@ is well defined because pool-group formation already keys on `isSparse`
 Step 1 deleted sub-slot addressing rather than adapting it: it existed only because the
 storage allocator deals in coalesced slots, and carrying it into an arena that has none
 would have preserved a workaround for a constraint that no longer exists. `SparseCacheView`
-lost `cachePages` and `numPages` and gained `baseCell`; the copy and index kernels each lost
+lost `cachePages` and `numPages` and gained `leaseIndex`; the copy and index kernels each lost
 a page lookup; and the arena pre-allocates the per-request metadata, so a resume no longer
 pairs a device allocation with a free.
 

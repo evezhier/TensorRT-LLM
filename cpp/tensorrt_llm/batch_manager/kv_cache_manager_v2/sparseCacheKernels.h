@@ -174,18 +174,23 @@ struct SparseUnitCopyArgs
     int32_t numBlocks = 0;
     int32_t pageTableBase = 0;
 
-    //! Base of the cell arena. One arena for every row: the lease differs per request, the
-    //! arena it comes from does not.
+    //! Base of this call's pool region in the cell arena. One arena for every row: the lease
+    //! differs per request, the arena it comes from does not. One call serves one pool,
+    //! because a pool fixes the cell size.
     CUdeviceptr deviceBase = 0;
 
-    //! A lease is one contiguous run of buffer-sized cells, so an entry is addressed by
-    //! arithmetic alone:
+    //! A lease holds one contiguous run of buffer-sized cells in each pool's region, so an
+    //! entry is addressed by arithmetic alone:
     //!
-    //!     cell = views[row].baseCell + buffer * cellsPerBuffer + entry / expansion
+    //!     cell = views[row].leaseIndex * cellsPerLease
+    //!          + views[row].bufferSlotInPool[buffer] * cellsPerBuffer
+    //!          + entry / expansion
     //!
     //! No page table and no slot indirection. Coalescing would earn nothing here because
     //! different layers select different units, so a slot's cells would never fill together.
     int32_t cellsPerBuffer = 0;
+    //! Cells one lease takes in this pool's region: its buffers there times cellsPerBuffer.
+    int32_t cellsPerLease = 0;
     uint64_t bufferBytes = 0;
 
     SparseCopyDirection direction = SparseCopyDirection::kFetch;
@@ -213,7 +218,7 @@ struct SparseUnitCopyArgs
     int32_t workRowBase = 0;
 
     //! The buffers this call copies: `numBuffers` of them starting at `bufferBase`. They are
-    //! consecutive because buffers are grouped by layer.
+    //! consecutive because buffers are grouped by layer and, within a layer, by pool.
     int32_t bufferBase = 0;
     int32_t numBuffers = 0;
 };
@@ -252,18 +257,24 @@ struct SparseOutIndexArgs
     int32_t const* outSlot = nullptr;
     int32_t selectionWidth = 0;
 
-    //! [numRows][numBuffers][selectionWidth] written in full: entry `k` is the index
-    //! holding `selected[row][k]` for this call's buffer `i`, and kBadPageIndex where the
-    //! selection is padded or the row holds no reservation. Padding stays where the
-    //! selection put it rather than being packed out, so slot `k` of the output and slot
-    //! `k` of the selection describe the same unit.
+    //! [numRows][outBuffers][selectionWidth] written in full: entry `k` is the index
+    //! holding `selected[row][k]` for the buffer, and kBadPageIndex where the selection is
+    //! padded or the row holds no reservation. Padding stays where the selection put it
+    //! rather than being packed out, so slot `k` of the output and slot `k` of the
+    //! selection describe the same unit.
+    //!
+    //! One call fills `numBuffers` of the row's `outBuffers` entries, starting at `outBase`,
+    //! because a call serves one pool while the caller asks for a whole layer.
     int32_t* out = nullptr;
+    int32_t outBuffers = 0;
+    int32_t outBase = 0;
 
     //! The buffers this call writes, as for the copy.
     int32_t bufferBase = 0;
     int32_t numBuffers = 0;
 
     int32_t cellsPerBuffer = 0;
+    int32_t cellsPerLease = 0;
     int32_t expansion = 1;
 };
 

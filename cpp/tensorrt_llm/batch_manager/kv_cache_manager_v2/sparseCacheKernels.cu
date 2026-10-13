@@ -445,7 +445,8 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
 
     // A cell is reached by arithmetic from the lease's base: the arena hands out a
     // contiguous run, so there is no page to look up.
-    auto const cell = static_cast<uint64_t>(view.baseCell + buffer * args.cellsPerBuffer + slot / args.expansion);
+    auto const cell = static_cast<uint64_t>(view.leaseIndex * args.cellsPerLease
+        + view.bufferSlotInPool[buffer] * args.cellsPerBuffer + slot / args.expansion);
 
     auto const hostPage
         = static_cast<uint64_t>(args.pageTable[static_cast<ptrdiff_t>(row) * args.pageTableStride + block]);
@@ -473,7 +474,8 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
     int32_t const row = static_cast<int32_t>(blockIdx.y);
     int32_t const buffer = args.bufferBase + static_cast<int32_t>(blockIdx.x);
     auto* out = args.out
-        + (static_cast<ptrdiff_t>(row) * args.numBuffers + blockIdx.x) * static_cast<ptrdiff_t>(args.selectionWidth);
+        + (static_cast<ptrdiff_t>(row) * args.outBuffers + args.outBase + blockIdx.x)
+            * static_cast<ptrdiff_t>(args.selectionWidth);
 
     SparseCacheView const view = args.views[row];
     bool const reserved = view.residentOrdinal != nullptr;
@@ -491,7 +493,8 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
             continue;
         }
 
-        int32_t const cell = view.baseCell + buffer * args.cellsPerBuffer + slot / args.expansion;
+        int32_t const cell = view.leaseIndex * args.cellsPerLease + view.bufferSlotInPool[buffer] * args.cellsPerBuffer
+            + slot / args.expansion;
         out[i] = cell * args.expansion + slot % args.expansion;
     }
 }
@@ -553,9 +556,13 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseOutIndices: every device array must be provided");
     }
-    if (args.cellsPerBuffer <= 0 || args.expansion <= 0 || args.bufferBase < 0)
+    if (args.cellsPerBuffer <= 0 || args.cellsPerLease <= 0 || args.expansion <= 0 || args.bufferBase < 0)
     {
         throw std::invalid_argument("launchSparseOutIndices: the cell geometry must be positive");
+    }
+    if (args.outBase < 0 || args.outBase + args.numBuffers > args.outBuffers)
+    {
+        throw std::invalid_argument("launchSparseOutIndices: this call's buffers must fit the output row");
     }
 
     dim3 const grid(static_cast<unsigned>(args.numBuffers), static_cast<unsigned>(args.numRows));
@@ -600,7 +607,7 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseUnitCopy: every device array must be provided");
     }
-    if (args.cellsPerBuffer <= 0 || args.bufferBytes == 0)
+    if (args.cellsPerBuffer <= 0 || args.cellsPerLease <= 0 || args.bufferBytes == 0)
     {
         throw std::invalid_argument("launchSparseUnitCopy: the cell geometry must be positive");
     }

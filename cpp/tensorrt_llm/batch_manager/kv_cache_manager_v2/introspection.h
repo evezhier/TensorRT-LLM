@@ -50,7 +50,7 @@ public:
     // White-box hook: the first cell of this request's lease on the life cycle's arena, or
     // -1 when it holds none. Identifies the lease the way the page list used to identify
     // the reservation, now that a lease is one contiguous run rather than scattered slots.
-    static int sparseCacheBaseCell(KvCache const& kvCache, int lcId);
+    static int sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool);
 
     // White-box hook: units the last write-back moved per buffer, -1 where none has run.
     static std::vector<int32_t> sparseFlushCounts(KvCache const& kvCache, int lcId);

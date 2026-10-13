@@ -266,22 +266,23 @@ std::vector<KvCache::SparseBufferRef> KvCache::_sparseBuffers(LifeCycleId lifeCy
     return refs;
 }
 
-SparseUnitCopyArgs KvCache::_sparseCopyArgs(LifeCycleId lifeCycle) const
+std::vector<SparseUnitCopyArgs> KvCache::_sparseCopyArgs(LifeCycleId lifeCycle) const
 {
-    // The pools and the layout are the manager's, since they follow from configuration.
+    // The pools and the layouts are the manager's, since they follow from configuration.
     // What a request adds is its own reservation, and the whole-life-cycle work shape a
     // write-back uses.
-    SparseUnitCopyArgs args = mManager->sparseCopyTemplate(lifeCycle);
+    auto args = mManager->sparseCopyTemplates(lifeCycle);
 
     auto const& state = mSparseCache[lifeCycle];
     auto const& view = state.view();
-    // One row: a write-back is per request. A batched fetch passes the batch's view array.
-    args.views = state.deviceView();
-    args.numRows = 1;
-    args.bufferBase = 0;
-    args.numBuffers = view.numBuffers;
-    args.workRowBase = 0;
-    args.workRowStride = view.numLayers;
+    for (auto& one : args)
+    {
+        // One row: a write-back is per request. A batched fetch passes the batch's view array.
+        one.views = state.deviceView();
+        one.numRows = 1;
+        one.workRowBase = 0;
+        one.workRowStride = view.numLayers;
+    }
     return args;
 }
 
@@ -340,17 +341,21 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
     listArgs.maxFlushUnits = view.maxFlushUnits;
     launchSparseFlushList(listArgs, stream);
 
-    SparseUnitCopyArgs copyArgs = _sparseCopyArgs(lifeCycle);
-    copyArgs.pageTable = view.flushPageSlice;
-    copyArgs.pageTableStride = numBlocks;
-    copyArgs.numBlocks = numBlocks;
-    copyArgs.pageTableBase = firstBlock;
-    copyArgs.direction = SparseCopyDirection::kWriteBack;
-    copyArgs.workOrdinal = view.flushOrdinal;
-    copyArgs.workSlot = view.flushSlot;
-    copyArgs.workCount = view.flushCount;
-    copyArgs.workWidth = view.maxFlushUnits;
-    launchSparseUnitCopy(copyArgs, stream);
+    // One pass per pool, each covering every layer: the flush list is per layer and a
+    // template's buffer run already spans as many of them as share its pool.
+    for (auto copyArgs : _sparseCopyArgs(lifeCycle))
+    {
+        copyArgs.pageTable = view.flushPageSlice;
+        copyArgs.pageTableStride = numBlocks;
+        copyArgs.numBlocks = numBlocks;
+        copyArgs.pageTableBase = firstBlock;
+        copyArgs.direction = SparseCopyDirection::kWriteBack;
+        copyArgs.workOrdinal = view.flushOrdinal;
+        copyArgs.workSlot = view.flushSlot;
+        copyArgs.workCount = view.flushCount;
+        copyArgs.workWidth = view.maxFlushUnits;
+        launchSparseUnitCopy(copyArgs, stream);
+    }
 }
 
 int KvCache::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const
