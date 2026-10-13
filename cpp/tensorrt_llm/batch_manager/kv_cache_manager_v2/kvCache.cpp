@@ -394,7 +394,7 @@ void KvCache::activate()
         }
         auto& holder = std::get<SharedPtr<PageHolder>>(*bp);
         TLLM_CHECK_DEBUG(holder);
-        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId, holder->page->queryLockLevel()});
+        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId});
     }
 
     {
@@ -529,7 +529,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
             if (!tmpSlots[lc].empty())
             {
-                CacheLevel const residency = storageMgr.residencyLevel(lc);
+                CacheLevel const residency = kHotLevel;
                 // Mirrors Python: `if self._never_resumed and (... SsmLifeCycle or has_partial):`
                 bool needsDeferred = mNeverResumed && ((ssmLcId.has_value() && lc == *ssmLcId) || hasPartial);
                 if (needsDeferred)
@@ -675,8 +675,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 blockOrdinal = lastOrdinal;
             }
 
-            auto newPage = makeShared<UncommittedPage>(
-                *this, blockOrdinal, lcIdx, storageManager()->residencyLevel(lcIdx), beamIdx);
+            auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kHotLevel, beamIdx);
             newPage->setSlot(newSlot);
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
@@ -720,12 +719,11 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
-        CacheLevel const destination = std::max(target, page->queryLockLevel());
-        if (page->cacheLevel < destination || !seen.insert(page.get()).second)
+        if (page->cacheLevel < target || !seen.insert(page.get()).second)
         {
             continue;
         }
-        pagesByDestination.at(destination).push_back(std::move(page));
+        pagesByDestination.at(target).push_back(std::move(page));
     }
 
     try
@@ -1494,8 +1492,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             {
                 auto slot = std::move(slots[lc].back());
                 slots[lc].pop_back();
-                mScratchSlots[lc].emplace_back(
-                    std::move(slot), *this, lc, mManager->storage().residencyLevel(lc), /*skipWait=*/true);
+                mScratchSlots[lc].emplace_back(std::move(slot), *this, lc, kHotLevel, /*skipWait=*/true);
             }
         }
 
@@ -1553,7 +1550,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     }
                     auto slot = std::move(slots[lc].back());
                     slots[lc].pop_back();
-                    auto page = makeShared<UncommittedPage>(*this, ord, lc, storageManager()->residencyLevel(lc), bi);
+                    auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, bi);
                     page->setSlot(slot);
                     sb.pages[bi][lc] = page->lock(*this, bi, ord, lc, /*skipWait=*/true);
                 }
@@ -1816,7 +1813,7 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
         iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(storage, kHotLevel, lc);
         _recordDirectIterationStats(lc, iterationStats);
 
-        auto page = makeShared<UncommittedPage>(*this, ordinal, lc, storageManager()->residencyLevel(lc), beamIdx);
+        auto page = makeShared<UncommittedPage>(*this, ordinal, lc, kHotLevel, beamIdx);
         page->setSlot(slot);
         return page->lock(*this, beamIdx, ordinal, lc, /*skipWait=*/true);
     };
@@ -1917,7 +1914,7 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
                 }
                 TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
                 auto holder = blockPageGetPage(bp)->hold();
-                ret.push_back({ord, bi, lcIdx, holder, holder->page->cacheLevel});
+                ret.push_back({ord, bi, lcIdx, holder});
                 bp = holdForCommit ? BlockPage{std::move(holder)} : BlockPage{std::monostate{}};
             }
         }
@@ -1930,7 +1927,7 @@ void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
     std::vector<BatchedLockTarget> targets;
     targets.reserve(backup.size());
     for (auto const& b : backup)
-        targets.push_back({b.holder->page, b.beamIdx, b.ordinal, b.lcId, b.cacheLevel});
+        targets.push_back({b.holder->page, b.beamIdx, b.ordinal, b.lcId});
 
     auto locks = batchedLockPages(*this, targets);
     for (size_t i = 0; i < locks.size(); ++i)
@@ -2118,8 +2115,8 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                     auto holder = blockPageGetPage(bp)->hold();
                     bp = std::move(holder);
                 }
-                reuseTasks.push_back({existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord),
-                    lc, existingPage->queryLockLevel()});
+                reuseTasks.push_back(
+                    {existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc});
             }
         }
         if (!reuseTasks.empty())

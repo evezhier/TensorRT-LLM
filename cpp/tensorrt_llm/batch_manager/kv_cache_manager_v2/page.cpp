@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/assert.h"
 
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -95,11 +96,6 @@ SharedPtr<PageHolder> Page::hold()
 SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
 {
     return hold()->lock(kvCache, beamIndex, ordinal, lc, skipWait);
-}
-
-CacheLevel Page::queryLockLevel() const
-{
-    return manager->residencyLevel(lifeCycle);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,9 +284,9 @@ SharedPageLock PageHolder::lock(
 UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
     : holder(std::move(h))
 {
-    if (holder->page->cacheLevel != holder->page->queryLockLevel())
+    if (holder->page->cacheLevel != kHotLevel)
     {
-        throw LogicError("Pages can only be locked on GPU or, for sparse attention, in level-1 host memory");
+        throw LogicError("Pages can only be locked at the hot level");
     }
 }
 
@@ -300,7 +296,7 @@ UniqPageLock::~UniqPageLock()
         [this]
         {
             Page& p = *page();
-            TLLM_CHECK_DEBUG(p.cacheLevel == p.queryLockLevel() && !p.scheduledForEviction());
+            TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
             // Set readyEvent to the merged finish events of all readers. For committed (read-only)
             // pages, this means the next reader will wait for prior reads to complete, which is
             // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
@@ -444,23 +440,20 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
 
     // Shared prefixes and beams may name the same physical page more than once.
     // Reserve and migrate once per page, but issue one lock per owner below.
-    std::unordered_map<Page*, CacheLevel> destinations;
-    TypedVec<CacheLevel, std::vector<SharedPtr<Page>>> pagesByLevel(storeMgr->numCacheLevels());
+    //
+    // One destination, always the hot level: that is where every page is locked, whatever
+    // its pool group is made of. A sparse life cycle's hot pages are host memory, but that
+    // is a property of the allocation rather than of the level, so locking does not see it.
+    std::unordered_set<Page*> seen;
+    std::vector<SharedPtr<Page>> pages;
+    pages.reserve(targets.size());
     for (auto const& target : targets)
     {
         auto const& page = target.page;
-        CacheLevel const level = target.cacheLevel;
-        if ((level != kHotLevel && level != page->queryLockLevel()) || page->cacheLevel < level)
-        {
-            throw LogicError("Invalid destination for page locking; offload requires a separate handoff");
-        }
-        if (page->status() == PageStatus::LOCKED && page->cacheLevel != level)
+        if (page->status() == PageStatus::LOCKED && page->cacheLevel != kHotLevel)
             throw LogicError("Cannot migrate a page locked by another owner");
-        auto const [it, inserted] = destinations.emplace(page.get(), level);
-        if (!inserted && it->second != level)
-            throw LogicError("Conflicting lock levels for a shared page");
-        if (inserted)
-            pagesByLevel[level].push_back(page);
+        if (seen.insert(page.get()).second)
+            pages.push_back(page);
     }
 
     // Protect every destination group while any group is allocating. On failure,
@@ -468,32 +461,27 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
     auto reschedule = FuncGuard(
         [&]()
         {
-            for (auto const& pages : pagesByLevel)
-                for (auto const& page : pages)
-                    if (!page->scheduledForEviction() && storeMgr->isEvictable(*page))
-                        storeMgr->scheduleForEviction(*page);
+            for (auto const& page : pages)
+                if (!page->scheduledForEviction() && storeMgr->isEvictable(*page))
+                    storeMgr->scheduleForEviction(*page);
         });
-    for (auto const& pages : pagesByLevel)
-        for (auto const& page : pages)
-            if (page->scheduledForEviction())
-                storeMgr->excludeFromEviction(*page);
+    for (auto const& page : pages)
+        if (page->scheduledForEviction())
+            storeMgr->excludeFromEviction(*page);
 
     MigrationRecorder const migrationRecorder
         = [&kvCache](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
               CacheLevel dstLevel) { kvCache._recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
     DropRecorder const dropRecorder = [&kvCache](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
     { kvCache._recordDroppedPages(pages, cacheLevel); };
-    for (CacheLevel level{0}; level < pagesByLevel.size(); ++level)
+    if (!pages.empty())
     {
-        auto const& pages = pagesByLevel[level];
-        if (pages.empty())
-            continue;
-        TypedVec<PoolGroupIndex, SlotCount> requirements(storeMgr->numPoolGroups(level), 0);
+        TypedVec<PoolGroupIndex, SlotCount> requirements(storeMgr->numPoolGroups(kHotLevel), 0);
         for (auto const& page : pages)
-            if (page->cacheLevel != level)
-                ++requirements[storeMgr->getPoolGroupIndex(level, page->lifeCycle)];
-        storeMgr->prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
-        storeMgr->batchedMigrate(level, pages, migrationRecorder);
+            if (page->cacheLevel != kHotLevel)
+                ++requirements[storeMgr->getPoolGroupIndex(kHotLevel, page->lifeCycle)];
+        storeMgr->prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder);
+        storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder);
     }
 
     // Wait for all ready events on KvCache's stream (deduplicated).

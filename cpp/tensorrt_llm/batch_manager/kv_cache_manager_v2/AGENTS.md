@@ -112,8 +112,9 @@ pages and performs final commit-state bookkeeping.
 ### Page status
 
 - `LOCKED`: pinned at the current storage level; neither eviction nor dropping
-  is permitted. GPU locks support every lifecycle. Level-1 `HOST_MEM` locks
-  support sparse attention only; disk pages cannot be locked.
+  is permitted. Every lifecycle locks at the hot level, sparse or not. A sparse
+  lifecycle's hot pool group is host memory, but that is a property of the
+  allocation rather than of the level, so locking does not distinguish them.
 - `HELD`: eviction is allowed, but dropping is not.
 - `DROPPABLE`: both eviction and dropping are allowed.
 
@@ -123,13 +124,13 @@ they establish write completion, migration ordering, and safe reuse across
 streams. A stream change for an active cache intentionally synchronizes the
 new stream with the old one.
 
-`batchedLockPages()` takes an explicit destination per page and restores cold
-pages before locking, deduplicating pages shared by multiple owners. Resume,
-prefetch, and prefix rebasing preserve host-resident sparse history. A partial
-prefix copies from the source's actual tier into a private GPU page without
-moving a shared host source. Rollback records the original lock level, and
-`ScratchSlotLock` remains GPU-only. This does not itself demote GPU history;
-offload requires a separate transfer and GPU-slot ownership handoff.
+`batchedLockPages()` restores cold pages to the hot level before locking them,
+deduplicating pages shared by multiple owners. The destination is always the hot
+level: an earlier revision carried one per page, for sparse lifecycles that
+resided at level 1, and that is gone along with the residency split. A partial
+prefix copies from the source's actual tier into a private hot page without
+moving a shared source. `ScratchSlotLock` remains GPU-only. This does not itself
+demote history; offload requires a separate transfer and slot ownership handoff.
 
 ## Ownership and lifetime
 

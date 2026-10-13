@@ -585,7 +585,7 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newResidentSlots(
     std::set<CacheLevel> present;
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
-        levels[lc] = residencyLevel(lc);
+        levels[lc] = kHotLevel;
         if (numSlotsPerLc[lc] > 0)
         {
             present.insert(levels[lc]);
@@ -1437,15 +1437,6 @@ int64_t StorageManager::prefetch(
 LifeCycle const& StorageManager::getLifeCycle(LifeCycleId lc) const
 {
     return mLifeCycles[lc];
-}
-
-CacheLevel StorageManager::residencyLevel(LifeCycleId lc) const
-{
-    // Every life cycle resides at the hot level, sparse or not. A sparse one's hot pool
-    // group is host memory, which is a property of the allocation rather than of the level,
-    // so nothing here has to know about it.
-    (void) lc;
-    return kHotLevel;
 }
 
 PoolGroupIndex StorageManager::getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const

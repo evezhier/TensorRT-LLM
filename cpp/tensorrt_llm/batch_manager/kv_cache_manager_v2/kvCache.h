@@ -571,7 +571,6 @@ private:
         BeamIndex beamIdx;
         LifeCycleId lcId;
         SharedPtr<PageHolder> holder;
-        CacheLevel cacheLevel;
     };
 
     // Unlock stale SWA blocks. Returns backup holders for rollback.

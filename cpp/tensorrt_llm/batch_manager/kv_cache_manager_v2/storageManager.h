@@ -213,12 +213,6 @@ public:
 
     LifeCycle const& getLifeCycle(LifeCycleId lc) const;
 
-    // The cache level the pages of this life cycle live at while locked, and the
-    // level their slots are allocated from. kHotLevel for every life cycle except
-    // sparse-attention ones, whose pages stay in device-mapped host memory and
-    // reach the kernels through the per-request device cache instead.
-    CacheLevel residencyLevel(LifeCycleId lc) const;
-
     LifeCycleId numLifeCycles() const noexcept
     {
         return mHotPoolGroupMapping.forward().size();

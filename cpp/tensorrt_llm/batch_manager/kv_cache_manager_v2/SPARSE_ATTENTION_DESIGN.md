@@ -688,11 +688,12 @@ Slot release is already level-aware: `Page::~Page()` releases with the page's ow
 `cacheLevel`, and the `kHotLevel` in `ScratchSlotLock::unlock()` is correct, since SWA
 prefill scratch is GPU-only by definition.
 
-- **`_lockHeldBlocks`'s level hazard is gone.** The OOM rollback for `resize` calls
-  `batchedLockToGpu`, which re-locks at level 0. That used to corrupt a sparse page table,
+- **`_lockHeldBlocks`'s level hazard is gone, and so is the machinery for it.** The OOM
+  rollback for `resize` re-locks at the hot level. That used to corrupt a sparse page table,
   whose entries were level-1 ids — a failure-path-only bug that survives happy-path testing.
-  With sparse pages locking at level 0 like every other page there is nothing to mismatch.
-  The `StaleBackup` lock-level plumbing added for it is now redundant and can go.
+  With every page locking at the hot level there is nothing to mismatch, so `queryLockLevel`,
+  `BatchedLockTarget::cacheLevel`, `StaleBackup::cacheLevel` and `residencyLevel` have been
+  removed rather than left returning a constant.
 - **`_unlockStaleBlocks` is not the flush hook.** It exists for SWA blocks outside the
   window, whose content is *dead*; sparse history is live and will be read. Same trigger and
   range arithmetic, different disposition — routing sparse layers through it drops the data
