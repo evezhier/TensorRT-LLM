@@ -95,7 +95,7 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, uint64_t bufferBy
     }
     if (shape.pageBufferOffset.size() != static_cast<size_t>(shape.numBuffers))
     {
-        throw std::invalid_argument("SparseCellArena requires one cold-page offset per buffer");
+        throw std::invalid_argument("SparseCellArena requires one page offset per buffer");
     }
     if (shape.bufferLayer.size() != static_cast<size_t>(shape.numBuffers))
     {

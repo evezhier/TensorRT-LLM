@@ -58,8 +58,9 @@ must eventually be `close()`d. Its normal flow is:
 
 1. Match the input `TokenSpan` against `BlockRadixTree` within a `ReuseScope`.
 2. Allocate request-local pages for unmatched blocks through `StorageManager`.
-3. Lock or restore required pages before model execution: GPU for writable and
-   dense pages, level-1 host memory for cold sparse history.
+3. Lock or restore required pages before model execution. Every page locks at the
+   hot level; a sparse life cycle's hot pool group is host memory, which is a
+   property of the allocation rather than of the level.
 4. Commit completed blocks to the tree, making their immutable pages available
    for later requests; `stopCommitting()` finalizes this process.
 5. Suspend or close the request, returning pages to holding/eviction ownership.
@@ -70,9 +71,11 @@ recurrent-state checkpoint. A pool-group index is a storage-layout index and is
 not interchangeable with a layer ID or lifecycle ID.
 
 Attention lifecycle identity also includes `isSparse`. All buffers in one
-attention layer must agree on this flag. Sparse buffers require `HOST_MEM` at
-level 1 and are invalid for SSM layers. Sparse and dense GPU pools stay separate
-even when their slot sizes match; compatible sparse buffers still coalesce.
+attention layer must agree on this flag, and sparse buffers are invalid for SSM
+layers. Sparse and dense pools stay separate even when their slot sizes match,
+which is what lets a sparse life cycle's hot pool group be backed by host memory
+while a dense one at the same level is device memory; compatible sparse buffers
+still coalesce. Sparse buffers place no requirement on the cold tiers.
 
 `StorageManager` coordinates GPU, host, and disk cache levels. It allocates
 slots, schedules pages for eviction, migrates pages between levels, and resizes

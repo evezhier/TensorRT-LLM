@@ -510,9 +510,9 @@ private:
     //! their host pages before the move can be reported.
     [[nodiscard]] int _sparseUnitsCrossed(LifeCycleId lifeCycle, int fromHistory, int toHistory) const;
 
-    //! Assemble the addressing shared by both copy directions: pool bases and strides, the
-    //! cold-page offsets, the sub-slot geometry and the unit layout. The work list and the
-    //! direction are the caller's to fill in.
+    //! Assemble the addressing shared by both copy directions: the pool and arena bases,
+    //! the per-buffer page offsets, the cell geometry and the unit layout. The work list and
+    //! the direction are the caller's to fill in.
     [[nodiscard]] SparseUnitCopyArgs _sparseCopyArgs(LifeCycleId lifeCycle) const;
 
     //! One sparse buffer of a life cycle, in the order SparseCacheView indexes them.

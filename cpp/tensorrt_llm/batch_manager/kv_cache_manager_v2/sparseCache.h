@@ -84,8 +84,8 @@ struct SparseCacheView
 
     //! Layers in this life cycle: the metadata's first dimension.
     int32_t numLayers = 0;
-    //! Sparse buffers in this life cycle, one per (layer, role). Cells and cold-page offsets
-    //! are per buffer, so this is the dimension the copy walks.
+    //! Sparse buffers in this life cycle, one per (layer, role). Cells and page offsets are
+    //! per buffer, so this is the dimension the copy walks.
     int32_t numBuffers = 0;
     int32_t entriesPerLayer = 0;
 

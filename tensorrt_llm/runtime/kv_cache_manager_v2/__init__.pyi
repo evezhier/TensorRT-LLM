@@ -892,9 +892,10 @@ class KVCacheManager:
     def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
         """Whether this buffer was declared ``BufferConfig.is_sparse``.
 
-        A sparse buffer locks every page to ``CACHE_LEVEL1``; an ordinary buffer locks
-        every page to ``GPU_LEVEL``. Either way the level is a property of the buffer, so
+        Every buffer locks its pages at the hot level, sparse or not, so
         :meth:`_KVCache.get_base_page_indices` reports one level's numbering throughout.
+        What a sparse buffer changes is the *medium*: its life cycle's hot pool group is
+        host memory, device-mapped, rather than device memory.
 
         That level is not what a caller addresses to read a unit resolved by
         :meth:`fetch_sparse_pages`. Those live in the request's lease on the life cycle's

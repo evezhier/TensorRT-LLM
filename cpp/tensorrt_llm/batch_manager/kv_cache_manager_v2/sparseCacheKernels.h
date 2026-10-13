@@ -151,7 +151,7 @@ enum class SparseCopyDirection : uint8_t
 //! which of the two is the source changes.
 struct SparseUnitCopyArgs
 {
-    //! [numRows] per-row cache state: the reserved pages, the cold-page offsets and the
+    //! [numRows] per-row cache state: the lease, the per-buffer page offsets and the
     //! buffer-to-layer map all live here, because a batched fetch spans rows whose
     //! metadata belongs to different requests and so is not contiguous. A row with a null
     //! residentOrdinal holds no reservation and is skipped. A single-request write-back
