@@ -268,16 +268,13 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
 // ---------------------------------------------------------------------------
 // ScratchSlotLock — manages a scratch slot for SWA prefill memory reuse.
 // Wraps a Slot with owner (KvCache) and lifecycle references.
-// GPU-only: on destruction, releases the slot back to the GPU storage pool.
+// On destruction, releases the slot back to the hot storage pool.
 // Mirrors _page.py::ScratchSlotLock.
 // ---------------------------------------------------------------------------
 class ScratchSlotLock
 {
 public:
-    // cacheLevel is the level the slot was allocated from, and the level it is
-    // returned to. Scratch for a life cycle whose pages are not GPU-resident is
-    // allocated from that life cycle's residency level, not from the hot level.
-    ScratchSlotLock(Slot slot, KvCache& owner, LifeCycleId lifeCycle, CacheLevel cacheLevel, bool skipWait = false);
+    ScratchSlotLock(Slot slot, KvCache& owner, LifeCycleId lifeCycle, bool skipWait = false);
     ~ScratchSlotLock();
 
     ScratchSlotLock(ScratchSlotLock&& other) noexcept;
@@ -297,26 +294,10 @@ public:
         return mSlot;
     }
 
-    CacheLevel cacheLevel() const noexcept
-    {
-        return mCacheLevel;
-    }
-
 private:
     Slot mSlot;
     KvCache* mOwner;
     LifeCycleId mLifeCycle;
-    CacheLevel mCacheLevel;
 };
-
-// ---------------------------------------------------------------------------
-// SparseCacheSlotLock — a GPU slot reserved for a request's sparse history cache.
-//
-// Mechanically identical to a scratch slot: hold a GPU slot for the owning KvCache and
-// release it to the GPU pool on destruction. The alias names the second purpose, which
-// is not SWA prefill reuse; the shared type is expected to be renamed to something
-// purpose-neutral once both callers are in place.
-// ---------------------------------------------------------------------------
-using SparseCacheSlotLock = ScratchSlotLock;
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

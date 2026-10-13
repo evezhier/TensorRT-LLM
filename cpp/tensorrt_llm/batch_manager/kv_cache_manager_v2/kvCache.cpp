@@ -529,7 +529,6 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
             if (!tmpSlots[lc].empty())
             {
-                CacheLevel const residency = kHotLevel;
                 // Mirrors Python: `if self._never_resumed and (... SsmLifeCycle or has_partial):`
                 bool needsDeferred = mNeverResumed && ((ssmLcId.has_value() && lc == *ssmLcId) || hasPartial);
                 if (needsDeferred)
@@ -544,8 +543,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 scratchSlots.reserve(scratchSlots.size() + tmpSlots[lc].size());
                 for (auto& slot : tmpSlots[lc])
                 {
-                    scratchSlots.emplace_back(std::move(slot), *this, lc, residency,
-                        /*skipWait=*/true);
+                    scratchSlots.emplace_back(std::move(slot), *this, lc, /*skipWait=*/true);
                     scratchReadyEvents.push_back(scratchSlots.back().slot().readyEvent.handle());
                 }
             }
@@ -1492,7 +1490,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             {
                 auto slot = std::move(slots[lc].back());
                 slots[lc].pop_back();
-                mScratchSlots[lc].emplace_back(std::move(slot), *this, lc, kHotLevel, /*skipWait=*/true);
+                mScratchSlots[lc].emplace_back(std::move(slot), *this, lc, /*skipWait=*/true);
             }
         }
 
