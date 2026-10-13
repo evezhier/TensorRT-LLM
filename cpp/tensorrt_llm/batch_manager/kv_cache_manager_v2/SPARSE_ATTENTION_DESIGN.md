@@ -780,12 +780,26 @@ adaptive path (`adjustCacheLevel` -> `computeSlotCountList`) get the same answer
 either being told. That mattered: excluding only at construction would have let the first
 runtime rebalance undo it.
 
-**Deferred: headroom above the floor.** Extra host pages buy cross-request reuse retention,
-since sparse pages sit in the radix tree like any other. Floor-only holds a request's pages
-while it lives and reclaims them after, retaining nothing for a later prefix match. For a
-disagg decode instance that is a mild loss -- KV arrives by transfer, not recomputation --
-and shared system prompts are the case that would notice. A knob belongs here if measurement
-shows it matters, not before.
+**Headroom above the floor.** A floor with no slack means every page that leaves is an
+encode and every page that returns a decode, so an off-quota group is scaled above its floor
+by the slack the *on-quota* groups were given:
+
+```
+headroom = clamp(quota / on_quota_min_quota, 1, K)
+```
+
+The same generosity, applied to a medium the quota does not measure. It needs no new config,
+because the operator already expressed it once in the gap between `constraints` and `quota`.
+
+`K` is clamped for two reasons, and is **provisional**. The raw ratio is driven by that gap,
+and `constraints` is a floor people deliberately set low, so it reaches tens in practice; and
+an over-large host allocation has no backstop the way a device allocation has the device. The
+quantity that would justify a value is encode/decode volume measured against headroom, which
+is not observable until a codec is configured -- so the low end of the considered range was
+taken, and raising it is a one-constant change.
+
+With no on-quota groups at all -- every attention layer sparse -- there is no ratio to take,
+and the bound stands in for one.
 
 **Open: coverage.** No test asserts bytes end to end through a fetch *and* a write-back
 against real hot pages. The kernels are covered by white-box hooks against synthetic pools,

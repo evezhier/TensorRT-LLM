@@ -853,15 +853,49 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
     size_t remainingGrains = totalGrains;
     std::vector<PoolGroupIndex> activePgs;
     activePgs.reserve(toSizeT(numPg));
+
+    // Grains the on-quota groups would need at their floor. The ratio of the quota to that
+    // is how much slack the operator left them, which is the only signal available for how
+    // much to leave a group the quota does not measure.
+    size_t onQuotaMinGrains = 0;
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
     {
-        // A pool group whose medium is not this tier's draws on a different resource, so it
-        // takes its constraint floor and its grains are never subtracted from this budget.
-        // Pinning rather than ratio-sharing is right because the floor already expresses
-        // what the declared constraints need, scaled for the resume guard.
         if (offQuota.count(pgIdx) != 0)
         {
-            slotCntList[pgIdx] = minSlots[pgIdx];
+            continue;
+        }
+        for (auto slotSize : sizeLists[pgIdx])
+        {
+            onQuotaMinGrains += divUp(slotCountToSizeT(minSlots[pgIdx]) * slotSize, granularity);
+        }
+    }
+
+    // A floor with no slack means every page that leaves is an encode and every page that
+    // comes back a decode, so off-quota groups get headroom above theirs -- the same
+    // generosity the on-quota groups were given.
+    //
+    // Clamped, for two reasons. The ratio is driven by the gap between `constraints`, a floor
+    // people deliberately set low, and `quota`, real capacity, so it can reach tens; and an
+    // over-large host allocation has no backstop the way a device allocation has the device.
+    // The bound is provisional: justifying a value needs encode/decode volume measured
+    // against headroom, which is not observable until a codec is configured.
+    //
+    // With no on-quota groups at all -- every attention layer sparse -- there is no signal,
+    // and the bound stands in for one.
+    constexpr size_t kMaxOffQuotaHeadroom = 2;
+    size_t const headroom = onQuotaMinGrains == 0
+        ? kMaxOffQuotaHeadroom
+        : std::clamp(totalGrains / onQuotaMinGrains, size_t{1}, kMaxOffQuotaHeadroom);
+
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        // A pool group whose medium is not this tier's draws on a different resource, so its
+        // grains are never subtracted from this budget. Pinning rather than ratio-sharing is
+        // right because the floor already expresses what the declared constraints need,
+        // scaled for the resume guard; headroom is applied on top.
+        if (offQuota.count(pgIdx) != 0)
+        {
+            slotCntList[pgIdx] = SlotCount{static_cast<int64_t>(slotCountToSizeT(minSlots[pgIdx]) * headroom)};
             continue;
         }
         activePgs.push_back(pgIdx);

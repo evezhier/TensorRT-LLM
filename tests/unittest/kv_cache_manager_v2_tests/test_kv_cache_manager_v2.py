@@ -671,6 +671,20 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             wide.shutdown()
 
+    def test_host_backed_pages_get_headroom_above_their_floor(self):
+        """A floor with no slack makes every page that leaves an encode.
+
+        The headroom is the slack the on-quota groups were given, clamped -- see
+        kMaxOffQuotaHeadroom in storage/core.cpp. Here the raw ratio is large, so this
+        pins the clamp rather than the ratio.
+        """
+        manager = self._sized_manager(gpu_mb=64, capacity=8192)
+        try:
+            floor_blocks = 8192 // 128 * 4
+            self.assertGreater(self._hot_slots(manager), floor_blocks)
+        finally:
+            manager.shutdown()
+
     def test_host_backed_pages_scale_with_the_declared_capacity(self):
         """What they do track: the context length the constraints declared."""
         small = self._sized_manager(gpu_mb=64, capacity=8192)
