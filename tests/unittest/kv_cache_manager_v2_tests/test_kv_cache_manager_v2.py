@@ -325,20 +325,6 @@ class TestSparseBufferConfig(unittest.TestCase):
         buffer.is_sparse = False
         self.assertTrue(copied.is_sparse)
 
-    def test_requires_host_at_level_one(self):
-        layer = AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)])
-        gpu = GpuCacheTierConfig(4 << 20)
-        for tiers in ([gpu], [gpu, gpu], [gpu, DiskCacheTierConfig(4 << 20, "/tmp")]):
-            with self.subTest(tiers=tiers):
-                with self.assertRaisesRegex(ValueError, "level 1.*HOST_MEM"):
-                    KVCacheManagerConfig(tokens_per_block=4, cache_tiers=tiers, layers=[layer])
-        config = KVCacheManagerConfig(
-            tokens_per_block=4,
-            cache_tiers=[gpu, HostCacheTierConfig(4 << 20)],
-            layers=[layer],
-        )
-        self.assertTrue(config.layers[0].buffers[0].is_sparse)
-
     def test_sparse_sizing_defaults_and_roundtrip(self):
         plain = BufferConfig("key", 4096)
         self.assertEqual((plain.num_selected_blocks, plain.max_cached_units), (0, 0))
@@ -414,6 +400,58 @@ class TestSparseBufferConfig(unittest.TestCase):
                 ],
                 layers=[layer],
             )
+
+
+class TestSparseTierFlexibility(unittest.TestCase):
+    """What a sparse deployment requires of its cold tiers: nothing.
+
+    History lives on a host-backed pool group at the *hot* level, so level 1 is an ordinary
+    codec target. It may be host, disk, or absent. An earlier revision required level 1 to
+    be HOST_MEM, because that was where sparse history resided.
+    """
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @staticmethod
+    def _manager(tiers) -> KVCacheManager:
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=128,
+                cache_tiers=tiers,
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=1024, history_length=0)] * 2)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig(
+                                "key",
+                                4096,
+                                is_sparse=True,
+                                num_selected_blocks=2,
+                                max_cached_units=4,
+                                sparse_unit_layout=SelectionUnitLayout(1, 4096, 0, 4096),
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+
+    def test_any_cold_tier_arrangement_is_accepted(self):
+        for name, tiers in (
+            ("gpu only", [GpuCacheTierConfig(64 << 20)]),
+            ("gpu + disk", [GpuCacheTierConfig(64 << 20), DiskCacheTierConfig(64 << 20, "/tmp")]),
+            ("gpu + host", [GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)]),
+        ):
+            with self.subTest(tiers=name):
+                manager = self._manager(tiers)
+                try:
+                    self.assertGreater(manager.get_sparse_cache_max_units(0), 0)
+                finally:
+                    manager.shutdown()
 
 
 class TestSparseCacheReservation(unittest.TestCase):
@@ -1383,6 +1421,165 @@ class TestSparseFetch(unittest.TestCase):
                 manager.fetch_sparse_pages(
                     batch, self._buffers(roles), selected, self._out(torch, 2, 1), handle
                 )
+
+
+class TestSparseDataPath(unittest.TestCase):
+    """The bytes themselves, end to end, against real hot pages.
+
+    Every other sparse test asserts residency, index shape or counts. Those pass whatever
+    base address the copy uses, so they cannot see a page side pointed at the wrong
+    allocation -- which is exactly what moving history to the hot tier changed. These two
+    read and write the actual memory on both sides of the copy.
+    """
+
+    TPB = 128
+    BUF = 4096
+    SELECTED = 2
+    CELLS = 4
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @classmethod
+    def _manager(cls) -> KVCacheManager:
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=cls.TPB,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig(
+                                "key",
+                                cls.BUF,
+                                is_sparse=True,
+                                num_selected_blocks=cls.SELECTED,
+                                max_cached_units=cls.CELLS,
+                                sparse_unit_layout=SelectionUnitLayout(1, cls.BUF, 0, cls.BUF),
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+
+    def _deps(self):
+        try:
+            import ctypes
+
+            import cuda.bindings.runtime as cudart
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch and the CUDA bindings are needed to address raw memory")
+        return ctypes, cudart, torch
+
+    @staticmethod
+    def _pattern(size: int, seed: int) -> bytes:
+        return bytes((i * seed + 13) % 251 for i in range(size))
+
+    def test_a_fetched_cell_holds_the_bytes_of_its_hot_page(self):
+        ctypes, cudart, torch = self._deps()
+        manager = self._manager()
+        cache = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+            stride = manager.get_page_stride(LayerId(0), "key")
+            arena = int(manager.get_sparse_cache_base_address(LayerId(0), "key"))
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resize(4 * self.TPB, 4 * self.TPB))
+
+                # Paint one block's hot page. It is host memory, so the host writes it
+                # directly; the kernel reaches the same bytes through the device mapping.
+                ordinal = 1
+                pattern = self._pattern(self.BUF, 7)
+                pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                ctypes.memmove(pool + pages[ordinal] * stride, pattern, self.BUF)
+
+                batch.publish(handle)
+                selected = torch.tensor([[ordinal, -1]], dtype=torch.int32, device="cuda")
+                out = torch.full((1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
+                manager.fetch_sparse_pages(batch, [BufferId(0, "key")], selected, out, handle)
+                torch.cuda.synchronize()
+
+                index = int(out[0][0][0])
+                self.assertNotEqual(index, BAD_PAGE_INDEX)
+                got = bytearray(self.BUF)
+                sink = (ctypes.c_ubyte * self.BUF).from_buffer(got)
+                (err,) = cudart.cudaMemcpy(
+                    ctypes.addressof(sink),
+                    arena + index * self.BUF,
+                    self.BUF,
+                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                )
+                self.assertEqual(int(err), 0)
+                self.assertEqual(bytes(got), pattern, "the cell does not hold its page's bytes")
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_a_flushed_cell_lands_in_its_hot_page(self):
+        ctypes, cudart, torch = self._deps()
+        manager = self._manager()
+        cache = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+            stride = manager.get_page_stride(LayerId(0), "key")
+            arena = int(manager.get_sparse_cache_base_address(LayerId(0), "key"))
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                # Capacity one token past a watermark that has not reached unit 0, so unit 0
+                # is in flight and the resolve pins a cell for it.
+                self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
+                batch.publish(handle)
+                selected = torch.tensor([[-1, -1]], dtype=torch.int32, device="cuda")
+                out = torch.full((1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
+                manager.fetch_sparse_pages(batch, [BufferId(0, "key")], selected, out, handle)
+                torch.cuda.synchronize()
+
+                resident = _introspection.sparse_cache_resident_ordinals(cache, lg)
+                self.assertIn(0, resident, "the in-flight unit must hold a cell")
+                cell = _introspection.sparse_cache_base_cell(cache, lg) + resident.index(0)
+
+                pattern = self._pattern(self.BUF, 11)
+                source = (ctypes.c_ubyte * self.BUF).from_buffer(bytearray(pattern))
+                (err,) = cudart.cudaMemcpy(
+                    arena + cell * self.BUF,
+                    ctypes.addressof(source),
+                    self.BUF,
+                    cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                )
+                self.assertEqual(int(err), 0)
+
+                batch.wait_published()
+                # The watermark crosses unit 0, so its cell is written back.
+                self.assertTrue(cache.resize(self.TPB + 1, self.TPB))
+                torch.cuda.synchronize()
+
+                pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                landed = ctypes.string_at(pool + pages[0] * stride, self.BUF)
+                self.assertEqual(landed, pattern, "the write-back did not reach the hot page")
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
 
 
 class TestSparseFlush(unittest.TestCase):

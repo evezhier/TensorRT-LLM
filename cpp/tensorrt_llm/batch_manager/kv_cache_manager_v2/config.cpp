@@ -73,10 +73,6 @@ void KVCacheManagerConfig::validate() const
                 }
                 for (auto const& buf : cfg.buffers)
                 {
-                    if (buf.isSparse && (cacheTiers.size() < 2 || cacheTierOf(cacheTiers[1]) != CacheTier::HOST_MEM))
-                    {
-                        throw std::invalid_argument("Sparse buffers require cache level 1 to use HOST_MEM");
-                    }
                     if (buf.tokensPerBlockOverride.has_value()
                         && (*buf.tokensPerBlockOverride <= 0 || tokensPerBlock % *buf.tokensPerBlockOverride != 0))
                     {

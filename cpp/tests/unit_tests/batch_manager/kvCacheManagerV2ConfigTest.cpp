@@ -46,23 +46,6 @@ TEST(KvCacheManagerV2ConfigTest, ExistingBufferConfigurationDefaultsToDense)
     EXPECT_NO_THROW(makeConfig().validate());
 }
 
-TEST(KvCacheManagerV2ConfigTest, SparseBuffersRequireHostMemoryAtLevelOne)
-{
-    auto config = makeConfig();
-    config.layers = {makeAttentionLayer(0, true)};
-    EXPECT_THROW(config.validate(), std::invalid_argument);
-
-    config.cacheTiers.emplace_back(DiskCacheTierConfig{4 << 20, "/tmp"});
-    EXPECT_THROW(config.validate(), std::invalid_argument);
-
-    config.cacheTiers[1] = GpuCacheTierConfig{4 << 20};
-    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
-    EXPECT_THROW(config.validate(), std::invalid_argument);
-
-    config.cacheTiers[1] = HostCacheTierConfig{4 << 20};
-    EXPECT_NO_THROW(config.validate());
-}
-
 TEST(KvCacheManagerV2ConfigTest, MixedBuffersInOneLayerAreRejected)
 {
     auto config = makeTieredConfig();
