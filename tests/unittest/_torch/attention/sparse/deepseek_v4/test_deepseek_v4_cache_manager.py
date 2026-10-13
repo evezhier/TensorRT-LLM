@@ -61,9 +61,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     BatchDesc,
-    BufferConfig,
     GpuCacheTierConfig,
-    HostCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
     PageIndexMode,
@@ -345,63 +343,92 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
             prepare.assert_called_once_with(batch)
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("tokens_per_block", [128, 256])
-@pytest.mark.parametrize("pp_layers", [[0, 1, 2, 3], [2, 3]])
-@pytest.mark.parametrize(("dtype", "bytes_per_element"), [(DataType.BF16, 2), (DataType.FP8, 1)])
-def test_sparse_offload_cache_roles(
+def _cache_config_case(
+    *,
     enabled: bool,
-    tokens_per_block: int,
-    pp_layers: list[int],
-    dtype: DataType,
-    bytes_per_element: int,
-) -> None:
+    tokens_per_block: int = 128,
+    pp_layers: list[int] | None = None,
+    dtype: DataType = DataType.BF16,
+    nvfp4_residual_dim: int = 0,
+    index_topk: int | None = 512,
+    indexer_k_dtype: str = "fp8",
+) -> tuple[DeepseekV4CacheManager, KVCacheManagerConfig]:
     manager = object.__new__(DeepseekV4CacheManager)
     manager._enable_kv_cache_offload = enabled
-    manager.pp_layers = pp_layers
+    manager._sparse_offload_topk = index_topk
+    manager.pp_layers = [0, 1, 2, 3] if pp_layers is None else pp_layers
     manager._compress_ratios = [1, 4, 128, 4]
     manager.compressed_block_sizes = [tokens_per_block // r for r in manager._compress_ratios]
     manager.tokens_per_block = tokens_per_block
     manager.head_dim = 512
     manager.index_head_dim = 128
-    manager.dtype = dtype
-    manager._indexer_k_dtype = "fp8"
-    manager._use_nvfp4_compress = False
+    manager.dtype = DataType.FP8 if dtype == DataType.NVFP4 else dtype
+    manager._indexer_k_dtype = indexer_k_dtype
+    manager._use_nvfp4_compress = dtype == DataType.NVFP4
+    manager._nvfp4_residual_dim = nvfp4_residual_dim
     manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager.max_seq_len = 1024
     manager.max_batch_size = 2
     manager.is_estimating_kv_cache = False
     manager.max_cuda_graph_batch_size = None
-    manager.max_attention_window_vec = [None] * len(pp_layers)
+    manager.max_attention_window_vec = [None] * len(manager.pp_layers)
     manager.max_draft_len = manager._max_draft_len = 0
     manager.num_extra_kv_tokens = 0
     config = KVCacheManagerConfig(
         tokens_per_block=tokens_per_block,
-        cache_tiers=[
-            GpuCacheTierConfig(quota=1 << 20),
-            HostCacheTierConfig(quota=1 << 20),
-        ],
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
         layers=[],
     )
+    return manager, config
 
-    def make_buffer_config(*, role: str, size: int, is_sparse: bool = False) -> BufferConfig:
-        """Keep native buffers while the mock records the unsupported sparse flag."""
-        return BufferConfig(role=role, size=size)
 
-    with patch.object(
-        deepseek_v4_cache, "BufferConfig", side_effect=make_buffer_config
-    ) as create_buffer:
-        result = manager._build_cache_config(config)
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+@pytest.mark.parametrize("pp_layers", [[0, 1, 2, 3], [2, 3], [0, 2]])
+@pytest.mark.parametrize("index_topk", [1, 512])
+@pytest.mark.parametrize("indexer_k_dtype", ["fp8", "fp4"])
+@pytest.mark.parametrize(
+    ("dtype", "nvfp4_residual_dim", "data_row_bytes", "scale_row_bytes"),
+    [
+        (DataType.BF16, 0, 1024, None),
+        (DataType.FP8, 0, 512, None),
+        (DataType.NVFP4, 0, 256, 32),
+        (DataType.NVFP4, 64, 288, 36),
+    ],
+)
+def test_sparse_offload_cache_roles(
+    enabled: bool,
+    tokens_per_block: int,
+    pp_layers: list[int],
+    index_topk: int,
+    indexer_k_dtype: str,
+    dtype: DataType,
+    nvfp4_residual_dim: int,
+    data_row_bytes: int,
+    scale_row_bytes: int | None,
+) -> None:
+    manager, config = _cache_config_case(
+        enabled=enabled,
+        tokens_per_block=tokens_per_block,
+        pp_layers=pp_layers,
+        dtype=dtype,
+        nvfp4_residual_dim=nvfp4_residual_dim,
+        index_topk=index_topk,
+        indexer_k_dtype=indexer_k_dtype,
+    )
+    result = manager._build_cache_config(config)
 
     assert result.tokens_per_block == tokens_per_block
     assert len(result.layers) == manager._num_manager_layers
-    sparse_flags = {}
-    buffers = [(layer.layer_id, buffer) for layer in result.layers for buffer in layer.buffers]
-    for (layer_id, buffer), call in zip(buffers, create_buffer.call_args_list, strict=True):
-        assert (buffer.role, buffer.size) == (call.kwargs["role"], call.kwargs["size"])
-        sparse_flags[layer_id, buffer.role] = call.kwargs.get("is_sparse", False)
+    for layer in result.layers:
+        assert len({buffer.is_sparse for buffer in layer.buffers}) == 1
+        for buffer in layer.buffers:
+            if not buffer.is_sparse:
+                assert buffer.tokens_per_block_override is None
+                assert buffer.num_selected_blocks == buffer.max_cached_units == 0
+                assert buffer.sparse_unit_layout is None
     layers = {layer.layer_id: layer for layer in result.layers}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
         assert model_layer in pp_layers
@@ -410,18 +437,63 @@ def test_sparse_offload_cache_roles(
             attn_type,
         )
         buffer = next(b for b in layers[layer_id].buffers if b.role == attn_type.role)
-        assert buffer.tokens_per_block_override is None
         ratio = manager._compress_ratios[model_layer]
-        assert sparse_flags[layer_id, buffer.role] == (
+        assert buffer.is_sparse == (
             enabled and ratio == 4 and attn_type == DeepseekV4AttentionType.COMPRESS
         )
         if attn_type == DeepseekV4AttentionType.COMPRESS:
-            assert buffer.size == tokens_per_block // ratio * manager.head_dim * bytes_per_element
+            row_sizes = {attn_type.role: data_row_bytes}
+            if scale_row_bytes is not None:
+                row_sizes[deepseek_v4_cache.COMPRESS_BLOCK_SCALE_ROLE] = scale_row_bytes
+            compressed_rows = tokens_per_block // ratio
+            for role, row_bytes in row_sizes.items():
+                role_buffer = next(b for b in layers[layer_id].buffers if b.role == role)
+                if enabled and ratio == 4:
+                    assert role_buffer.is_sparse
+                    assert role_buffer.tokens_per_block_override == 4
+                    assert role_buffer.size == row_bytes
+                    assert role_buffer.num_selected_blocks == index_topk
+                    assert role_buffer.max_cached_units == 2 * index_topk
+                    layout = role_buffer.sparse_unit_layout
+                    assert layout is not None
+                    assert layout.num_chunks == 1
+                    assert layout.chunk_bytes == layout.unit_stride == row_bytes
+                    assert layout.chunk_stride == 0
+                    # Both ends of the copy preserve the full compressed-page footprint.
+                    assert (compressed_rows - 1) * layout.unit_stride + layout.chunk_bytes == (
+                        compressed_rows * row_bytes
+                    )
+                    expansion = tokens_per_block // role_buffer.tokens_per_block_override
+                    assert role_buffer.size * expansion == compressed_rows * row_bytes
+                else:
+                    assert role_buffer.size == compressed_rows * row_bytes
             if ratio == 4:
                 indexer_layer_id = manager._layer_attn_to_layer_id[
                     model_layer, DeepseekV4AttentionType.INDEXER_COMPRESS
                 ]
                 assert (layer_id != indexer_layer_id) is enabled
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("pp_layers", [[0, 1], [0, 2]])
+def test_sparse_offload_cache_config_footer_layout(enabled: bool, pp_layers: list[int]) -> None:
+    manager, config = _cache_config_case(enabled=enabled, pp_layers=pp_layers, dtype=DataType.FP8)
+    manager.use_fp8_ds_mla = True
+    if enabled and 1 in pp_layers:
+        with pytest.raises(NotImplementedError, match="separate data and footer-scale regions"):
+            manager._build_cache_config(config)
+    else:
+        result = manager._build_cache_config(config)
+        assert all(not buffer.is_sparse for layer in result.layers for buffer in layer.buffers)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("index_topk", [None, 0, -1])
+def test_sparse_offload_cache_config_requires_positive_topk(index_topk: int | None) -> None:
+    manager, config = _cache_config_case(enabled=True, index_topk=index_topk)
+    with pytest.raises(ValueError, match="positive index_topk"):
+        manager._build_cache_config(config)
 
 
 @pytest.mark.cpu_only

@@ -902,8 +902,9 @@ class KVCacheManager:
     def get_sparse_cache_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
         """Base of the sparse cache arena backing this buffer. Raises if it has no fetch path.
 
-        This is what the indices from :meth:`fetch_sparse_pages` are relative to, and the
-        only GPU-resident copy an attention kernel can read.
+        The indices from :meth:`fetch_sparse_pages` and :meth:`prepare_sparse_write_indices`
+        are relative to this base. The arena holds the GPU-resident units that model kernels
+        read and write.
 
         Distinct from :meth:`get_mem_pool_base_address`, which names this buffer's *pages*
         for every buffer alike -- what the transceiver and the KV transfer path address.
@@ -931,6 +932,59 @@ class KVCacheManager:
 
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def prepare_sparse_write_indices(
+        self,
+        batch: Batch,
+        buffers: Sequence[BufferId],
+        out: DeviceArray,  # int32[batch.max_batch_size, len(buffers), 1]
+        stream: CudaStream,
+    ) -> None:
+        """Prepare per-buffer GPU destinations for the current in-flight selection unit.
+
+        Call after publishing the batch's current capacities and history lengths, before
+        the model writes new sparse KV and before fetching this layer's selections. No
+        top-k selection is needed: the in-flight unit is determined from those watermarks
+        on the GPU. This supports the same single-query-token decode shape as
+        :meth:`fetch_sparse_pages`.
+
+        With ``unit_tokens = tokens_per_block // get_sparse_cache_expansion(layer_id)``,
+        in-flight ordinals are in ``[history_length // unit_tokens, capacity // unit_tokens)``.
+        That range contains at most one unit. A token that does not complete a unit needs
+        no write destination, even when capacity exceeds history length.
+
+        Find or reserve the unit's entry in the request's cache for this layer, shared by
+        all its sparse buffers, and pin it against eviction. Repeated preparation for the
+        same in-flight unit preserves its entry and contents; a later
+        :meth:`fetch_sparse_pages` reuses that entry. Preparation neither copies KV bytes
+        from the host nor initializes them: the model writes the unit's bytes for every
+        buffer. The entry stays pinned until the history watermark passes the unit or the
+        request releases its lease. Order the model's writes before :meth:`_KVCache.resize`
+        advances that watermark and writes the completed unit back to its host page.
+
+        Output indices use the same unit-granular arena index space as
+        :meth:`fetch_sparse_pages`. Each buffer's index is relative to its own
+        :meth:`get_sparse_cache_base_address`, including for data and scales in different
+        pools. The indices include the request and buffer placement; they are neither
+        request-local cache-entry numbers nor byte addresses.
+
+        Args:
+            batch: A batch belonging to this manager, with its latest device state
+                published. Its stable row order determines the output row order.
+            buffers: Exactly one layer's sparse buffers with a configured fetch path,
+                in the same nonempty order required by :meth:`fetch_sparse_pages`.
+            out: Caller-owned contiguous GPU ``int32[batch.max_batch_size, len(buffers), 1]``
+                array. ``out[b, i, 0]`` is the physical write index for the in-flight unit
+                of row ``b`` and ``buffers[i]``. Every element is overwritten, using
+                ``BAD_PAGE_INDEX`` for an unoccupied row, a row without an active cache
+                lease, or a row with no in-flight unit. Its contents do not alias the
+                manager's temporary resolve scratch.
+            stream: CUDA stream on which preparation is enqueued. Order it after batch
+                publication and before consumers using the same stream or events across
+                streams. The call returns without reading device values on the host and
+                is CUDA-graph-capturable with fixed batch and output shapes.
+        """
+        ...
+
     def fetch_sparse_pages(
         self,
         batch: Batch,
@@ -982,6 +1036,10 @@ class KVCacheManager:
         fetched cell moves no data. The copies are a snapshot, which is sound only because a
         block below the watermark is already written back and immutable. A cell holding an
         in-flight block is the one exception, and is never an eviction candidate.
+
+        The in-flight unit is reserved internally but is not appended to ``out``. Use
+        :meth:`prepare_sparse_write_indices` before the model's KV writes to obtain its
+        per-buffer physical write indices independently of the selection.
 
         ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the
         ``GPU_LEVEL`` index holding ``selected[b][k]`` for ``buffers[i]``, and

@@ -56,6 +56,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     PageIndexMode,
     ScratchDesc,
+    SelectionUnitLayout,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
@@ -339,6 +340,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             )
 
         self._enable_kv_cache_offload = sparse_attn_config.enable_kv_cache_offload
+        self._sparse_offload_topk = sparse_attn_config.index_topk
         if self._enable_kv_cache_offload:
             # The attention adapter is connected; enable only after validating
             # the real runtime's transfer, addressing, and scratch contracts.
@@ -1090,6 +1092,43 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 if padding_pages:
                     nvfp4_padding_pages[grouped_layers[-1]] = padding_pages
 
+        def _make_buffer_config(
+            layer_idx: int,
+            role: DataRole,
+            page_bytes: int,
+            *,
+            is_sparse: bool,
+        ) -> BufferConfig:
+            if not is_sparse:
+                return BufferConfig(role=role, size=page_bytes)
+            if self.use_fp8_ds_mla:
+                raise NotImplementedError(
+                    "Sparse fp8_ds_mla compressed KV requires a selection layout with "
+                    "separate data and footer-scale regions"
+                )
+            topk = self._sparse_offload_topk
+            if topk is None or topk <= 0:
+                raise ValueError("Sparse compressed KV requires a positive index_topk")
+
+            # One selected row covers four original tokens. KVCM expands the per-row
+            # size back to a full storage block; the hot-page layout stays unchanged.
+            row_bytes = page_bytes // self.compressed_block_sizes[layer_idx]
+            return BufferConfig(
+                role=role,
+                size=row_bytes,
+                tokens_per_block_override=DEEPSEEK_V4_SPARSE_RATIO,
+                is_sparse=True,
+                num_selected_blocks=topk,
+                # Retain history beyond the current selection and pin the in-flight row.
+                max_cached_units=2 * topk,
+                sparse_unit_layout=SelectionUnitLayout(
+                    num_chunks=1,
+                    chunk_bytes=row_bytes,
+                    chunk_stride=0,
+                    unit_stride=row_bytes,
+                ),
+            )
+
         def _add_layer(
             layer_idx: int,
             attention_types: List[DeepseekV4AttentionType],
@@ -1107,12 +1146,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             buffers = []
             for attn_type in attention_types:
                 size = self._get_attn_bytes_per_block(attn_type, layer_idx)
-                if is_sparse:
-                    buffer = BufferConfig(role=attn_type.role, size=size, is_sparse=True)
-                else:
-                    # The current runtime does not yet accept the sparse keyword.
-                    buffer = BufferConfig(role=attn_type.role, size=size)
-                buffers.append(buffer)
+                buffers.append(
+                    _make_buffer_config(layer_idx, attn_type.role, size, is_sparse=is_sparse)
+                )
             if self._use_nvfp4_compress and DeepseekV4AttentionType.COMPRESS in attention_types:
                 scale_page_size = (
                     self.compressed_block_sizes[layer_idx]
@@ -1120,9 +1156,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     // NVFP4_VECTOR_SIZE
                 )
                 buffers.append(
-                    BufferConfig(
-                        role=COMPRESS_BLOCK_SCALE_ROLE,
-                        size=scale_page_size,
+                    _make_buffer_config(
+                        layer_idx,
+                        COMPRESS_BLOCK_SCALE_ROLE,
+                        scale_page_size,
+                        is_sparse=is_sparse,
                     )
                 )
                 # Reuse snapshots copy complete coalesced slots in 16-byte
@@ -1138,13 +1176,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     )
                     buffers.extend(
                         [
-                            BufferConfig(
-                                role=data_padding_role,
-                                size=data_page_size,
+                            _make_buffer_config(
+                                layer_idx,
+                                data_padding_role,
+                                data_page_size,
+                                is_sparse=is_sparse,
                             ),
-                            BufferConfig(
-                                role=scale_padding_role,
-                                size=scale_page_size,
+                            _make_buffer_config(
+                                layer_idx,
+                                scale_padding_role,
+                                scale_page_size,
+                                is_sparse=is_sparse,
                             ),
                         ]
                     )
