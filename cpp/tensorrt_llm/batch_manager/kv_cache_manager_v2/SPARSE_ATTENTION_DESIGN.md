@@ -839,9 +839,15 @@ encoded while the cache still held a cell copied from it. It cannot:
 of an existing tree page -- not one the request goes on to read.
 
 The one configuration where a live request holds unlocked pages is a **sparse layer with a
-sliding window**, where `_unlockStaleBlocks` unlocks out-of-window blocks. A stale unit is
-neither selectable nor within a flush range, so the argument still holds, but it holds by two
-inferences rather than one and deserves a test rather than a paragraph.
+sliding window**, where `_unlockStaleBlocks` releases out-of-window blocks. It is safe, and
+not by caller discipline: the indexer that produces the selection applies the same window, so
+a block the window has made stale is never named. Nothing reads an unlocked page, so nothing
+can read one that has been encoded or recycled.
+
+That is worth stating because it is the *selector*, not this package, that makes it true.
+`fetch_sparse_pages` cannot detect an ineligible ordinal — the page table is uniform, so a
+stale ordinal still resolves to a real page of the same request. The combination is unusual
+in any case: sparsity already bounds how much history a step reads.
 
 ## Settled by construction
 

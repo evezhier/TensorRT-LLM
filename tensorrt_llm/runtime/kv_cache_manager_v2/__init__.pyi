@@ -321,6 +321,14 @@ class BufferConfig:
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
+    """One attention layer's buffers and its history rules.
+
+    A sparse layer may also declare a sliding window, though the combination is unusual:
+    sparsity already bounds how much history a step reads. Where both apply, the window
+    bounds what is *selectable* as well as what is retained -- the indexer producing the
+    selection applies the same window, so it never names a block the window has made stale.
+    """
+
     layer_id: LayerId
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
