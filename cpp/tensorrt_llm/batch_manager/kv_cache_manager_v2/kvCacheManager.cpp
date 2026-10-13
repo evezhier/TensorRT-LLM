@@ -380,6 +380,20 @@ std::vector<SelectionUnitLayout> KvCacheManager::sparseUnitLayouts(LifeCycleId l
     return layouts;
 }
 
+MemAddress KvCacheManager::getSparseCacheBaseAddress(LayerId layerId, DataRole const& role) const
+{
+    LifeCycleId const lcId{getLayerGroupId(layerId).value()};
+    auto const& arena = mSparseArenas[lcId];
+    if (arena.empty())
+    {
+        throw std::invalid_argument("getSparseCacheBaseAddress: this buffer has no sparse fetch path");
+    }
+    // Every buffer of the life cycle shares the arena: a cell index is absolute within it,
+    // so one base serves them all.
+    (void) role;
+    return static_cast<MemAddress>(arena.base());
+}
+
 void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
     int selectionWidth, int32_t* out, CUstream stream)
 {

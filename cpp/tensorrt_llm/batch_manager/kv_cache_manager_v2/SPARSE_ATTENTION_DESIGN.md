@@ -594,10 +594,19 @@ index = cell * expansion + unit
         + entry % expansion
 ```
 
-`get_mem_pool_base_address` for a sparse buffer therefore reports the **arena's** base, not
-the hot pool's. The consumer's side is unchanged — one base, one index list, the expanded
-index space `PageIndexConverter` already produces — but the allocation that base names is
-the cache, which is the only GPU-resident copy a kernel can read.
+A sparse buffer therefore has **two** base addresses, answering different questions:
+
+| accessor | names | consumer |
+| --- | --- | --- |
+| `get_mem_pool_base_address` | the buffer's pages, hot tier | transceiver, KV transfer, anything addressing blocks |
+| `get_sparse_cache_base_address` | the cache arena | the attention kernel, against the fetch's index list |
+
+`get_mem_pool_base_address` keeps meaning "this buffer's pages" for every buffer, sparse or
+dense, which is what lets the transceiver work unchanged on hot, coalesced pages. The arena
+is a second allocation holding the only GPU-resident copy a kernel can read, so it gets a
+second accessor rather than overloading the first. The consumer's side is otherwise
+unchanged: one base, one index list, the expanded index space `PageIndexConverter` already
+produces.
 
 Note that `tokens_per_block_override` is only an index-conversion mechanism: it yields
 `expansion = tokens_per_block / tokens_per_block_override` and scales `BufferConfig.size`

@@ -624,6 +624,30 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_the_arena_and_the_pages_have_different_bases(self):
+        """Two allocations, two accessors.
+
+        get_mem_pool_base_address keeps naming the buffer's pages whether or not it is
+        sparse, which is what the transceiver and the KV transfer path address. The arena
+        is where the fetch's indices point, and it is a different allocation entirely.
+        """
+        manager = self._manager(max_cached_units=4)
+        try:
+            pages = manager.get_mem_pool_base_address(LayerId(0), "key")
+            arena = manager.get_sparse_cache_base_address(LayerId(0), "key")
+            self.assertNotEqual(int(pages), int(arena))
+            self.assertNotEqual(int(arena), 0)
+        finally:
+            manager.shutdown()
+
+    def test_the_arena_accessor_rejects_a_buffer_without_a_fetch_path(self):
+        manager = self._manager(max_cached_units=0)
+        try:
+            with self.assertRaises(ValueError):
+                manager.get_sparse_cache_base_address(LayerId(0), "key")
+        finally:
+            manager.shutdown()
+
     def test_leases_are_distinct_and_within_the_arena(self):
         """Two live requests must not be handed the same cells."""
         manager = self._manager(max_cached_units=4)

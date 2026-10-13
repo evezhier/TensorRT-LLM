@@ -875,6 +875,20 @@ class KVCacheManager:
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
     ) -> MemAddress: ...
+    def get_sparse_cache_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
+        """Base of the sparse cache arena backing this buffer. Raises if it has no fetch path.
+
+        This is what the indices from :meth:`fetch_sparse_pages` are relative to, and the
+        only GPU-resident copy an attention kernel can read.
+
+        Distinct from :meth:`get_mem_pool_base_address`, which names this buffer's *pages*
+        for every buffer alike -- what the transceiver and the KV transfer path address.
+        That meaning does not change when a buffer is sparse; the arena is a second
+        allocation, so it gets a second accessor rather than overloading the first.
+
+        Every buffer of a life cycle shares one arena, because a cell index is absolute
+        within it.
+        """
     def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
         """Whether this buffer was declared ``BufferConfig.is_sparse``.
 
@@ -883,9 +897,9 @@ class KVCacheManager:
         :meth:`_KVCache.get_base_page_indices` reports one level's numbering throughout.
 
         That level is not what a caller addresses to read a unit resolved by
-        :meth:`fetch_sparse_pages`. Those live in the request's cache, reserved from the
-        ``GPU_LEVEL`` pool and reached through the unchanged
-        :meth:`get_mem_pool_base_address`.
+        :meth:`fetch_sparse_pages`. Those live in the request's lease on the life cycle's
+        cache arena, which is a separate allocation reached through
+        :meth:`get_sparse_cache_base_address`.
         """
 
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...

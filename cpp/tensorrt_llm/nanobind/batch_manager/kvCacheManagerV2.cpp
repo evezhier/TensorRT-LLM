@@ -2659,6 +2659,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
             nb::arg("data_role"), nb::arg("index_mode") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))
+        .def("get_sparse_cache_base_address", &kv::KvCacheManager::getSparseCacheBaseAddress, nb::arg("layer_id"),
+            nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>(),
+            "Base of the sparse cache arena backing this buffer, for a consumer reading units the "
+            "fetch resolved.\n\n"
+            "Distinct from get_mem_pool_base_address, which names the buffer's pages for every "
+            "buffer alike - what the transceiver and the KV transfer path address. The arena is a "
+            "second allocation holding the only GPU-resident copy a kernel can read.")
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())

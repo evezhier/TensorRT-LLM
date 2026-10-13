@@ -425,6 +425,15 @@ public:
     //! within the life cycle, counting only layers that contribute a cached buffer.
     [[nodiscard]] std::vector<int32_t> sparseBufferLayers(LifeCycleId lifeCycle) const;
 
+    //! Base of the sparse cache arena backing this buffer, for a consumer reading units the
+    //! fetch resolved. Throws when the buffer has no sparse fetch path.
+    //!
+    //! Distinct from getMemPoolBaseAddress, which names the buffer's *pages* for every
+    //! buffer alike -- that is what the transceiver and the KV transfer path address, and it
+    //! keeps one meaning whether or not a buffer is sparse. The arena is a second allocation
+    //! holding the only GPU-resident copy a kernel can read, so it gets its own accessor.
+    [[nodiscard]] MemAddress getSparseCacheBaseAddress(LayerId layerId, DataRole const& role) const;
+
     //! This life cycle's arena of GPU cells, from which a request takes its lease at
     //! resume(). Empty when the life cycle has no sparse fetch path configured.
     //!
