@@ -151,6 +151,7 @@ void KvCacheManager::_computeSparseCacheShape()
     mSparseCacheSelection = TypedVec<LifeCycleId, int>(numLc, 0);
     mSparseCacheLayers = TypedVec<LifeCycleId, int>(numLc, 0);
 
+    TypedVec<LifeCycleId, std::optional<size_t>> sizeByLifeCycle(numLc, std::nullopt);
     for (auto const& layer : mConfig.layers)
     {
         auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
@@ -159,6 +160,7 @@ void KvCacheManager::_computeSparseCacheShape()
             continue;
         }
         LifeCycleId const lcId = mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock));
+        auto& sizeSeen = sizeByLifeCycle[lcId];
         bool layerCounted = false;
         for (auto const& buf : attn->buffers)
         {
@@ -167,6 +169,17 @@ void KvCacheManager::_computeSparseCacheShape()
                 continue;
             }
             int const expansion = mConfig.tokensPerBlock / buf.tokensPerBlockOverride.value_or(mConfig.tokensPerBlock);
+            // Pools partition a life cycle's buffers by size, and the copy addresses one pool
+            // with one set of strides, so a life cycle's sparse buffers must agree on size.
+            // Rejected here rather than at the first fetch: a deployment that only finds out
+            // mid-step has already resumed requests and started serving.
+            if (sizeSeen.has_value() && buf.size != *sizeSeen)
+            {
+                throw std::invalid_argument(
+                    "Sparse buffers of one life cycle must have the same size; the quantised shape, where "
+                    "block scales are a separate smaller DataRole, is not supported yet");
+            }
+            sizeSeen = buf.size;
             mSparseCacheMaxUnits[lcId] = std::max(mSparseCacheMaxUnits[lcId], buf.maxCachedUnits);
             mSparseCacheSelection[lcId] = std::max(mSparseCacheSelection[lcId], buf.numSelectedBlocks);
             mSparseCacheExpansion[lcId] = std::max(mSparseCacheExpansion[lcId], expansion);

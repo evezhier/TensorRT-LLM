@@ -325,6 +325,41 @@ class TestSparseBufferConfig(unittest.TestCase):
         buffer.is_sparse = False
         self.assertTrue(copied.is_sparse)
 
+    def test_rejects_mixed_sparse_buffer_sizes_at_construction(self):
+        """The quantised shape, refused where a deployment can still act on it.
+
+        Pools partition a life cycle's buffers by size and the copy addresses one pool with
+        one set of strides, so mixed sizes are unsupported. The point of catching it here is
+        that it used to surface at the first fetch -- after the deployment had constructed,
+        resumed requests and begun serving.
+        """
+        init_cuda_once()
+        layout = SelectionUnitLayout(1, 4096, 0, 4096)
+        data = BufferConfig(
+            "key",
+            4096,
+            is_sparse=True,
+            num_selected_blocks=2,
+            max_cached_units=4,
+            sparse_unit_layout=layout,
+        )
+        scales = BufferConfig(
+            "key_scale",
+            128,
+            is_sparse=True,
+            num_selected_blocks=2,
+            max_cached_units=4,
+            sparse_unit_layout=SelectionUnitLayout(1, 128, 0, 128),
+        )
+        config = KVCacheManagerConfig(
+            tokens_per_block=128,
+            cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+            constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=1024, history_length=0)] * 2)],
+            layers=[AttentionLayerConfig(0, [data, scales])],
+        )
+        with self.assertRaisesRegex(ValueError, "same size"):
+            KVCacheManager(config)
+
     def test_sparse_sizing_defaults_and_roundtrip(self):
         plain = BufferConfig("key", 4096)
         self.assertEqual((plain.num_selected_blocks, plain.max_cached_units), (0, 0))

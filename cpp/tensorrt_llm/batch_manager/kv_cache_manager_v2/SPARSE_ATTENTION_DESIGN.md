@@ -630,9 +630,12 @@ request occupies. `Batch` owns that: membership, row order, the page table, `num
 and the staging mirror. It is global, not per layer group, and carries one page table per
 layer group.
 
-**Dirty rows.** A `_KVCache` knows its `Batch` and row; any lock-changing operation marks
-that row dirty, and `Batch` republishes only dirty rows. This follows the existing
-`mark_stats_dirty` / `clear_stats_dirty` / `get_dirty_stats_kv_cache_ids` pattern.
+**Dirty rows — planned, not built.** `publish()` restages every row. The intended refinement
+is that a `_KVCache` knows its `Batch` and row (it does, for detach), any lock-changing
+operation marks that row dirty, and `Batch` republishes only the dirty ones, following the
+existing `mark_stats_dirty` / `clear_stats_dirty` / `get_dirty_stats_kv_cache_ids` pattern.
+Until then a step restages the whole table, which is a cost rather than a wrong answer.
+
 Rejecting direct mutation instead was considered and rejected: `commit` changes locks and
 runs every decode step, so strictness would require a batched twin for every mutator before
 anything could ship. Dirty tracking degrades into a slower step rather than a wrong answer.
@@ -725,6 +728,36 @@ prefill scratch is GPU-only by definition.
 Also: the host pool is far larger than the GPU pool, so a page index must be widened to 64
 bits before multiplying by the page stride. MSA already does this
 (`triton_sparse_decode.py`); QSA and XQA should be audited.
+
+## Planned: sparse buffers across more than one pool
+
+**Not implemented.** A life cycle's sparse buffers must currently agree on size, which the
+manager's constructor enforces. That excludes the **quantised shape**, where block scales are
+a separate, smaller `DataRole` — a real configuration rather than an exotic one, so this is
+the limitation most likely to matter.
+
+Pools partition a life cycle's buffers by size, and the copy addresses one pool with one set
+of strides: `bufferBytes`, the hot slot stride, and the unit layout are all per pool. The
+refusal is checked at construction rather than at the first fetch, because a deployment that
+only learns at a fetch has already resumed requests and begun serving.
+
+The shape of the fix, which the existing structure mostly accommodates:
+
+- **One launch per `(layer, pool)`.** The fetch is already per layer, so grouping its buffers
+  by pool gives a second, inner dimension — typically two launches, data and scales. Every
+  per-pool quantity stays a launch scalar, so the kernels keep their current shape.
+- **Order buffers by `(layer, pool, role)`.** A layer's buffers must stay consecutive for the
+  fetch's `bufferBase`/`numBuffers` range, and a pool's buffers within a layer must be
+  consecutive for the same reason. Ordering on both keys satisfies both, and leaves
+  `bufferLayer` non-decreasing.
+- **Arena regions per buffer**, each `maxLeases * cellsPerBuffer * size`, rather than one run
+  of uniform cells. A lease is then an index, and buffer *b*'s cell *c* is at
+  `region(b) + (lease * cellsPerBuffer + c) * size(b)`. Regions of one `(layer, pool)` group
+  are contiguous and equally sized, so a launch needs only a group base and a stride.
+- **`get_sparse_cache_base_address` becomes role-dependent**, returning that buffer's region.
+  It already takes a role and ignores it.
+
+The index a fetch emits stays `cell * expansion + unit`, relative to the buffer's own region.
 
 ## Migration state
 
