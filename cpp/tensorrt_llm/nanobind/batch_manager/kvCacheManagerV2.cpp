@@ -2889,9 +2889,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return self.sparseCacheMaxUnits(self.getLayerGroupId(layerId)); },
             nb::arg("layer_id"),
             "Cells a request's sparse cache holds per buffer of this layer, in selection units, "
-            "counting both the cached history and everything in flight. The reservation follows "
-            "from this alone; the surplus above the selection width is what "
-            "_KVCache.max_input_length reports.")
+            "counting both the cached history and everything in flight. The lease follows from "
+            "this alone. Only one unit is ever in flight, so the surplus above the selection "
+            "width is retention rather than headroom.")
         .def(
             "get_sparse_cache_expansion",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
@@ -2902,8 +2902,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
             { return self.sparseCacheBufferCount(self.getLayerGroupId(layerId)); },
             nb::arg("layer_id"),
-            "Sparse buffers of this layer's life cycle, one per (layer, role), each an "
-            "independent cache. Also the cells a reserved slot yields.")
+            "Sparse buffers of this layer's life cycle, one per (layer, role), each with its "
+            "own cells. A lease is this many runs of get_sparse_cache_max_units cells.")
         .def("get_page_index_converter", &kv::KvCacheManager::getPageIndexConverter, nb::arg("layer_id"),
             nb::arg("data_role"))
         .def(

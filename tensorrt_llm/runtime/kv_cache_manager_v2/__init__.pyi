@@ -234,16 +234,15 @@ class DiskCacheTierConfig:
 class SelectionUnitLayout:
     """Where one selection unit's bytes sit inside a sparse buffer.
 
-    Buffer-relative, carrying no page offset. ``BufferConfig`` is an input to the
-    ``KVCacheManager`` constructor, while a buffer's placement inside a cold page is not
-    settled until the cold-page codec is configured during that construction, so a
-    page-relative offset could not be supplied here. The manager adds both page offsets
-    itself, which is why this path requires the default cold-page codec: its cold page is
-    a plain concatenation of buffers, so their offsets are known.
+    Buffer-relative, carrying no page offset: it describes the internal shape of the
+    buffer, which is the part the model integration knows. The manager adds the page
+    offsets itself, from ``BufferAttr``.
 
-    Describes the cold side only. The default codec relocates a buffer's bytes verbatim,
-    so a unit is laid out identically in a cold page and in a hot slot, and one set of
-    strides serves both with only the unit index differing.
+    Describes both sides of the copy, which have the same shape. The fetch reads *hot*
+    pages, in ordinary slot layout, and writes cells holding one buffer's worth of the
+    same structure, so one set of strides serves both with only the unit index differing.
+    No codec is involved on this path -- a codec transforms pages on their way out of the
+    hot tier, which the fetch never reads.
 
     ``num_chunks * chunk_bytes`` must equal ``BufferConfig.size``, which is already
     per-unit.
@@ -258,48 +257,47 @@ class SelectionUnitLayout:
 class BufferConfig:
     """One buffer of a layer's KV cache.
 
-    ``is_sparse`` marks a buffer whose history is held on the host tier and read by
-    sparse-attention selection (see :meth:`KVCacheManager.is_sparse`).
+    ``is_sparse`` marks a buffer whose history is too large for device memory and is read
+    through a per-request device cache rather than directly (see
+    :meth:`KVCacheManager.is_sparse`).
 
-    It changes where a page locks, and that is what distinguishes it. An ordinary buffer
-    locks every page to ``GPU_LEVEL``. A sparse buffer locks **every** page to
-    ``CACHE_LEVEL1``, which must be configured with tier ``HOST_MEM``; configuring level 1
-    with another tier, or declaring fewer than two cache tiers, raises from the
-    ``KVCacheManager`` constructor. The page-index table is therefore uniform, and nothing
-    resolves against the GPU pool.
+    It changes the *medium* its pages are made of, not where they lock. Every buffer locks
+    its pages at the hot level; a sparse buffer's life cycle gets a host-backed hot pool
+    group, device-mapped so a kernel can read it. Its pages are otherwise ordinary hot
+    pages -- coalesced, addressed by page index, visible to the transceiver -- and the
+    page-index table stays uniform. A sparse buffer places no requirement on the cold
+    tiers, which may be host, disk, or absent.
 
-    Lock location is decided per lifecycle, and a page is one slot shared by every buffer of
-    its lifecycle, so a sparse buffer requires a lifecycle of its own; sharing one with a
-    non-sparse buffer raises from the ``KVCacheManager`` constructor.
+    Backing is decided per pool group, and pool groups are formed per lifecycle, so a
+    sparse buffer requires a lifecycle of its own; sharing one with a non-sparse buffer
+    raises from the ``KVCacheManager`` constructor.
 
-    All GPU residency is a per-request cache drawn from the sparse pool's GPU tier: both
-    the blocks still being written and the history a step selects are cells in it.
-    ``max_cached_units`` is the whole cache, counting both populations, and the reservation
-    follows from it alone. The two never overlap -- the selection is below the watermark,
-    everything in flight is above it -- so whatever the cache holds beyond a full selection
-    is the in-flight headroom, which is what :attr:`_KVCache.max_input_length` reports.
-    Prefill and decode share one manager, so that second population is a whole chunk during
-    prefill rather than a single block.
+    All device residency is a per-request lease on the life cycle's cache arena -- a
+    dedicated allocation, not a storage tier. Both the unit being written and the history a
+    step selects are cells in it. ``max_cached_units`` is the whole cache, counting both
+    populations, and the lease follows from it alone. The two never overlap: the selection
+    is below the watermark, everything in flight is above it. Only one unit is ever in
+    flight, because a request contributes one query token per step, so the surplus above the
+    selection width is retention rather than headroom.
 
-    A reserved slot is a row of buffer-sized cells and any layer's unit may occupy any cell,
-    so an entry is a ``(layer, entry index)`` pair resolved to a cell arithmetically.
-    Coalescing earns nothing here, because layers select different units and so share
-    nothing. :meth:`KVCacheManager.fetch_sparse_pages` fills the cells a step selects.
+    A lease is one contiguous run of buffer-sized cells, so an entry is a
+    ``(buffer, entry index)`` pair resolved to a cell by arithmetic alone -- no page table
+    and no slot indirection. :meth:`KVCacheManager.fetch_sparse_pages` fills the cells a
+    step selects.
 
-    Two to four times ``num_selected_blocks`` is the usual starting point -- a cache only as
+    Two to four times ``num_selected_blocks`` is the usual starting point: a cache only as
     wide as the selection retains nothing between steps, and retention of units not selected
-    this step is where the hit rate comes from -- but the surplus is also what bounds a
-    request's input length, so size for whichever demand is larger. ``max_cached_units``
-    must exceed ``num_selected_blocks``, since equality would leave no cell for the block
-    being written. Both default to zero, meaning the fetch path is not configured for this
-    buffer; sparse storage and locking work without them.
+    this step is where the hit rate comes from. ``max_cached_units`` must exceed
+    ``num_selected_blocks``, since equality would leave no cell for the unit being written.
+
+    Both default to zero, meaning the fetch path is not configured for this buffer; sparse
+    storage and locking work without them.
 
     ``sparse_unit_layout`` tells the manager where a selection unit's bytes are. It is
     required once ``max_cached_units`` is set, because a cell that cannot be located can be
-    neither filled nor written back. A buffer whose cold form is compressed, or whose units
-    are not locatable by arithmetic, supplies extraction code instead.
+    neither filled nor written back.
 
-    A block's data reaches its host page by a write-back that leaves the cell cached and
+    A block's data reaches its page by a write-back that leaves the cell cached and
     merely stops pinning it. A block must be written back before it can be selected, so
     :meth:`_KVCache.resize` is both the deadline and the only place it happens -- that being
     the one call through which the watermark ever moves. ``commit()`` is not a separate
@@ -883,6 +881,25 @@ class KVCacheManager:
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
     ) -> MemAddress: ...
+    def get_sparse_cache_max_units(self, layer_id: LayerId) -> int:
+        """Cells a request's cache holds per buffer of this layer, in selection units.
+
+        Counts both populations -- the history it caches and everything in flight -- so the
+        lease follows from this alone. Only one unit is ever in flight, so the surplus above
+        the selection width is retention rather than headroom. Zero when the layer has no
+        sparse fetch path.
+        """
+
+    def get_sparse_cache_expansion(self, layer_id: LayerId) -> int:
+        """Selection units carried by one buffer; one when a unit is a whole block."""
+
+    def get_sparse_cache_buffer_count(self, layer_id: LayerId) -> int:
+        """Sparse buffers of this layer's life cycle, one per ``(layer, role)``.
+
+        Each has its own cells, so a lease is this many runs of
+        :meth:`get_sparse_cache_max_units` cells.
+        """
+
     def get_sparse_cache_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
         """Base of the sparse cache arena backing this buffer. Raises if it has no fetch path.
 
@@ -980,11 +997,9 @@ class KVCacheManager:
 
         The buffer dimension is a dimension rather than a separate array per buffer
         because attention kernels commonly want one tensor covering K and V. It cannot be
-        dropped: a layer's buffers share the resolve, but not their cells. The cache packs
-        one buffer's entries densely across every cell of the pages it reserved, rather
-        than leaving each buffer at its nominal cell of a coalesced slot -- a layer would
-        otherwise reach only its own few cells of each page. So one selection resolves to
-        a different index per buffer, and each needs its own row.
+        dropped: a layer's buffers share the resolve, but not their cells. A lease gives
+        each buffer its own contiguous run of cells, so one selection resolves to a
+        different index per buffer, and each needs its own row.
 
         Indices are in the expanded index space :class:`PageIndexConverter` produces.
 

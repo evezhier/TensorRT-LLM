@@ -100,15 +100,14 @@ inline size_t cacheTierQuota(CacheTierConfig const& cfg)
 // ---------------------------------------------------------------------------
 // SelectionUnitLayout — where one selection unit's bytes sit inside a buffer.
 //
-// Buffer-relative, carrying no page offset: BufferConfig is an input to the
-// KVCacheManager constructor, while a buffer's placement inside a cold page is not
-// settled until the cold-page codec is configured during that construction. The manager
-// supplies both page offsets, which is why this path requires the default codec, whose
-// cold page is a plain concatenation of buffers.
+// Buffer-relative, carrying no page offset: it describes the internal shape of the buffer,
+// which is the part the model integration knows. The manager supplies the page offset from
+// BufferAttr.
 //
-// Describes the cold side only. The default codec relocates a buffer's bytes verbatim,
-// so a unit is laid out identically in a cold page and in a hot slot; one set of strides
-// serves both, with only the unit index differing.
+// Describes both sides of the copy, which have the same shape. The fetch reads hot pages in
+// ordinary slot layout and writes cells holding one buffer's worth of the same structure, so
+// one set of strides serves both with only the unit index differing. No codec is involved:
+// a codec transforms pages leaving the hot tier, which the fetch never reads.
 // ---------------------------------------------------------------------------
 struct SelectionUnitLayout
 {
