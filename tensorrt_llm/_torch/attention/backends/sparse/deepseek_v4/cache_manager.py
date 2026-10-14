@@ -16,7 +16,7 @@
 from collections import defaultdict
 from dataclasses import replace
 from math import gcd
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -555,6 +555,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         Returns:
             The buffer tensor (shape: [num_blocks, tokens_per_block, attn_dim])
             For blockwise FP8 layers, shape is [num_blocks, tokens_per_block, attn_dim + scale_size]
+            Sparse COMPRESS storage is device-mapped host memory with shape
+            [num_rows, 1, row_elements]. GPU arena views are returned by
+            get_sparse_compress_buffers().
         """
         layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
         data_role = attn_type.role
@@ -567,6 +570,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             DeepseekV4AttentionType.INDEXER_COMPRESS,
         ]:
             block_size = self.compressed_block_sizes[layer_idx]
+        if self.impl.is_sparse(layer_id, data_role):
+            # Sparse page indices and their upper bound already count selection units.
+            block_size //= self.impl.get_sparse_cache_expansion(layer_id)
 
         attn_dim = get_attn_dim(
             self.head_dim, self.index_head_dim, self._compress_ratios[layer_idx], attn_type
@@ -615,7 +621,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
     def get_compress_scale_buffers(self, layer_idx: int) -> torch.Tensor:
-        """Return E4M3 per-16 scales for an NVFP4 COMPRESS layer."""
+        """Return E4M3 per-16 scales from the NVFP4 COMPRESS storage pool.
+
+        Sparse storage is device-mapped host memory, indexed one compressed row
+        at a time. GPU arena scales are returned by get_sparse_compress_buffers().
+        """
         if not self._use_nvfp4_compress:
             raise RuntimeError("COMPRESS block scales exist only for NVFP4 KV cache.")
         layer_id = self._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS]
@@ -625,9 +635,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         page_index_upper_bound = self.impl.get_page_index_upper_bound(
             layer_id, COMPRESS_BLOCK_SCALE_ROLE
         )
+        block_size = self.compressed_block_sizes[layer_idx]
+        if self.impl.is_sparse(layer_id, COMPRESS_BLOCK_SCALE_ROLE):
+            block_size //= self.impl.get_sparse_cache_expansion(layer_id)
         shape = (
             page_index_upper_bound,
-            self.compressed_block_sizes[layer_idx],
+            block_size,
             (self.head_dim + self.nvfp4_residual_dim) // NVFP4_VECTOR_SIZE,
         )
         return convert_to_torch_tensor(TensorWrapper(addr, DataType.FP8, shape))
@@ -645,6 +658,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
         scale_pages = self.impl.get_page_index_upper_bound(layer_id, COMPRESS_BLOCK_SCALE_ROLE)
         tokens_per_page = self.compressed_block_sizes[layer_idx]
+        if self.impl.is_sparse(layer_id, DeepseekV4AttentionType.COMPRESS.role):
+            tokens_per_page //= self.impl.get_sparse_cache_expansion(layer_id)
         data = convert_to_torch_tensor(
             TensorWrapper(
                 self.compress_pool_ptrs[compress_ratio],
@@ -1738,7 +1753,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._prepare_sparse_batch(request_ids)
 
     def _prepare_sparse_batch(self, request_ids: list[int]) -> None:
-        """Publish scheduled caches in model input order before a serial forward.
+        """Publish scheduled caches in model input order before a forward.
 
         The allocation persists across steps and CUDA graph profiles. Membership lasts
         until the post-forward resource update: Batch temporarily owns every member's
@@ -1864,10 +1879,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _order_sparse_history_update(self, requests: Iterable[llm_request.LlmRequest]) -> None:
         """Order writeback after all model producers and attention readers.
 
-        The non-overlap executor orders its calling stream after model forward.
+        The executor orders its calling stream after model forward.
         Join it onto the cache stream before resize writes back completed units
         or recycles pages. prepare_sparse_batch() supplies the reverse dependency
-        for the next forward. Other executor schedules remain behind the inference guard.
+        for the next forward.
         """
         if not self._enable_kv_cache_offload:
             return
@@ -1889,16 +1904,47 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._order_sparse_history_update(scheduled_batch.context_requests)
         super().update_context_resources(scheduled_batch)
 
+    def update_forward_resources(
+        self, scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+    ) -> None:
+        """Advance sparse decode history from executed inputs before the next schedule.
+
+        Offload decode validates one input token per request, with speculation
+        disabled. That input's KV is produced by this forward; the sampled
+        output has no KV yet. Queue writeback after the forward on the cache
+        stream, independently of when the executor consumes sampling results.
+        """
+        if not self._enable_kv_cache_offload or not scheduled_batch.generation_requests:
+            return
+        wait_for_input_copy()
+        self._release_sparse_batch()
+        self._order_sparse_history_update(scheduled_batch.generation_requests)
+        for request in scheduled_batch.generation_requests:
+            request_id = request.py_request_id
+            cache = self.kv_cache_map.get(request_id)
+            if cache is None or not cache.is_active:
+                continue
+            history_length = cache.history_length + 1
+            if history_length > cache.capacity:
+                raise ValueError(f"Sparse decode request {request_id} has no reserved input token")
+            if not cache.resize(None, history_length):
+                raise ValueError(
+                    f"Failed to advance sparse KV history for request {request_id} "
+                    f"to {history_length} tokens after model forward"
+                )
+            self._allocated_draft_lens.pop(request_id, None)
+
     def update_resources(
         self,
         scheduled_batch: ScheduledRequests,
         attn_metadata: "AttentionMetadata | None" = None,
         kv_cache_dtype_byte_size: float | None = None,
     ) -> None:
-        self._release_sparse_batch()
-        self._order_sparse_history_update(scheduled_batch.generation_requests)
-        # The base computes max_beam_num_tokens - 1, excluding the sampled
-        # output token whose KV has not been produced yet. Never increment here.
+        if self._enable_kv_cache_offload:
+            # Sparse decode has no speculative slots to rewind. History follows
+            # forward completion; delayed sampling updates must neither rewind it
+            # nor detach the Batch prepared for a later forward.
+            return
         super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
 
     def get_sparse_offload_descriptors(self) -> dict[int, SparseOffloadLayerDescriptor]:
@@ -2411,12 +2457,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             f">1 attn buffer)"
         )
 
-    @torch.inference_mode()
-    def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
-        some_checks_unavailable = False
-        has_invalid_values = torch.tensor(
-            [False], dtype=torch.bool, device=torch.cuda.current_device()
-        )
+    def _iter_cache_cleanup_buffers(self) -> Iterable[tuple[torch.Tensor, int | None]]:
+        """Yield storage and arena views with their optional storage guard-page index."""
         buffers_handled = set()
 
         # Handle each attention buffer from start to end to traverse the whole
@@ -2433,25 +2475,41 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             for buffer_key, buffer in buffers:
                 if buffer_key in buffers_handled:
                     continue
-                # process in chunks of 256 pages to avoid OoM
-                for i in range(0, buffer.shape[0], 256):
-                    buffer_slice = buffer[i : i + 256]
-                    try:
-                        has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
-                        has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
-                    except NotImplementedError:
-                        some_checks_unavailable = True
-                if fill_with_zero:
-                    buffer.zero_()
-                    # Warmup scrubs the cache with fill_with_zero before inference;
-                    # restore this buffer's guard-page sentinel so the startup
-                    # warning does not claim a guard that was just wiped (mirrors
-                    # the base check_invalid_values_in_kv_cache). The guard key is
-                    # this buffer's (layer_id, role) identity == buffer_key.
-                    guard_page = self._guard_page_by_layer.get(buffer_key)
-                    if guard_page is not None and self._guard_page_value is not None:
-                        _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
                 buffers_handled.add(buffer_key)
+                yield buffer, self._guard_page_by_layer.get(buffer_key)
+
+        # Arena views span complete GPU pools and can be shared by several layers.
+        # Their physical row indices are independent of the host storage guard pages.
+        arenas_handled = set()
+        for arenas in self._sparse_arena_buffers.values():
+            for arena in arenas:
+                if arena is None or arena.data_ptr() in arenas_handled:
+                    continue
+                arenas_handled.add(arena.data_ptr())
+                yield arena, None
+
+    @torch.inference_mode()
+    def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
+        if self._enable_kv_cache_offload:
+            # Finish cache-stream writeback before scanning or clearing either tier.
+            torch.cuda.current_stream(self._stream.device).wait_stream(self._stream)
+        some_checks_unavailable = False
+        has_invalid_values = torch.tensor(
+            [False], dtype=torch.bool, device=torch.cuda.current_device()
+        )
+        for buffer, guard_page in self._iter_cache_cleanup_buffers():
+            # Process in chunks of 256 pages (or sparse rows) to avoid OoM.
+            for i in range(0, buffer.shape[0], 256):
+                buffer_slice = buffer[i : i + 256]
+                try:
+                    has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
+                    has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
+                except NotImplementedError:
+                    some_checks_unavailable = True
+            if fill_with_zero:
+                buffer.zero_()
+                if guard_page is not None and self._guard_page_value is not None:
+                    _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
         torch.cuda.synchronize()
 
         if some_checks_unavailable:

@@ -7799,6 +7799,11 @@ class PyExecutor:
             # before downstream operations use the outputs.
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
+            if self._is_kv_manager_v2:
+                self.kv_cache_manager.update_forward_resources(
+                    scheduled_requests,
+                    wait_for_input_copy=self._wait_for_model_engine_input_copy)
+
             self._kv_connector_wait_for_save()
             if route_capture is not None:
                 route_capture.finish_forward()  # R3: disarm between forwards

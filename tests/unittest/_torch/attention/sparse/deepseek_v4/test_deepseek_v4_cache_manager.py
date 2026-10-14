@@ -379,6 +379,156 @@ def test_sparse_arena_views_use_pool_capacity_and_share_storage(cache_dtype, max
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens_per_block", [16, 128, 256])
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("residual_dim", [0, 64])
+def test_compress_storage_views_match_allocation_size(
+    tokens_per_block: int, sparse: bool, residual_dim: int
+) -> None:
+    manager = _manager(tokens_per_block)
+    manager._use_nvfp4_compress = True
+    manager._nvfp4_residual_dim = residual_dim
+    manager.index_head_dim = 128
+    manager.compressed_block_sizes = [
+        tokens_per_block // ratio for ratio in manager._compress_ratios
+    ]
+    if not sparse:
+        manager.impl.sparse.clear()
+    main = DeepseekV4AttentionType.COMPRESS.role
+    scale = deepseek_v4_cache.COMPRESS_BLOCK_SCALE_ROLE
+    addresses = {main: 4096, scale: 8192}
+    manager.impl.get_mem_pool_base_address = Mock(
+        side_effect=lambda layer, role, mode: addresses[role]
+    )
+    expansion = tokens_per_block // 4 if sparse else 1
+    manager.impl.get_page_index_upper_bound = Mock(return_value=3 * expansion)
+    manager.compress_pool_ptrs = {4: addresses[main]}
+    manager.compress_scale_pool_ptrs = {4: addresses[scale]}
+    with patch.object(
+        deepseek_v4_cache,
+        "convert_to_torch_tensor",
+        side_effect=lambda wrapper: torch.empty(wrapper.shape, dtype=wrapper.dtype),
+    ) as convert:
+        data = manager.get_buffers(2, DeepseekV4AttentionType.COMPRESS)
+        scales = manager.get_compress_scale_buffers(2)
+        flat_data, flat_scales = manager.get_compress_pool_buffers(4)
+
+    rows_per_page = 1 if sparse else tokens_per_block // 4
+    storage_dim = manager.head_dim + residual_dim
+    assert data.shape == (3 * expansion, rows_per_page, storage_dim // 2)
+    assert scales.shape == (3 * expansion, rows_per_page, storage_dim // 16)
+    assert data.dtype == torch.uint8
+    assert scales.dtype == torch.float8_e4m3fn
+    assert data.numel() == flat_data.numel() == 3 * (tokens_per_block // 4) * storage_dim // 2
+    assert scales.numel() == flat_scales.numel() == 3 * (tokens_per_block // 4) * storage_dim // 16
+    assert [call.args[0].data_ptr() for call in convert.call_args_list] == [4096, 8192, 4096, 8192]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu_only),
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("nvfp4", [False, True])
+@pytest.mark.parametrize("fill_with_zero", [False, True])
+def test_sparse_warmup_cleanup_covers_storage_and_shared_arenas(
+    monkeypatch: pytest.MonkeyPatch, device: str, nvfp4: bool, fill_with_zero: bool
+) -> None:
+    manager = _manager()
+    manager._use_nvfp4_compress = nvfp4
+    manager._nvfp4_residual_dim = 64
+    manager.index_head_dim = 128
+    manager.compressed_block_sizes = [
+        manager.tokens_per_block // ratio for ratio in manager._compress_ratios
+    ]
+    manager._layer_attn_to_layer_id = {
+        (2, DeepseekV4AttentionType.COMPRESS): 41,
+        (4, DeepseekV4AttentionType.COMPRESS): 19,
+    }
+    main = DeepseekV4AttentionType.COMPRESS.role
+    scale = deepseek_v4_cache.COMPRESS_BLOCK_SCALE_ROLE
+    manager._guard_page_by_layer = {(41, main): 5}
+    manager._guard_page_value = 17
+    backings = []
+
+    def allocate(rows: int, width: int, dtype: torch.dtype, *, host: bool) -> torch.Tensor:
+        storage = torch.full(
+            (rows + 2, 1, width),
+            37,
+            dtype=torch.uint8 if dtype == torch.float8_e4m3fn else dtype,
+            device="cpu" if host else device,
+            pin_memory=host and device == "cuda",
+        )
+        backings.append((storage, storage[[0, -1]].clone()))
+        return storage[1:-1].view(dtype)
+
+    data_dtype = torch.uint8 if nvfp4 else torch.bfloat16
+    data_width = (manager.head_dim + manager.nvfp4_residual_dim) // 2 if nvfp4 else manager.head_dim
+    host_rows = 3 * (manager.tokens_per_block // 4)
+    storage = {}
+    for layer in (41, 19):
+        storage[layer, main] = allocate(host_rows, data_width, data_dtype, host=True)
+        if nvfp4:
+            storage[layer, scale] = allocate(host_rows, 36, torch.float8_e4m3fn, host=True)
+    arena_data = allocate(11, data_width, data_dtype, host=False)
+    arena_scales = allocate(11, 36, torch.float8_e4m3fn, host=False) if nvfp4 else None
+    manager._sparse_arena_buffers = {2: (arena_data, arena_scales), 4: (arena_data, arena_scales)}
+    if not nvfp4:
+        arena_data[0, 0, 0] = torch.nan
+    buffers = list(storage.values()) + [arena_data] + ([arena_scales] if nvfp4 else [])
+    originals = [buffer.view(torch.uint8).clone() for buffer in buffers]
+    manager.impl.get_mem_pool_base_address = Mock(
+        side_effect=lambda layer, role, mode: storage[layer, role].data_ptr()
+    )
+    manager.impl.get_page_index_upper_bound = Mock(return_value=host_rows)
+    by_address = {buffer.data_ptr(): buffer for buffer in storage.values()}
+    convert = deepseek_v4_cache.convert_to_torch_tensor
+
+    def convert_storage(wrapper: deepseek_v4_cache.TensorWrapper) -> torch.Tensor:
+        buffer = by_address[wrapper.data_ptr()]
+        # Check the native allocation bound before exposing a raw pointer to CUDA.
+        assert wrapper.numel() == buffer.numel()
+        assert wrapper.dtype == buffer.dtype
+        return convert(wrapper) if device == "cuda" else buffer.reshape(wrapper.shape)
+
+    monkeypatch.setattr(deepseek_v4_cache, "convert_to_torch_tensor", convert_storage)
+    if device == "cpu":
+        manager._stream = SimpleNamespace(device="cpu")
+        cleanup_stream = Mock()
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda device: cleanup_stream)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+        monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    else:
+        manager._stream = torch.cuda.Stream()
+        manager._stream.wait_stream(torch.cuda.current_stream())
+
+    with patch.object(torch, "isnan", wraps=torch.isnan) as isnan:
+        assert manager.check_invalid_values_in_kv_cache(fill_with_zero) == (not nvfp4)
+    if device == "cpu":
+        cleanup_stream.wait_stream.assert_called_once_with(manager._stream)
+    for arena in (arena_data, arena_scales):
+        if arena is not None:
+            assert (
+                sum(call.args[0].data_ptr() == arena.data_ptr() for call in isnan.call_args_list)
+                == 1
+            )
+    for buffer, original in zip(buffers, originals):
+        expected = original
+        if fill_with_zero:
+            expected = torch.zeros_like(original)
+            if buffer is storage[41, main]:
+                expected[5] = torch.full_like(buffer[5], 0x7F if nvfp4 else 17).view(torch.uint8)
+        torch.testing.assert_close(buffer.view(torch.uint8), expected)
+    for backing, edges in backings:
+        torch.testing.assert_close(backing[[0, -1]].view(torch.uint8), edges.view(torch.uint8))
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("invalid", ["count", "position", "missing_scales"])
 def test_sparse_offload_descriptors_reject_unpaired_nvfp4_arenas(invalid):
     manager = _manager()
@@ -458,20 +608,20 @@ def test_completed_history_advances_without_reuse_or_capacity_growth(tokens_per_
         assert cache.history_length == tokens_per_block - 1
         assert cache.calls == [(None, tokens_per_block - 1)]
         batch.context_requests, batch.generation_requests = [], [request]
-        for completed in (
-            tokens_per_block,
-            tokens_per_block + 1,
-            2 * tokens_per_block,
-            2 * tokens_per_block + 1,
-        ):
+        for completed in range(tokens_per_block, 2 * tokens_per_block + 2):
+            manager._allocated_draft_lens[request.py_request_id] = 0
+            manager.update_forward_resources(batch, wait_for_input_copy=Mock())
+            assert cache.history_length == completed
+            assert cache.calls[-1] == (None, completed)
+            assert request.py_request_id not in manager._allocated_draft_lens
             # Sampling has appended one output token; that token has no KV yet.
             request.max_beam_num_tokens = completed + 1
             manager.update_resources(batch)
             assert cache.history_length == completed
-            assert cache.calls[-1] == (3 * tokens_per_block, completed)
-        assert manager._stream.wait_stream.call_count == 5
+            assert cache.calls[-1] == (None, completed)
+        assert manager._stream.wait_stream.call_count == tokens_per_block + 3
         manager._stream.wait_stream.assert_called_with(caller_stream)
-        assert len(cache.calls) == 5
+        assert len(cache.calls) == tokens_per_block + 3
 
 
 @pytest.mark.cpu_only
@@ -481,7 +631,8 @@ def test_completed_history_advances_without_reuse_or_capacity_growth(tokens_per_
 )
 def test_history_update_rejects_failures_and_skips_inactive(context: bool, problem: str) -> None:
     manager, cache, request, batch = _history_case()
-    update = manager.update_context_resources if context else manager.update_resources
+    update = manager.update_context_resources if context else manager.update_forward_resources
+    update_kwargs = {} if context else {"wait_for_input_copy": Mock()}
     if not context:
         batch.context_requests, batch.generation_requests = [], [request]
     if problem == "resize_failure":
@@ -497,11 +648,11 @@ def test_history_update_rejects_failures_and_skips_inactive(context: bool, probl
         patch("torch.cuda.is_current_stream_capturing", return_value=problem == "capture"),
     ):
         if problem in ("suspended", "removed"):
-            update(batch)
+            update(batch, **update_kwargs)
             manager._stream.wait_stream.assert_not_called()
         else:
             with pytest.raises((ValueError, RuntimeError)):
-                update(batch)
+                update(batch, **update_kwargs)
     assert cache.history_length == 0
     assert len(cache.calls) == (1 if problem == "resize_failure" else 0)
 
@@ -765,7 +916,6 @@ def test_sparse_batch_restores_ownership_after_publication_failure(sparse_schedu
     "operation",
     [
         "update_context_resources",
-        "update_resources",
         "suspend_request",
         "free_resources",
         "release_index_slot",
@@ -813,6 +963,7 @@ def test_sparse_batch_publishes_updated_history_on_next_step(sparse_scheduling_c
     if context:
         manager.update_context_resources(case.scheduled)
     else:
+        manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
         manager.update_resources(case.scheduled)
     assert cache.history_length == cache.capacity == 8
     assert cache.page_index_owner == "runtime"
@@ -825,6 +976,127 @@ def test_sparse_batch_publishes_updated_history_on_next_step(sparse_scheduling_c
     manager.prepare_resources(case.scheduled)
     assert manager.get_sparse_batch([20]) is batch
     assert batch.snapshots[-1][0][1:3] == (8, 9)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("history_length", [7, 127, 255])
+def test_sparse_overlap_history_advances_before_delayed_samples(
+    sparse_scheduling_case: SimpleNamespace, history_length: int
+) -> None:
+    case = sparse_scheduling_case
+    manager, cache, request = case.manager, case.cache, case.request
+    case.scheduled.generation_requests = [request]
+    cache.history_length, cache.capacity = history_length, history_length + 1
+    request.max_beam_num_tokens = history_length + 1
+    manager.prepare_resources(case.scheduled)
+    batch = manager.get_sparse_batch([20])
+
+    # Forward N produces KV before the executor consumes sampling result N.
+    manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
+    assert cache.history_length == history_length + 1
+    assert cache.page_index_owner == "runtime"
+
+    assert cache.resize(history_length + 2, None)
+    manager.prepare_resources(case.scheduled)
+    assert batch.snapshots[-1][0][1:3] == (history_length + 1, history_length + 2)
+    calls = list(cache.calls)
+    # A delayed update must not detach the newly published Batch.
+    manager.update_resources(case.scheduled)
+    assert manager.get_sparse_batch([20]) is batch
+    assert cache.calls == calls
+
+    manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
+    assert cache.history_length == history_length + 2
+    calls = list(cache.calls)
+    # The overlap executor now consumes N's sample after forward N+1.
+    # Its CPU token count describes an older KV frontier.
+    request.max_beam_num_tokens = history_length + 2
+    manager.update_resources(case.scheduled)
+    assert cache.history_length == history_length + 2
+    assert cache.calls == calls
+
+    assert cache.resize(history_length + 3, None)
+    manager.prepare_resources(case.scheduled)
+    assert batch.snapshots[-1][0][1:3] == (history_length + 2, history_length + 3)
+
+
+@pytest.mark.cpu_only
+def test_sparse_history_does_not_advance_without_forward(
+    sparse_scheduling_case: SimpleNamespace,
+) -> None:
+    case = sparse_scheduling_case
+    manager, cache, request = case.manager, case.cache, case.request
+    case.scheduled.generation_requests = [request]
+    cache.history_length, cache.capacity = 7, 8
+    manager.prepare_resources(case.scheduled)
+    batch = manager.get_sparse_batch([20])
+    # Resource preparation alone can be followed by can_queue=False.
+    manager.update_resources(case.scheduled)
+    manager.prepare_resources(case.scheduled)
+    assert cache.history_length == 7
+    assert not cache.calls
+    assert batch.snapshots[-1][0][1:3] == (7, 8)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("copy_fails", [False, True])
+def test_sparse_forward_waits_for_input_copy_before_detaching(
+    sparse_scheduling_case: SimpleNamespace, copy_fails: bool
+) -> None:
+    case = sparse_scheduling_case
+    manager, cache, request = case.manager, case.cache, case.request
+    case.scheduled.generation_requests = [request]
+    cache.history_length, cache.capacity = 7, 8
+    manager.prepare_resources(case.scheduled)
+    batch = manager.get_sparse_batch([20])
+
+    def wait_for_input_copy() -> None:
+        assert manager.get_sparse_batch([20]) is batch
+        assert cache.page_index_owner == "batch"
+        assert not cache.calls
+        if copy_fails:
+            raise RuntimeError("input copy failed")
+
+    wait = Mock(side_effect=wait_for_input_copy)
+    if copy_fails:
+        with pytest.raises(RuntimeError, match="input copy failed"):
+            manager.update_forward_resources(case.scheduled, wait_for_input_copy=wait)
+        assert manager.get_sparse_batch([20]) is batch
+        assert cache.history_length == 7
+        assert not cache.calls
+    else:
+        manager.update_forward_resources(case.scheduled, wait_for_input_copy=wait)
+        assert cache.history_length == 8
+        assert cache.page_index_owner == "runtime"
+    wait.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_sparse_forward_requires_reserved_input_capacity() -> None:
+    manager, cache, request, batch = _history_case()
+    batch.context_requests, batch.generation_requests = [], [request]
+    cache.history_length = cache.capacity
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        pytest.raises(ValueError, match="no reserved input token"),
+    ):
+        manager.update_forward_resources(batch, wait_for_input_copy=Mock())
+    assert not cache.calls
+
+
+@pytest.mark.cpu_only
+def test_non_offload_history_still_follows_sampling() -> None:
+    manager, cache, request, batch = _history_case()
+    manager._enable_kv_cache_offload = False
+    batch.context_requests, batch.generation_requests = [], [request]
+    wait = Mock()
+    manager.update_forward_resources(batch, wait_for_input_copy=wait)
+    wait.assert_not_called()
+    assert not cache.calls
+    manager.update_resources(batch)
+    assert cache.history_length == request.max_beam_num_tokens - 1
+    manager._stream.wait_stream.assert_not_called()
 
 
 @pytest.mark.cpu_only
