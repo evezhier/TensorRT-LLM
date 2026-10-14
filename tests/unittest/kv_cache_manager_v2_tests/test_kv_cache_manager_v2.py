@@ -1622,6 +1622,399 @@ class TestSparseDataPath(unittest.TestCase):
             manager.shutdown()
 
 
+class TestSparseWriteIndices(unittest.TestCase):
+    """prepare_sparse_write_indices: the cell the model writes its new unit into.
+
+    The unit between the two watermarks has no host page yet, so nothing can be fetched for
+    it; what the model needs is only where to put it. These cover that the reported cell is
+    the one the write-back later reads, that asking twice does not move it, and that a fetch
+    running afterwards leaves it alone.
+    """
+
+    TPB = 128
+    BUF = 4096
+    SELECTED = 2
+    CELLS = 4
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @classmethod
+    def _manager(cls) -> KVCacheManager:
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=cls.TPB,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig(
+                                "key",
+                                cls.BUF,
+                                is_sparse=True,
+                                num_selected_blocks=cls.SELECTED,
+                                max_cached_units=cls.CELLS,
+                                sparse_unit_layout=SelectionUnitLayout(1, cls.BUF, 0, cls.BUF),
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+
+    def _deps(self):
+        try:
+            import ctypes
+
+            import cuda.bindings.runtime as cudart
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch and the CUDA bindings are needed to address raw memory")
+        return ctypes, cudart, torch
+
+    @staticmethod
+    def _pattern(size: int, seed: int) -> bytes:
+        return bytes((i * seed + 13) % 251 for i in range(size))
+
+    def test_the_prepared_cell_is_the_one_written_back(self):
+        """The whole contract in one path: write where it says, and the page gets it."""
+        ctypes, cudart, torch = self._deps()
+        manager = self._manager()
+        cache = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+            stride = manager.get_page_stride(LayerId(0), "key")
+            arena = int(manager.get_sparse_cache_base_address(LayerId(0), "key"))
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                # Capacity one token past a history that has not reached unit 0, so unit 0
+                # is the unit in flight.
+                self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
+                batch.publish(handle)
+
+                out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
+                torch.cuda.synchronize()
+                index = int(out[0][0])
+                self.assertNotEqual(index, BAD_PAGE_INDEX, "a unit is in flight")
+
+                pattern = self._pattern(self.BUF, 41)
+                source = (ctypes.c_ubyte * self.BUF).from_buffer(bytearray(pattern))
+                (err,) = cudart.cudaMemcpy(
+                    arena + index * self.BUF,
+                    ctypes.addressof(source),
+                    self.BUF,
+                    cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                )
+                self.assertEqual(int(err), 0)
+
+                batch.wait_published()
+                # The watermark crosses unit 0, so its cell is written back.
+                self.assertTrue(cache.resize(self.TPB + 1, self.TPB))
+                torch.cuda.synchronize()
+
+                pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                landed = ctypes.string_at(pool + pages[0] * stride, self.BUF)
+                self.assertEqual(landed, pattern, "the prepared cell was not the one written back")
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_preparing_twice_reports_the_same_cell(self):
+        """Idempotent while the watermarks hold: the second call must not move the unit."""
+        _, _, torch = self._deps()
+        manager = self._manager()
+        cache = None
+        try:
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
+                batch.publish(handle)
+
+                seen = []
+                for _ in range(3):
+                    out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                    manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
+                    torch.cuda.synchronize()
+                    seen.append(int(out[0][0]))
+                self.assertNotEqual(seen[0], BAD_PAGE_INDEX)
+                self.assertEqual(len(set(seen)), 1, f"the cell moved between calls: {seen}")
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_a_row_with_nothing_in_flight_reports_bad_page_index(self):
+        """Both watermarks on a unit boundary: there is no unit to write."""
+        _, _, torch = self._deps()
+        manager = self._manager()
+        cache = None
+        try:
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resize(self.TPB, self.TPB))
+                batch.publish(handle)
+
+                out = torch.full((2, 1), 12345, dtype=torch.int32, device="cuda")
+                manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
+                torch.cuda.synchronize()
+                self.assertEqual(
+                    int(out[0][0]), BAD_PAGE_INDEX, "capacity holds no unit above history"
+                )
+                # Written in full: the unoccupied row must be overwritten, not left at 12345.
+                self.assertEqual(
+                    int(out[1][0]), BAD_PAGE_INDEX, "a free row carries no reservation"
+                )
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_every_buffer_of_a_layer_gets_its_own_cell(self):
+        """Two buffers, and a headroom wider than what is actually in flight.
+
+        The resolve's in-flight array is a row per request of max_cached_units minus the
+        selection width, while at most one unit is ever in flight. Reading it with the wrong
+        row stride writes one buffer's slots over the next buffer's output, which this sees
+        as the second buffer losing its index.
+        """
+        _, _, torch = self._deps()
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=self.TPB,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig(
+                                role,
+                                self.BUF,
+                                is_sparse=True,
+                                num_selected_blocks=self.SELECTED,
+                                # Headroom of CELLS - SELECTED = 2, wider than the one unit
+                                # that can be in flight.
+                                max_cached_units=self.CELLS,
+                                sparse_unit_layout=SelectionUnitLayout(1, self.BUF, 0, self.BUF),
+                            )
+                            for role in ("key", "value")
+                        ],
+                    )
+                ],
+            )
+        )
+        cache = None
+        try:
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
+                batch.publish(handle)
+
+                out = torch.full((1, 2), 12345, dtype=torch.int32, device="cuda")
+                manager.prepare_sparse_write_indices(
+                    batch, [BufferId(0, "key"), BufferId(0, "value")], out, handle
+                )
+                torch.cuda.synchronize()
+                got = [int(out[0][0]), int(out[0][1])]
+                self.assertNotIn(
+                    BAD_PAGE_INDEX, got, f"both buffers hold the in-flight unit: {got}"
+                )
+                self.assertEqual(len(set(got)), 2, f"buffers must not share a cell: {got}")
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_each_layer_reports_a_cell_of_its_own(self):
+        """One unit ordinal, one index per layer -- never one answer for the step.
+
+        A layer resolves against its own resident set and its own recency order, so the same
+        ordinal lands on a different entry in each; and each layer's buffer owns its own run
+        of cells, so even equal entries would not collide. Both are why the call takes one
+        layer rather than a group.
+        """
+        _, _, torch = self._deps()
+        layers = 3
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=self.TPB,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        layer,
+                        [
+                            BufferConfig(
+                                "key",
+                                self.BUF,
+                                is_sparse=True,
+                                num_selected_blocks=self.SELECTED,
+                                max_cached_units=self.CELLS,
+                                sparse_unit_layout=SelectionUnitLayout(1, self.BUF, 0, self.BUF),
+                            )
+                        ],
+                    )
+                    for layer in range(layers)
+                ],
+            )
+        )
+        cache = None
+        try:
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
+                batch.publish(handle)
+
+                indices = []
+                for layer in range(layers):
+                    out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                    manager.prepare_sparse_write_indices(
+                        batch, [BufferId(LayerId(layer), "key")], out, handle
+                    )
+                    torch.cuda.synchronize()
+                    indices.append(int(out[0][0]))
+
+                self.assertNotIn(BAD_PAGE_INDEX, indices, "every layer has the same unit in flight")
+                self.assertEqual(
+                    len(set(indices)), layers, f"layers must not share a cell: {indices}"
+                )
+                # Each layer's buffer owns an adjacent run of cells_per_buffer cells, so the
+                # runs the three indices fall in are consecutive.
+                runs = sorted(index // self.CELLS for index in indices)
+                self.assertEqual(
+                    runs,
+                    list(range(runs[0], runs[0] + layers)),
+                    f"cell runs are not per buffer: {indices}",
+                )
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_a_fetch_neither_moves_nor_overwrites_the_prepared_cell(self):
+        """A fetch runs its own resolve; the prepared cell must come through unchanged.
+
+        It covers the copy list: an in-flight unit's host page holds nothing yet, so a fetch
+        that treated its entry as an ordinary miss would copy stale bytes over what the model
+        wrote. Removing that guard fails this.
+
+        It does not cover the separate `pinned` term in the victim test. Every in-flight
+        ordinal is probed in the resolve's required prefix, so its entry is always classified
+        hit or fetched and never `kClassUntouched` -- which the victim test already excludes.
+        Dropping `pinned` leaves every test here passing, so it appears to be redundant with
+        that classification rather than load-bearing.
+        """
+        ctypes, cudart, torch = self._deps()
+        manager = self._manager()
+        cache = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+            stride = manager.get_page_stride(LayerId(0), "key")
+            arena = int(manager.get_sparse_cache_base_address(LayerId(0), "key"))
+            cache = manager.create_kv_cache()
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                # resize() bounds capacity - history to one token, so a unit is in flight
+                # only as history reaches a unit boundary: two units of history behind the
+                # watermark, and unit 2 in flight.
+                self.assertTrue(cache.resize(3 * self.TPB, 3 * self.TPB - 1))
+                batch.publish(handle)
+
+                out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
+                torch.cuda.synchronize()
+                index = int(out[0][0])
+                self.assertNotEqual(index, BAD_PAGE_INDEX)
+
+                written = self._pattern(self.BUF, 53)
+                source = (ctypes.c_ubyte * self.BUF).from_buffer(bytearray(written))
+                (err,) = cudart.cudaMemcpy(
+                    arena + index * self.BUF,
+                    ctypes.addressof(source),
+                    self.BUF,
+                    cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                )
+                self.assertEqual(int(err), 0)
+
+                # Paint the history pages differently, so a copy over the in-flight cell
+                # would be visible rather than coincidentally matching.
+                pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                for ordinal in range(2):
+                    ctypes.memmove(
+                        pool + pages[ordinal] * stride,
+                        self._pattern(self.BUF, 60 + ordinal),
+                        self.BUF,
+                    )
+
+                # A full-width selection of the two eligible units, so the fetch fills every
+                # cell the reservation has beyond the one in flight.
+                selected = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+                fetched = torch.full((1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
+                manager.fetch_sparse_pages(batch, [BufferId(0, "key")], selected, fetched, handle)
+                torch.cuda.synchronize()
+
+                after = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], after, handle)
+                torch.cuda.synchronize()
+                self.assertEqual(int(after[0][0]), index, "the fetch moved the in-flight cell")
+
+                got = bytearray(self.BUF)
+                sink = (ctypes.c_ubyte * self.BUF).from_buffer(got)
+                (err,) = cudart.cudaMemcpy(
+                    ctypes.addressof(sink),
+                    arena + index * self.BUF,
+                    self.BUF,
+                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                )
+                self.assertEqual(int(err), 0)
+                self.assertEqual(bytes(got), written, "the fetch overwrote the in-flight cell")
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+
 class TestSparseQuantisedDataPath(unittest.TestCase):
     """The quantised shape end to end: one layer, two buffers, two pools.
 

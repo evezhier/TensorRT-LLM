@@ -2670,6 +2670,45 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "prepare_sparse_write_indices",
+            [](kv::KvCacheManager& self, kv::Batch& batch, std::vector<kv::BufferId> const& buffers,
+                DeviceArray2D const& out, nb::object stream)
+            {
+                if (static_cast<int>(out.shape(0)) != batch.maxBatchSize())
+                {
+                    throw std::invalid_argument(
+                        "prepare_sparse_write_indices: out must carry one row per batch row, not one per "
+                        "query token. A request has at most one unit in flight; prefill and speculative "
+                        "decoding give it several and are out of scope");
+                }
+                if (out.shape(1) != buffers.size())
+                {
+                    throw std::invalid_argument("prepare_sparse_write_indices: out's last extent must be len(buffers)");
+                }
+                auto const handle
+                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                auto* outPtr = out.data();
+                nb::gil_scoped_release rel;
+                self.prepareSparseWriteIndices(batch, buffers, outPtr, handle);
+            },
+            nb::arg("batch"), nb::arg("buffers"), nb::arg("out"), nb::arg("stream") = nb::none(),
+            "Give each request's in-flight unit a cell, and report where to write it.\n\n"
+            "The unit between the two watermarks is the one the model is about to produce. It has no "
+            "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
+            "it -- so nothing is fetched: the call assigns a cell and leaves its bytes to the model.\n\n"
+            "Separate from fetch_sparse_pages because the orders differ. A fetch needs the selection, "
+            "which the indexer produces from the previous layer; a write needs only the watermarks, so "
+            "it can run first, which is the order the model requires.\n\n"
+            "Idempotent while the watermarks and the reservation hold: a later call, including the "
+            "fetch's own resolve, finds the entry and reuses it. The entry is pinned while its unit is "
+            "in flight, so no fetch can evict it.\n\n"
+            "buffers is one layer's sparse buffers, exactly as for fetch_sparse_pages. out is "
+            "int32[batch, len(buffers)], written in full, in the same expanded index space "
+            "fetch_sparse_pages produces and relative to the same get_sparse_cache_base_address "
+            "region: BAD_PAGE_INDEX where the row holds no reservation or nothing in flight.\n\n"
+            "Device-driven and stream-ordered: enqueues and returns, and every shape is static, so a "
+            "CUDA graph can capture it.")
+        .def(
             "fetch_sparse_pages",
             [](kv::KvCacheManager& self, kv::Batch& batch, std::vector<kv::BufferId> const& buffers,
                 DeviceArray2D const& selected, DeviceArray3D const& out, nb::object stream)

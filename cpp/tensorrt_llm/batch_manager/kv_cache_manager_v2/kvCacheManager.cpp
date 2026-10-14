@@ -406,16 +406,12 @@ MemAddress KvCacheManager::getSparseCacheBaseAddress(LayerId layerId, DataRole c
     return static_cast<MemAddress>(arena.base(it->poolIndex));
 }
 
-void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
-    int selectionWidth, int32_t* out, CUstream stream)
+KvCacheManager::SparseLayerSpan KvCacheManager::_sparseLayerSpan(
+    std::vector<BufferId> const& buffers, char const* api) const
 {
     if (buffers.empty())
     {
-        throw std::invalid_argument("fetchSparsePages: no buffers");
-    }
-    if (selected == nullptr || out == nullptr)
-    {
-        throw std::invalid_argument("fetchSparsePages: selected and out must be device pointers");
+        throw std::invalid_argument(std::string(api) + ": no buffers");
     }
 
     LayerId const layerId = buffers.front().layerId;
@@ -423,12 +419,13 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     {
         if (id.layerId != layerId)
         {
-            throw std::invalid_argument("fetchSparsePages: every buffer must belong to one layer");
+            throw std::invalid_argument(std::string(api) + ": every buffer must belong to one layer");
         }
     }
 
-    LifeCycleId const lcId{getLayerGroupId(layerId).value()};
-    auto const all = sparseBufferIds(lcId);
+    SparseLayerSpan span;
+    span.lifeCycle = LifeCycleId{getLayerGroupId(layerId).value()};
+    auto const all = sparseBufferIds(span.lifeCycle);
     // Buffers are grouped by layer, so this layer's are a contiguous run.
     auto const first
         = std::find_if(all.begin(), all.end(), [layerId](BufferId const& id) { return id.layerId == layerId; });
@@ -436,21 +433,114 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     if (!std::equal(first, last, buffers.begin(), buffers.end()))
     {
         throw std::invalid_argument(
-            "fetchSparsePages: buffers must be exactly this layer's sparse buffers, in the cache's order");
+            std::string(api) + ": buffers must be exactly this layer's sparse buffers, in the cache's order");
     }
 
-    auto const bufferBase = static_cast<int32_t>(std::distance(all.begin(), first));
-    auto const numBuffers = static_cast<int32_t>(std::distance(first, last));
+    span.bufferBase = static_cast<int32_t>(std::distance(all.begin(), first));
+    span.numBuffers = static_cast<int32_t>(std::distance(first, last));
     // The metadata row is the layer's index among those carrying a cache, which is the
     // number of distinct layers before it in the same walk.
-    int32_t layerInGroup = 0;
     for (auto it = all.begin(); it != first; ++it)
     {
         if (it == all.begin() || it->layerId != std::prev(it)->layerId)
         {
-            ++layerInGroup;
+            ++span.layerInGroup;
         }
     }
+    return span;
+}
+
+void KvCacheManager::prepareSparseWriteIndices(
+    Batch& batch, std::vector<BufferId> const& buffers, int32_t* out, CUstream stream)
+{
+    if (out == nullptr)
+    {
+        throw std::invalid_argument("prepareSparseWriteIndices: out must be a device pointer");
+    }
+
+    auto const span = _sparseLayerSpan(buffers, "prepareSparseWriteIndices");
+    LifeCycleId const lcId = span.lifeCycle;
+
+    LayerGroupId const lgId{lcId.value()};
+    auto const& scratch = batch.sparseFetchScratch(lgId);
+    if (scratch.inFlightSlot == nullptr)
+    {
+        throw std::invalid_argument("prepareSparseWriteIndices: this layer group carries no sparse cache");
+    }
+
+    int const expansion = sparseCacheExpansion(lcId);
+    auto const views = reinterpret_cast<SparseCacheView const*>(batch.sparseCacheViews(lgId));
+    auto const watermarks = batch.watermarks();
+    auto const numRows = batch.maxBatchSize();
+
+    // A resolve with no selection. It makes the in-flight unit resident -- reusing its entry
+    // when a previous step already pinned it -- and does nothing else: an in-flight unit's
+    // host page is not written until the watermark passes it, so there is nothing to copy.
+    //
+    // The selection and miss arrays are therefore left null, which the resolve tolerates only
+    // because it records a miss against the copy list under `ordinal < historyUnits`, and an
+    // in-flight ordinal never satisfies it. A change that made that write unconditional would
+    // fault here rather than quietly copying stale bytes over what the model wrote.
+    SparseResolveArgs resolve;
+    resolve.views = views;
+    resolve.numRows = numRows;
+    resolve.layerInGroup = span.layerInGroup;
+    resolve.numLayers = sparseCacheLayerCount(lcId);
+    resolve.entriesPerLayer = sparseCacheSubSlotsPerBuffer(lcId) * expansion;
+    resolve.selectionWidth = 0;
+    resolve.historyTokens = reinterpret_cast<int32_t const*>(watermarks.historyLength);
+    resolve.capacityTokens = reinterpret_cast<int32_t const*>(watermarks.capacity);
+    resolve.unitTokens = mConfig.tokensPerBlock / expansion;
+    resolve.inFlightSlot = scratch.inFlightSlot;
+    resolve.maxInFlightUnits = scratch.maxInFlightUnits;
+    resolve.missCount = scratch.missCount;
+    launchSparseResolve(resolve, stream);
+
+    // The in-flight list stands in for a selection: the resolve writes kNoSparseSlot past the
+    // span, so a row with nothing in flight needs no separate signal.
+    for (auto const& copy : sparseCopyTemplates(lcId))
+    {
+        auto const runBase = std::max(copy.bufferBase, span.bufferBase);
+        auto const runEnd = std::min(copy.bufferBase + copy.numBuffers, span.bufferBase + span.numBuffers);
+        if (runBase >= runEnd)
+        {
+            continue;
+        }
+        SparseOutIndexArgs indices;
+        indices.views = views;
+        indices.numRows = numRows;
+        indices.selected = nullptr;
+        indices.outSlot = scratch.inFlightSlot;
+        // One entry per request: resize() bounds capacity - history to a single token, so at
+        // most one unit is ever in flight. The scratch row is the reservation's headroom,
+        // which is wider, hence the separate stride.
+        indices.selectionWidth = 1;
+        indices.outSlotStride = scratch.maxInFlightUnits;
+        indices.out = out;
+        indices.outBuffers = span.numBuffers;
+        indices.outBase = runBase - span.bufferBase;
+        indices.bufferBase = runBase;
+        indices.numBuffers = runEnd - runBase;
+        indices.cellsPerBuffer = copy.cellsPerBuffer;
+        indices.cellsPerLease = copy.cellsPerLease;
+        indices.expansion = expansion;
+        launchSparseOutIndices(indices, stream);
+    }
+}
+
+void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
+    int selectionWidth, int32_t* out, CUstream stream)
+{
+    if (selected == nullptr || out == nullptr)
+    {
+        throw std::invalid_argument("fetchSparsePages: selected and out must be device pointers");
+    }
+
+    auto const span = _sparseLayerSpan(buffers, "fetchSparsePages");
+    LifeCycleId const lcId = span.lifeCycle;
+    auto const bufferBase = span.bufferBase;
+    auto const numBuffers = span.numBuffers;
+    auto const layerInGroup = span.layerInGroup;
 
     auto const& scratch = batch.sparseFetchScratch(LayerGroupId{lcId.value()});
     if (scratch.outSlot == nullptr)

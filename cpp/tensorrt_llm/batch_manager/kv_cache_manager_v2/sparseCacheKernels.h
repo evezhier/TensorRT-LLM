@@ -257,6 +257,12 @@ struct SparseOutIndexArgs
     int32_t const* outSlot = nullptr;
     int32_t selectionWidth = 0;
 
+    //! Row stride of `outSlot`, when it is wider than the part this call reads. Zero means
+    //! `selectionWidth`. The write-index path needs it: its slots come from the resolve's
+    //! in-flight array, whose row is the reservation's headroom, while only the units
+    //! actually in flight -- at most one -- are read out.
+    int32_t outSlotStride = 0;
+
     //! [numRows][outBuffers][selectionWidth] written in full: entry `k` is the index
     //! holding `selected[row][k]` for the buffer, and kBadPageIndex where the selection is
     //! padded or the row holds no reservation. Padding stays where the selection put it

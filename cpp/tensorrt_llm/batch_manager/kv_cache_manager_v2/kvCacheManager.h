@@ -225,6 +225,29 @@ public:
     void fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
         int selectionWidth, int32_t* out, CUstream stream);
 
+    //! Give the in-flight unit of each request a cell, and report where to write it.
+    //!
+    //! The unit between the two watermarks is the one the model is about to produce. It has
+    //! no host copy yet -- a unit reaches its page only when resize() carries the watermark
+    //! past it -- so nothing is fetched here: the call assigns a cell and leaves its bytes
+    //! to the model.
+    //!
+    //! Separate from fetchSparsePages because the orders differ. A fetch needs the
+    //! selection, which the indexer produces from the previous layer; a write needs only
+    //! the watermarks, so it can run first, which is the order the model requires.
+    //!
+    //! Idempotent while the watermarks and the reservation hold: the resolve probes
+    //! residency before it takes a victim, so a later call -- including the fetch's own
+    //! resolve -- finds the entry and reuses it rather than assigning a second. The entry
+    //! is pinned for as long as its unit is in flight, so no fetch can evict it.
+    //!
+    //! `buffers` is one layer's sparse buffers, exactly as for fetchSparsePages.
+    //!
+    //! `out` is [maxBatchSize][buffers.size()], written in full, in the same expanded index
+    //! space fetchSparsePages produces and relative to the same per-pool arena region:
+    //! kBadPageIndex where the row holds no reservation or has nothing in flight.
+    void prepareSparseWriteIndices(Batch& batch, std::vector<BufferId> const& buffers, int32_t* out, CUstream stream);
+
     // Group a set of BufferIds into contiguous AggregatedPageDesc descriptors.
     // Mirrors Python's KVCacheManager.get_aggregated_pages().
     std::vector<AggregatedPageDesc> getAggregatedPages(std::vector<BufferId> const& buffers) const;
@@ -564,6 +587,18 @@ private:
 
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.
+    //! One layer's run within its life cycle's sparse buffer list, as the sparse entry
+    //! points name it: they take a layer's buffers and address them as a range.
+    struct SparseLayerSpan
+    {
+        LifeCycleId lifeCycle{0};
+        int32_t bufferBase = 0;
+        int32_t numBuffers = 0;
+        int32_t layerInGroup = 0; //!< Its metadata row: the dense index of the layer.
+    };
+
+    [[nodiscard]] SparseLayerSpan _sparseLayerSpan(std::vector<BufferId> const& buffers, char const* api) const;
+
     void _checkNoLivingKvCaches(char const* api) const;
 
     void _adjustLevel(CacheLevel level, size_t quota);

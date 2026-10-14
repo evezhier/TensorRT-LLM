@@ -931,6 +931,66 @@ class KVCacheManager:
 
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def prepare_sparse_write_indices(
+        self,
+        batch: Batch,
+        buffers: Sequence[BufferId],
+        out: DeviceArray,  # int32[batch, len(buffers)]
+        stream: CudaStream | None = None,
+    ) -> None:
+        """Give each request's in-flight unit a cell, and report where to write it.
+
+        The unit between the two watermarks is the one the model is about to produce. It
+        has no host copy yet -- a unit reaches its page only when :meth:`_KVCache.resize`
+        carries the watermark past it -- so nothing is fetched here. The call assigns a
+        cell and leaves its bytes to the model; reading one before the model writes it
+        yields whatever the cell last held.
+
+        Separate from :meth:`fetch_sparse_pages` because the orders differ. A fetch needs
+        the selection, which the indexer produces from the previous layer's output; a write
+        needs only the watermarks. So this can run first, which is the order the model
+        requires, and it needs no top-k.
+
+        Idempotent while the watermarks and the reservation hold. The resolve probes
+        residency before taking a victim, so a later call -- including the one inside
+        :meth:`fetch_sparse_pages` -- finds the entry and reuses it rather than assigning a
+        second. The entry is pinned for as long as its unit is in flight, so no fetch can
+        evict it, and a fetch never copies over it: a unit at or above the watermark has no
+        written-back host page, so there is nothing it could be refilled from.
+
+        Args:
+            batch: whose watermarks and cache views are published. A row's cache must hold
+                the reservation taken at :meth:`_KVCache.resume`.
+            buffers: exactly one layer's sparse buffers, in the cache's order -- the same
+                rule and the same order as :meth:`fetch_sparse_pages`.
+            out: int32 ``[batch.max_batch_size, len(buffers)]``, written in full.
+                ``out[b][i]`` is the index of the in-flight unit's cell for ``buffers[i]``,
+                and ``BAD_PAGE_INDEX`` where the row holds no reservation or has nothing in
+                flight. One entry per request, not per query token: :meth:`_KVCache.resize`
+                bounds ``capacity - history_length`` to a single token, so at most one unit
+                is ever in flight.
+
+                ``BAD_PAGE_INDEX`` is an ordinary outcome, not an error. A unit is in flight
+                only once it is whole: with ``tokens_per_block_override`` of 4, that is one
+                step in four, which is also the only step on which a ratio-4 compressor has
+                produced anything to write. With one token per unit it is every step.
+            stream: the CUDA stream to enqueue on.
+
+        Indices are in the same expanded index space :meth:`fetch_sparse_pages` produces
+        and relative to the same base -- :meth:`get_sparse_cache_base_address` for that
+        buffer, **not** :meth:`get_mem_pool_base_address`. The latter names the buffer's
+        host-backed *pages*; the cells live in a separate GPU arena.
+
+        Call it after publication and before the model's KV writes, ordering the two
+        through the stream. Regenerate the output whenever a watermark or a reservation
+        changes, and keep it unmodified until its consumers are done. Complete the writes
+        before advancing history through :meth:`_KVCache.resize`, which is what writes a
+        finished unit back to its host page.
+
+        Device-driven and stream-ordered, with static shapes, so a CUDA graph can capture
+        it.
+        """
+
     def fetch_sparse_pages(
         self,
         batch: Batch,

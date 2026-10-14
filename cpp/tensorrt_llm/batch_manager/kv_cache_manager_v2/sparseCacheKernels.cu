@@ -231,6 +231,12 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     {
         cls[i] = kClassUntouched;
     }
+    // Slots past the in-flight span say "no unit in flight", so a consumer can read this
+    // array without also being told how many units there are.
+    for (int32_t i = static_cast<int32_t>(threadIdx.x) + inFlight; i < args.maxInFlightUnits; i += kThreads)
+    {
+        inFlightSlot[i] = kNoSparseSlot;
+    }
     __syncthreads();
 
     // Build the probe index over the resident set. Ordinals are unique within a layer, so
@@ -480,14 +486,18 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
     SparseCacheView const view = args.views[row];
     bool const reserved = view.residentOrdinal != nullptr;
     auto const base = static_cast<ptrdiff_t>(row) * args.selectionWidth;
+    int32_t const slotStride = args.outSlotStride > 0 ? args.outSlotStride : args.selectionWidth;
+    auto const slotBase = static_cast<ptrdiff_t>(row) * slotStride;
 
     // Every slot is written, so a stale index from a previous step can never be read back.
     // One pass does it, because the output is the selection's own shape: a padded slot and
     // an unreserved row both just take the sentinel here rather than needing a prior fill.
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < args.selectionWidth; i += kThreads)
     {
-        int32_t const slot = reserved ? args.outSlot[base + i] : kNoSparseSlot;
-        if (args.selected[base + i] < 0 || slot < 0)
+        int32_t const slot = reserved ? args.outSlot[slotBase + i] : kNoSparseSlot;
+        // Without a selection array the slot alone says whether the entry is live, which is
+        // what the write-index path passes: its in-flight list is already self-describing.
+        if ((args.selected != nullptr && args.selected[base + i] < 0) || slot < 0)
         {
             out[i] = kBadPageIndexValue;
             continue;
@@ -552,7 +562,7 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseOutIndices: every extent must be positive");
     }
-    if (args.views == nullptr || args.selected == nullptr || args.outSlot == nullptr || args.out == nullptr)
+    if (args.views == nullptr || args.outSlot == nullptr || args.out == nullptr)
     {
         throw std::invalid_argument("launchSparseOutIndices: every device array must be provided");
     }
@@ -563,6 +573,10 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
     if (args.outBase < 0 || args.outBase + args.numBuffers > args.outBuffers)
     {
         throw std::invalid_argument("launchSparseOutIndices: this call's buffers must fit the output row");
+    }
+    if (args.outSlotStride < 0 || (args.outSlotStride > 0 && args.outSlotStride < args.selectionWidth))
+    {
+        throw std::invalid_argument("launchSparseOutIndices: the slot stride must cover what this call reads");
     }
 
     dim3 const grid(static_cast<unsigned>(args.numBuffers), static_cast<unsigned>(args.numRows));
@@ -641,16 +655,24 @@ int32_t sparseResolveMaxEntries(int32_t selectionWidth, int32_t maxInFlightUnits
 
 void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
 {
-    if (args.numLayers <= 0 || args.entriesPerLayer <= 0 || args.selectionWidth <= 0 || args.numRows <= 0)
+    if (args.numLayers <= 0 || args.entriesPerLayer <= 0 || args.selectionWidth < 0 || args.numRows <= 0)
     {
-        throw std::invalid_argument("launchSparseResolve: rows, layers, entries and selection width must be positive");
+        throw std::invalid_argument("launchSparseResolve: rows, layers and entries must be positive");
+    }
+    // A zero-width resolve is the write-index path: it makes the in-flight unit resident and
+    // nothing else, so it needs neither a selection to read nor a miss list to fill.
+    if (args.selectionWidth == 0 && args.maxInFlightUnits == 0)
+    {
+        throw std::invalid_argument("launchSparseResolve: a resolve with no selection must have an in-flight span");
     }
     if (args.layerInGroup < 0 || args.layerInGroup >= args.numLayers)
     {
         throw std::invalid_argument("launchSparseResolve: layerInGroup must name a layer of the group");
     }
-    if (args.views == nullptr || args.selected == nullptr || args.outSlot == nullptr || args.missOrdinal == nullptr
-        || args.missSlot == nullptr || args.missCount == nullptr || args.historyTokens == nullptr
+    bool const selectionArrays = args.selectionWidth == 0
+        || (args.selected != nullptr && args.outSlot != nullptr && args.missOrdinal != nullptr
+            && args.missSlot != nullptr);
+    if (args.views == nullptr || !selectionArrays || args.missCount == nullptr || args.historyTokens == nullptr
         || args.capacityTokens == nullptr || (args.maxInFlightUnits > 0 && args.inFlightSlot == nullptr))
     {
         throw std::invalid_argument("launchSparseResolve: every device array must be provided");
