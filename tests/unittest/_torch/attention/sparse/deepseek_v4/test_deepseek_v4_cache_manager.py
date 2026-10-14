@@ -113,7 +113,13 @@ class _SparseRuntime:
 
     @property
     def init_config(self):
-        return SimpleNamespace(layers=list(self.layers.values()))
+        return SimpleNamespace(
+            layers=list(self.layers.values()),
+            constraints=[
+                SimpleNamespace(kv_caches=[None] * 2),
+                SimpleNamespace(kv_caches=[None] * 6),
+            ],
+        )
 
     @property
     def pool_group_descs(self):
@@ -135,6 +141,9 @@ class _SparseRuntime:
     def get_sparse_cache_expansion(self, layer_id):
         return self.expansions[layer_id]
 
+    def get_sparse_cache_base_address(self, layer_id, role):
+        return 100000 + layer_id * 4096 + self.pool_indices[BufferId(layer_id, role)] * 1024
+
 
 def _manager(tokens_per_block=128):
     manager = object.__new__(DeepseekV4CacheManager)
@@ -152,6 +161,10 @@ def _manager(tokens_per_block=128):
     manager._has_cp_helix = False
     manager.is_draft = False
     manager._use_nvfp4_compress = False
+    manager._nvfp4_residual_dim = 0
+    manager._sparse_arena_buffers = {}
+    manager.dtype = DataType.BF16
+    manager.head_dim = 512
     manager.use_fp8_ds_mla = False
     manager.pp_layers = [2, 3, 4]
     manager._compress_ratios = [1, 4, 4, 128, 4]
@@ -190,6 +203,11 @@ def test_sparse_offload_descriptors_use_runtime_ids(tokens_per_block):
         assert descriptor.buffer_ids[0].role == DeepseekV4AttentionType.COMPRESS.role
         assert descriptor.group_id == 13
         assert descriptor.unit_tokens == 4
+        assert descriptor.data_buffer_index == 0
+        assert descriptor.arena_row_counts == (6 * 2 * (tokens_per_block // 4),)
+        assert descriptor.arena_base_addresses == (
+            manager.impl.get_sparse_cache_base_address(*descriptor.buffer_ids[0]),
+        )
 
 
 @pytest.mark.cpu_only
@@ -230,6 +248,7 @@ def test_sparse_offload_descriptors_include_all_roles_in_native_order():
     manager.impl.configure_buffers(
         41, [(main_role, 1), (scale_role, 0), ("scale_padding", 0), ("data_padding", 1)]
     )
+    manager.impl.configure_buffers(19, [(main_role, 1), (scale_role, 0)])
     descriptor = manager.get_sparse_offload_descriptors()[2]
     assert [buffer.role for buffer in descriptor.buffer_ids] == [
         scale_role,
@@ -238,6 +257,148 @@ def test_sparse_offload_descriptors_include_all_roles_in_native_order():
         "data_padding",
     ]
     assert all(buffer.layer_id == 41 for buffer in descriptor.buffer_ids)
+    assert descriptor.data_buffer_index == 2
+    assert descriptor.scale_buffer_index == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("row_sizes", [(256, 32), (288, 36)])
+@pytest.mark.parametrize("max_units", [16, 65])
+def test_sparse_arena_padding_initialization_covers_all_leases(row_sizes, max_units):
+    manager = _manager()
+    manager._use_nvfp4_compress = True
+    manager._stream = torch.cuda.Stream()
+    manager._nvfp4_residual_dim = row_sizes[0] * 2 - manager.head_dim
+    main = DeepseekV4AttentionType.COMPRESS.role
+    scale = deepseek_v4_cache.COMPRESS_BLOCK_SCALE_ROLE
+    manager.impl.configure_buffers(
+        41, [(main, 1), (scale, 0), ("scale_padding", 0), ("data_padding", 1)]
+    )
+    manager.impl.configure_buffers(19, [(main, 1), (scale, 0)])
+    for layer in manager.impl.layers.values():
+        buffers = layer.buffers
+        for buffer in buffers:
+            buffer.size = row_sizes["scale" in buffer.role]
+            buffer.max_cached_units = max_units if layer.layer_id == 19 else 16
+        layer.buffers = buffers
+    expansion = manager.tokens_per_block // 4
+    rows = (max_units + expansion - 1) // expansion * expansion
+    # Native constraints reserve six leases even though the runtime's batch limit
+    # in this fixture is four. Two model buffers and one padding buffer share each pool.
+    arenas = [
+        torch.full((6, 3, rows, size), 37, dtype=torch.uint8, device="cuda") for size in row_sizes
+    ]
+    manager.impl.get_sparse_cache_base_address = lambda layer, role: arenas[
+        "scale" in role
+    ].data_ptr()
+    descriptors = manager.get_sparse_offload_descriptors()
+    manager._initialize_sparse_arena_buffers(descriptors)
+    data_view, scale_view = manager.get_sparse_compress_buffers(2)
+    assert manager.get_sparse_compress_buffers(4)[0] is data_view
+    assert manager.get_sparse_compress_buffers(4)[1] is scale_view
+    for view, arena, size in zip((data_view, scale_view), arenas, row_sizes):
+        assert view.shape == (6 * 3 * rows, 1, size)
+        assert view.is_contiguous() and view.data_ptr() == arena.data_ptr()
+        torch.testing.assert_close(view.view(torch.uint8).reshape_as(arena), arena)
+    manager._stream.wait_stream(torch.cuda.current_stream())
+    manager._initialize_sparse_arena_padding(descriptors)
+    for arena in arenas:
+        expected = torch.full_like(arena, 37)
+        expected[:, 1] = 0
+        torch.testing.assert_close(arena, expected)
+    # Rebuilding graph metadata describes the same regions without reinitializing
+    # an arena that may already contain live request data.
+    for arena in arenas:
+        arena.fill_(19)
+    manager.get_sparse_offload_descriptors()
+    assert all(torch.all(arena == 19) for arena in arenas)
+    assert torch.all(data_view == 19)
+    assert torch.all(scale_view.view(torch.uint8) == 19)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cache_dtype", [DataType.BF16, DataType.FP8, DataType.UINT8])
+@pytest.mark.parametrize("max_units", [16, 65])
+def test_sparse_arena_views_use_pool_capacity_and_share_storage(cache_dtype, max_units):
+    manager = _manager()
+    manager.dtype = cache_dtype
+    manager._use_nvfp4_compress = cache_dtype == DataType.UINT8
+    manager._nvfp4_residual_dim = 64
+    manager._stream = SimpleNamespace(device="cuda:0")
+    main = DeepseekV4AttentionType.COMPRESS.role
+    scale = deepseek_v4_cache.COMPRESS_BLOCK_SCALE_ROLE
+    roles = [(main, 1), ("data_padding", 1)]
+    if manager._use_nvfp4_compress:
+        roles += [(scale, 0), ("scale_padding", 0)]
+    manager.impl.configure_buffers(41, roles)
+    manager.impl.configure_buffers(
+        19, [(main, 1)] + ([(scale, 0)] if manager._use_nvfp4_compress else [])
+    )
+    config = manager.impl.layers[19]
+    buffers = config.buffers
+    for buffer in buffers:
+        buffer.max_cached_units = max_units
+    config.buffers = buffers
+    manager.impl.get_sparse_cache_base_address = lambda layer, role: (
+        8192 if "scale" in role else 4096
+    )
+    descriptors = manager.get_sparse_offload_descriptors()
+    rows = 6 * 3 * ((max_units + 31) // 32 * 32)
+    with (
+        patch.object(torch.cuda, "device"),
+        patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        patch.object(
+            deepseek_v4_cache,
+            "convert_to_torch_tensor",
+            side_effect=lambda wrapper: torch.empty(wrapper.shape, dtype=wrapper.dtype),
+        ) as convert,
+    ):
+        manager._initialize_sparse_arena_buffers(descriptors)
+    data, scales = manager.get_sparse_compress_buffers(2)
+    assert data.shape == (rows, 1, 288 if manager._use_nvfp4_compress else 512)
+    assert data.dtype == binding_to_torch_dtype(cache_dtype)
+    assert data.is_contiguous()
+    assert manager.get_sparse_compress_buffers(4)[0] is data
+    if manager._use_nvfp4_compress:
+        assert scales.shape == (rows, 1, 36)
+        assert scales.dtype == torch.float8_e4m3fn
+        assert manager.get_sparse_compress_buffers(4)[1] is scales
+    else:
+        assert scales is None
+    assert convert.call_count == (2 if manager._use_nvfp4_compress else 1)
+    assert convert.call_args_list[0].args[0].data_ptr() == 4096
+
+    with (
+        patch.object(torch.cuda, "device"),
+        patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+        patch.object(deepseek_v4_cache, "convert_to_torch_tensor") as convert,
+    ):
+        with pytest.raises(RuntimeError, match="before graph capture"):
+            manager._initialize_sparse_arena_buffers(descriptors)
+        convert.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("invalid", ["count", "position", "missing_scales"])
+def test_sparse_offload_descriptors_reject_unpaired_nvfp4_arenas(invalid):
+    manager = _manager()
+    manager._use_nvfp4_compress = True
+    main = DeepseekV4AttentionType.COMPRESS.role
+    scale = deepseek_v4_cache.COMPRESS_BLOCK_SCALE_ROLE
+    manager.impl.configure_buffers(41, [(main, 1), (scale, 0)])
+    manager.impl.configure_buffers(19, [(main, 1), (scale, 0)])
+    if invalid == "count":
+        # An extra buffer in a later layer changes every request's lease stride.
+        manager.impl.configure_buffers(19, [(main, 1), (scale, 0), ("scale_padding", 0)])
+    elif invalid == "position":
+        # Equal pool sizes alone do not align the corresponding buffer positions.
+        manager.impl.configure_buffers(
+            41, [("data_padding", 1), (main, 1), (scale, 0), ("scale_padding", 0)]
+        )
+    else:
+        manager.impl.configure_buffers(41, [(main, 1)])
+    with pytest.raises(ValueError, match="Sparse NVFP4 COMPRESS"):
+        manager.get_sparse_offload_descriptors()
 
 
 class _HistoryCache:

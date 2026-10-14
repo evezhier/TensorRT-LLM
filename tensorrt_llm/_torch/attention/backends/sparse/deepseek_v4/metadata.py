@@ -347,6 +347,22 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 )
                 for count in sorted({len(descriptor.buffer_ids) for descriptor in layers.values()})
             },
+            write_indices={
+                count: allocate(f"write_indices_{count}", (batch, count, 1), -1)
+                for count in sorted({len(descriptor.buffer_ids) for descriptor in layers.values()})
+            },
+            scatter_start_positions=allocate("scatter_start_positions", (batch,), 0),
+            nvfp4_scratch=(
+                self.get_empty(
+                    self.cuda_graph_buffers,
+                    (batch, self.sparse_mla_topk, manager.head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    cache_name="dsv4_sparse_offload_nvfp4_scratch",
+                    capture_graph=self.is_cuda_graph,
+                )
+                if manager._use_nvfp4_compress
+                else None
+            ),
         )
 
     def prepare_for_indexer_k_cache(self):
@@ -507,7 +523,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         swa_buffer_ptrs = {layer_idx: manager.swa_pool_ptr for layer_idx in manager.pp_layers}
         compressed_buffer_ptrs = {
-            layer_idx: manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
+            layer_idx: (
+                manager.impl.get_sparse_cache_base_address(
+                    manager._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS],
+                    DeepseekV4AttentionType.COMPRESS.role,
+                )
+                if manager._enable_kv_cache_offload and compress_ratios_by_layer[layer_idx] == 4
+                else manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
+            )
             for layer_idx in manager.pp_layers
             if is_compress_layer(compress_ratios_by_layer[layer_idx])
         }

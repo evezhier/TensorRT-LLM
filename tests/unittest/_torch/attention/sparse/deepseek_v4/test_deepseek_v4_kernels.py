@@ -26,6 +26,110 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.kernels import (
 _requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
+@_requires_cuda
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("active", [0, 2, 4])
+@pytest.mark.parametrize("split_extra", [False, True])
+def test_sparse_index_preparation_merges_history_and_writes(strided, active, split_extra):
+    # Request order differs from query order. Some rows complete a unit, one has
+    # no newly completed row, and another has no valid write destination.
+    topk = _cuda_tensor([[1, -1, 0, 99], [32, 31, 0, -2], [0, -1, -1, -1], [0, 1, 2, -1]], strided)
+    rows = _cuda_tensor([1, 0, 3, 2], strided)
+    lengths = _cuda_tensor([33, 2, 3, 1], strided)
+    history = _cuda_tensor([131, 8, 11, 3], strided)
+    fetched = _cuda_tensor(torch.arange(4 * 3 * 4).reshape(4, 3, 4) + 100, strided)[:, 1]
+    writes = _cuda_tensor([[7, 7, 50], [-1, -1, -1], [5, 5, 42], [-1, -1, -1]], strided)[:, 1]
+    kwargs = dict(
+        req_id=rows,
+        block_table_swa=_cuda_tensor([[2], [3], [5], [9]]),
+        swa_local_indices=_cuda_tensor([[0, 1, -1, 3]] * 4),
+        swa_pool_base_ptr=4096,
+        swa_buffer_ptr=4096,
+        tokens_per_block=4,
+        token_stride=1024,
+        compress_ratio=4,
+        num_compressed_indices=4,
+        compressed_local_indices=topk,
+        compressed_fetched_indices=fetched,
+        compressed_write_indices=writes,
+        compressed_history_lengths=history,
+        compressed_lengths=lengths,
+        active_request_count=_cuda_tensor([active]),
+        mask_invalid_pages=True,
+        split_extra=split_extra,
+    )
+    out = deepseek_v4_local_to_global_indices(**kwargs)
+    expected = torch.full((4, 8), -1, dtype=torch.int32)
+    for query, request in enumerate(rows.cpu().tolist()):
+        if query >= active or request >= active:
+            continue
+        page = [2, 3, 5, 9][request]
+        expected[query, :4] = torch.tensor([page * 4, page * 4 + 1, -1, page * 4 + 3])
+        for slot, unit in enumerate(topk.cpu().tolist()[query]):
+            if not 0 <= unit < lengths[request].item():
+                continue
+            if unit < history[request].item() // 4:
+                expected[query, 4 + slot] = fetched[request, slot].cpu()
+            elif unit == history[request].item() // 4:
+                expected[query, 4 + slot] = writes[request].cpu()
+    if split_extra:
+        torch.testing.assert_close(out[0].cpu(), expected[:, :4])
+        torch.testing.assert_close(out[1].cpu(), expected[:, 4:])
+    else:
+        torch.testing.assert_close(out.cpu(), expected)
+
+
+@_requires_cuda
+def test_sparse_index_preparation_replays_with_new_watermarks_and_padding():
+    # The graph has two query rows; native Batch retains four rows. Invalid
+    # request IDs in graph padding must never index either cache's metadata.
+    rows = _cuda_tensor([0, 999])
+    topk = _cuda_tensor([[0, 1, 2, -1], [0, 1, 2, 3]])
+    fetched = _cuda_tensor([[71, 29, 88, -1]] * 4)
+    writes = _cuda_tensor([7, -1, -1, -1], strided=True)
+    history = _cuda_tensor([7, 0, 0, 0])
+    lengths = _cuda_tensor([2, 0])
+    active = _cuda_tensor([1])
+    kwargs = dict(
+        req_id=rows,
+        block_table_swa=_cuda_tensor([[2], [3]]),
+        swa_local_indices=_cuda_tensor([[0, 1, -1, 3]] * 2),
+        swa_pool_base_ptr=4096,
+        swa_buffer_ptr=4096,
+        tokens_per_block=4,
+        token_stride=1024,
+        compress_ratio=4,
+        num_compressed_indices=4,
+        compressed_local_indices=topk,
+        compressed_fetched_indices=fetched,
+        compressed_write_indices=writes,
+        compressed_history_lengths=history,
+        compressed_lengths=lengths,
+        active_request_count=active,
+        mask_invalid_pages=True,
+    )
+    deepseek_v4_local_to_global_indices(**kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = deepseek_v4_local_to_global_indices(**kwargs)
+    for history_tokens, length, destination, active_count, compressed in (
+        (7, 2, 7, 1, [71, 7, -1, -1]),
+        (8, 2, -1, 1, [71, 29, -1, -1]),
+        (11, 3, 5, 1, [71, 29, 5, -1]),
+        (11, 3, -1, 1, [71, 29, -1, -1]),
+        (11, 3, 5, 0, [-1] * 4),
+    ):
+        history[0] = history_tokens
+        lengths[0] = length
+        writes[0] = destination
+        active[0] = active_count
+        graph.replay()
+        swa = [8, 9, -1, 11] if active_count else [-1] * 4
+        torch.testing.assert_close(
+            out.cpu(), torch.tensor([swa + compressed, [-1] * 8], dtype=torch.int32)
+        )
+
+
 def _cuda_tensor(value: torch.Tensor | list, strided: bool = False) -> torch.Tensor:
     tensor = torch.as_tensor(value, dtype=torch.int32, device="cuda")
     if not strided:

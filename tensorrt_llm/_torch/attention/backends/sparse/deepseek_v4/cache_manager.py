@@ -54,6 +54,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     CudaStream,
     DataRole,
     KVCacheDesc,
+    LayerGroupId,
     LayerId,
     PageIndexMode,
     ScratchDesc,
@@ -64,7 +65,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVC
 
 from .compressor import KVCacheDtype, get_nvfp4_compress_residual_dim
 from .kernels import select_sparse_history_units
-from .offload import SparseOffloadLayerDescriptor, SparseOffloadState
+from .offload import SparseOffloadLayerDescriptor, SparseOffloadPaddingRegion, SparseOffloadState
 from .params import (
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
@@ -431,6 +432,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # to be in the same pool and have the same scale.
         self._assert_layer_pool_scale()
         self._assert_nvfp4_compress_pool_layout()
+        self._sparse_arena_buffers: dict[int, tuple[torch.Tensor, torch.Tensor | None]] = {}
+        if self._enable_kv_cache_offload:
+            descriptors = self.get_sparse_offload_descriptors()
+            self._initialize_sparse_arena_buffers(descriptors)
+            self._initialize_sparse_arena_padding(descriptors)
 
         # For DeepSeek-V4 Attention, the base pointer for SWA pool
         # Use first PP layer instead of hardcoded 0 for pipeline parallelism.
@@ -488,6 +494,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return
         for layer_idx in self.pp_layers:
             compress_ratio = self._compress_ratios[layer_idx]
+            if self._enable_kv_cache_offload and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
+                # Arena geometry is validated when building the sparse descriptors;
+                # the host page converters do not address the arena.
+                continue
             if not compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS):
                 continue
             layer_id = self._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS]
@@ -1926,6 +1936,25 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             for layer in self.impl.init_config.layers
             if isinstance(layer, AttentionLayerConfig)
         }
+        # Match KVCM's arena walk: configuration layer order, then declaration
+        # order within each pool. Host coalesced-buffer order is not used here.
+        sparse_pool_buffers: dict[tuple[LayerGroupId, int], list[BufferId]] = defaultdict(list)
+        max_units_by_group: dict[LayerGroupId, int] = defaultdict(int)
+        for layer_config in layer_configs.values():
+            group_id = self.impl.get_layer_group_id(layer_config.layer_id)
+            for buffer in layer_config.buffers:
+                if buffer.is_sparse and buffer.max_cached_units > 0:
+                    buffer_id = BufferId(layer_config.layer_id, buffer.role)
+                    sparse_pool_buffers[group_id, pool_indices[buffer_id]].append(buffer_id)
+                    max_units_by_group[group_id] = max(
+                        max_units_by_group[group_id], buffer.max_cached_units
+                    )
+        arena_layouts = {
+            buffer_id: (len(buffers), position)
+            for buffers in sparse_pool_buffers.values()
+            for position, buffer_id in enumerate(buffers)
+        }
+        max_leases = max(len(batch.kv_caches) for batch in self.impl.init_config.constraints)
         descriptors = {}
         for layer in local_layers:
             layer_id = self._layer_attn_to_layer_id[layer, DeepseekV4AttentionType.COMPRESS]
@@ -1952,10 +1981,49 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             if BufferId(layer_id, role) not in buffers:
                 raise ValueError(f"Layer {layer}'s sparse buffers must include COMPRESS")
             buffers.sort(key=pool_indices.__getitem__)
+            scale_id = BufferId(layer_id, COMPRESS_BLOCK_SCALE_ROLE)
+            if self._use_nvfp4_compress and scale_id not in buffers:
+                raise ValueError("Sparse NVFP4 COMPRESS requires a block-scale buffer")
+            if self._use_nvfp4_compress:
+                data_layout = arena_layouts[BufferId(layer_id, role)]
+                scale_layout = arena_layouts[scale_id]
+                if data_layout != scale_layout:
+                    raise ValueError(
+                        "Sparse NVFP4 COMPRESS data and scale arenas must have matching "
+                        "buffer counts and positions, including padding, to share physical "
+                        f"indices; got {data_layout} and {scale_layout}."
+                    )
+            sizes = {buffer.role: buffer.size for buffer in layer_configs[layer_id].buffers}
+            group_id = self.impl.get_layer_group_id(layer_id)
+            reserved_units = (max_units_by_group[group_id] + expansion - 1) // expansion * expansion
+            arena_bases = tuple(
+                self.impl.get_sparse_cache_base_address(buffer.layer_id, buffer.role)
+                for buffer in buffers
+            )
+            padding_regions = []
+            for buffer, base in zip(buffers, arena_bases):
+                if buffer.role == role or buffer == scale_id:
+                    continue
+                pool_count, position = arena_layouts[buffer]
+                buffer_bytes = reserved_units * sizes[buffer.role]
+                padding_regions.append(
+                    SparseOffloadPaddingRegion(
+                        base_address=base + position * buffer_bytes,
+                        bytes_per_lease=buffer_bytes,
+                        lease_stride=pool_count * buffer_bytes,
+                    )
+                )
             descriptors[layer] = SparseOffloadLayerDescriptor(
                 buffer_ids=tuple(buffers),
-                group_id=self.impl.get_layer_group_id(layer_id),
+                arena_base_addresses=arena_bases,
+                arena_row_counts=tuple(
+                    max_leases * arena_layouts[buffer][0] * reserved_units for buffer in buffers
+                ),
+                data_buffer_index=buffers.index(BufferId(layer_id, role)),
+                scale_buffer_index=buffers.index(scale_id) if scale_id in buffers else None,
+                group_id=group_id,
                 unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
+                padding_regions=tuple(padding_regions),
             )
 
         sparse_groups = {descriptor.group_id for descriptor in descriptors.values()}
@@ -1967,6 +2035,86 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     "Sparse COMPRESS must have a separate lifecycle from ordinary cache buffers"
                 )
         return descriptors
+
+    def _initialize_sparse_arena_buffers(
+        self, layers: dict[int, SparseOffloadLayerDescriptor]
+    ) -> None:
+        """Cache tensor views over KVCM-owned arena regions before graph capture.
+
+        Each view is [pool_rows, 1, row_elements], so an arena index is also a
+        one-row page index. Pool rows cover all leases and buffers, including
+        padding roles. Layers sharing a region reuse the same tensor storage.
+        KVCM must keep the allocation alive while these views or graphs use it.
+        """
+        if not layers:
+            return
+        with torch.cuda.device(self._stream.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Sparse arena views must be initialized before graph capture")
+            pool_views: dict[int, torch.Tensor] = {}
+            for layer, descriptor in layers.items():
+                specs = [
+                    (
+                        descriptor.data_buffer_index,
+                        DataType.UINT8 if self._use_nvfp4_compress else self.dtype,
+                        (self.head_dim + self.nvfp4_residual_dim) // 2
+                        if self._use_nvfp4_compress
+                        else self.head_dim,
+                    )
+                ]
+                if descriptor.scale_buffer_index is not None:
+                    specs.append(
+                        (
+                            descriptor.scale_buffer_index,
+                            DataType.FP8,
+                            (self.head_dim + self.nvfp4_residual_dim) // NVFP4_VECTOR_SIZE,
+                        )
+                    )
+                views = []
+                for index, dtype, row_elements in specs:
+                    base = descriptor.arena_base_addresses[index]
+                    if base not in pool_views:
+                        pool_views[base] = convert_to_torch_tensor(
+                            TensorWrapper(
+                                base, dtype, (descriptor.arena_row_counts[index], 1, row_elements)
+                            )
+                        )
+                    views.append(pool_views[base])
+                self._sparse_arena_buffers[layer] = (views[0], views[1] if len(views) > 1 else None)
+
+    def get_sparse_compress_buffers(
+        self, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return cached data/scales arena views indexed by prepared or fetched rows."""
+        return self._sparse_arena_buffers[layer_idx]
+
+    def _initialize_sparse_arena_padding(
+        self, layers: dict[int, SparseOffloadLayerDescriptor]
+    ) -> None:
+        """Initialize unused roles once, before requests can acquire arena leases.
+
+        The arena's per-pool lease strides follow its configuration, independently
+        of host page capacities. Views cover only padding buffers; real KV and
+        scale buffers are initialized by their producers. KVCM owns these allocations.
+        """
+        regions = [region for layer in layers.values() for region in layer.padding_regions]
+        if not regions:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Sparse arena padding must be initialized before graph capture")
+        max_leases = max(len(batch.kv_caches) for batch in self.impl.init_config.constraints)
+        with torch.cuda.device(self._stream.device), torch.cuda.stream(self._stream):
+            for region in regions:
+                convert_to_torch_tensor(
+                    TensorWrapper(
+                        region.base_address,
+                        torch.uint8,
+                        (max_leases, region.bytes_per_lease),
+                        strides=(region.lease_stride, 1),
+                    )
+                ).zero_()
+        # Construction completes before any producer or captured graph can use the arena.
+        self._stream.synchronize()
 
     @nvtx_range_debug("dsv4_prepare_sparse_offload")
     def prepare_sparse_offload(
@@ -1984,6 +2132,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         This prepares fetch metadata, not compressor write destinations.
         """
         state.prepared = False
+        state.write_layer = None
         if not self._enable_kv_cache_offload or beam_width != 1:
             raise ValueError("Sparse offload preparation requires offload enabled and beam width 1")
         with torch.cuda.device(state.selected_history_units.device):
@@ -2004,7 +2153,42 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             state.selected_history_units.fill_(BAD_PAGE_INDEX)
             for out in state.fetched_indices.values():
                 out.fill_(BAD_PAGE_INDEX)
+            for out in state.write_indices.values():
+                out.fill_(BAD_PAGE_INDEX)
         state.prepared = True
+
+    def prepare_sparse_compressor_write_indices(
+        self, state: SparseOffloadState, layer_idx: int
+    ) -> torch.Tensor:
+        """Reserve this layer's pinned destinations on the compressor's stream.
+
+        Return int32[B, F, 1] in Batch and descriptor buffer order. The caller
+        must join Batch publication before this call, and join the compressor
+        stream before fetch/attention or a history update. No KV is fetched here.
+        Padding roles were initialized during manager construction. The fused
+        compressor uses the data column as a one-row page table for data and
+        NVFP4 scales, whose matching geometry is checked during descriptor construction.
+        Each buffer still uses its own arena base and byte stride.
+        """
+        if (
+            not self._enable_kv_cache_offload
+            or not state.prepared
+            or state.is_prefill
+            or state.batch is None
+        ):
+            raise RuntimeError("Sparse compressor writes require prepared decode metadata")
+        descriptor = state.layers[layer_idx]
+        out = state.write_indices[len(descriptor.buffer_ids)]
+        state.write_layer = None
+        with torch.cuda.device(out.device):
+            self.impl.prepare_sparse_write_indices(
+                batch=state.batch,
+                buffers=descriptor.buffer_ids,
+                out=out,
+                stream=CudaStream(torch.cuda.current_stream().cuda_stream),
+            )
+        state.write_layer = layer_idx
+        return out
 
     @nvtx_range_debug("dsv4_fetch_sparse_indices")
     def fetch_sparse_indices(

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -145,8 +148,9 @@ def inplace_info():
         torch.ops.trtllm.compressor_postprocess_scatter.default: {
             1: "kv_out",
             2: "kv_cache",
-            3: "quant_output",
-            4: "scale_output"
+            3: "kv_cache_scale",
+            4: "quant_output",
+            5: "scale_output"
         },
         torch.ops.trtllm.mhc_big_fuse.default: {
             1: "post_mix",

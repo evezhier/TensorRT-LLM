@@ -915,6 +915,9 @@ class KVCacheManager:
         different sizes -- data and its block scales, say -- sit in regions of their own, and
         an index is relative to the region of the buffer it was fetched for. Buffers sharing
         a pool share a region, and the index already carries which of them it belongs to.
+        Different regions and row sizes do not imply different numerical indices: paired
+        data/scale pools can use one index with their respective bases and byte strides.
+        See :meth:`prepare_sparse_write_indices` for the required layout conditions.
         """
     def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
         """Whether this buffer was declared ``BufferConfig.is_sparse``.
@@ -966,6 +969,39 @@ class KVCacheManager:
         :meth:`get_sparse_cache_base_address`, including for data and scales in different
         pools. The indices include the request and buffer placement; they are neither
         request-local cache-entry numbers nor byte addresses.
+
+        The in-flight entry is shared by all buffers of the layer. Convert that entry
+        using exactly the same arena geometry as fetch and write-back::
+
+            expansion = get_sparse_cache_expansion(layer_id)
+            reserved_units = ceil(max_cached_units / expansion) * expansion
+            index = (lease_index * buffers_in_pool + buffer_slot_in_pool) * reserved_units + entry
+
+        Here ``max_cached_units`` is the life cycle's configured maximum, ``buffers_in_pool``
+        counts its sparse buffers with a fetch path in this pool, and ``buffer_slot_in_pool``
+        is the buffer's zero-based position among them, in configuration layer order and
+        declaration order within each layer. The shared entry and lease are device state;
+        preparation resolves and converts them on the GPU without fetching host KV.
+
+        Within one life cycle, data and scales have identical indices when their pools
+        contain the same number of sparse buffers and the two buffers occupy matching
+        positions. This requires matching padding roles as well. Their byte sizes and
+        arena bases can differ. For contiguous 512-element NVFP4 rows without residual
+        quantization, a common index of 7 addresses ``data_base + 7 * 256`` and
+        ``scale_base + 7 * 32``. Both output columns still receive that index (or both -1).
+        Callers may consume one column for both buffers after validating this geometry
+        at initialization; equality is not guaranteed for arbitrary buffer configurations.
+
+        A single-query decoder can adapt the common index to an existing paged scatter:
+        use one compressed row per page, a contiguous ``int32[B, 1]`` block table containing
+        the indices, and zero scatter start positions. Set the output count to zero for
+        every negative index so the scatter never dereferences an invalid page. Actual
+        RoPE position IDs are unchanged. NVFP4 data and scales use that same block table
+        with their respective arena bases. Tensor-based operators can receive non-owning
+        views over those arena regions, sized by the arena capacity rather than host-page
+        capacity. The one-row page is only the kernel's addressing view: an arena cell
+        still contains ``expansion`` units. Preparation must not renumber an index solely
+        for the writer: later fetch and write-back must address the same bytes.
 
         Args:
             batch: A batch belonging to this manager, with its latest device state
@@ -1056,9 +1092,11 @@ class KVCacheManager:
 
         The buffer dimension is a dimension rather than a separate array per buffer
         because attention kernels commonly want one tensor covering K and V. It cannot be
-        dropped: a layer's buffers share the resolve, but not their cells. A lease gives
-        each buffer its own contiguous run of cells, so one selection resolves to a
-        different index per buffer, and each needs its own row.
+        dropped in the general API: a layer's buffers share the resolve, but each has its
+        own cells. Indices may differ with buffer placement. Paired data/scale pools with
+        matching counts and positions have equal numerical indices relative to different
+        bases, as described in :meth:`prepare_sparse_write_indices`. A caller that validates
+        this geometry may use one index column for both buffers in fetch and write outputs.
 
         Indices are in the expanded index space :class:`PageIndexConverter` produces.
 
