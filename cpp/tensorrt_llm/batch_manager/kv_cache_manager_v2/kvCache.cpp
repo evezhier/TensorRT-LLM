@@ -244,6 +244,17 @@ uint64_t KvCache::reserveExternalReceive(LayerGroupId group, BlockOrdinal ordina
     state->destinationLevel = level;
     state->validTokens = valid;
     state->pinned.push_back(page);
+    if (page->scheduledForEviction())
+    {
+        storage.excludeFromEviction(*page);
+    }
+    ++page->externalAccessPins;
+    auto provisionalPin = FuncGuard(
+        [&]()
+        {
+            --page->externalAccessPins;
+            storage.scheduleForEviction(*page);
+        });
     auto slots = storage.newSlotsForPoolGroup(level, storage.getPoolGroupIndex(level, group), SlotCount{1});
     state->destination.emplace(std::move(slots.front()));
     auto* pending = state.get();
@@ -259,6 +270,8 @@ uint64_t KvCache::reserveExternalReceive(LayerGroupId group, BlockOrdinal ordina
     describePage(state->descriptors, storage, group, ordinal, level, state->destination->slotId(), valid);
     auto const id = _registerExternalAccess(state);
     rollback.cancel();
+    provisionalPin.cancel();
+    --page->externalAccessPins;
     return id;
 }
 
@@ -361,7 +374,7 @@ void KvCache::endExternalAccess(uint64_t id)
         mExternalAccessKeepAlive = self;
         return;
     }
-    if (!mExternalAccesses.contains(id))
+    if (mExternalAccesses.find(id) == mExternalAccesses.end())
     {
             throw LogicError("Unknown or already settled external access ID");
     }

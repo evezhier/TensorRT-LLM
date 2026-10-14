@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # KV Cache Transceiver Bandwidth / UCX-Tuning Harness
 
 A standalone SLURM harness that validates the TensorRT-LLM KV cache transceiver
@@ -30,20 +35,20 @@ bandwidth excludes allocation, registration, KVCM admission, scheduling, and
 model execution; it is not end-to-end serving throughput.
 
 The `kvcm_transfer_benchmark` adds the native-page measurement. It creates a
-single sparse attention layer in KVCM V2, writes deterministic bytes to its GPU
-history, and calls `enter_decode()` to offload that history when a mode uses a
-host source. The destination reserves detached GPU or host pages. Both sides
+dense attention layer for GPU modes and a sparse attention layer for host modes.
+Sparse hot pages are host-backed at cache level 0; dense hot pages are GPU-backed.
+The source writes deterministic bytes directly into its hot pages. The destination
+reserves detached pages of the selected memory kind. Both sides
 pin and expose their pages through KVCM external-access claims; NIXL registers
 the claimed pools and transfers pages paired by group, ordinal, and pool index.
 After each transfer the receiver compares every byte. On completion it
 finalizes the receive pages, then releases claims only after the backend status
-and peer handshake prove physical settlement. `mixed` reserves alternating
-host and GPU destination pages, exercising two NIXL memory-type batches.
+and peer handshake prove physical settlement.
 
 The KVCM benchmark compares host modes against its own GPU→GPU baseline with
 the same page geometry. It measures transport-only bandwidth through real KVCM
-addresses. Source offload occurs once during setup, and destination promotion
-to GPU is not timed, so its host→host ratio must not be read as a GPU-ready
+addresses. Destination sparse-cache fetch into the GPU arena is not timed, so
+its host→host ratio must not be read as a GPU-ready
 speedup. Production PD transfer planning, layer remapping, and decode are
 outside this benchmark.
 

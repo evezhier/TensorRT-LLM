@@ -836,4 +836,33 @@ TEST(KvCacheManagerV2ColdPageTest, SparseHistoryPassesThroughTheCodec)
     page->readyEvent.synchronize();
 }
 
+TEST(KvCacheManagerV2ColdPageTest, SparseHotPoolAndExternalReceiveUseHostMemory)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeSparseTieredConfig());
+    auto const descriptors = manager->poolGroupDescs();
+    ASSERT_EQ(descriptors.size(), PoolGroupIndex{1});
+    EXPECT_EQ(descriptors.at(PoolGroupIndex{0}).memoryTier, CacheTier::HOST_MEM);
+
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(reinterpret_cast<CUstream>(stream)));
+    ASSERT_TRUE(cache->resize(4, 4));
+    cache->suspend();
+
+    auto const access = cache->reserveExternalReceive(LayerGroupId{0}, BlockOrdinal{0}, kHotLevel);
+    auto const pages = cache->getExternalAccessPages(access);
+    ASSERT_EQ(pages.size(), 1U);
+    EXPECT_EQ(pages.front().cacheLevel, kHotLevel);
+    EXPECT_EQ(pages.front().memoryTier, CacheTier::HOST_MEM);
+    EXPECT_GE(pages.front().address, pages.front().poolBaseAddress);
+    EXPECT_LE(pages.front().address + pages.front().bytes,
+        pages.front().poolBaseAddress + pages.front().poolBytes);
+
+    cache->endExternalAccess(access);
+    cache->close();
+}
+
 } // namespace

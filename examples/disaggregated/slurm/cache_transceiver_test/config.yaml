@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 # Configuration for the 2-node KV cache transceiver bandwidth / UCX-tuning harness.
 #
 # Fill in the placeholders (<...>) and run:
@@ -72,10 +75,10 @@ host_transfer_benchmark:
   timeout_ms: 30000
 
 kvcm_transfer_benchmark:
-  # Native KVCM V2 sparse pages, including actual GPU→host offload and detached
-  # receive reservations. The same NIXL path is used for every mode.
+  # Native KVCM V2 pages: dense hot pages are GPU-backed, sparse hot pages are
+  # host-backed. The same NIXL path is used for every mode.
   enabled: true
-  modes: ["gpu", "host", "host_to_gpu", "gpu_to_host", "mixed"]
+  modes: ["gpu", "host", "host_to_gpu", "gpu_to_host"]
   page_bytes: 1048576
   pages: 16
   tokens_per_block: 32

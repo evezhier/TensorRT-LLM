@@ -28,7 +28,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
 pytestmark = pytest.mark.cpu_only
 
@@ -521,11 +521,8 @@ class TestAdapterBlockOrdinals:
         class _KvCache:
             is_active = True
 
-            def get_page_storage_snapshot(self, group_idx):
-                return SimpleNamespace(
-                    base_page_indices=[-1, -1, 12, 13],
-                    cache_levels=[None, None, GPU_LEVEL, GPU_LEVEL],
-                )
+            def get_base_page_indices(self, group_idx):
+                return [-1, -1, 12, 13]
 
         class _V2Mgr:
             enable_block_reuse = True
@@ -533,6 +530,10 @@ class TestAdapterBlockOrdinals:
 
             def __init__(self):
                 self.kv_cache_map = {7: _KvCache()}
+                self.impl = SimpleNamespace(
+                    pool_group_descs=[SimpleNamespace(memory_tier=CacheTier.GPU_MEM)],
+                    get_life_cycle_pool_group_indices=lambda level: [0],
+                )
 
         mgr = _V2Mgr()
         req = _FakeReq(prompt_len=7)

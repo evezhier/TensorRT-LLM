@@ -46,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     Mapping,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
 
 class DummyRankInfo:
@@ -506,6 +507,7 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
 
     pg_desc = SimpleNamespace(
         pool_group_index=0,
+        memory_tier=CacheTier.GPU_MEM,
         num_slots=4,
         pools=[
             SimpleNamespace(pool_index=pi, base_address=base, slot_bytes=sb)
@@ -531,6 +533,17 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
         get_disagg_role_layouts=lambda: {},
     )
+
+
+def test_v2_builder_uses_hot_pool_memory_tier():
+    from types import SimpleNamespace
+
+    attrs = {(0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=64)}
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED})
+    manager.impl.pool_group_descs[0].memory_tier = CacheTier.HOST_MEM
+
+    page_table = build_page_table_from_manager(manager)
+    assert page_table.pool_groups[0].pools[0].memory_type == "DRAM"
 
 
 def test_v2_builder_stamps_homogeneous_pool_kinds():
@@ -762,6 +775,7 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
 
     recurrent_pg = SimpleNamespace(
         pool_group_index=0,
+        memory_tier=CacheTier.GPU_MEM,
         num_slots=4,
         pools=[
             SimpleNamespace(pool_index=0, base_address=0x10000, slot_bytes=256),
@@ -792,6 +806,7 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
     )
     attention_pg = SimpleNamespace(
         pool_group_index=1,
+        memory_tier=CacheTier.GPU_MEM,
         num_slots=8,
         pools=[SimpleNamespace(pool_index=0, base_address=0x30000, slot_bytes=128)],
         slot_desc=SimpleNamespace(

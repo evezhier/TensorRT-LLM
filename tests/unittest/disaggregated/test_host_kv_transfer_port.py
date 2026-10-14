@@ -35,7 +35,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
-from tensorrt_llm.runtime.kv_cache_manager_v2 import CACHE_LEVEL1, GPU_LEVEL
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
 pytestmark = pytest.mark.cpu_only
 
@@ -276,13 +276,16 @@ def test_native_host_transfer_copies_every_prompt_page(unsupported):
 
 
 @pytest.mark.parametrize("method", ["get_block_ids", "get_block_ordinals"])
-@pytest.mark.parametrize("levels", [[GPU_LEVEL, GPU_LEVEL, None], [CACHE_LEVEL1, GPU_LEVEL, None]])
-def test_gpu_adapter_checks_tiers_even_when_host_slots_are_positive(method, levels):
-    snapshot = SimpleNamespace(base_page_indices=[7, 1, -1], cache_levels=levels)
-    cache = SimpleNamespace(is_active=True, get_page_storage_snapshot=Mock(return_value=snapshot))
-    adapter = cache_reuse._CacheReuseAdapterV2(SimpleNamespace(kv_cache_map={42: cache}))
+@pytest.mark.parametrize("host_backed", [False, True])
+def test_gpu_adapter_checks_tiers_even_when_host_slots_are_positive(method, host_backed):
+    cache = SimpleNamespace(is_active=True, get_base_page_indices=Mock(return_value=[7, 1, -1]))
+    pool = SimpleNamespace(memory_tier=CacheTier.HOST_MEM if host_backed else CacheTier.GPU_MEM)
+    impl = SimpleNamespace(
+        pool_group_descs=[pool], get_life_cycle_pool_group_indices=lambda level: [0]
+    )
+    adapter = cache_reuse._CacheReuseAdapterV2(SimpleNamespace(kv_cache_map={42: cache}, impl=impl))
     req = SimpleNamespace(py_request_id=42)
-    if levels[0] == CACHE_LEVEL1:
+    if host_backed:
         with pytest.raises(RuntimeError, match="locked GPU pages"):
             getattr(adapter, method)(req, 0, None)
     else:

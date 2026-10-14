@@ -22,7 +22,7 @@ import numpy as np
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, GPU_LEVEL
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL, CacheTier
 
 from .page import AttentionLayerGroup
 from .utils import get_global_layer_ids

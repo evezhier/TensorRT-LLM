@@ -32,8 +32,8 @@ from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
+    CacheTier,
     GpuCacheTierConfig,
-    HostCacheTierConfig,
     KVCacheManager,
     KVCacheManagerConfig,
 )
@@ -43,7 +43,6 @@ MODES = {
     "host": ("DRAM", "DRAM"),
     "host_to_gpu": ("DRAM", "VRAM"),
     "gpu_to_host": ("VRAM", "DRAM"),
-    "mixed": ("DRAM", "MIXED"),
 }
 
 
@@ -102,10 +101,10 @@ def _pattern(rank: int, ordinal: int, mode_index: int) -> int:
 
 
 def _describe(pages: list, kind: str) -> list[dict]:
-    expected_level = 1 if kind == "DRAM" else 0
+    expected_tier = CacheTier.HOST_MEM if kind == "DRAM" else CacheTier.GPU_MEM
     for page in pages:
-        if page.cache_level != expected_level:
-            raise RuntimeError(f"expected cache level {expected_level}, got {page.cache_level}")
+        if page.cache_level != 0 or page.memory_tier != expected_tier:
+            raise RuntimeError(f"expected hot {kind} page, got level {page.cache_level} tier {page.memory_tier}")
         if (
             page.bytes <= 0
             or page.address < page.pool_base_address
@@ -128,7 +127,7 @@ def _describe(pages: list, kind: str) -> list[dict]:
     ]
 
 
-def _new_cache(config: dict, role: str, source_kind: str):
+def _new_cache(config: dict, role: str, kind: str):
     page_bytes = int(config["page_bytes"])
     pages = int(config["pages"])
     tokens_per_block = int(config.get("tokens_per_block", 32))
@@ -136,8 +135,8 @@ def _new_cache(config: dict, role: str, source_kind: str):
     quota = max(4 * pages * page_bytes, 4 << 20)
     native_config = KVCacheManagerConfig(
         tokens_per_block=tokens_per_block,
-        cache_tiers=[GpuCacheTierConfig(quota), HostCacheTierConfig(quota)],
-        layers=[AttentionLayerConfig(0, [BufferConfig("key", page_bytes, is_sparse=True)])],
+        cache_tiers=[GpuCacheTierConfig(quota)],
+        layers=[AttentionLayerConfig(0, [BufferConfig("key", page_bytes, is_sparse=kind == "DRAM")])],
         enable_partial_reuse=False,
     )
     manager = KVCacheManager(native_config)
@@ -147,46 +146,33 @@ def _new_cache(config: dict, role: str, source_kind: str):
         if not cache.resume(stream) or not cache.resize(tokens, tokens):
             raise RuntimeError("native benchmark cache could not allocate history")
         if role == "ctx":
-            snapshot = cache.get_page_storage_snapshot(0)
-            if len(snapshot.base_page_indices) != pages or any(
-                level != 0 for level in snapshot.cache_levels
-            ):
-                raise RuntimeError("source history was not fully allocated on GPU")
+            slots = cache.get_base_page_indices(0)
+            if len(slots) != pages:
+                raise RuntimeError("source history was not fully allocated")
             base = int(manager.get_mem_pool_base_address(0, "key"))
             stride = int(manager.get_page_stride(0, "key"))
-            for ordinal, slot in enumerate(snapshot.base_page_indices):
+            for ordinal, slot in enumerate(slots):
                 if slot < 0:
                     raise RuntimeError("source history has a missing page")
-                _check_cuda(
-                    cudart.cudaMemsetAsync(
-                        base + int(slot) * stride,
-                        _pattern(config["rank"], ordinal, config["mode_index"]),
-                        page_bytes,
-                        stream,
-                    ),
-                    "cudaMemsetAsync",
-                )
+                address = base + int(slot) * stride
+                pattern = _pattern(config["rank"], ordinal, config["mode_index"])
+                if kind == "DRAM":
+                    ctypes.memset(address, pattern, page_bytes)
+                else:
+                    _check_cuda(cudart.cudaMemsetAsync(address, pattern, page_bytes, stream), "cudaMemsetAsync")
             torch.cuda.current_stream().synchronize()
-            if source_kind == "DRAM" and not cache.enter_decode():
-                raise RuntimeError("native cache could not offload sparse history")
             access = cache.begin_external_read([0], tokens)
             cache.wait_external_access_ready(access)
             source_pages = cache.get_external_access_pages(access)
             if len(source_pages) != pages:
                 raise RuntimeError("native source page count differs from requested history")
-            return manager, cache, [access], _describe(source_pages, source_kind), stream
+            return manager, cache, [access], _describe(source_pages, kind), stream
 
         cache.suspend()
         accesses = []
         destinations = []
-        destination_kind = config["destination_kind"]
         for ordinal in range(pages):
-            kind = (
-                ("DRAM" if ordinal % 2 == 0 else "VRAM")
-                if destination_kind == "MIXED"
-                else destination_kind
-            )
-            access = cache.reserve_external_receive(0, ordinal, 1 if kind == "DRAM" else 0)
+            access = cache.reserve_external_receive(0, ordinal, 0)
             cache.wait_external_access_ready(access)
             accesses.append(access)
             received = cache.get_external_access_pages(access)
@@ -245,8 +231,9 @@ def _run_mode(
     role: str, rank: int, mode: str, mode_index: int, config: dict, socket: zmq.Socket, sweep: int
 ) -> None:
     source_kind, destination_kind = MODES[mode]
-    local_config = dict(config, rank=rank, mode_index=mode_index, destination_kind=destination_kind)
-    manager, cache, accesses, pages, stream = _new_cache(local_config, role, source_kind)
+    local_config = dict(config, rank=rank, mode_index=mode_index)
+    kind = source_kind if role == "ctx" else destination_kind
+    manager, cache, accesses, pages, stream = _new_cache(local_config, role, kind)
     name = f"kvcm_{role}_{rank}_{mode}_{sweep}"
     peer = f"kvcm_{'gen' if role == 'ctx' else 'ctx'}_{rank}_{mode}_{sweep}"
     agent = None
