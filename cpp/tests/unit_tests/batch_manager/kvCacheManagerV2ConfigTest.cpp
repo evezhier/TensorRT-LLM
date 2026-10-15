@@ -34,8 +34,13 @@ using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
 
 AttentionLayerConfig makeAttentionLayer(LayerId layerId, bool isSparse, size_t bufferSize = 4096)
 {
-    return AttentionLayerConfig{
+    AttentionLayerConfig layer{
         .layerId = layerId, .buffers = {BufferConfig{.role = "key", .size = bufferSize, .isSparse = isSparse}}};
+    if (isSparse)
+    {
+        layer.sparseCache = SparseCacheConfig{/*numSelectedBlocks=*/1, /*maxCachedUnits=*/2};
+    }
+    return layer;
 }
 
 TEST(KvCacheManagerV2ConfigTest, ExistingBufferConfigurationDefaultsToDense)
@@ -145,7 +150,7 @@ TEST(KvCacheManagerV2ConfigTest, SparseBuffersCoalesceBySize)
     // size coalesce however finely each divides its page into selection units.
     auto config = makeTieredConfig();
     auto firstLayer = makeAttentionLayer(0, true, 4096);
-    firstLayer.buffers.front().sparseSelectionUnitTokens = 2;
+    firstLayer.sparseCache = SparseCacheConfig{/*numSelectedBlocks=*/1, /*maxCachedUnits=*/2, /*unitTokens=*/2};
     config.layers = {firstLayer, makeAttentionLayer(1, true, 4096)};
     ASSERT_NO_THROW(config.validate());
 

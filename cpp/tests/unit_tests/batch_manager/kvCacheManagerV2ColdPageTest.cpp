@@ -72,9 +72,8 @@ KVCacheManagerConfig makeSparseTieredConfig()
     layer.layerId = 0;
     BufferConfig buffer{"key", 2 << 20, std::nullopt};
     buffer.isSparse = true;
-    buffer.numSelectedBlocks = 1;
-    buffer.maxCachedUnits = 2;
     layer.buffers.push_back(std::move(buffer));
+    layer.sparseCache = SparseCacheConfig{/*numSelectedBlocks=*/1, /*maxCachedUnits=*/2};
     // A pool group sizes its slots from its device-backed pools, so a sparse layer carries
     // one -- which is also the shape a model uses.
     layer.buffers.push_back(BufferConfig{"index", 256, std::nullopt});

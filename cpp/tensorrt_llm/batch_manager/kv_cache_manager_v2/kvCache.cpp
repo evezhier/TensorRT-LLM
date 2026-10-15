@@ -254,11 +254,14 @@ std::vector<KvCache::SparseBufferRef> KvCache::_sparseBuffers(LifeCycleId lifeCy
         }
         for (auto const& buf : attn->buffers)
         {
-            if (!buf.isSparse || buf.maxCachedUnits <= 0)
+            // A sparse buffer in a layer with no sparse_cache has storage and locking but
+            // no fetch path, so it contributes no cells and no layout.
+            if (!buf.isSparse || !attn->sparseCache.has_value())
             {
                 continue;
             }
-            refs.push_back(SparseBufferRef{BufferId{attn->layerId, buf.role}, buf.sparseLayout(mTokensPerBlock)});
+            refs.push_back(SparseBufferRef{
+                BufferId{attn->layerId, buf.role}, buf.sparseLayout(attn->sparseCache->unitsPerPage(mTokensPerBlock))});
         }
     }
     return refs;

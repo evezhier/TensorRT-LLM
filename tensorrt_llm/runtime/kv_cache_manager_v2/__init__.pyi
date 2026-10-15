@@ -291,38 +291,60 @@ class BufferConfig:
     size: int
     tokens_per_block_override: int | None = None
     is_sparse: bool = False
-    num_selected_blocks: int = 0
-    max_cached_units: int = 0
-
-    sparse_selection_unit_tokens: int | None = None
-    """Original tokens one selection unit spans. Sparse buffers only.
-
-    ``None`` means a unit is a whole page, i.e. no sub-page selection. Must divide
-    ``tokens_per_block``; the quotient is how many units a page holds.
-
-    Distinct from ``tokens_per_block_override``, which reinterprets a buffer's page for
-    *storage*: this names the sparse cache's granularity and nothing else, so the buffer's
-    pages, its page indices and its index space all keep the manager's ``tokens_per_block``.
-    Setting both on one buffer is rejected.
-    """
 
     sparse_unit_chunks: int = 1
-    """Pieces a selection unit is gathered from within its page. Sparse buffers only.
+    """Pieces a selection unit is gathered from within *this buffer's* page.
 
-    A unit is the tokens it spans across *every* KV head, so how many pieces that is
-    follows from the page's dimension order:
+    Per buffer, because it is this buffer's own dimension order:
 
     - **1** for a sequence-major page (``[token][head][dim]``), where a unit's tokens carry
       their heads with them and the whole unit is one contiguous range. Also 1 for any
-      single-head page -- a compressed or pooled latent, say -- where the two orders are
-      the same bytes.
+      single-head page -- a compressed or pooled latent -- where the orders coincide.
     - **numHeads** for a head-major page (``[head][token][dim]``), where each head
-      contributes its own contiguous run and a unit is that many strided pieces.
+      contributes its own run and a unit is that many strided pieces.
 
     Every sparse model in this repository today is one of the first two cases, so 1 is
-    almost always right. The rest of the layout -- chunk size, chunk stride, unit stride --
-    follows from this and the page being densely packed, so a padded page (an alignment gap
-    between heads, or between units) is not expressible.
+    almost always right. The rest of the layout follows from this, the layer's
+    ``sparse_cache.unit_tokens`` and the page being densely packed, so a padded page is not
+    expressible.
+    """
+
+@dataclass(slots=True)
+class SparseCacheConfig:
+    """One layer's sparse fetch path.
+
+    Per layer rather than per buffer because every sparse buffer of a layer shares one
+    resolve, one resident set and one recency order: the metadata is laid out
+    ``[layer][entry]``, and a selection names units for all of them at once. Declaring
+    these per buffer would let two of them disagree with nothing to reconcile it.
+
+    Its presence is what configures the fetch path. A sparse buffer in a layer without it
+    still gets sparse storage and locking; it simply has no GPU cache to read through.
+
+    Layers sharing a life cycle must declare the same values -- they share one arena.
+    """
+
+    num_selected_blocks: int
+    """Selection width: units a sparse-attention step selects for this layer."""
+
+    max_cached_units: int
+    """Cells one buffer gets in a request's GPU cache, counting both populations: the
+    history it caches and every unit still in flight.
+
+    Two to four times ``num_selected_blocks`` is the usual starting point: a cache only as
+    wide as the selection retains nothing between steps, and retention of units not
+    selected this step is where the hit rate comes from. It must exceed
+    ``num_selected_blocks``, since equality would leave no cell for the unit being written.
+    """
+
+    unit_tokens: int | None = None
+    """Original tokens one selection unit spans. ``None`` means a unit is a whole page.
+
+    Must divide ``tokens_per_block``; the quotient is how many units a page holds.
+    Distinct from ``BufferConfig.tokens_per_block_override``, which reinterprets a buffer's
+    page for *storage*: this names the sparse cache's granularity and nothing else, so
+    pages, page indices and index spaces all keep the manager's ``tokens_per_block``.
+    Setting both on one buffer is rejected.
     """
 
 @dataclass(slots=True)
@@ -339,6 +361,12 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+
+    sparse_cache: SparseCacheConfig | None = None
+    """The sparse fetch path for this layer's sparse buffers, if it has one.
+
+    Setting it on a layer with no sparse buffer to serve is rejected.
+    """
     @property
     def window_size(self) -> int | None: ...
 

@@ -158,18 +158,45 @@ void KvCacheManager::_computeSparseCacheShape()
         {
             continue;
         }
+        if (!attn->sparseCache.has_value())
+        {
+            continue;
+        }
         LifeCycleId const lcId = mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock));
+        auto const& cache = *attn->sparseCache;
+        int const unitsPerPage = cache.unitsPerPage(mConfig.tokensPerBlock);
+
+        // Layers of one life cycle must currently declare the same sparse_cache. The arena
+        // is per life cycle and its metadata is one stride: a layer's rows are found at
+        // `residentOrdinal + layer * entriesPerLayer`, so a single entry count serves them
+        // all, and cellsPerBuffer follows from maxCachedUnits and unitsPerPage alike.
+        //
+        // Not a fundamental limit, just unimplemented. The way out is to size a cell from
+        // the largest unit -- or from a whole page -- and let a layer with a smaller unit
+        // subdivide that cell, which is the mechanism a cell already uses to hold
+        // `unitsPerPage` units. Requiring unit sizes to be powers of two makes every such
+        // division exact. The resident set and recency order are already per layer, so
+        // they need no change. See SPARSE_ATTENTION_DESIGN.md.
+        //
+        // Until then, disagreement is rejected rather than silently resolved.
+        if (mSparseCacheLayers[lcId] > 0)
+        {
+            TLLM_CHECK_WITH_INFO(mSparseCacheMaxUnits[lcId] == cache.maxCachedUnits
+                    && mSparseCacheSelection[lcId] == cache.numSelectedBlocks
+                    && mSparseCacheUnitsPerPage[lcId] == unitsPerPage,
+                "Layers sharing a life cycle must declare the same sparse_cache; they share one arena");
+        }
+        mSparseCacheMaxUnits[lcId] = cache.maxCachedUnits;
+        mSparseCacheSelection[lcId] = cache.numSelectedBlocks;
+        mSparseCacheUnitsPerPage[lcId] = unitsPerPage;
+
         bool layerCounted = false;
         for (auto const& buf : attn->buffers)
         {
-            if (!buf.isSparse || buf.maxCachedUnits <= 0)
+            if (!buf.isSparse)
             {
                 continue;
             }
-            int const unitsPerPage = buf.sparseUnitsPerPage(mConfig.tokensPerBlock);
-            mSparseCacheMaxUnits[lcId] = std::max(mSparseCacheMaxUnits[lcId], buf.maxCachedUnits);
-            mSparseCacheSelection[lcId] = std::max(mSparseCacheSelection[lcId], buf.numSelectedBlocks);
-            mSparseCacheUnitsPerPage[lcId] = std::max(mSparseCacheUnitsPerPage[lcId], unitsPerPage);
             // One more cell in a reserved slot.
             ++mSparseCacheBuffers[lcId];
             if (!layerCounted)
@@ -224,7 +251,9 @@ std::vector<SparseBufferPlan> KvCacheManager::sparseBufferPlan(LifeCycleId lifeC
         auto const firstOfLayer = plan.size();
         for (auto const& buf : attn->buffers)
         {
-            if (!buf.isSparse || buf.maxCachedUnits <= 0)
+            // A sparse buffer in a layer with no sparse_cache has storage and locking but
+            // no fetch path, so it contributes no cells and no layout.
+            if (!buf.isSparse || !attn->sparseCache.has_value())
             {
                 continue;
             }
@@ -235,7 +264,8 @@ std::vector<SparseBufferPlan> KvCacheManager::sparseBufferPlan(LifeCycleId lifeC
             }
             auto const attr = bufferAttr(attn->layerId, buf.role);
             plan.push_back(SparseBufferPlan{BufferId{attn->layerId, buf.role}, attr.poolIndex, attr.size,
-                static_cast<uint32_t>(attr.offset), buf.sparseLayout(mConfig.tokensPerBlock), layerRow, 0});
+                static_cast<uint32_t>(attr.offset),
+                buf.sparseLayout(attn->sparseCache->unitsPerPage(mConfig.tokensPerBlock)), layerRow, 0});
         }
         // Group a layer's buffers by pool so a (layer, pool) run is consecutive too: a pool is
         // what fixes a cell's size, the slot stride it is read from, and the unit layout, so

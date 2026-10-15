@@ -61,6 +61,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         PlannedDropHandle,
         ReuseScope,
         SlidingWindowSize,
+        SparseCacheConfig,
         SsmLayerConfig,
         SwaScratchReuseConfig,
         TokenId,
@@ -113,6 +114,7 @@ else:
         PlannedDropHandle,
         ReuseScope,
         SlidingWindowSize,
+        SparseCacheConfig,
         SsmLayerConfig,
         SwaScratchReuseConfig,
         TokenId,
@@ -335,22 +337,24 @@ class TestSparseBufferConfig(unittest.TestCase):
             "key",
             4096,
             is_sparse=True,
-            num_selected_blocks=2,
-            max_cached_units=4,
         )
         scales = BufferConfig(
             "key_scale",
             128,
             is_sparse=True,
-            num_selected_blocks=2,
-            max_cached_units=4,
         )
         config = KVCacheManagerConfig(
             tokens_per_block=128,
             cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
             constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=1024, history_length=0)] * 2)],
             # A pool group sizes its slots from its device-backed pools.
-            layers=[AttentionLayerConfig(0, [data, scales, BufferConfig("index", 256)])],
+            layers=[
+                AttentionLayerConfig(
+                    0,
+                    [data, scales, BufferConfig("index", 256)],
+                    sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+                )
+            ],
         )
         manager = KVCacheManager(config)
         try:
@@ -364,41 +368,47 @@ class TestSparseBufferConfig(unittest.TestCase):
 
     def test_sparse_sizing_defaults_and_roundtrip(self):
         plain = BufferConfig("key", 4096)
-        self.assertEqual((plain.num_selected_blocks, plain.max_cached_units), (0, 0))
-        self.assertIsNone(plain.sparse_selection_unit_tokens)
+        self.assertFalse(plain.is_sparse)
         self.assertEqual(plain.sparse_unit_chunks, 1)
 
-        buffer = BufferConfig(
-            "key",
-            4096,
-            is_sparse=True,
-            num_selected_blocks=16,
-            max_cached_units=64,
-            sparse_selection_unit_tokens=4,
-            sparse_unit_chunks=4,
-        )
+        buffer = BufferConfig("key", 4096, is_sparse=True, sparse_unit_chunks=4)
         copied = deepcopy(buffer)
-        buffer.max_cached_units = 0
-        self.assertEqual(copied.max_cached_units, 64)
-        self.assertEqual(copied.sparse_selection_unit_tokens, 4)
+        buffer.sparse_unit_chunks = 1
         self.assertEqual(copied.sparse_unit_chunks, 4)
+        self.assertTrue(copied.is_sparse)
 
-    def test_rejects_sparse_fields_on_dense_buffer(self):
-        layer = AttentionLayerConfig(0, [BufferConfig("key", 4096, num_selected_blocks=4)])
-        with self.assertRaisesRegex(ValueError, "sparse-only fields"):
+        cache = SparseCacheConfig(num_selected_blocks=16, max_cached_units=64, unit_tokens=4)
+        copied_cache = deepcopy(cache)
+        cache.max_cached_units = 0
+        self.assertEqual(copied_cache.max_cached_units, 64)
+        self.assertEqual(copied_cache.num_selected_blocks, 16)
+        self.assertEqual(copied_cache.unit_tokens, 4)
+
+    def test_rejects_unit_chunks_on_a_dense_buffer(self):
+        layer = AttentionLayerConfig(0, [BufferConfig("key", 4096, sparse_unit_chunks=2)])
+        with self.assertRaisesRegex(ValueError, "sparseUnitChunks set on a non-sparse buffer"):
+            self._make_config(layer)
+
+    def test_rejects_a_cache_on_a_layer_with_no_sparse_buffer(self):
+        """sparse_cache configures a fetch path, so there must be something to fetch for."""
+        layer = AttentionLayerConfig(
+            0,
+            [BufferConfig("key", 4096)],
+            sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+        )
+        with self.assertRaisesRegex(ValueError, "no sparse buffer to serve"):
             self._make_config(layer)
 
     def test_rejects_cache_narrower_than_selection(self):
         layer = AttentionLayerConfig(
             0,
             [
-                BufferConfig(
-                    "key", 4096, is_sparse=True, num_selected_blocks=16, max_cached_units=8
-                ),
+                BufferConfig("key", 4096, is_sparse=True),
                 # A pool group sizes its slots from its device-backed pools, so a sparse
                 # layer carries one -- which is also the shape a model uses.
                 BufferConfig("index", 256),
             ],
+            sparse_cache=SparseCacheConfig(num_selected_blocks=16, max_cached_units=8),
         )
         with self.assertRaisesRegex(ValueError, "maxCachedUnits"):
             self._make_config(layer)
@@ -411,8 +421,6 @@ class TestSparseBufferConfig(unittest.TestCase):
                     "key",
                     4096,
                     is_sparse=True,
-                    num_selected_blocks=16,
-                    max_cached_units=64,
                     # 3 chunks do not divide 4096, so a unit has no whole-byte size.
                     sparse_unit_chunks=3,
                 ),
@@ -420,6 +428,7 @@ class TestSparseBufferConfig(unittest.TestCase):
                 # layer carries one -- which is also the shape a model uses.
                 BufferConfig("index", 256),
             ],
+            sparse_cache=SparseCacheConfig(num_selected_blocks=16, max_cached_units=64),
         )
         with self.assertRaisesRegex(ValueError, "divide evenly"):
             self._make_config(layer)
@@ -433,14 +442,14 @@ class TestSparseBufferConfig(unittest.TestCase):
                     4096,
                     tokens_per_block_override=4,
                     is_sparse=True,
-                    num_selected_blocks=16,
-                    max_cached_units=64,
-                    sparse_selection_unit_tokens=4,
                 ),
                 # A pool group sizes its slots from its device-backed pools, so a sparse
                 # layer carries one -- which is also the shape a model uses.
                 BufferConfig("index", 256),
             ],
+            sparse_cache=SparseCacheConfig(
+                num_selected_blocks=16, max_cached_units=64, unit_tokens=4
+            ),
         )
         with self.assertRaisesRegex(ValueError, "tokensPerBlockOverride is not supported"):
             self._make_config(layer)
@@ -501,14 +510,13 @@ class TestSparseTierFlexibility(unittest.TestCase):
                                 "key",
                                 4096,
                                 is_sparse=True,
-                                num_selected_blocks=2,
-                                max_cached_units=4,
                             ),
                             # A pool group is sized from its device-backed pools, so a sparse layer
                             # carries one. This is also the shape a model uses: an indexer and the
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
+                        sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
                     )
                 ],
             )
@@ -536,10 +544,14 @@ class TestSparseCacheReservation(unittest.TestCase):
 
     @staticmethod
     def _manager(max_cached_units: int) -> KVCacheManager:
-        # Both widths are zero together: a selection width without a cache to hold it is
-        # rejected at construction, so "fetch path unconfigured" means both are unset.
+        # sparse_cache is absent when the fetch path is unconfigured: the buffer still gets
+        # sparse storage and locking, it simply has no GPU cache to read through.
         # The cache must exceed the selection, since the surplus is the in-flight headroom.
-        num_selected = 2 if max_cached_units > 0 else 0
+        sparse_cache = (
+            SparseCacheConfig(num_selected_blocks=2, max_cached_units=max_cached_units)
+            if max_cached_units > 0
+            else None
+        )
         return KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=128,
@@ -557,8 +569,6 @@ class TestSparseCacheReservation(unittest.TestCase):
                                 "key",
                                 4096,
                                 is_sparse=True,
-                                num_selected_blocks=num_selected,
-                                max_cached_units=max_cached_units,
                                 # One contiguous run per unit; a cached buffer must say how
                                 # to find a unit inside itself.
                             ),
@@ -567,6 +577,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
+                        sparse_cache=sparse_cache,
                     )
                 ],
             )
@@ -760,14 +771,13 @@ class TestSparseCacheReservation(unittest.TestCase):
                                 "key",
                                 sparse_bytes,
                                 is_sparse=True,
-                                num_selected_blocks=2,
-                                max_cached_units=4,
                             ),
                             # A pool group is sized from its device-backed pools, so a sparse layer
                             # carries one. This is also the shape a model uses: an indexer and the
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
+                        sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
                     )
                 ],
             )
@@ -1301,8 +1311,6 @@ class TestSparseFetch(unittest.TestCase):
                                 role,
                                 4096,
                                 is_sparse=True,
-                                num_selected_blocks=cls.SELECTED,
-                                max_cached_units=cls.CACHED_UNITS,
                             )
                             for role in roles
                         ]
@@ -1311,6 +1319,9 @@ class TestSparseFetch(unittest.TestCase):
                             # sparse layer carries one -- the shape a model uses anyway.
                             BufferConfig("index", 256)
                         ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=cls.SELECTED, max_cached_units=cls.CACHED_UNITS
+                        ),
                     )
                 ],
             )
@@ -1529,14 +1540,15 @@ class TestSparseDataPath(unittest.TestCase):
                                 "key",
                                 cls.BUF,
                                 is_sparse=True,
-                                num_selected_blocks=cls.SELECTED,
-                                max_cached_units=cls.CELLS,
                             ),
                             # A pool group is sized from its device-backed pools, so a sparse layer
                             # carries one. This is also the shape a model uses: an indexer and the
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=cls.SELECTED, max_cached_units=cls.CELLS
+                        ),
                     )
                 ],
             )
@@ -1691,14 +1703,15 @@ class TestSparseWriteIndices(unittest.TestCase):
                                 "key",
                                 cls.BUF,
                                 is_sparse=True,
-                                num_selected_blocks=cls.SELECTED,
-                                max_cached_units=cls.CELLS,
                             ),
                             # A pool group is sized from its device-backed pools, so a sparse layer
                             # carries one. This is also the shape a model uses: an indexer and the
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=cls.SELECTED, max_cached_units=cls.CELLS
+                        ),
                     )
                 ],
             )
@@ -1853,10 +1866,8 @@ class TestSparseWriteIndices(unittest.TestCase):
                                 role,
                                 self.BUF,
                                 is_sparse=True,
-                                num_selected_blocks=self.SELECTED,
                                 # Headroom of CELLS - SELECTED = 2, wider than the one unit
                                 # that can be in flight.
-                                max_cached_units=self.CELLS,
                             )
                             for role in ("key", "value")
                         ]
@@ -1864,6 +1875,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                             # A pool group sizes its slots from its device-backed pools.
                             BufferConfig("index", 256)
                         ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=self.SELECTED, max_cached_units=self.CELLS
+                        ),
                     )
                 ],
             )
@@ -1920,14 +1934,15 @@ class TestSparseWriteIndices(unittest.TestCase):
                                 "key",
                                 self.BUF,
                                 is_sparse=True,
-                                num_selected_blocks=self.SELECTED,
-                                max_cached_units=self.CELLS,
                             ),
                             # A pool group is sized from its device-backed pools, so a sparse layer
                             # carries one. This is also the shape a model uses: an indexer and the
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=self.SELECTED, max_cached_units=self.CELLS
+                        ),
                     )
                     for layer in range(layers)
                 ],
@@ -2085,8 +2100,6 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                 role,
                 size,
                 is_sparse=True,
-                num_selected_blocks=cls.SELECTED,
-                max_cached_units=cls.CELLS,
             )
 
         return KVCacheManager(
@@ -2105,6 +2118,9 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                             # A pool group sizes its slots from its device-backed pools.
                             BufferConfig("index", 256),
                         ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=cls.SELECTED, max_cached_units=cls.CELLS
+                        ),
                     )
                 ],
             )
@@ -2422,14 +2438,13 @@ class TestBatch(unittest.TestCase):
                                 "key",
                                 4096,
                                 is_sparse=True,
-                                num_selected_blocks=2,
-                                max_cached_units=4,
                             ),
                             # A pool group is sized from its device-backed pools, so a sparse layer
                             # carries one. This is also the shape a model uses: an indexer and the
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
+                        sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
                     )
                 ],
             )

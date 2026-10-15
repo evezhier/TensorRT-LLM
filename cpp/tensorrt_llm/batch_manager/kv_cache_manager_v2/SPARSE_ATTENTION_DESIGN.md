@@ -756,6 +756,28 @@ Also: the host pool is far larger than the GPU pool, so a page index must be wid
 bits before multiplying by the page stride. MSA already does this
 (`triton_sparse_decode.py`); QSA and XQA should be audited.
 
+## Planned: a selection unit size per layer
+
+A layer declares its fetch path with `sparse_cache`, and layers sharing a life cycle must
+currently declare the same one. The arena is per life cycle and its metadata is a single
+stride — a layer's rows live at `residentOrdinal + layer * entriesPerLayer` — so one entry
+count serves every layer, and `cellsPerBuffer` follows from `max_cached_units` and the unit
+size together.
+
+That is an implementation limit, not a property of the design. Lifting it:
+
+- **Size a cell from the largest unit of the life cycle**, or simply from a whole page.
+- **A layer with a smaller unit subdivides that cell.** This is the mechanism a cell already
+  uses: it holds `unitsPerPage` units, addressed as `cell * unitsPerPage + unit`. A layer
+  whose unit is half the cell's just has twice the divisor.
+- **Require unit sizes to be powers of two**, so every such division is exact and a buffer's
+  bytes split without remainder at any level.
+- The resident set and the recency order are **already per layer**, so they need no change;
+  only the entry count and the divisor become per layer rather than per life cycle.
+
+Until then a mismatch is rejected at construction. It was previously taken as a `max` across
+the life cycle, which quietly served one layer's shape to another.
+
 ## Sparse buffers across more than one pool
 
 A life cycle's sparse buffers need not agree on size. The **quantised shape** — block scales

@@ -1612,24 +1612,29 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
+    nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
+        .def(nb::init<int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
+            nb::arg("unit_tokens") = std::nullopt)
+        .def_rw("num_selected_blocks", &kv::SparseCacheConfig::numSelectedBlocks)
+        .def_rw("max_cached_units", &kv::SparseCacheConfig::maxCachedUnits)
+        .def_rw("unit_tokens", &kv::SparseCacheConfig::unitTokens) DEF_COPY(kv::SparseCacheConfig);
+
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<int>, int>(),
-            nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
-            nb::arg("is_sparse") = false, nb::arg("num_selected_blocks") = 0, nb::arg("max_cached_units") = 0,
-            nb::arg("sparse_selection_unit_tokens") = std::nullopt, nb::arg("sparse_unit_chunks") = 1)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int>(), nb::arg("role"), nb::arg("size"),
+            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false,
+            nb::arg("sparse_unit_chunks") = 1)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
-        .def_rw("num_selected_blocks", &kv::BufferConfig::numSelectedBlocks)
-        .def_rw("max_cached_units", &kv::BufferConfig::maxCachedUnits)
-        .def_rw("sparse_selection_unit_tokens", &kv::BufferConfig::sparseSelectionUnitTokens)
         .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
-        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),
+        .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
+                 std::optional<kv::SparseCacheConfig>>(),
             nb::arg("layer_id"), nb::arg("buffers"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt)
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("sparse_cache") = std::nullopt)
+        .def_rw("sparse_cache", &kv::AttentionLayerConfig::sparseCache)
         .def_rw("layer_id", &kv::AttentionLayerConfig::layerId)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)

@@ -75,6 +75,7 @@ class _BatchDescFieldSpec:
 BatchDesc.__dataclass_fields__ = _BatchDescFieldSpec.__dataclass_fields__
 del _BatchDescFieldSpec, _dataclasses_bd
 BufferConfig = _cpp.BufferConfig
+SparseCacheConfig = _cpp.SparseCacheConfig
 BufferId = _cpp.BufferId
 CoalescedBuffer = _cpp.CoalescedBuffer
 CacheTier = _cpp.CacheTier
@@ -208,6 +209,7 @@ __all__ = [
     "BatchDesc",
     "BeamIndex",
     "BufferConfig",
+    "SparseCacheConfig",
     "BufferId",
     "CoalescedBuffer",
     "CacheLevel",
