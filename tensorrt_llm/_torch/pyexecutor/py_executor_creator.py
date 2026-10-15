@@ -44,7 +44,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     compute_max_num_sequences, create_py_executor_instance,
                     instantiate_sampler, is_disagg_enabled, is_mla,
                     validate_feature_combination)
-from .config_utils import (is_hybrid_linear, is_minimax_m3,
+from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -1021,6 +1021,14 @@ def _create_py_executor(
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
+
+        if not skip_est and is_decode_only(sparse_attention_config):
+            # The estimation dry run prefills dummy prompts, which a
+            # decode-only worker cannot execute. Size the KV cache from free
+            # memory instead, as with TRTLLM_SKIP_KV_CACHE_ESTIMATION=1.
+            logger.info("KV cache size estimation is not supported for a "
+                        "decode-only worker, disable it.")
+            skip_est = True
 
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,

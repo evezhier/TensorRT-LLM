@@ -598,6 +598,7 @@ def _history_case(
         context_current_position=tokens_per_block - 1,
         context_remaining_length=0,
         is_dummy_request=False,
+        is_disagg_generation_init_state=False,
         py_num_accepted_draft_tokens=0,
         py_rewind_len=0,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
@@ -690,7 +691,10 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
     batch = SimpleNamespace(
         context_requests=[
             SimpleNamespace(
-                py_request_id=20, is_first_context_chunk=first, is_last_context_chunk=last
+                py_request_id=20,
+                is_first_context_chunk=first,
+                is_last_context_chunk=last,
+                is_disagg_generation_init_state=False,
             )
         ],
         generation_requests=[],
@@ -764,7 +768,7 @@ def sparse_scheduling_case():
     second.page_index_owner = "runtime"
     manager.kv_cache_map[10] = second
     request.is_first_context_chunk = request.is_last_context_chunk = True
-    other_request = SimpleNamespace(py_request_id=10)
+    other_request = SimpleNamespace(py_request_id=10, is_disagg_generation_init_state=False)
     scheduled = SimpleNamespace(context_requests=[], generation_requests=[request, other_request])
 
     def restore(request_id, request_cache):
@@ -832,7 +836,9 @@ def test_sparse_batch_clears_rows_for_empty_or_padded_schedule(sparse_scheduling
     case = sparse_scheduling_case
     case.manager.prepare_resources(case.scheduled)
     case.scheduled.generation_requests = [
-        SimpleNamespace(py_request_id=CUDA_GRAPH_DUMMY_REQUEST_ID)
+        SimpleNamespace(
+            py_request_id=CUDA_GRAPH_DUMMY_REQUEST_ID, is_disagg_generation_init_state=False
+        )
     ] * dummy_count
     case.manager.prepare_resources(case.scheduled)
     batch = case.manager.get_sparse_batch([CUDA_GRAPH_DUMMY_REQUEST_ID] * dummy_count)
@@ -874,7 +880,10 @@ def test_sparse_batch_rejects_invalid_schedule_before_binding(sparse_scheduling_
         case.scheduled.generation_requests = [case.request, case.request]
     elif problem == "padding":
         case.scheduled.generation_requests.insert(
-            0, SimpleNamespace(py_request_id=CUDA_GRAPH_DUMMY_REQUEST_ID)
+            0,
+            SimpleNamespace(
+                py_request_id=CUDA_GRAPH_DUMMY_REQUEST_ID, is_disagg_generation_init_state=False
+            ),
         )
     elif problem == "size":
         case.manager.max_batch_size = 1
@@ -895,6 +904,44 @@ def test_sparse_batch_checks_consumer_row_order(sparse_scheduling_case, request_
     case.manager.prepare_resources(case.scheduled)
     with pytest.raises(ValueError, match="request order"):
         case.manager.get_sparse_batch(request_ids)
+
+
+def _gen_init_request(request_id: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=request_id,
+        is_first_context_chunk=True,
+        is_last_context_chunk=True,
+        is_disagg_generation_init_state=True,
+    )
+
+
+@pytest.mark.cpu_only
+def test_sparse_batch_ignores_disagg_gen_init_preparation(sparse_scheduling_case):
+    """Gen-init requests are prepared before their KV transfer and run no forward.
+
+    Their admission bypasses the batch budget, so a burst can exceed the Batch rows.
+    """
+    case = sparse_scheduling_case
+    burst = case.manager.max_batch_size + 2
+    case.scheduled.context_requests = [_gen_init_request(100 + i) for i in range(burst)]
+    case.scheduled.generation_requests = []
+
+    case.manager.prepare_resources(case.scheduled)
+
+    case.create_batch.assert_not_called()
+    with pytest.raises(RuntimeError, match="must be prepared"):
+        case.manager.get_sparse_batch([])
+
+
+@pytest.mark.cpu_only
+def test_sparse_batch_publishes_only_requests_that_run_a_forward(sparse_scheduling_case):
+    case = sparse_scheduling_case
+    case.scheduled.context_requests = [_gen_init_request(100)]
+
+    case.manager.prepare_resources(case.scheduled)
+
+    batch = case.manager.get_sparse_batch([20, 10])
+    assert [row[0] for row in batch.snapshots[-1]] == [20, 10, None, None]
 
 
 @pytest.mark.cpu_only
@@ -1095,6 +1142,52 @@ def test_sparse_forward_requires_reserved_input_capacity() -> None:
     ):
         manager.update_forward_resources(batch, wait_for_input_copy=Mock())
     assert not cache.calls
+
+
+@pytest.mark.cpu_only
+def test_sparse_scheduling_keeps_a_reserved_input_token() -> None:
+    """An attention-DP dummy arrives holding its input token; the scheduler must not grow it."""
+    manager, cache, request, batch = _history_case()
+    batch.context_requests, batch.generation_requests = [], [request]
+    # add_dummy_requests(is_gen=True) reserves the step's input token up front.
+    cache.history_length, cache.capacity = 0, 1
+
+    with patch.object(KVCacheManagerV2, "try_allocate_generation") as grow:
+        assert manager.try_allocate_generation(request)
+    grow.assert_not_called()
+    assert not cache.calls
+    assert request.py_request_id not in manager._allocated_draft_lens
+
+    # A fleet-wide skipped step (can_queue=False) has no growth to give back.
+    manager.revert_allocate_generation(request)
+    assert not cache.calls
+
+    # The forward consumes exactly the reserved token.
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        manager.update_forward_resources(batch, wait_for_input_copy=Mock())
+    assert cache.history_length == cache.capacity == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("reserved", [False, True])
+def test_generation_growth_defers_to_the_base_policy(offload: bool, reserved: bool) -> None:
+    """Only an offload cache that already holds its input token skips growth.
+
+    Without offload, history follows sampling and lags one step under the overlap
+    scheduler, so capacity beyond history is normal there and must still grow.
+    """
+    manager, cache, request, _ = _history_case()
+    manager._enable_kv_cache_offload = offload
+    cache.history_length = 7
+    cache.capacity = 8 if reserved else 7
+
+    with patch.object(KVCacheManagerV2, "try_allocate_generation", return_value=True) as grow:
+        assert manager.try_allocate_generation(request)
+    assert grow.call_count == (0 if offload and reserved else 1)
 
 
 @pytest.mark.cpu_only

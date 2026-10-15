@@ -9,7 +9,9 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          DeepSeekV4SparseAttentionConfig,
+                                          SparseAttentionConfig)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -450,6 +452,19 @@ def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
 def is_minimax_m3(sparse_attention_config):
     """True when the sparse attention config selects the MiniMax-M3 algorithm."""
     return sparse_attention_config is not None and sparse_attention_config.algorithm == "minimax_m3"
+
+
+def is_decode_only(
+        sparse_attention_config: Optional[SparseAttentionConfig]) -> bool:
+    """True when the sparse attention config restricts the worker to decode.
+
+    DeepSeek-V4 KV cache offload keeps compressed attention history in host
+    memory and admits one query token per request per step, so its worker
+    serves the decode phase of disaggregated serving and never runs a context
+    batch.
+    """
+    return (isinstance(sparse_attention_config, DeepSeekV4SparseAttentionConfig)
+            and sparse_attention_config.enable_kv_cache_offload)
 
 
 def is_qwen3_next(config):

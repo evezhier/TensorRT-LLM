@@ -1729,14 +1729,19 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # that does not complete its prompt. Reject before model writes.
             raise NotImplementedError("Sparse offload does not support chunked prefill")
         super().prepare_resources(scheduled_batch)
-        if self._enable_kv_cache_offload:
-            self.prepare_sparse_batch(
-                [
-                    request.py_request_id
-                    for request in scheduled_batch.context_requests
-                    + scheduled_batch.generation_requests
-                ]
-            )
+        if not self._enable_kv_cache_offload:
+            return
+        requests = scheduled_batch.context_requests + scheduled_batch.generation_requests
+        # Disaggregated gen-init requests are prepared before their KV transfer
+        # starts and run no forward this step, so they never join the Batch. A
+        # batch holding only those publishes nothing.
+        forward_request_ids = [
+            request.py_request_id
+            for request in requests
+            if not request.is_disagg_generation_init_state
+        ]
+        if forward_request_ids or not requests:
+            self.prepare_sparse_batch(forward_request_ids)
 
     def prepare_sparse_batch(self, request_ids: list[int]) -> None:
         """Publish scheduler or warmup requests, or join an already published batch.
@@ -1902,6 +1907,22 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._release_sparse_batch()
         self._order_sparse_history_update(scheduled_batch.context_requests)
         super().update_context_resources(scheduled_batch)
+
+    def try_allocate_generation(self, req: llm_request.LlmRequest) -> bool:
+        """Reserve a decode request's next input token unless it is already reserved.
+
+        With offload, history advances right after each forward, so at scheduling
+        time a cache holding capacity beyond its history has already reserved this
+        step. Attention-DP padding dummies are created that way. Growing such a
+        cache again would exceed the sparse cache's one-token bound between
+        capacity and history. No growth is recorded, so a skipped step reverts
+        nothing.
+        """
+        if self._enable_kv_cache_offload:
+            cache = self.kv_cache_map.get(req.py_request_id)
+            if cache is not None and cache.is_active and cache.capacity > cache.history_length:
+                return True
+        return super().try_allocate_generation(req)
 
     def update_forward_resources(
         self, scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]

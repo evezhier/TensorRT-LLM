@@ -75,7 +75,7 @@ from ..utils import (get_per_request_prefill_cuda_graph_flag, helix_local_len,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from .config_utils import is_hybrid_linear
+from .config_utils import is_decode_only, is_hybrid_linear
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 get_mrope_dummy_seq_slot)
@@ -1367,6 +1367,20 @@ class PyTorchModelEngine(ModelEngine):
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
+    def _generation_warmup_shapes(
+        self,
+        warmup_requests_configs: List[Tuple[int,
+                                            int]]) -> List[Tuple[int, int]]:
+        """Keeps the warmup shapes whose tokens all belong to generation requests.
+
+        Each shape is ``(num_tokens, num_gen_requests)``, as consumed by
+        ``_create_warmup_request``. Order is preserved.
+        """
+        tokens_per_gen_request = 1 + self.max_total_draft_tokens
+        return [(num_tokens, num_gen_requests)
+                for num_tokens, num_gen_requests in warmup_requests_configs
+                if num_tokens == num_gen_requests * tokens_per_gen_request]
+
     @contextmanager
     def maybe_autotune_lora(self):
         """Enable autotuning while warming up CUDA-graph LoRA kernels."""
@@ -1508,6 +1522,10 @@ class PyTorchModelEngine(ModelEngine):
             not is_enc_dec and not self.mapping.has_cp_helix()
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
+        # A decode-only worker never runs a context batch, so every phase
+        # below warms up pure-generation shapes only. The flag comes from the
+        # configuration, so every rank takes the same branch.
+        decode_only = is_decode_only(self.sparse_attention_config)
 
         log_mem_snapshot("warmup/before_warmup")
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
@@ -1521,16 +1539,22 @@ class PyTorchModelEngine(ModelEngine):
                     "attention_jit",
                     metrics=self._metrics,
                     metric_name="attention_warmup_seconds"):
-                self._run_attention_warmup(resource_manager,
-                                           can_run_general_warmup)
+                self._run_attention_warmup(
+                    resource_manager, can_run_general_warmup
+                    and not decode_only)
 
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
             with self._warmup_timer.phase("general",
                                           metrics=self._metrics,
                                           metric_name="general_warmup_seconds"):
+                warmup_requests_configs = self._get_full_general_warmup_requests(
+                    resource_manager)
+                if decode_only:
+                    warmup_requests_configs = self._generation_warmup_shapes(
+                        warmup_requests_configs)
                 warmup_requests_configs = self._agree_warmup_shapes(
-                    self._get_full_general_warmup_requests(resource_manager))
+                    warmup_requests_configs)
                 # Currently graph has not been captured, disable cuda graph for this warmup.
                 with self.no_cuda_graph():
                     self._general_warmup(resource_manager,
@@ -1551,7 +1575,8 @@ class PyTorchModelEngine(ModelEngine):
                     "autotuner",
                     metrics=self._metrics,
                     metric_name="autotuner_warmup_seconds"):
-                self._run_autotuner_warmup(resource_manager)
+                self._run_autotuner_warmup(resource_manager,
+                                           decode_only=decode_only)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
             # for Mamba hybrid models. Runs regardless of enable_autotuner,
@@ -1617,6 +1642,9 @@ class PyTorchModelEngine(ModelEngine):
                     metric_name="memory_pool_prepopulation_seconds"):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(
                     resource_manager)
+                if decode_only:
+                    warmup_requests_configs = self._generation_warmup_shapes(
+                        warmup_requests_configs)
                 self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
@@ -2193,8 +2221,17 @@ class PyTorchModelEngine(ModelEngine):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
-    def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
-        """Runs forward passes to populate the autotuner cache."""
+    def _run_autotuner_warmup(self,
+                              resource_manager: ResourceManager,
+                              decode_only: bool = False) -> None:
+        """Runs forward passes to populate the autotuner cache.
+
+        Args:
+            resource_manager: Resource manager that allocates the warmup batches.
+            decode_only: Tune with the largest pure-generation batch instead of
+                the largest context batch, for a worker that never runs a
+                context batch.
+        """
         from ..custom_ops.torch_custom_ops import (
             IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE, MXFP8GemmRunner)
         from ..modules.linear import (MXFP8LinearMethod,
@@ -2285,18 +2322,26 @@ class PyTorchModelEngine(ModelEngine):
             f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})...")
-        kv_cache_manager = resource_manager.get_resource_manager(
-            self.kv_cache_manager_key)
-        token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
-        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num_upper_bound,
-            max_num_draft_tokens=self.original_max_draft_len)
+        if decode_only:
+            # Every step on this worker is a generation batch, so tune with
+            # the largest one.
+            warmup_configs = self._generation_warmup_shapes(
+                self._get_max_shape_warmup_requests(resource_manager))
+        else:
+            kv_cache_manager = resource_manager.get_resource_manager(
+                self.kv_cache_manager_key)
+            token_num_upper_bound = min(
+                self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
+            curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=token_num_upper_bound,
+                max_num_draft_tokens=self.original_max_draft_len)
+            warmup_configs = [(curr_max_num_tokens, 0)]
 
-        warmup_configs = [(curr_max_num_tokens, 0)]
-        if self.guided_decoder is None and not self.mapping.has_pp():
+        generation_config = (1 + self.max_total_draft_tokens, 1)
+        if (self.guided_decoder is None and not self.mapping.has_pp()
+                and generation_config not in warmup_configs):
             # Add generation request to warmup the autotuner cache.
-            warmup_configs.append((1 + self.max_total_draft_tokens, 1))
+            warmup_configs.append(generation_config)
 
         def run_autotuner_pass(autotune_context: Any,
                                synchronize_trtllm_cache: bool) -> bool:
@@ -3067,6 +3112,11 @@ class PyTorchModelEngine(ModelEngine):
                 or (self.prefill_cuda_graph_backend
                     == PrefillCudaGraphBackend.PIECEWISE
                     and not self._torch_compile_enabled)):
+            return
+        if is_decode_only(self.sparse_attention_config):
+            logger.warning(
+                "Skipping prefill CUDA graph capture: this worker serves "
+                "decode only and never runs a context batch.")
             return
 
         logger.info("Running prefill CUDA graph warmup...")

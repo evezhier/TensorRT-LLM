@@ -2990,19 +2990,21 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self._maybe_record_hang_diagnostic_phase(
-                        "preparing_resources", scheduled_batch)
-                    self.resource_manager.prepare_resources(scheduled_batch)
-
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
+                    # Sort before preparing resources: a resource manager can
+                    # assign per-request rows in this order.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
                         key=lambda req: int(req.py_batch_idx is not None),
                     )
+
+                    self._maybe_record_hang_diagnostic_phase(
+                        "preparing_resources", scheduled_batch)
+                    self.resource_manager.prepare_resources(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
@@ -5387,6 +5389,18 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
+                    # made in model_engine.py::_forward_step. This is only important
+                    # for disaggregated serving. For non-disaggregated serving,
+                    # the generation requests always have batch_idx.
+                    # Sort before preparing resources: a resource manager can
+                    # assign per-request rows in this order.
+                    scheduled_batch.generation_requests = sorted(  # stable sort
+                        scheduled_batch.generation_requests,
+                        key=lambda req: int(req.py_batch_idx is not None),
+                    )
+
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
@@ -5414,17 +5428,6 @@ class PyExecutor:
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
-
-                    # The generation requests that do not have batch_idx
-                    # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
-
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)

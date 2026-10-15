@@ -32,6 +32,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
@@ -46,6 +47,8 @@ from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
     DraftTargetDecodingConfig,
     PARDDecodingConfig,
     PrefillCudaGraphBackend,
@@ -1532,6 +1535,113 @@ class TestWarmupCleanup(unittest.TestCase):
 
         self.assertFalse(method.use_native_autotuner)
         self.assertFalse(method.needs_native_autotune)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (None, False),
+        (DeepSeekSparseAttentionConfig(), False),
+        (DeepSeekV4SparseAttentionConfig(), False),
+        (DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True), True),
+    ],
+    ids=["none", "dsa", "dsv4", "dsv4_offload"],
+)
+def test_only_kv_cache_offload_makes_a_worker_decode_only(config, expected: bool) -> None:
+    assert is_decode_only(config) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_total_draft_tokens", "expected"),
+    [(0, [(1, 1), (13, 13)]), (2, [(3, 1), (39, 13)])],
+)
+def test_generation_warmup_shapes_drop_context_tokens(
+    max_total_draft_tokens: int, expected: list[tuple[int, int]]
+) -> None:
+    engine = SimpleNamespace(max_total_draft_tokens=max_total_draft_tokens)
+    configs = [(1, 0), (1, 1), (3, 1), (258, 0), (13, 13), (39, 13), (2, 0), (2, 1)]
+
+    assert PyTorchModelEngine._generation_warmup_shapes(engine, configs) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("decode_only", "expected_shapes"),
+    [(False, [(258, 0), (1, 1)]), (True, [(13, 13), (1, 1)])],
+    ids=["default", "decode_only"],
+)
+def test_autotuner_warmup_tunes_largest_decode_batch_when_decode_only(
+    monkeypatch: pytest.MonkeyPatch, decode_only: bool, expected_shapes: list[tuple[int, int]]
+) -> None:
+    """A decode-only worker tunes with its largest generation batch, never a context batch."""
+    create_warmup_request = Mock(return_value=None)
+    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 258)
+    resources = SimpleNamespace(get_resource_manager=lambda key: cache)
+    engine = SimpleNamespace(
+        llm_args=SimpleNamespace(enable_autotuner=True),
+        model=SimpleNamespace(modules=lambda: []),
+        _torch_compile_enabled=False,
+        cuda_graph_runner=SimpleNamespace(enabled=False),
+        mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
+        dist=None,
+        kv_cache_manager_key="kv_cache",
+        max_num_tokens=258,
+        batch_size=13,
+        max_seq_len=258,
+        original_max_draft_len=0,
+        max_total_draft_tokens=0,
+        max_draft_loop_tokens=0,
+        max_beam_width=1,
+        guided_decoder=None,
+        _warmup_timer=_WarmupTimer(rank=0),
+        no_cuda_graph=contextlib.nullcontext,
+        _create_warmup_request=create_warmup_request,
+        _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
+        _should_run_warmup_batch=Mock(return_value=False),
+        _release_megamoe_profiling_scratch=Mock(),
+    )
+    engine._get_max_shape_warmup_requests = lambda resource_manager: (
+        PyTorchModelEngine._get_max_shape_warmup_requests(engine, resource_manager)
+    )
+    engine._generation_warmup_shapes = lambda configs: (
+        PyTorchModelEngine._generation_warmup_shapes(engine, configs)
+    )
+    monkeypatch.setattr(model_engine_module.AutoTuner, "get", lambda: Mock(profiling_cache={}))
+    monkeypatch.setattr(model_engine_module, "autotune", lambda **kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(model_engine_module, "clear_memory_buffers", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    PyTorchModelEngine._run_autotuner_warmup(engine, resources, decode_only=decode_only)
+
+    assert [c.args[1:] for c in create_warmup_request.call_args_list] == expected_shapes
+
+
+@pytest.mark.parametrize("decode_only", [False, True], ids=["default", "decode_only"])
+def test_decode_only_warmup_requests_generation_shapes_only(decode_only: bool) -> None:
+    """Every warmup phase of a decode-only worker builds pure-generation batches."""
+    engine, resource_manager = _build_engine_and_resource_manager()
+    shapes = []
+
+    def record(resources, num_tokens, num_gen_requests, **kwargs):
+        shapes.append((num_tokens, num_gen_requests))
+        return None  # No batch, so each phase skips its forward.
+
+    with (
+        patch.object(model_engine_module, "is_decode_only", return_value=decode_only),
+        patch.object(engine, "_create_warmup_request", side_effect=record),
+        patch.object(engine, "_capture_generation_cuda_graphs"),
+    ):
+        engine.warmup(resource_manager)
+
+    assert shapes
+    context_shapes = [shape for shape in shapes if shape[0] != shape[1]]
+    if decode_only:
+        assert context_shapes == [], shapes
+        assert (engine.batch_size, engine.batch_size) in shapes
+    else:
+        assert context_shapes, shapes
 
 
 if __name__ == "__main__":
