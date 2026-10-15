@@ -1585,6 +1585,49 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.vocab_size = vocab_size
 
+        # With pipeline parallelism, multiple microbatches can be in-flight
+        # simultaneously, so we need slots for all concurrent sequences.
+        # Reserve stable slots for persistent request IDs such as CUDA-graph
+        # padding requests. The default preserves the main-branch allocation.
+        # In disaggregated mode, use a coefficient of 2: at any moment up to
+        # `max_num_sequences` requests can be actively generating while another
+        # up to `max_num_sequences` requests are still in KV transfer
+        # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
+        # capacity lets the next batch of active requests acquire slots without
+        # waiting for the previous batch's transfers to finish. With the overlap
+        # scheduler on (non-PP), a retiring request holds its lease one extra
+        # iteration and needs the same coefficient.
+        max_num_sequences = max_batch_size * mapping.pp_size
+        needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
+        assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
+        # Both diagnostics below are off unless their environment variable is
+        # set; with neither set nothing here changes any allocation, any page
+        # content or any reported count.
+        self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
+        self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
+        self._guard_page_by_layer: dict[int, int] = {}
+        self._fresh_page_fill = _parse_kv_fill_value(
+            os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
+            "TRTLLM_KV_FRESH_PAGE_FILL",
+        )
+        # request id -> pool id -> the pool's last-seen base page-index array
+        # (indexed by block ordinal). Comparing it against the current array is
+        # both the early-out (unchanged -> nothing handed out since the previous
+        # step) and the per-ordinal freshness key (see ``_fill_fresh_kv_pages``).
+        self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
+        self._fresh_fill_announced = False
+        self._fresh_fill_unavailable_announced = False
+        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
+        # The guard page is held by a permanent sequence, so it needs an index
+        # slot of its own. Taking one of the scheduler's would change which
+        # requests get admitted, so a run with the diagnostic on would no
+        # longer be comparable with the run it is being read against.
+        index_mapper_capacity = (
+            self.max_admissible_sequences
+            + num_reserved_index_slots
+            + (1 if self._guard_page_value is not None else 0)
+        )
+
         config = self._build_base_config(
             kv_cache_config,
             tokens_per_block=tokens_per_block,
@@ -1592,6 +1635,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
+        config = self._reserve_sparse_arena_leases(config, index_mapper_capacity)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -1784,48 +1828,6 @@ class KVCacheManagerV2(BaseResourceManager):
             else None
         )
 
-        # With pipeline parallelism, multiple microbatches can be in-flight
-        # simultaneously, so we need slots for all concurrent sequences.
-        # Reserve stable slots for persistent request IDs such as CUDA-graph
-        # padding requests. The default preserves the main-branch allocation.
-        # In disaggregated mode, use a coefficient of 2: at any moment up to
-        # `max_num_sequences` requests can be actively generating while another
-        # up to `max_num_sequences` requests are still in KV transfer
-        # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
-        # capacity lets the next batch of active requests acquire slots without
-        # waiting for the previous batch's transfers to finish. With the overlap
-        # scheduler on (non-PP), a retiring request holds its lease one extra
-        # iteration and needs the same coefficient.
-        max_num_sequences = max_batch_size * mapping.pp_size
-        needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
-        assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
-        # Both diagnostics below are off unless their environment variable is
-        # set; with neither set nothing here changes any allocation, any page
-        # content or any reported count.
-        self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
-        self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
-        self._guard_page_by_layer: dict[int, int] = {}
-        self._fresh_page_fill = _parse_kv_fill_value(
-            os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
-            "TRTLLM_KV_FRESH_PAGE_FILL",
-        )
-        # request id -> pool id -> the pool's last-seen base page-index array
-        # (indexed by block ordinal). Comparing it against the current array is
-        # both the early-out (unchanged -> nothing handed out since the previous
-        # step) and the per-ordinal freshness key (see ``_fill_fresh_kv_pages``).
-        self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
-        self._fresh_fill_announced = False
-        self._fresh_fill_unavailable_announced = False
-        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
-        # The guard page is held by a permanent sequence, so it needs an index
-        # slot of its own. Taking one of the scheduler's would change which
-        # requests get admitted, so a run with the diagnostic on would no
-        # longer be comparable with the run it is being read against.
-        index_mapper_capacity = (
-            self.max_admissible_sequences
-            + num_reserved_index_slots
-            + (1 if self._guard_page_value is not None else 0)
-        )
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
             f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
@@ -2941,6 +2943,33 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    @staticmethod
+    def _reserve_sparse_arena_leases(
+        config: KVCacheManagerConfigPy, max_leases: int
+    ) -> KVCacheManagerConfigPy:
+        """Reserve sparse leases for every resident request, including persistent dummies.
+
+        Native arenas use the largest constraint's request count. Requests hold
+        their leases from resume to suspension, even when absent from the current
+        attention Batch. The index-slot bound includes padding and retiring requests;
+        zero-token descriptors express that bound without adding attention KV pages.
+        """
+        if not any(
+            buffer.is_sparse and buffer.max_cached_units > 0
+            for layer in config.layers
+            for buffer in layer.buffers
+        ):
+            return config
+        if max((len(batch.kv_caches) for batch in config.constraints), default=0) >= max_leases:
+            return config
+        return replace(
+            config,
+            constraints=[
+                *config.constraints,
+                BatchDesc([KVCacheDesc(capacity=0, history_length=0) for _ in range(max_leases)]),
+            ],
+        )
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -6002,6 +6031,19 @@ class KVCacheManagerV2(BaseResourceManager):
         granularity = _gpu_alloc_granularity(sum(layer_bytes))
         quota = sum(math.ceil(bytes_ / granularity) * granularity for bytes_ in layer_bytes)
         return quota if quota > 0 else None
+
+    def update_forward_resources(
+        self, scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+    ) -> None:
+        """Update resources after a successful model forward has been enqueued.
+
+        The caller's stream must wait for model execution before this hook.
+        It runs outside CUDA graph capture, before CPU sampling-result processing
+        and the next scheduling pass. Managers whose history depends on executed inputs
+        can override it; ordinary caches update history after sampling.
+        Overrides must call wait_for_input_copy before changing host page tables
+        that the model's input preparation may still be copying to the device.
+        """
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests):
         """Update KV cache for context requests in the current batch.

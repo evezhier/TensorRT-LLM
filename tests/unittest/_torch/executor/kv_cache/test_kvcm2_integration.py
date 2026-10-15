@@ -57,6 +57,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     AttentionLayerConfig,
     AttnLifeCycle,
+    Batch,
     BatchDesc,
     BufferConfig,
     CacheLevel,
@@ -70,6 +71,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManagerConfig,
     LayerId,
     ReuseScope,
+    SelectionUnitLayout,
     SsmLayerConfig,
     _introspection,
 )
@@ -2418,6 +2420,8 @@ def _index_mapper_capacity_for(
     is_disagg: bool = False,
     num_reserved_index_slots: int = 1,
     disable_overlap_scheduler: bool = True,
+    sparse: bool = False,
+    guard_page: bool = False,
 ) -> tuple[int, int, int]:
     """Construct a manager and return the three sizes it derives.
 
@@ -2441,23 +2445,43 @@ def _index_mapper_capacity_for(
         *,
         tokens_per_block: int,
         cache_tiers: list[object],
-    ) -> _FakeManagerConfig:
-        del self, config, tokens_per_block
-        return _FakeManagerConfig(cache_tiers=cache_tiers)
+    ) -> KVCacheManagerConfig:
+        del self, config
+        return KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            cache_tiers=cache_tiers,
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(
+                            role=Role.KEY,
+                            size=128,
+                            is_sparse=sparse,
+                            num_selected_blocks=1 if sparse else 0,
+                            max_cached_units=2 if sparse else 0,
+                            sparse_unit_layout=SelectionUnitLayout(1, 128, 0, 128)
+                            if sparse
+                            else None,
+                        )
+                    ],
+                )
+            ],
+        )
 
     with (
-        # Pin both diagnostics off: the guard page would add an index slot.
         patch.dict(
             os.environ,
-            {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""},
+            {"TRTLLM_KV_GUARD_PAGE": "1" if guard_page else "", "TRTLLM_KV_FRESH_PAGE_FILL": ""},
         ),
         patch(f"{module}.IndexMapper") as index_mapper_cls,
-        patch(f"{module}.KVCacheManagerPy", Mock(return_value=fake_impl)),
+        patch(f"{module}.KVCacheManagerPy", return_value=fake_impl) as create_impl,
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
         patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
         patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
         patch.object(KVCacheManagerV2, "_prepare_page_table_tensor") as page_table,
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+        patch.object(KVCacheManagerV2, "_reserve_guard_page"),
     ):
         manager = KVCacheManagerV2(
             # A quota must be set or __init__ asserts; the value is irrelevant here.
@@ -2484,6 +2508,14 @@ def _index_mapper_capacity_for(
         )
     index_mapper_cls.assert_called_once()
     page_table.assert_called_once()
+    config = create_impl.call_args.args[0]
+    if sparse:
+        assert (
+            max(len(batch.kv_caches) for batch in config.constraints)
+            == (index_mapper_cls.call_args.args[0])
+        )
+    else:
+        assert not config.constraints
     return (
         index_mapper_cls.call_args.args[0],
         page_table.call_args.args[0],
@@ -2509,10 +2541,13 @@ _INDEX_MAPPER_CAPACITY_CASES = [
     pytest.param(2, 4, True, True, 1, 17, id="pp4_disagg_unchanged"),
     # Reserved slots are still added on top of the widened pool.
     pytest.param(2, 1, False, False, 5, 9, id="reserved_slots_still_added"),
+    pytest.param(1, 1, True, False, 1, 2, id="single_live_request_and_padding"),
+    pytest.param(2, 1, True, False, 0, 2, id="no_reserved_slots"),
 ]
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("sparse", [False, True])
 @pytest.mark.parametrize(
     "max_batch_size,pp_size,disable_overlap_scheduler,is_disagg,reserved,expected",
     _INDEX_MAPPER_CAPACITY_CASES,
@@ -2524,6 +2559,7 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     is_disagg: bool,
     reserved: int,
     expected: int,
+    sparse: bool,
 ) -> None:
     capacity, page_table_capacity, max_admissible_sequences = _index_mapper_capacity_for(
         max_batch_size=max_batch_size,
@@ -2531,10 +2567,106 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
         is_disagg=is_disagg,
         num_reserved_index_slots=reserved,
         disable_overlap_scheduler=disable_overlap_scheduler,
+        sparse=sparse,
     )
     assert capacity == expected
     assert page_table_capacity == expected
     assert max_admissible_sequences == expected - reserved
+
+
+@pytest.mark.cpu_only
+def test_sparse_arena_also_reserves_guard_request() -> None:
+    assert _index_mapper_capacity_for(
+        max_batch_size=2, num_reserved_index_slots=1, sparse=True, guard_page=True
+    ) == (4, 4, 2)
+
+
+def _sparse_arena_config(max_batch_size: int, explicit_ratio: bool) -> KVCacheManagerConfig:
+    return KVCacheManagerConfig(
+        tokens_per_block=16,
+        cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[
+                    BufferConfig(
+                        role=role,
+                        size=size,
+                        tokens_per_block_override=4,
+                        is_sparse=True,
+                        num_selected_blocks=2,
+                        max_cached_units=4,
+                        sparse_unit_layout=SelectionUnitLayout(1, size, 0, size),
+                    )
+                    for role, size in ((Role.KEY, 4096), (Role.KEY_BLOCK_SCALE, 128))
+                ],
+            )
+        ],
+        constraints=[]
+        if explicit_ratio
+        else [BatchDesc([KVCacheDesc(capacity=16, history_length=0)] * max_batch_size)],
+        initial_pool_ratio=[1.0] if explicit_ratio else None,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("explicit_ratio", [False, True])
+def test_sparse_arena_capacity_preserves_page_sizing(explicit_ratio: bool) -> None:
+    config = _sparse_arena_config(2, explicit_ratio)
+    constraints = list(config.constraints)
+    result = KVCacheManagerV2._reserve_sparse_arena_leases(config, 5)
+
+    assert config.constraints == constraints
+    assert result.constraints[:-1] == constraints
+    assert len(result.constraints[-1].kv_caches) == 5
+    assert all(
+        cache.capacity == cache.history_length == 0 for cache in result.constraints[-1].kv_caches
+    )
+    assert result.layers == config.layers
+    assert result.typical_step == config.typical_step
+    assert result.initial_pool_ratio == config.initial_pool_ratio
+    # An existing larger bound must survive subsequent configuration passes.
+    assert KVCacheManagerV2._reserve_sparse_arena_leases(result, 3) is result
+
+
+@pytest.mark.parametrize("max_batch_size,reserved", [(1, 1), (3, 2)])
+@pytest.mark.parametrize("explicit_ratio", [False, True])
+def test_sparse_arena_retains_padding_with_full_live_batch(
+    max_batch_size: int, reserved: int, explicit_ratio: bool
+) -> None:
+    torch.cuda.synchronize()
+    config = KVCacheManagerV2._reserve_sparse_arena_leases(
+        _sparse_arena_config(max_batch_size, explicit_ratio), max_batch_size + reserved
+    )
+    core = KVCacheManager(config)
+    caches = []
+    batch = Batch(core, max_batch_size=max_batch_size, max_blocks_per_seq=1)
+    stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+    try:
+        # Retained padding caches stay outside the attention Batch but own leases.
+        for index in range(reserved + max_batch_size):
+            cache = core.create_kv_cache()
+            caches.append(cache)
+            assert cache.resume(stream)
+            assert cache.resize(1)
+            if index >= reserved:
+                batch.add_kv_cache(cache)
+        assert batch.max_batch_size == max_batch_size
+        batch.publish(stream)
+        batch.wait_published()
+
+        extra = core.create_kv_cache()
+        caches.append(extra)
+        assert not extra.resume(stream)
+        caches[0].suspend()
+        assert extra.resume(stream)
+        assert extra.resize(1)
+    finally:
+        for cache in caches:
+            if batch.row_of(cache) >= 0:
+                batch.remove_kv_cache(cache)
+            cache.close()
+        core.shutdown()
 
 
 @pytest.mark.parametrize(

@@ -17,72 +17,94 @@
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferId, LayerGroupId
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import Batch, BufferId, LayerGroupId
+
+
+@dataclass(frozen=True, slots=True)
+class SparseOffloadPaddingRegion:
+    """Unused buffer bytes across arena leases, initialized during manager construction."""
+
+    base_address: int
+    bytes_per_lease: int
+    lease_stride: int
 
 
 @dataclass(frozen=True, slots=True)
 class SparseOffloadLayerDescriptor:
-    """One local model layer's main compressed buffer in KVCM's namespace.
+    """All sparse buffers of one model layer, in KVCM's required fetch order.
 
-    ``page_scale`` converts resident raw GPU slots to SHARED physical pages.
-    ``fetched_page_scale`` must be bound separately once KVCM specifies fetch
-    output units: 1 for SHARED physical pages, or the appropriate converter
-    scale for raw slots in the same pool. None keeps decode disabled rather
-    than guessing the unfinished API's units. Buffer pointers supply the
-    layer offset in either case.
+    ``unit_tokens`` original tokens produce one compressed row. Fetch returns
+    a separate physical index for each buffer, relative to that buffer's
+    ``get_sparse_cache_base_address()``. These indices already include the
+    request and buffer placement; no page scaling or layer offset is needed.
+    Descriptor construction validates matching NVFP4 data/scale pool counts
+    and buffer positions, including padding. Their index columns are equal,
+    so compressor scatter and gather consume the data column for both pools
+    while retaining their respective base addresses and byte strides.
+    ``arena_row_counts`` covers each complete pool region across all leases
+    and buffers, including padding; it is independent of host-page capacity.
     """
 
-    buffer_id: BufferId
+    buffer_ids: tuple[BufferId, ...]
+    arena_base_addresses: tuple[int, ...]
+    arena_row_counts: tuple[int, ...]
+    data_buffer_index: int
+    scale_buffer_index: int | None
     group_id: LayerGroupId
-    page_scale: int
-    # Exclusive physical-page bound relative to this layer's SHARED pointer,
-    # as returned by KVCM. Its runtime implementation must include scratch.
-    page_index_upper_bound: int
-    fetched_page_scale: int | None = None
+    unit_tokens: int
+    padding_regions: tuple[SparseOffloadPaddingRegion, ...] = ()
 
 
 @dataclass(kw_only=True)
 class SparseOffloadState:
     """Fixed-capacity storage owned by one serial attention metadata instance.
 
-    All device tensors are int32. Tables are [B, M], selections are [B, S],
-    history counts are [B], and the active count is [1]. History staging is
-    pinned CPU memory. Layer workspaces are reused only after the previous
-    layer's attention has consumed them on the same stream. Concurrent
-    forwards require separate metadata and KVCM scratch ownership.
+    Index and count tensors are int32. Selections are [B, K], fetch outputs are
+    [B, F, K], write destinations are [B, F, 1], and the active count is [1].
+    B is the native Batch capacity, including when an attention graph uses
+    fewer query rows. The existing attention-index preparation kernel reads
+    fetch/write mappings directly to assemble the query-ordered index list. Storage
+    is shared by layers with the same buffer count F. Reuse must follow the
+    previous layer's attention on the consuming stream.
+
+    NVFP4 additionally uses persistent FP8 scratch [B, K, head_dim] for the
+    dequantized rows consumed by attention. Arena allocations remain owned by
+    KVCM; the cache manager retains non-owning tensor views sized by arena
+    geometry. ``scatter_start_positions`` is initialized to zero once and
+    supplies the one-row-page view used by the existing compressor scatter.
+
+    ``history_lengths`` is a zero-copy view of Batch's published token counts,
+    bound outside capture. Batch owns the page tables and watermarks; metadata
+    does not maintain another copy. Query-to-Batch row mappings are supplied
+    to selection on the GPU. Fetch output remains in Batch row order.
 
     ``prepared`` means preparation was enqueued successfully; stream ordering
     establishes device readiness. ``is_prefill`` is set by host batch validation
     before execution, never inferred from a device count inside a layer.
+    ``write_layer`` tracks which layer enqueued the shared write mapping during
+    eager execution or capture. Graph replay uses the captured GPU operations;
+    this host marker does not determine device readiness.
 
-    ``read_table_valid`` is a private int32 [1] diagnostic flag, refreshed by
-    GPU validation after each decode fetch. Only the device assertion requires
-    ``TLLM_DSV4_OFFLOAD_DEBUG_ASSERT=1``, read at initialization before graph
-    capture. A failed assertion makes the CUDA context unusable. By default,
-    the flag does not trigger an error or request recovery; production trusts
-    KVCM to provide valid mappings for every required page.
+    An in-flight selection is masked out of the history fetch. Its physical
+    index must come from the separately prepared write mapping when assembling
+    attention inputs.
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
-    base_page_tables: dict[LayerGroupId, torch.Tensor]
-    history_blocks: torch.Tensor
-    history_blocks_host: torch.Tensor
     active_request_count: torch.Tensor
-    selected_history_pages: torch.Tensor
-    fetched_page_table: torch.Tensor
-    compress_read_table: torch.Tensor
-    read_table_valid: torch.Tensor
-    debug_assert: bool = field(
-        default_factory=lambda: os.environ.get("TLLM_DSV4_OFFLOAD_DEBUG_ASSERT", "0") == "1"
-    )
-    history_upload_done: torch.cuda.Event = field(default_factory=torch.cuda.Event)
-    history_upload_pending: bool = False
+    selected_history_units: torch.Tensor
+    fetched_indices: dict[int, torch.Tensor]
+    write_indices: dict[int, torch.Tensor]
+    scatter_start_positions: torch.Tensor
+    nvfp4_scratch: torch.Tensor | None = None
+    batch: Batch | None = None
+    history_lengths: torch.Tensor | None = None
     prepared: bool = False
     is_prefill: bool = False
+    write_layer: int | None = None

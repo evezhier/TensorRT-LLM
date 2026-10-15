@@ -902,8 +902,9 @@ class KVCacheManager:
     def get_sparse_cache_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
         """Base of the sparse cache arena backing this buffer. Raises if it has no fetch path.
 
-        This is what the indices from :meth:`fetch_sparse_pages` are relative to, and the
-        only GPU-resident copy an attention kernel can read.
+        The indices from :meth:`fetch_sparse_pages` and :meth:`prepare_sparse_write_indices`
+        are relative to this base. The arena holds the GPU-resident units that model kernels
+        read and write.
 
         Distinct from :meth:`get_mem_pool_base_address`, which names this buffer's *pages*
         for every buffer alike -- what the transceiver and the KV transfer path address.
@@ -989,6 +990,16 @@ class KVCacheManager:
 
         Device-driven and stream-ordered, with static shapes, so a CUDA graph can capture
         it.
+
+
+        Order it after batch publication and before consumers, on the same stream or
+        through events across streams. The call reads no device values on the host, and
+        with fixed batch and output shapes it is CUDA-graph-capturable.
+
+        The entry is shared by all of the layer's sparse buffers, but each buffer's index
+        is relative to its own :meth:`get_sparse_cache_base_address`, including when data
+        and scales sit in different pools. The indices carry request and buffer placement;
+        they are neither request-local cache-entry numbers nor byte addresses.
         """
 
     def fetch_sparse_pages(
@@ -1042,6 +1053,10 @@ class KVCacheManager:
         fetched cell moves no data. The copies are a snapshot, which is sound only because a
         block below the watermark is already written back and immutable. A cell holding an
         in-flight block is the one exception, and is never an eviction candidate.
+
+        The in-flight unit is reserved internally but is not appended to ``out``. Use
+        :meth:`prepare_sparse_write_indices` before the model's KV writes to obtain its
+        per-buffer physical write indices independently of the selection.
 
         ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the
         ``GPU_LEVEL`` index holding ``selected[b][k]`` for ``buffers[i]``, and
