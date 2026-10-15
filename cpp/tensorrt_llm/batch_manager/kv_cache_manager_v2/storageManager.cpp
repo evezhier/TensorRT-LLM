@@ -672,9 +672,9 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
     PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
     PoolGroupIndex const dstPgIdx = getPoolGroupIndex(dstLevel, batchingLayerGroupId);
-    // Per pool group, not per level: a sparse life cycle's hot pool group is host memory, so
-    // a migration out of it is host-to-host rather than device-to-host, and the copy engine
-    // must be told which.
+    // Per pool group, not per level: pool groups of one level can differ in medium. The
+    // copy below refines this per pool, since a GPU-tier group's sparse pools are host
+    // memory while its dense ones are device memory.
     CacheTier const srcTier = cacheTier(srcLevel, srcPgIdx);
     CacheTier const dstTier = cacheTier(dstLevel, dstPgIdx);
     bool const srcIsHot = srcLevel == kHotLevel;
@@ -701,7 +701,15 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[index].dst)).at(poolIdx),
                     srcPoolGroup.slotAddress(toSlotId(pageIndices[index].src)).at(poolIdx)});
             }
-            mCopyEngine->transfer(dstTier, srcTier, srcSizes.at(poolIdx), tasks, stream);
+            // Per pool, not per group: a GPU-tier group holds device-backed pools beside
+            // host-backed sparse ones, and the copy engine picks its implementation from
+            // the medium. Taking the group's tier would run a device-to-device kernel over
+            // host pointers -- legal, since the host memory is registered, but tuned for a
+            // bandwidth it does not have.
+            auto const poolTier = [&](PoolGroupBase const& pg, CacheTier groupTier)
+            { return pg.isSparse(poolIdx) ? CacheTier::HOST_MEM : groupTier; };
+            mCopyEngine->transfer(
+                poolTier(dstPoolGroup, dstTier), poolTier(srcPoolGroup, srcTier), srcSizes.at(poolIdx), tasks, stream);
         }
         return;
     }
@@ -1719,7 +1727,10 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         : lvlStorage.totalQuota();
     auto const minSlots
         = level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
-    size_t minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
+    // Chargeable, not total: a rebalance that charged host bytes to the device budget would
+    // under-size the level and evict live pages to reach it.
+    size_t minQuota
+        = minQuotaForLevel(lvlStorage.chargeableSlotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
     if (quota < minQuota)
     {
         throw std::invalid_argument("Quota " + std::to_string(quota)

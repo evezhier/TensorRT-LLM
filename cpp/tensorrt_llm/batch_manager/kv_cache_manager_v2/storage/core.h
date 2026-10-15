@@ -330,10 +330,10 @@ public:
 
     //! What this pool group's memory actually is.
     //!
-    //! A property of the pool group rather than of its level, because a sparse life cycle's
-    //! hot pool group is host memory while a dense one at the same level is device memory.
-    //! Pool groups never mix the two: formation keys on `isSparse`, so a group is uniformly
-    //! one or the other.
+    //! A property of the pool group rather than of its level, because groups of one level
+    //! can differ in medium. A GPU-tier group reports GPU_MEM even when some of its pools
+    //! are host-backed; isSparse(PoolIndex) names those, and anything choosing a copy
+    //! implementation must ask per pool rather than per group.
     [[nodiscard]] virtual CacheTier cacheTier() const noexcept = 0;
 
     //! Whether this pool's pages are host memory rather than this tier's own medium.
@@ -392,6 +392,21 @@ public:
         size_t total = 0;
         for (auto const& pool : mPools)
             total += roundUp(pool->numBytes(), granularity);
+        return total;
+    }
+
+    //! The part of roundedNumBytes this tier's quota pays for: sparse pools are host memory
+    //! and are not counted.
+    size_t chargeableNumBytes(size_t granularity) const noexcept
+    {
+        size_t total = 0;
+        for (PoolIndex pool{0}; pool < mPools.size(); ++pool)
+        {
+            if (!isSparse(pool))
+            {
+                total += roundUp(mPools.at(pool)->numBytes(), granularity);
+            }
+        }
         return total;
     }
 
@@ -527,12 +542,15 @@ public:
         return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
     }
 
+    //! Bytes this level's quota is paying for. Host-backed sparse pools are excluded: the
+    //! quota measures one medium, and a rebalance that defaulted to an inflated figure
+    //! would hand the level more slots than the device can hold.
     size_t totalQuota() const noexcept
     {
         size_t granularity = poolSizeGranularity();
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
-            total += pg->roundedNumBytes(granularity);
+            total += pg->chargeableNumBytes(granularity);
         return total;
     }
 
@@ -543,6 +561,33 @@ public:
         ret.reserve(mPoolGroups.size());
         for (auto const& pg : mPoolGroups)
             ret.push_back(pg->numSlots());
+        return ret;
+    }
+
+    //! Slot sizes as this level's quota sees them: sparse pools are host memory and are
+    //! omitted, so a group's bytes per slot count only what the quota measures.
+    //!
+    //! Every path that derives a slot count from a quota must use this rather than
+    //! slotSizeLists(), construction and rebalance alike: charging host bytes to a device
+    //! budget silently under-sizes the level and can make a quota the device could hold
+    //! look insufficient.
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> chargeableSlotSizeLists() const
+    {
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> ret;
+        ret.reserve(mPoolGroups.size());
+        for (auto const& pg : mPoolGroups)
+        {
+            auto const all = pg->slotSize();
+            TypedVec<PoolIndex, size_t> chargeable;
+            for (PoolIndex pool{0}; pool < all.size(); ++pool)
+            {
+                if (!pg->isSparse(pool))
+                {
+                    chargeable.push_back(all.at(pool));
+                }
+            }
+            ret.push_back(std::move(chargeable));
+        }
         return ret;
     }
 
@@ -591,14 +636,12 @@ public:
 
     // Static version: compute slot counts from quota, slot size lists, ratio, granularity, and min_slots.
     // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
-    //! A sparse pool's size is zero in `sizeLists`: its pages are host memory and are not
-    //! charged to this level's quota, so they add nothing to any group's bytes per slot.
+    //! Sparse pools are absent from `sizeLists`: their pages are host memory and are not
+    //! charged to this level's quota.
     static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
         TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
-
-    //! Pool groups whose medium differs from this level's declared tier.
 
     // Distribute grains among pools within a pool group.
     // Returns {num_slots, grains_consumed}.

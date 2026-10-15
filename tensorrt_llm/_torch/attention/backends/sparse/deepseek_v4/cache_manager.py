@@ -554,9 +554,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         Returns:
             The buffer tensor (shape: [num_blocks, tokens_per_block, attn_dim])
             For blockwise FP8 layers, shape is [num_blocks, tokens_per_block, attn_dim + scale_size]
-            Sparse COMPRESS storage is device-mapped host memory with shape
-            [num_rows, 1, row_elements]. GPU arena views are returned by
-            get_sparse_compress_buffers().
+            Sparse COMPRESS storage is device-mapped host memory and keeps the ordinary
+            page shape, [num_blocks, compressed_block_size, dim_per_token]: a sparse
+            buffer's size is its whole page, which the cache divides into selection units.
+            GPU arena views are returned by get_sparse_compress_buffers().
         """
         layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
         data_role = attn_type.role

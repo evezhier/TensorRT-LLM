@@ -573,6 +573,11 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
         cuCheck(cuDeviceTotalMem(&totalGpuMem, dev));
     }
     // @TODO: We should replace maxSlotSize with sum. This should also be updated in Python. Will do it later.
+    // @TODO: maxSlotSize spans sparse pools too, though they reserve no device VA. When a
+    // sparse pool is the largest, every dense pool's vmSize is scaled down by that ratio,
+    // which costs growth headroom (the floor below keeps the initial allocation correct),
+    // so expandPoolGroup can hit the VA limit earlier than intended. Size the ratio from
+    // the device-backed pools alone.
     TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "GpuPoolGroup: slotSizeList must not be empty");
     size_t maxSlotSize = *std::max_element(slotSizeList.begin(), slotSizeList.end());
     for (PoolIndex p{0}; p < slotSizeList.size(); ++p)
@@ -984,7 +989,7 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::computeSlotCountList(
 {
     size_t q = quota.value_or(totalQuota());
     TLLM_CHECK_DEBUG(ratioList.size() == mPoolGroups.size());
-    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
+    return ratioToSlotCountList(q, chargeableSlotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
