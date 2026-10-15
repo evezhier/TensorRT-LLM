@@ -77,21 +77,22 @@ LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
-    """The attention life cycle, keyed by its window, sink-token shape, and sparsity."""
+    """The attention life cycle, keyed by its window and sink-token shape.
+
+    Not by sparsity: that is a property of a pool, so one life cycle may hold both sparse
+    and dense buffers and two layers differing only in sparsity share one life cycle.
+    """
 
     @staticmethod
     def make(
         window_size: int | None,
         num_sink_tokens: int | None,
         tokens_per_block: int,
-        is_sparse: bool = False,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
     @property
     def num_sink_blocks(self) -> int: ...
-    @property
-    def is_sparse(self) -> bool: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -231,29 +232,6 @@ class DiskCacheTierConfig:
     def assert_valid(self) -> None: ...
 
 @dataclass(slots=True, frozen=True)
-class SelectionUnitLayout:
-    """Where one selection unit's bytes sit inside a sparse buffer.
-
-    Buffer-relative, carrying no page offset: it describes the internal shape of the
-    buffer, which is the part the model integration knows. The manager adds the page
-    offsets itself, from ``BufferAttr``.
-
-    Describes both sides of the copy, which have the same shape. The fetch reads *hot*
-    pages, in ordinary slot layout, and writes cells holding one buffer's worth of the
-    same structure, so one set of strides serves both with only the unit index differing.
-    No codec is involved on this path -- a codec transforms pages on their way out of the
-    hot tier, which the fetch never reads.
-
-    ``num_chunks * chunk_bytes`` must equal ``BufferConfig.size``, which is already
-    per-unit.
-    """
-
-    num_chunks: int  # one per head; 1 for token-major
-    chunk_bytes: int  # contiguous bytes of one unit within one chunk
-    chunk_stride: int
-    unit_stride: int
-
-@dataclass(slots=True)
 class BufferConfig:
     """One buffer of a layer's KV cache.
 
@@ -315,7 +293,37 @@ class BufferConfig:
     is_sparse: bool = False
     num_selected_blocks: int = 0
     max_cached_units: int = 0
-    sparse_unit_layout: SelectionUnitLayout | None = None
+
+    sparse_selection_unit_tokens: int | None = None
+    """Original tokens one selection unit spans. Sparse buffers only.
+
+    ``None`` means a unit is a whole page, i.e. no sub-page selection. Must divide
+    ``tokens_per_block``; the quotient is how many units a page holds.
+
+    Distinct from ``tokens_per_block_override``, which reinterprets a buffer's page for
+    *storage*: this names the sparse cache's granularity and nothing else, so the buffer's
+    pages, its page indices and its index space all keep the manager's ``tokens_per_block``.
+    Setting both on one buffer is rejected.
+    """
+
+    sparse_unit_chunks: int = 1
+    """Pieces a selection unit is gathered from within its page. Sparse buffers only.
+
+    A unit is the tokens it spans across *every* KV head, so how many pieces that is
+    follows from the page's dimension order:
+
+    - **1** for a sequence-major page (``[token][head][dim]``), where a unit's tokens carry
+      their heads with them and the whole unit is one contiguous range. Also 1 for any
+      single-head page -- a compressed or pooled latent, say -- where the two orders are
+      the same bytes.
+    - **numHeads** for a head-major page (``[head][token][dim]``), where each head
+      contributes its own contiguous run and a unit is that many strided pieces.
+
+    Every sparse model in this repository today is one of the first two cases, so 1 is
+    almost always right. The rest of the layout -- chunk size, chunk stride, unit stride --
+    follows from this and the page being densely packed, so a padded page (an alignment gap
+    between heads, or between units) is not expressible.
+    """
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -889,8 +897,14 @@ class KVCacheManager:
         sparse fetch path.
         """
 
-    def get_sparse_cache_expansion(self, layer_id: LayerId) -> int:
-        """Selection units carried by one buffer; one when a unit is a whole block."""
+    def get_sparse_cache_units_per_page(self, layer_id: LayerId) -> int:
+        """Selection units one page of this layer's buffers holds; one when a unit is a page.
+
+        Distinct from :attr:`PageIndexConverter.expansion`, which is how much a buffer's page
+        *index space* is stretched by ``tokens_per_block_override``. A sparse buffer does not
+        stretch its index space -- that stays 1 -- while this counts the sparse cache's own
+        granularity, set by ``BufferConfig.sparse_selection_unit_tokens``.
+        """
 
     def get_sparse_cache_buffer_count(self, layer_id: LayerId) -> int:
         """Sparse buffers of this layer's life cycle, one per ``(layer, role)``.

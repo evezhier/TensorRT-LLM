@@ -301,7 +301,7 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
 std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
     std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& deviceArena, int baseCell,
     std::vector<uint32_t> const& coldBufferOffset, int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks,
-    uint32_t chunkBytes, uint32_t chunkStride, uint32_t unitStride, int expansion,
+    uint32_t chunkBytes, uint32_t chunkStride, uint32_t unitStride, int unitsPerPage,
     std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
     std::vector<int32_t> const& missCount, int selectionWidth, std::vector<int32_t> const& bufferLayer, bool writeBack)
 {
@@ -358,7 +358,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.layout.chunkBytes = chunkBytes;
     args.layout.chunkStride = chunkStride;
     args.layout.unitStride = unitStride;
-    args.expansion = expansion;
+    args.unitsPerPage = unitsPerPage;
     args.workOrdinal = reinterpret_cast<int32_t const*>(missOrd.get());
     args.workSlot = reinterpret_cast<int32_t const*>(missSlotBuf.get());
     args.workCount = reinterpret_cast<int32_t const*>(missCountBuf.get());

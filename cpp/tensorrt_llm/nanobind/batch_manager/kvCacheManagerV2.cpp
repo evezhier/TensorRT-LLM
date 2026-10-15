@@ -1416,15 +1416,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int, bool>(), nb::arg("window_size").none(), nb::arg("num_sink_blocks"),
-            nb::arg("is_sparse") = false)
+        .def(nb::init<std::optional<int>, int>(), nb::arg("window_size").none(), nb::arg("num_sink_blocks"))
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
-            nb::arg("tokens_per_block"), nb::arg("is_sparse") = false)
+            nb::arg("tokens_per_block"))
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
-        .def_ro("is_sparse", &kv::AttnLifeCycle::isSparse)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1614,27 +1612,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
-    nb::class_<kv::SelectionUnitLayout>(m, "SelectionUnitLayout")
-        .def(nb::init<uint32_t, uint32_t, uint32_t, uint32_t>(), nb::arg("num_chunks"), nb::arg("chunk_bytes"),
-            nb::arg("chunk_stride"), nb::arg("unit_stride"))
-        .def_rw("num_chunks", &kv::SelectionUnitLayout::numChunks)
-        .def_rw("chunk_bytes", &kv::SelectionUnitLayout::chunkBytes)
-        .def_rw("chunk_stride", &kv::SelectionUnitLayout::chunkStride)
-        .def_rw("unit_stride", &kv::SelectionUnitLayout::unitStride) DEF_COPY(kv::SelectionUnitLayout);
-
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int,
-                 std::optional<kv::SelectionUnitLayout>>(),
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<int>, int>(),
             nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
             nb::arg("is_sparse") = false, nb::arg("num_selected_blocks") = 0, nb::arg("max_cached_units") = 0,
-            nb::arg("sparse_unit_layout") = std::nullopt)
+            nb::arg("sparse_selection_unit_tokens") = std::nullopt, nb::arg("sparse_unit_chunks") = 1)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
         .def_rw("num_selected_blocks", &kv::BufferConfig::numSelectedBlocks)
         .def_rw("max_cached_units", &kv::BufferConfig::maxCachedUnits)
-        .def_rw("sparse_unit_layout", &kv::BufferConfig::sparseUnitLayout) DEF_COPY(kv::BufferConfig);
+        .def_rw("sparse_selection_unit_tokens", &kv::BufferConfig::sparseSelectionUnitTokens)
+        .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),
@@ -2936,10 +2926,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "this alone. Only one unit is ever in flight, so the surplus above the selection "
             "width is retention rather than headroom.")
         .def(
-            "get_sparse_cache_expansion",
+            "get_sparse_cache_units_per_page",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)
-            { return self.sparseCacheExpansion(self.getLayerGroupId(layerId)); },
-            nb::arg("layer_id"), "Selection units carried by one buffer; one when a unit is a whole block.")
+            { return self.sparseCacheUnitsPerPage(self.getLayerGroupId(layerId)); },
+            nb::arg("layer_id"),
+            "Selection units one page of this layer's buffers holds; one when a unit is a whole page.\n\n"
+            "Distinct from PageIndexConverter.expansion, which is how much a buffer's page index space "
+            "is stretched by tokens_per_block_override. A sparse buffer does not stretch its index "
+            "space, so that stays 1 while this counts the cache's own granularity.")
         .def(
             "get_sparse_cache_buffer_count",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)

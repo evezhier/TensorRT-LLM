@@ -138,7 +138,7 @@ class _SparseRuntime:
     def get_layer_group_id(self, layer_id):
         return self.groups[layer_id]
 
-    def get_sparse_cache_expansion(self, layer_id):
+    def get_sparse_cache_units_per_page(self, layer_id):
         return self.expansions[layer_id]
 
     def get_sparse_cache_base_address(self, layer_id, role):

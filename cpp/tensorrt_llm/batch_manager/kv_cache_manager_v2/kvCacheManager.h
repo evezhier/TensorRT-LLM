@@ -414,9 +414,9 @@ public:
 
     //! Selection units carried by one buffer of this life cycle, i.e. tokens_per_block
     //! divided by the unit's token count. One when the unit is a whole block.
-    [[nodiscard]] int sparseCacheExpansion(LifeCycleId lifeCycle) const noexcept
+    [[nodiscard]] int sparseCacheUnitsPerPage(LifeCycleId lifeCycle) const noexcept
     {
-        return lifeCycle < mSparseCacheExpansion.size() ? mSparseCacheExpansion[lifeCycle] : 1;
+        return lifeCycle < mSparseCacheUnitsPerPage.size() ? mSparseCacheUnitsPerPage[lifeCycle] : 1;
     }
 
     //! Layers this life cycle has that carry a sparse cache.
@@ -627,7 +627,7 @@ private:
 
     // All indexed by life cycle; see the sparseCache* accessors.
     TypedVec<LifeCycleId, int> mSparseCacheMaxUnits;
-    TypedVec<LifeCycleId, int> mSparseCacheExpansion;
+    TypedVec<LifeCycleId, int> mSparseCacheUnitsPerPage;
     TypedVec<LifeCycleId, int> mSparseCacheBuffers;
     TypedVec<LifeCycleId, int> mSparseCacheSelection;
     TypedVec<LifeCycleId, int> mSparseCacheLayers;

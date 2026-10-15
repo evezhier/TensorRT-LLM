@@ -86,7 +86,7 @@ struct SparseResolveArgs
     //! "Unflushed entries carry no state" in SPARSE_ATTENTION_DESIGN.md.
     int32_t const* historyTokens = nullptr;
     int32_t const* capacityTokens = nullptr;
-    //! tokens_per_block / expansion, a per-layer-group constant.
+    //! tokens_per_block / unitsPerPage, a per-layer-group constant.
     int32_t unitTokens = 1;
 
     //! [numRows][selectionWidth] entry index per selection, kNoSparseSlot where padded or
@@ -184,7 +184,7 @@ struct SparseUnitCopyArgs
     //!
     //!     cell = views[row].leaseIndex * cellsPerLease
     //!          + views[row].bufferSlotInPool[buffer] * cellsPerBuffer
-    //!          + entry / expansion
+    //!          + entry / unitsPerPage
     //!
     //! No page table and no slot indirection. Coalescing would earn nothing here because
     //! different layers select different units, so a slot's cells would never fill together.
@@ -196,8 +196,8 @@ struct SparseUnitCopyArgs
     SparseCopyDirection direction = SparseCopyDirection::kFetch;
 
     SparseUnitLayout layout;
-    //! Selection units per buffer, i.e. tokens_per_block / tokens_per_block_override.
-    int32_t expansion = 1;
+    //! Selection units one page of this buffer holds.
+    int32_t unitsPerPage = 1;
 
     //! The work list: the resolve's misses when fetching, the flush list when writing back.
     //! [numRows][workRowStride][workWidth], of which the first workCount[...] are valid.
@@ -231,7 +231,7 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream);
 //!
 //! The entry index the resolve produced is private to the cache: it names a unit within a
 //! layer's partition. What a consumer needs is a value in the expanded index space,
-//! `(page * buffersPerSlot + cell) * expansion + unit`.
+//! `(page * buffersPerSlot + cell) * unitsPerPage + unit`.
 //!
 //! The result is compact -- one entry per selection slot, in the selection's own order --
 //! rather than a table indexed by unit ordinal. That is the shape every sparse attention
@@ -281,7 +281,7 @@ struct SparseOutIndexArgs
 
     int32_t cellsPerBuffer = 0;
     int32_t cellsPerLease = 0;
-    int32_t expansion = 1;
+    int32_t unitsPerPage = 1;
 };
 
 //! Launch the index scatter. One CTA per (row, buffer).

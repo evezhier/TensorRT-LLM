@@ -146,7 +146,7 @@ void KvCacheManager::_computeSparseCacheShape()
 {
     LifeCycleId const numLc = mStorage->numLifeCycles();
     mSparseCacheMaxUnits = TypedVec<LifeCycleId, int>(numLc, 0);
-    mSparseCacheExpansion = TypedVec<LifeCycleId, int>(numLc, 1);
+    mSparseCacheUnitsPerPage = TypedVec<LifeCycleId, int>(numLc, 1);
     mSparseCacheBuffers = TypedVec<LifeCycleId, int>(numLc, 0);
     mSparseCacheSelection = TypedVec<LifeCycleId, int>(numLc, 0);
     mSparseCacheLayers = TypedVec<LifeCycleId, int>(numLc, 0);
@@ -166,10 +166,10 @@ void KvCacheManager::_computeSparseCacheShape()
             {
                 continue;
             }
-            int const expansion = mConfig.tokensPerBlock / buf.tokensPerBlockOverride.value_or(mConfig.tokensPerBlock);
+            int const unitsPerPage = buf.sparseUnitsPerPage(mConfig.tokensPerBlock);
             mSparseCacheMaxUnits[lcId] = std::max(mSparseCacheMaxUnits[lcId], buf.maxCachedUnits);
             mSparseCacheSelection[lcId] = std::max(mSparseCacheSelection[lcId], buf.numSelectedBlocks);
-            mSparseCacheExpansion[lcId] = std::max(mSparseCacheExpansion[lcId], expansion);
+            mSparseCacheUnitsPerPage[lcId] = std::max(mSparseCacheUnitsPerPage[lcId], unitsPerPage);
             // One more cell in a reserved slot.
             ++mSparseCacheBuffers[lcId];
             if (!layerCounted)
@@ -191,12 +191,12 @@ int KvCacheManager::sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const no
     }
     // maxCachedUnits counts both populations, the history this caches and everything still
     // in flight, so the reservation follows from configuration alone.
-    return divUp(maxUnits, sparseCacheExpansion(lifeCycle));
+    return divUp(maxUnits, sparseCacheUnitsPerPage(lifeCycle));
 }
 
 int KvCacheManager::sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept
 {
-    int const cells = sparseCacheSubSlotsPerBuffer(lifeCycle) * sparseCacheExpansion(lifeCycle);
+    int const cells = sparseCacheSubSlotsPerBuffer(lifeCycle) * sparseCacheUnitsPerPage(lifeCycle);
     if (cells <= 0)
     {
         return 0;
@@ -233,11 +233,9 @@ std::vector<SparseBufferPlan> KvCacheManager::sparseBufferPlan(LifeCycleId lifeC
                 previousLayer = attn->layerId;
                 ++layerRow;
             }
-            // Guaranteed by BufferConfig::validate: a cached sparse buffer carries a layout.
-            TLLM_CHECK(buf.sparseUnitLayout.has_value());
             auto const attr = bufferAttr(attn->layerId, buf.role);
             plan.push_back(SparseBufferPlan{BufferId{attn->layerId, buf.role}, attr.poolIndex, attr.size,
-                static_cast<uint32_t>(attr.offset), *buf.sparseUnitLayout, layerRow, 0});
+                static_cast<uint32_t>(attr.offset), buf.sparseLayout(mConfig.tokensPerBlock), layerRow, 0});
         }
         // Group a layer's buffers by pool so a (layer, pool) run is consecutive too: a pool is
         // what fixes a cell's size, the slot stride it is read from, and the unit layout, so
@@ -299,9 +297,9 @@ void KvCacheManager::_buildSparseArenas()
         shape.numLayers = sparseCacheLayerCount(lcId);
         shape.numBuffers = sparseCacheBufferCount(lcId);
         shape.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lcId);
-        shape.entriesPerLayer = shape.cellsPerBuffer * sparseCacheExpansion(lcId);
+        shape.entriesPerLayer = shape.cellsPerBuffer * sparseCacheUnitsPerPage(lcId);
         shape.maxFlushUnits = sparseCacheMaxInFlightUnits(lcId);
-        shape.maxFlushBlocks = divUp(shape.maxFlushUnits, sparseCacheExpansion(lcId)) + 1;
+        shape.maxFlushBlocks = divUp(shape.maxFlushUnits, sparseCacheUnitsPerPage(lcId)) + 1;
 
         // The arena mirrors the hot pool group: one region per pool the life cycle's sparse
         // buffers draw on, sized by that pool's cell and the buffers sharing it.
@@ -377,7 +375,7 @@ std::vector<SparseUnitCopyArgs> KvCacheManager::sparseCopyTemplates(LifeCycleId 
         args.bufferBytes = arena.bufferBytes(pool);
         args.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lifeCycle);
         args.cellsPerLease = arena.cellsPerLease(pool);
-        args.expansion = sparseCacheExpansion(lifeCycle);
+        args.unitsPerPage = sparseCacheUnitsPerPage(lifeCycle);
         args.layout.numChunks = layout.numChunks;
         args.layout.chunkBytes = layout.chunkBytes;
         args.layout.chunkStride = layout.chunkStride;
@@ -468,7 +466,7 @@ void KvCacheManager::prepareSparseWriteIndices(
         throw std::invalid_argument("prepareSparseWriteIndices: this layer group carries no sparse cache");
     }
 
-    int const expansion = sparseCacheExpansion(lcId);
+    int const unitsPerPage = sparseCacheUnitsPerPage(lcId);
     auto const views = reinterpret_cast<SparseCacheView const*>(batch.sparseCacheViews(lgId));
     auto const watermarks = batch.watermarks();
     auto const numRows = batch.maxBatchSize();
@@ -486,11 +484,11 @@ void KvCacheManager::prepareSparseWriteIndices(
     resolve.numRows = numRows;
     resolve.layerInGroup = span.layerInGroup;
     resolve.numLayers = sparseCacheLayerCount(lcId);
-    resolve.entriesPerLayer = sparseCacheSubSlotsPerBuffer(lcId) * expansion;
+    resolve.entriesPerLayer = sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
     resolve.selectionWidth = 0;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(watermarks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(watermarks.capacity);
-    resolve.unitTokens = mConfig.tokensPerBlock / expansion;
+    resolve.unitTokens = mConfig.tokensPerBlock / unitsPerPage;
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
     resolve.missCount = scratch.missCount;
@@ -523,7 +521,7 @@ void KvCacheManager::prepareSparseWriteIndices(
         indices.numBuffers = runEnd - runBase;
         indices.cellsPerBuffer = copy.cellsPerBuffer;
         indices.cellsPerLease = copy.cellsPerLease;
-        indices.expansion = expansion;
+        indices.unitsPerPage = unitsPerPage;
         launchSparseOutIndices(indices, stream);
     }
 }
@@ -552,7 +550,7 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
         throw std::invalid_argument("fetchSparsePages: selectionWidth must match the configured numSelectedBlocks");
     }
 
-    int const expansion = sparseCacheExpansion(lcId);
+    int const unitsPerPage = sparseCacheUnitsPerPage(lcId);
     LayerGroupId const lgId{lcId.value()};
     auto const views = reinterpret_cast<SparseCacheView const*>(batch.sparseCacheViews(lgId));
     auto const watermarks = batch.watermarks();
@@ -564,12 +562,12 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     resolve.numRows = numRows;
     resolve.layerInGroup = layerInGroup;
     resolve.numLayers = sparseCacheLayerCount(lcId);
-    resolve.entriesPerLayer = sparseCacheSubSlotsPerBuffer(lcId) * expansion;
+    resolve.entriesPerLayer = sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
     resolve.selected = selected;
     resolve.selectionWidth = selectionWidth;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(watermarks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(watermarks.capacity);
-    resolve.unitTokens = mConfig.tokensPerBlock / expansion;
+    resolve.unitTokens = mConfig.tokensPerBlock / unitsPerPage;
     resolve.outSlot = scratch.outSlot;
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
@@ -621,7 +619,7 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
         indices.numBuffers = copy.numBuffers;
         indices.cellsPerBuffer = copy.cellsPerBuffer;
         indices.cellsPerLease = copy.cellsPerLease;
-        indices.expansion = expansion;
+        indices.unitsPerPage = unitsPerPage;
         launchSparseOutIndices(indices, stream);
     }
 }

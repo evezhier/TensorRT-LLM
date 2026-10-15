@@ -160,7 +160,10 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     // grouping below intentionally remains sorted, which can make observable
     // pool-group indices/layout order differ from Python. Later lookups use
     // StorageConfig mappings, so this is not expected to affect correctness.
-    std::map<LifeCycleId, std::map<size_t, std::vector<BufferId>>> bufferGroups;
+    // Keyed on sparsity as well as size: a pool is uniformly sparse or uniformly dense, so
+    // one layer may contribute to both, and the GPU tier can host-back exactly the sparse
+    // pools without the life cycle having to be wholly one or the other.
+    std::map<LifeCycleId, std::map<std::pair<size_t, bool>, std::vector<BufferId>>> bufferGroups;
     std::unordered_map<BufferId, int, BufferIdHash> expansionMap;
 
     for (auto const& layer : config.layers)
@@ -179,7 +182,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
                     BufferId bid{cfg.layerId, buf.role};
                     expansionMap[bid] = exp;
-                    bufferGroups[lcId][expandedSize].push_back(bid);
+                    bufferGroups[lcId][{expandedSize, buf.isSparse}].push_back(bid);
                 }
             },
             layer);
@@ -193,28 +196,37 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     {
         SlotDescVariant var;
         var.lifeCycleId = lcId;
-        for (auto const& [sz, bufIds] : sizeMap)
+        for (auto const& [key, bufIds] : sizeMap)
         {
+            auto const& [sz, isSparse] = key;
             CoalescedBuffer cb;
             cb.singleBufferSize = sz;
+            cb.isSparse = isSparse;
             cb.bufferIds = bufIds;
             var.coalescedBuffers.push_back(std::move(cb));
         }
         // Sort descending by size.
         std::sort(var.coalescedBuffers.begin(), var.coalescedBuffers.end(),
-            [](CoalescedBuffer const& a, CoalescedBuffer const& b) { return a.size() > b.size(); });
+            [](CoalescedBuffer const& a, CoalescedBuffer const& b)
+            {
+                // Size descending, then sparsity, so two pools of equal size keep a stable
+                // and reproducible order rather than depending on map iteration.
+                return a.size() != b.size() ? a.size() > b.size() : a.isSparse < b.isSparse;
+            });
         slotGroups.push_back(std::move(var));
     }
 
-    // Keep sparse and dense lifecycles in separate GPU pools even when slot sizes match.
+    // Life cycles share a pool group only when their pools match position-wise on both
+    // size and sparsity. Matching on sparsity is what keeps a pool uniformly host-backed
+    // or device-backed once several life cycles share it.
     struct PoolGroupKey
     {
         std::vector<size_t> slotSizes;
-        bool isSparse = false;
+        std::vector<uint8_t> sparsity;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(slotSizes, isSparse) < std::tie(other.slotSizes, other.isSparse);
+            return std::tie(slotSizes, sparsity) < std::tie(other.slotSizes, other.sparsity);
         }
     };
 
@@ -222,9 +234,8 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     for (auto& sg : slotGroups)
     {
         auto const sizes = sg.slotSizeList();
-        auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
-        bool const isSparse = attn != nullptr && attn->isSparse;
-        poolGroups[{.slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
+        auto const sparsity = sg.sparsityList();
+        poolGroups[{.slotSizes = sizes.raw(), .sparsity = sparsity.raw()}].push_back(std::move(sg));
     }
 
     StorageConfig out;

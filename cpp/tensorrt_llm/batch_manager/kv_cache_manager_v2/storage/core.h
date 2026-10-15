@@ -336,6 +336,13 @@ public:
     //! one or the other.
     [[nodiscard]] virtual CacheTier cacheTier() const noexcept = 0;
 
+    //! Whether this pool's pages are host memory rather than this tier's own medium.
+    //! True only for a sparse pool of the GPU tier.
+    [[nodiscard]] virtual bool isSparse(PoolIndex) const noexcept
+    {
+        return false;
+    }
+
     PoolIndex numPools() const noexcept
     {
         return mPools.size();
@@ -403,13 +410,32 @@ protected:
 class GpuPoolGroup : public PoolGroupBase
 {
 public:
-    GpuPoolGroup(
-        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
+    //! `sparsity`, when given, marks the pools to allocate from host memory instead of
+    //! device memory. They hold a sparse buffer's pages: ordinary hot pages that are read
+    //! through the sparse GPU cache rather than directly, so they are device-mapped but do
+    //! not consume the tier's device budget.
+    //!
+    //! The group still reports GPU_MEM. Migration never reads the hot side's tier -- the
+    //! codec path keeps only the cold side's -- and host memory is device-accessible, so a
+    //! mixed group needs no second tier.
+    GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, uint8_t> const& sparsity = {});
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
         return CacheTier::GPU_MEM;
     }
+
+    [[nodiscard]] bool isSparse(PoolIndex poolIndex) const noexcept override
+    {
+        return poolIndex < mSparsity.size() && mSparsity.at(poolIndex) != 0;
+    }
+
+    //! The host allocation behind a sparse pool, or nullptr for a device-backed one.
+    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
+
+private:
+    TypedVec<PoolIndex, uint8_t> mSparsity;
 };
 
 class HostPoolGroup : public PoolGroupBase
@@ -565,15 +591,14 @@ public:
 
     // Static version: compute slot counts from quota, slot size lists, ratio, granularity, and min_slots.
     // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
-    //! `offQuota` names pool groups not drawn from this level's quota -- a sparse life
-    //! cycle's host-backed hot pages. They take their constraint floor instead.
+    //! A sparse pool's size is zero in `sizeLists`: its pages are host memory and are not
+    //! charged to this level's quota, so they add nothing to any group's bytes per slot.
     static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::set<PoolGroupIndex> const& offQuota = {});
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
 
     //! Pool groups whose medium differs from this level's declared tier.
-    [[nodiscard]] std::set<PoolGroupIndex> offQuotaPoolGroups() const;
 
     // Distribute grains among pools within a pool group.
     // Returns {num_slots, grains_consumed}.
@@ -591,13 +616,12 @@ protected:
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    //! `hostBacked` names the pool groups to allocate from host memory instead. They are
-    //! the sparse life cycles': their history is too large for device memory and is read
-    //! through the sparse cache rather than directly, so they live on the hot level as
-    //! ordinary pages that merely happen to be host-resident.
+    //! Sparse pools are allocated from host memory, which each SlotDesc declares per pool.
+    //! Their pages are too large for device memory and are read through the sparse cache
+    //! rather than directly, so they live on the hot level as ordinary pages that merely
+    //! happen to be host-resident.
     GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
-        std::set<PoolGroupIndex> const& hostBacked = {});
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -653,6 +677,6 @@ private:
 // Factory: create appropriate CacheLevelStorage for a given tier config.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, std::set<PoolGroupIndex> const& hostBacked = {});
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

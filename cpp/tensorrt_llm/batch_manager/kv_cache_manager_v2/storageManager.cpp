@@ -103,14 +103,13 @@ PoolGroupIndex LifeCyclePoolGroupMapping::numPoolGroups() const noexcept
 
 CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
     CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator,
-    std::set<PoolGroupIndex> const& hostBacked)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
-    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, hostBacked);
+    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator);
 }
 
 size_t CacheLevelManager::cacheTierGranularity(CacheTier tier, size_t quota)
@@ -273,12 +272,34 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     TLLM_CHECK_DEBUG_WITH_INFO(
         std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[kHotLevel]), "First cache tier must be GPU");
 
-    // Compute slot size lists for all pool groups.
+    // Slot size lists for all pool groups, as the GPU quota sees them: sparse pools are
+    // host memory and are left out. A slot spans every pool of its group, so their row
+    // count follows from the device-backed pools the quota does size -- which is why they
+    // need no budget, and no heuristic, of their own.
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizeLists;
     slotSizeLists.reserve(hotSlotDescList.size());
     for (auto const& sd : hotSlotDescList)
     {
-        slotSizeLists.push_back(sd.slotSizeList());
+        auto const all = sd.slotSizeList();
+        auto const sparsity = sd.sparsityList();
+        // Only the sums matter downstream, so a sparse pool is left out rather than given a
+        // zero size: the slot count then follows from the device-backed pools alone.
+        TypedVec<PoolIndex, size_t> sizes;
+        for (PoolIndex p{0}; p < all.size(); ++p)
+        {
+            if (sparsity.at(p) == 0)
+            {
+                sizes.push_back(all.at(p));
+            }
+        }
+        bool const anyChargeable = !sizes.empty();
+        // Without one, the group has no bytes per slot and so no slot count to derive.
+        // Only the GPU tier needs this: sparsity exists at the hot level alone, so a cold
+        // level's groups are entirely device-independent and size from their own quota.
+        TLLM_CHECK_WITH_INFO(anyChargeable,
+            "A pool group must hold at least one non-sparse pool; a wholly sparse group has no device "
+            "bytes from which to size its slots");
+        slotSizeLists.push_back(std::move(sizes));
     }
 
     size_t const gpuQuota = cacheTierQuota(config.cacheTiers[kHotLevel]);
@@ -337,30 +358,17 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     mLevels.reserve(config.cacheTiers.size());
 
-    // A sparse life cycle's hot pages are host memory: its history is too large for device
-    // memory and is read through the sparse cache rather than directly. Pool group formation
-    // keys on `isSparse` (storage/config.cpp), so a group is uniformly sparse or dense and
-    // the backing is well defined per group.
+    // A sparse buffer's hot pages are host memory: its history is too large for device
+    // memory and is read through the sparse cache rather than directly. Which pools those
+    // are is declared per pool by SlotDesc, so a life cycle may hold both kinds and the
+    // GPU tier host-backs exactly the sparse ones.
     //
-    // Computed before the slot counts because those groups are sized from their constraint
-    // floor rather than from the GPU quota, which measures a resource they do not consume.
-    std::set<PoolGroupIndex> hostBackedHot;
-    {
-        auto const& hotGrouping = lifeCycleGrouping(kHotLevel);
-        for (LifeCycleId lcId{0}; lcId < mLifeCycles.size(); ++lcId)
-        {
-            auto const* attention = std::get_if<AttnLifeCycle>(&mLifeCycles[lcId]);
-            if (attention != nullptr && attention->isSparse)
-            {
-                hostBackedHot.insert(hotGrouping[lcId]);
-            }
-        }
-    }
-
-    auto gpuSlotCounts
-        = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots, hostBackedHot);
+    // Their bytes are excluded from the quota rather than sized from it: a slot spans every
+    // pool of its group, so a sparse pool's row count follows from the group's device-backed
+    // pools, which the quota does size.
+    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get(), hostBackedHot);
+        gpuSlotCounts, mGpuPhysMemAllocator.get());
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -817,6 +825,11 @@ CacheTier StorageManager::cacheTier(CacheLevel level) const
 CacheTier StorageManager::cacheTier(CacheLevel level, PoolGroupIndex pgIdx) const
 {
     return mLevels.at(level).storage->cacheTier(pgIdx);
+}
+
+bool StorageManager::isSparsePool(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+{
+    return mLevels.at(level).storage->poolGroup(pgIdx).isSparse(poolIdx);
 }
 
 void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
@@ -1706,8 +1719,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         : lvlStorage.totalQuota();
     auto const minSlots
         = level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
-    size_t minQuota = minQuotaForLevel(
-        lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots, lvlStorage.offQuotaPoolGroups());
+    size_t minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
     if (quota < minQuota)
     {
         throw std::invalid_argument("Quota " + std::to_string(quota)
@@ -2041,15 +2053,14 @@ TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-    std::set<PoolGroupIndex> const& offQuota) const
+    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
     CacheTier tier = cacheTierOf(tierConfig);
     size_t quota = cacheTierQuota(tierConfig);
     size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
                                                     : CacheLevelManager::cacheTierGranularity(tier, quota);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots, offQuota), roundUp(quota, granularity));
-    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots, offQuota);
+    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
+    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
 }
 
 // ---------------------------------------------------------------------------
@@ -2057,17 +2068,12 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
 // ---------------------------------------------------------------------------
 
 size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-    std::set<PoolGroupIndex> const& offQuota) const
+    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
     size_t total = 0;
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
-        // Not drawn from this level's quota, so its floor is not a demand on it.
-        if (offQuota.count(pgIdx) != 0)
-        {
-            continue;
-        }
+        // Sparse pools are absent from these lists, so they add nothing to the floor.
         for (auto slotSize : slotSizeLists[pgIdx])
         {
             total += roundUp(slotCountToSizeT(minSlots[pgIdx]) * slotSize, granularity);

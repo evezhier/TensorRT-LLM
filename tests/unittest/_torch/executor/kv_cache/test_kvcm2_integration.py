@@ -71,7 +71,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManagerConfig,
     LayerId,
     ReuseScope,
-    SelectionUnitLayout,
     SsmLayerConfig,
     _introspection,
 )
@@ -2460,9 +2459,6 @@ def _index_mapper_capacity_for(
                             is_sparse=sparse,
                             num_selected_blocks=1 if sparse else 0,
                             max_cached_units=2 if sparse else 0,
-                            sparse_unit_layout=SelectionUnitLayout(1, 128, 0, 128)
-                            if sparse
-                            else None,
                         )
                     ],
                 )
@@ -2596,7 +2592,6 @@ def _sparse_arena_config(max_batch_size: int, explicit_ratio: bool) -> KVCacheMa
                         is_sparse=True,
                         num_selected_blocks=2,
                         max_cached_units=4,
-                        sparse_unit_layout=SelectionUnitLayout(1, size, 0, size),
                     )
                     for role, size in ((Role.KEY, 4096), (Role.KEY_BLOCK_SCALE, 128))
                 ],

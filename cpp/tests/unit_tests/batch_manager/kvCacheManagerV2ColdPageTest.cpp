@@ -74,8 +74,10 @@ KVCacheManagerConfig makeSparseTieredConfig()
     buffer.isSparse = true;
     buffer.numSelectedBlocks = 1;
     buffer.maxCachedUnits = 2;
-    buffer.sparseUnitLayout = SelectionUnitLayout{1, 2 << 20, 0, 2 << 20};
     layer.buffers.push_back(std::move(buffer));
+    // A pool group sizes its slots from its device-backed pools, so a sparse layer carries
+    // one -- which is also the shape a model uses.
+    layer.buffers.push_back(BufferConfig{"index", 256, std::nullopt});
     config.layers.emplace_back(std::move(layer));
     BatchDesc constraint;
     constraint.kvCaches.assign(2, KVCacheDesc{/*capacity=*/16, /*historyLength=*/0});
@@ -802,11 +804,19 @@ TEST(KvCacheManagerV2ColdPageTest, SparseHistoryPassesThroughTheCodec)
     CacheLevel const coldLevel{1};
     TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
 
-    // The arrangement this test is about: the life cycle's *hot* pool group is host memory.
-    // Without this the test would pass for a dense life cycle too, and prove nothing.
+    // The arrangement this test is about: the sparse buffer's *hot* pages are host memory,
+    // sitting in a GPU-tier group beside a device-backed pool. Without this the test would
+    // pass for a dense life cycle too, and prove nothing.
     PoolGroupIndex const hotPg = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
-    ASSERT_EQ(storage.cacheTier(kHotLevel, hotPg), CacheTier::HOST_MEM)
-        << "a sparse life cycle's hot pages must be host memory";
+    ASSERT_EQ(storage.cacheTier(kHotLevel, hotPg), CacheTier::GPU_MEM);
+    auto const hotPools = storage.slotSize(kHotLevel, hotPg);
+    ASSERT_EQ(hotPools.size(), PoolIndex{2}) << "a sparse pool beside a device-backed one";
+    int sparsePools = 0;
+    for (PoolIndex pool{0}; pool < hotPools.size(); ++pool)
+    {
+        sparsePools += storage.isSparsePool(kHotLevel, hotPg, pool) ? 1 : 0;
+    }
+    ASSERT_EQ(sparsePools, 1) << "exactly one of the group's pools holds host-backed pages";
 
     // A hot page of the sparse life cycle. Host-backed, but an ordinary hot page: locked at
     // the hot level and migratable like any other.

@@ -258,9 +258,7 @@ std::vector<KvCache::SparseBufferRef> KvCache::_sparseBuffers(LifeCycleId lifeCy
             {
                 continue;
             }
-            // Guaranteed by BufferConfig::validate: a cached sparse buffer carries a layout.
-            TLLM_CHECK(buf.sparseUnitLayout.has_value());
-            refs.push_back(SparseBufferRef{BufferId{attn->layerId, buf.role}, *buf.sparseUnitLayout});
+            refs.push_back(SparseBufferRef{BufferId{attn->layerId, buf.role}, buf.sparseLayout(mTokensPerBlock)});
         }
     }
     return refs;
@@ -292,7 +290,7 @@ int KvCache::_sparseUnitsCrossed(LifeCycleId lifeCycle, int fromHistory, int toH
     {
         return 0;
     }
-    int const unitTokens = mTokensPerBlock / mManager->sparseCacheExpansion(lifeCycle);
+    int const unitTokens = mTokensPerBlock / mManager->sparseCacheUnitsPerPage(lifeCycle);
     return toHistory / unitTokens - fromHistory / unitTokens;
 }
 
@@ -302,11 +300,11 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
     TLLM_CHECK_DEBUG(!state.empty() && toUnits > fromUnits);
     auto const& view = state.view();
     auto const stream = reinterpret_cast<CUstream>(cudaStream());
-    int const expansion = mManager->sparseCacheExpansion(lifeCycle);
+    int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lifeCycle);
 
     // Which blocks the crossed units live in, as a half-open range.
-    int const firstBlock = fromUnits / expansion;
-    int const lastBlock = (toUnits - 1) / expansion;
+    int const firstBlock = fromUnits / unitsPerPage;
+    int const lastBlock = (toUnits - 1) / unitsPerPage;
     int const numBlocks = lastBlock - firstBlock + 1;
     if (numBlocks > view.maxFlushBlocks)
     {
@@ -1574,7 +1572,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         {
             continue;
         }
-        int const unitTokens = mTokensPerBlock / mManager->sparseCacheExpansion(lc);
+        int const unitTokens = mTokensPerBlock / mManager->sparseCacheUnitsPerPage(lc);
         // Only a unit that was in flight can hold its one copy in a cell, and in flight
         // means below the capacity this resize started from. A unit at or above that was
         // not in the cache at all, so history reaching it writes nothing back: this is the

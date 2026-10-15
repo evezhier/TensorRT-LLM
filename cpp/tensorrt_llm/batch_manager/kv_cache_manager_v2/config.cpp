@@ -80,6 +80,20 @@ void KVCacheManagerConfig::validate() const
                             "KVCacheManagerConfig: tokensPerBlockOverride must be a divisor of "
                             "tokensPerBlock");
                     }
+                    if (buf.sparseSelectionUnitTokens.has_value()
+                        && (*buf.sparseSelectionUnitTokens <= 0
+                            || tokensPerBlock % *buf.sparseSelectionUnitTokens != 0))
+                    {
+                        throw AssertionError(
+                            "KVCacheManagerConfig: sparseSelectionUnitTokens must be a divisor of "
+                            "tokensPerBlock");
+                    }
+                    if (buf.isSparse && buf.maxCachedUnits > 0)
+                    {
+                        // Checked here rather than at the first fetch: a deployment that only
+                        // finds out mid-step has already resumed requests and begun serving.
+                        buf.sparseLayout(tokensPerBlock);
+                    }
                 }
             },
             layer);

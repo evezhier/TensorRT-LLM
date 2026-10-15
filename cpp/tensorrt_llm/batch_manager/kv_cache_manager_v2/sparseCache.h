@@ -34,7 +34,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // cache for one life cycle, as the fetch kernel sees it.
 //
 // A reserved slot is a row of buffer-sized cells, and any layer's unit may occupy any cell;
-// a cell holds `expansion` units when the selection unit is smaller than a buffer. An entry
+// a cell holds `unitsPerPage` units when a selection unit is smaller than a buffer. An entry
 // is identified by (layer, entry index) and resolved to a cell arithmetically, so nothing
 // ties a layer to a fixed position.
 //
@@ -111,7 +111,7 @@ struct SparseCacheInit
     int32_t numLayers = 0;
     int32_t numBuffers = 0;
     int32_t entriesPerLayer = 0;
-    //! Cells one buffer gets, i.e. entriesPerLayer / expansion. A lease is this many cells
+    //! Cells one buffer gets, i.e. entriesPerLayer / unitsPerPage. A lease is this many cells
     //! per buffer, laid out buffer-major.
     int32_t cellsPerBuffer = 0;
     //! [numBuffers] byte offset of each buffer within a cold page.

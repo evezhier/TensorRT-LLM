@@ -111,12 +111,29 @@ inline size_t cacheTierQuota(CacheTierConfig const& cfg)
 // ---------------------------------------------------------------------------
 struct SelectionUnitLayout
 {
-    uint32_t numChunks = 1;   //!< One per head; 1 for token-major.
+    uint32_t numChunks = 1;   //!< One per head for a head-major page; 1 otherwise.
     uint32_t chunkBytes = 0;  //!< Contiguous bytes of one unit within one chunk.
     uint32_t chunkStride = 0; //!< Distance between consecutive chunks.
     uint32_t unitStride = 0;  //!< Distance between consecutive selection units.
 
-    //! @param unitSize Bytes of one selection unit, i.e. BufferConfig::size.
+    //! Derive the layout of a densely packed page.
+    //!
+    //! @param pageBytes One buffer's bytes for a whole page, i.e. BufferConfig::size.
+    //! @param unitsPerPage Selection units the page holds.
+    //! @param numChunks Pieces a unit is gathered from; see BufferConfig::sparseUnitChunks.
+    static SelectionUnitLayout derive(size_t pageBytes, int unitsPerPage, int numChunks)
+    {
+        SelectionUnitLayout out;
+        out.numChunks = static_cast<uint32_t>(numChunks);
+        out.chunkStride = static_cast<uint32_t>(pageBytes / static_cast<size_t>(numChunks));
+        out.chunkBytes = out.chunkStride / static_cast<uint32_t>(unitsPerPage);
+        // Units pack densely inside a chunk, which is what makes the page's own extent
+        // enough to place them: a unit's stride is its size.
+        out.unitStride = out.chunkBytes;
+        return out;
+    }
+
+    //! @param unitSize Bytes of one selection unit, i.e. size / unitsPerPage.
     void validate(size_t unitSize) const
     {
         if (numChunks == 0 || chunkBytes == 0)
@@ -125,7 +142,7 @@ struct SelectionUnitLayout
         }
         if (static_cast<size_t>(numChunks) * chunkBytes != unitSize)
         {
-            throw std::invalid_argument("SelectionUnitLayout: numChunks * chunkBytes must equal the buffer size");
+            throw std::invalid_argument("SelectionUnitLayout: numChunks * chunkBytes must equal one unit's bytes");
         }
         if (numChunks > 1 && chunkStride < chunkBytes)
         {
@@ -141,7 +158,7 @@ struct SelectionUnitLayout
 struct BufferConfig
 {
     DataRole role;
-    size_t size = 0; // bytes per page (without expansion)
+    size_t size = 0; // bytes per page
 
     // If set, overrides tokens_per_block for this buffer.
     // Must be a divisor of KVCacheManagerConfig::tokensPerBlock.
@@ -161,20 +178,57 @@ struct BufferConfig
     //! sparse request contributes one query token per step, so the rest is all reuse.
     int maxCachedUnits = 0;
 
-    //! Where a selection unit's bytes sit. Leave unset for a buffer whose cold form is
-    //! compressed or whose units are not locatable by arithmetic; such a buffer supplies
-    //! extraction code instead.
-    std::optional<SelectionUnitLayout> sparseUnitLayout;
+    //! Original tokens one selection unit spans. Sparse buffers only.
+    //!
+    //! Unset means a unit is a whole page, i.e. no sub-page selection. Must divide
+    //! KVCacheManagerConfig::tokensPerBlock; the quotient is how many units a page holds.
+    //!
+    //! Distinct from tokensPerBlockOverride, which is a storage-wide reinterpretation of a
+    //! buffer's page: this names the sparse cache's granularity and nothing else, so a
+    //! buffer's pages, its page indices and its index space keep the manager's
+    //! tokensPerBlock. Setting both on one buffer is rejected.
+    std::optional<int> sparseSelectionUnitTokens;
+
+    //! Pieces a selection unit is gathered from within its page. Sparse buffers only.
+    //!
+    //! A unit is the tokens it spans across *every* KV head, so how many pieces that is
+    //! follows from the page's dimension order:
+    //!
+    //!   - **1** for a sequence-major page (`[token][head][dim]`), where a unit's tokens
+    //!     carry all their heads with them and the whole unit is one contiguous range.
+    //!     Also 1 for any single-head page -- a compressed or pooled latent, say -- where
+    //!     the two orders are the same bytes.
+    //!   - **numHeads** for a head-major page (`[head][token][dim]`), where each head
+    //!     contributes its own contiguous run and the unit is that many strided pieces.
+    //!
+    //! Everything else about the layout follows from this and the page being densely
+    //! packed, so a padded page -- an alignment gap between heads or between units -- is
+    //! not expressible.
+    int sparseUnitChunks = 1;
 
     void validate() const
     {
         if (!isSparse)
         {
-            if (numSelectedBlocks != 0 || maxCachedUnits != 0 || sparseUnitLayout.has_value())
+            if (numSelectedBlocks != 0 || maxCachedUnits != 0 || sparseSelectionUnitTokens.has_value()
+                || sparseUnitChunks != 1)
             {
                 throw std::invalid_argument("BufferConfig: sparse-only fields set on a non-sparse buffer");
             }
             return;
+        }
+        if (tokensPerBlockOverride.has_value())
+        {
+            // Both would name a unit count, and nothing makes them agree. The override is a
+            // storage-wide reinterpretation; a sparse buffer says what it means with
+            // sparseSelectionUnitTokens, which leaves its pages and index space alone.
+            throw std::invalid_argument(
+                "BufferConfig: tokensPerBlockOverride is not supported on a sparse buffer; use "
+                "sparseSelectionUnitTokens");
+        }
+        if (sparseUnitChunks <= 0)
+        {
+            throw std::invalid_argument("BufferConfig: sparseUnitChunks must be positive");
         }
         // Zero means the fetch path is not configured for this buffer: sparse storage and
         // locking work without it, and the per-request cache rejects it when constructed.
@@ -191,16 +245,26 @@ struct BufferConfig
             throw std::invalid_argument(
                 "BufferConfig: maxCachedUnits must exceed numSelectedBlocks, to leave room for units in flight");
         }
-        if (sparseUnitLayout.has_value())
+    }
+
+    //! Selection units one page holds, given the manager's tokensPerBlock.
+    [[nodiscard]] int sparseUnitsPerPage(int tokensPerBlock) const
+    {
+        return tokensPerBlock / sparseSelectionUnitTokens.value_or(tokensPerBlock);
+    }
+
+    //! Where this buffer's selection units sit inside a page. Throws when the page cannot
+    //! be divided as declared, which is a configuration error rather than a fetch-time one.
+    [[nodiscard]] SelectionUnitLayout sparseLayout(int tokensPerBlock) const
+    {
+        int const unitsPerPage = sparseUnitsPerPage(tokensPerBlock);
+        auto const pieces = static_cast<size_t>(sparseUnitChunks) * static_cast<size_t>(unitsPerPage);
+        if (size == 0 || size % pieces != 0)
         {
-            sparseUnitLayout->validate(size);
+            throw std::invalid_argument(
+                "BufferConfig: size must divide evenly into sparseUnitChunks * units-per-page pieces");
         }
-        else if (maxCachedUnits > 0)
-        {
-            // A cache with no way to locate a unit inside the buffer cannot be filled or
-            // written back, so reject it here rather than at the first fetch.
-            throw std::invalid_argument("BufferConfig: a cached sparse buffer needs a sparseUnitLayout");
-        }
+        return SelectionUnitLayout::derive(size, unitsPerPage, sparseUnitChunks);
     }
 };
 
@@ -253,12 +317,11 @@ struct AttentionLayerConfig
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
+        // A layer may mix sparse and dense buffers. Sparsity decides which pool a buffer
+        // lands in, and nothing above that, so an indexer and the data it selects over can
+        // stay in the one layer they belong to.
         for (auto const& buf : buffers)
         {
-            if (buf.isSparse != buffers.front().isSparse)
-            {
-                throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
-            }
             buf.validate();
         }
     }

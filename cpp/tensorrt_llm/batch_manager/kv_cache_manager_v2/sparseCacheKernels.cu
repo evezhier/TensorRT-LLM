@@ -440,10 +440,10 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     int32_t const slot = args.workSlot[index];
 
     // A unit ordinal names a unit within a block; a cache entry names a unit within a
-    // sub-slot. Both divide by the same expansion.
-    int32_t const block = ordinal / args.expansion - args.pageTableBase;
-    int32_t const srcUnit = ordinal % args.expansion;
-    int32_t const dstUnit = slot % args.expansion;
+    // sub-slot. Both divide by the same units-per-page.
+    int32_t const block = ordinal / args.unitsPerPage - args.pageTableBase;
+    int32_t const srcUnit = ordinal % args.unitsPerPage;
+    int32_t const dstUnit = slot % args.unitsPerPage;
     if (block < 0 || block >= args.numBlocks)
     {
         return;
@@ -452,7 +452,7 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     // A cell is reached by arithmetic from the lease's base: the arena hands out a
     // contiguous run, so there is no page to look up.
     auto const cell = static_cast<uint64_t>(view.leaseIndex * args.cellsPerLease
-        + view.bufferSlotInPool[buffer] * args.cellsPerBuffer + slot / args.expansion);
+        + view.bufferSlotInPool[buffer] * args.cellsPerBuffer + slot / args.unitsPerPage);
 
     auto const hostPage
         = static_cast<uint64_t>(args.pageTable[static_cast<ptrdiff_t>(row) * args.pageTableStride + block]);
@@ -504,8 +504,8 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
         }
 
         int32_t const cell = view.leaseIndex * args.cellsPerLease + view.bufferSlotInPool[buffer] * args.cellsPerBuffer
-            + slot / args.expansion;
-        out[i] = cell * args.expansion + slot % args.expansion;
+            + slot / args.unitsPerPage;
+        out[i] = cell * args.unitsPerPage + slot % args.unitsPerPage;
     }
 }
 
@@ -566,7 +566,7 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseOutIndices: every device array must be provided");
     }
-    if (args.cellsPerBuffer <= 0 || args.cellsPerLease <= 0 || args.expansion <= 0 || args.bufferBase < 0)
+    if (args.cellsPerBuffer <= 0 || args.cellsPerLease <= 0 || args.unitsPerPage <= 0 || args.bufferBase < 0)
     {
         throw std::invalid_argument("launchSparseOutIndices: the cell geometry must be positive");
     }
@@ -601,11 +601,12 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
 
 void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
 {
-    if (args.numBuffers <= 0 || args.workWidth <= 0 || args.expansion <= 0 || args.numRows <= 0
+    if (args.numBuffers <= 0 || args.workWidth <= 0 || args.unitsPerPage <= 0 || args.numRows <= 0
         || args.workRowStride <= 0)
     {
         throw std::invalid_argument(
-            "launchSparseUnitCopy: rows, buffers, work width, work row stride and expansion must be positive");
+            "launchSparseUnitCopy: rows, buffers, work width, work row stride and units-per-page must be "
+            "positive");
     }
     if (args.bufferBase < 0 || args.workRowBase < 0 || args.pageTableStride < args.numBlocks)
     {

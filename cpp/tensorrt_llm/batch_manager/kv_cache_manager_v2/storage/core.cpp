@@ -553,10 +553,17 @@ TypedVec<PoolIndex, size_t> PoolGroupBase::slotSize() const
 // GpuPoolGroup
 // ---------------------------------------------------------------------------
 
-GpuPoolGroup::GpuPoolGroup(
-    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator)
+GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+    PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, uint8_t> const& sparsity)
     : PoolGroupBase(numSlots)
+    , mSparsity(sparsity)
 {
+    if (mSparsity.empty())
+    {
+        mSparsity = TypedVec<PoolIndex, uint8_t>(slotSizeList.size(), uint8_t{0});
+    }
+    TLLM_CHECK_WITH_INFO(
+        mSparsity.size() == slotSizeList.size(), "GpuPoolGroup: one sparsity flag per pool is required");
     size_t physMemSize = physMemAllocator.physMemSize();
     // Query total GPU memory to size virtual address space (mirrors Python GpuPoolGroup).
     size_t totalGpuMem = 0;
@@ -568,8 +575,16 @@ GpuPoolGroup::GpuPoolGroup(
     // @TODO: We should replace maxSlotSize with sum. This should also be updated in Python. Will do it later.
     TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "GpuPoolGroup: slotSizeList must not be empty");
     size_t maxSlotSize = *std::max_element(slotSizeList.begin(), slotSizeList.end());
-    for (size_t sz : slotSizeList)
+    for (PoolIndex p{0}; p < slotSizeList.size(); ++p)
     {
+        size_t const sz = slotSizeList.at(p);
+        if (mSparsity.at(p) != 0)
+        {
+            // A sparse pool's pages: host memory, device-mapped, so the sparse cache fills
+            // from them without a host round trip. No device VA is reserved for them.
+            mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots));
+            continue;
+        }
         // VA proportional to GPU memory, scaled by slot size ratio (mirrors Python).
         // Compute ratio as double first to avoid size_t overflow.
         double sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
@@ -577,6 +592,15 @@ GpuPoolGroup::GpuPoolGroup(
         vmSize = std::max(vmSize, roundUp(slotCountToSizeT(numSlots) * sz, physMemSize));
         mPools.push_back(std::make_unique<GpuSlotPool>(sz, vmSize, physMemAllocator, numSlots));
     }
+}
+
+HostMem const* GpuPoolGroup::hostMem(PoolIndex poolIndex) const
+{
+    if (!isSparse(poolIndex))
+    {
+        return nullptr;
+    }
+    return static_cast<HostSlotPool const&>(*mPools.at(poolIndex)).hostMem();
 }
 
 // ---------------------------------------------------------------------------
@@ -640,24 +664,15 @@ TypedVec<PoolIndex, Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx
 // ---------------------------------------------------------------------------
 
 GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
-    std::set<PoolGroupIndex> const& hostBacked)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator)
     : mPhysMemAllocator(physMemAllocator)
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        if (hostBacked.count(pgIdx) != 0)
-        {
-            // A sparse life cycle's pages: ordinary hot pages in host memory, device-mapped
-            // so the sparse cache can fill from them without a host round trip.
-            mPoolGroups.push_back(
-                std::make_unique<HostPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList()));
-            continue;
-        }
-        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
-            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator));
+        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(),
+            mPhysMemAllocator, slotDescList[pgIdx].sparsityList()));
     }
 }
 
@@ -700,7 +715,7 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator, std::set<PoolGroupIndex> const& hostBacked)
+    PooledPhysMemAllocator* gpuPhysMemAllocator)
 {
     TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(
@@ -709,8 +724,7 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             using T = std::decay_t<decltype(cfg)>;
             if constexpr (std::is_same_v<T, GpuCacheTierConfig>)
             {
-                return std::make_unique<GpuCacheLevelStorage>(
-                    slotDescList, slotCountList, *gpuPhysMemAllocator, hostBacked);
+                return std::make_unique<GpuCacheLevelStorage>(slotDescList, slotCountList, *gpuPhysMemAllocator);
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {
@@ -832,7 +846,7 @@ size_t CacheLevelStorage::grainsForSlots(
 TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size_t quota,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& sizeLists,
     TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::set<PoolGroupIndex> const& offQuota)
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
 {
     PoolGroupIndex numPg = sizeLists.size();
     TLLM_CHECK_DEBUG(ratioList.size() == numPg);
@@ -854,50 +868,8 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
     std::vector<PoolGroupIndex> activePgs;
     activePgs.reserve(toSizeT(numPg));
 
-    // Grains the on-quota groups would need at their floor. The ratio of the quota to that
-    // is how much slack the operator left them, which is the only signal available for how
-    // much to leave a group the quota does not measure.
-    size_t onQuotaMinGrains = 0;
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
     {
-        if (offQuota.count(pgIdx) != 0)
-        {
-            continue;
-        }
-        for (auto slotSize : sizeLists[pgIdx])
-        {
-            onQuotaMinGrains += divUp(slotCountToSizeT(minSlots[pgIdx]) * slotSize, granularity);
-        }
-    }
-
-    // A floor with no slack means every page that leaves is an encode and every page that
-    // comes back a decode, so off-quota groups get headroom above theirs -- the same
-    // generosity the on-quota groups were given.
-    //
-    // Clamped, for two reasons. The ratio is driven by the gap between `constraints`, a floor
-    // people deliberately set low, and `quota`, real capacity, so it can reach tens; and an
-    // over-large host allocation has no backstop the way a device allocation has the device.
-    // The bound is provisional: justifying a value needs encode/decode volume measured
-    // against headroom, which is not observable until a codec is configured.
-    //
-    // With no on-quota groups at all -- every attention layer sparse -- there is no signal,
-    // and the bound stands in for one.
-    constexpr size_t kMaxOffQuotaHeadroom = 2;
-    size_t const headroom = onQuotaMinGrains == 0
-        ? kMaxOffQuotaHeadroom
-        : std::clamp(totalGrains / onQuotaMinGrains, size_t{1}, kMaxOffQuotaHeadroom);
-
-    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
-    {
-        // A pool group whose medium is not this tier's draws on a different resource, so its
-        // grains are never subtracted from this budget. Pinning rather than ratio-sharing is
-        // right because the floor already expresses what the declared constraints need,
-        // scaled for the resume guard; headroom is applied on top.
-        if (offQuota.count(pgIdx) != 0)
-        {
-            slotCntList[pgIdx] = SlotCount{static_cast<int64_t>(slotCountToSizeT(minSlots[pgIdx]) * headroom)};
-            continue;
-        }
         activePgs.push_back(pgIdx);
     }
 
@@ -1012,23 +984,7 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::computeSlotCountList(
 {
     size_t q = quota.value_or(totalQuota());
     TLLM_CHECK_DEBUG(ratioList.size() == mPoolGroups.size());
-    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots, offQuotaPoolGroups());
-}
-
-std::set<PoolGroupIndex> CacheLevelStorage::offQuotaPoolGroups() const
-{
-    // Groups whose medium differs from the level's declared tier: a sparse life cycle's
-    // host-backed hot pages. The level's quota measures device bytes, which these do not
-    // consume, so they must not be sized from it -- nor inflate the minimum it has to meet.
-    std::set<PoolGroupIndex> out;
-    for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
-    {
-        if (mPoolGroups[pgIdx]->cacheTier() != cacheTier())
-        {
-            out.insert(pgIdx);
-        }
-    }
-    return out;
+    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -58,7 +58,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     PageIndexMode,
     ScratchDesc,
-    SelectionUnitLayout,
     _KVCache,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
@@ -570,9 +569,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             DeepseekV4AttentionType.INDEXER_COMPRESS,
         ]:
             block_size = self.compressed_block_sizes[layer_idx]
-        if self.impl.is_sparse(layer_id, data_role):
-            # Sparse page indices and their upper bound already count selection units.
-            block_size //= self.impl.get_sparse_cache_expansion(layer_id)
 
         attn_dim = get_attn_dim(
             self.head_dim, self.index_head_dim, self._compress_ratios[layer_idx], attn_type
@@ -636,8 +632,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             layer_id, COMPRESS_BLOCK_SCALE_ROLE
         )
         block_size = self.compressed_block_sizes[layer_idx]
-        if self.impl.is_sparse(layer_id, COMPRESS_BLOCK_SCALE_ROLE):
-            block_size //= self.impl.get_sparse_cache_expansion(layer_id)
         shape = (
             page_index_upper_bound,
             block_size,
@@ -658,8 +652,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
         scale_pages = self.impl.get_page_index_upper_bound(layer_id, COMPRESS_BLOCK_SCALE_ROLE)
         tokens_per_page = self.compressed_block_sizes[layer_idx]
-        if self.impl.is_sparse(layer_id, DeepseekV4AttentionType.COMPRESS.role):
-            tokens_per_page //= self.impl.get_sparse_cache_expansion(layer_id)
         data = convert_to_torch_tensor(
             TensorWrapper(
                 self.compress_pool_ptrs[compress_ratio],
@@ -1135,23 +1127,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             if topk is None or topk <= 0:
                 raise ValueError("Sparse compressed KV requires a positive index_topk")
 
-            # One selected row covers four original tokens. KVCM expands the per-row
-            # size back to a full storage block; the hot-page layout stays unchanged.
-            row_bytes = page_bytes // self.compressed_block_sizes[layer_idx]
+            # One selected row covers DEEPSEEK_V4_SPARSE_RATIO original tokens. `size` is
+            # the whole page, as for any other buffer; the sparse cache divides it.
+            # num_kv_heads is 1 here, so a row is one contiguous range and the default
+            # sparse_unit_chunks of 1 is right.
             return BufferConfig(
                 role=role,
-                size=row_bytes,
-                tokens_per_block_override=DEEPSEEK_V4_SPARSE_RATIO,
+                size=page_bytes,
                 is_sparse=True,
                 num_selected_blocks=topk,
                 # Retain history beyond the current selection and pin the in-flight row.
                 max_cached_units=2 * topk,
-                sparse_unit_layout=SelectionUnitLayout(
-                    num_chunks=1,
-                    chunk_bytes=row_bytes,
-                    chunk_stride=0,
-                    unit_stride=row_bytes,
-                ),
+                sparse_selection_unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
             )
 
         def _add_layer(
@@ -2007,8 +1994,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             role = DeepseekV4AttentionType.COMPRESS.role
             if not self.impl.is_sparse(layer_id, role):
                 raise ValueError(f"Layer {layer}'s COMPRESS buffer must be sparse")
-            expansion = self.impl.get_sparse_cache_expansion(layer_id)
-            if expansion <= 0 or self.tokens_per_block != expansion * DEEPSEEK_V4_SPARSE_RATIO:
+            units_per_page = self.impl.get_sparse_cache_units_per_page(layer_id)
+            if (
+                units_per_page <= 0
+                or self.tokens_per_block != units_per_page * DEEPSEEK_V4_SPARSE_RATIO
+            ):
                 raise ValueError("Sparse offload requires one compressed row per selection unit")
             buffers = []
             for buffer in layer_configs[layer_id].buffers:
@@ -2041,7 +2031,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     )
             sizes = {buffer.role: buffer.size for buffer in layer_configs[layer_id].buffers}
             group_id = self.impl.get_layer_group_id(layer_id)
-            reserved_units = (max_units_by_group[group_id] + expansion - 1) // expansion * expansion
+            reserved_units = (
+                (max_units_by_group[group_id] + units_per_page - 1)
+                // units_per_page
+                * units_per_page
+            )
             arena_bases = tuple(
                 self.impl.get_sparse_cache_base_address(buffer.layer_id, buffer.role)
                 for buffer in buffers

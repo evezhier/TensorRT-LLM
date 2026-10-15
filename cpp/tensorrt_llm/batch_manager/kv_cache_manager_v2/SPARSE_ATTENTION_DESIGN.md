@@ -2,17 +2,18 @@
 
 Target: the **decode instance of a disaggregated deployment**.
 
-This document describes one design. Where the code has not caught up, the text says so
-inline and *Migration state* below tracks it; everything else is in place.
-
 **Implemented**: the resolve, copy, index and flush-list kernels; `Batch`; the per-request
-reservation and device state; the write-back at `resize()`; `KVCacheManager.fetch_sparse_pages`.
+reservation and device state; the write-back at `resize()`; `fetch_sparse_pages` and
+`prepare_sparse_write_indices`; sparse buffers across more than one pool; sparsity as a pool
+attribute, so one layer may hold both sparse and dense buffers.
 
-**Pending** (see *Migration state*): compression is reachable but not turned on.
+**Pending**: compression is reachable but not turned on.
 
 Out of scope, by decision rather than by omission: prefill, which a separate instance serves,
-and speculative decoding — see *Supported scope*. Kernel fusion remains future work; so do
-multi-beam requests. `ISparseUnitGather` is retired — see *Extraction interface*.
+and speculative decoding — see *Supported scope*; and per-KV-head selection, which no
+per-`(request, layer)` resident set can express — see *Device-side cache*. Kernel fusion
+remains future work; so do multi-beam requests. `ISparseUnitGather` is retired — see
+*Extraction interface*.
 
 Read `AGENTS.md` in this directory first for the storage, locking and concurrency model
 this builds on.
@@ -45,7 +46,7 @@ Two existing properties make this cheap:
 | buffer | one layer's slice of a page; several coalesce into one page |
 | selection unit | what the backend selects; a factor of `tokens_per_block`, never larger |
 | in-flight | blocks above the watermark: written but not yet flushed |
-| expansion | selection units per page, `tokens_per_block / tokens_per_block_override` |
+| units per page | selection units a page holds, `tokens_per_block / sparse_selection_unit_tokens` |
 | pure history | a block whose ordinal is below the history watermark set by `resize()` |
 
 ## Scope
@@ -203,11 +204,9 @@ request while an attention kernel indexes its selection per query token; the two
 at one token each. This is the guard that keeps prefill and speculative decoding out — see
 *Supported scope* below.
 
-An earlier revision derived it from the reservation, as `(cells - selection_width) *
-unit_tokens`, which described what the cache *could* pin rather than what a step actually
-produces. Both readings reject the same accidents, but the derived one also admitted
-multi-token steps whenever the cache happened to be wide, which the fetch cannot serve at
-any width.
+It is one token rather than anything derived from the reservation's width. What the cache
+*could* pin says nothing about what a step produces: the fetch cannot serve a multi-token
+step at any width.
 
 The lease therefore depends on configuration alone. It is taken once at `resume()` and
 fails there if the arena is full, so the fetch path never has to handle exhaustion. Because
@@ -245,6 +244,14 @@ answer "which block does this page hold", and it has no answer.
 
 Per `(request, layer)`, managed entirely by kernels: a resident set, an LRU queue and a
 free list.
+
+**Scope is per `(request, layer)`, never per KV head.** Every head of a layer shares one
+resident set, because a selection unit is the tokens it spans across all of them. An
+algorithm that lets different heads select different units is not expressible here, and this
+is a real exclusion rather than a hypothetical: Rocket's selection indices are
+`[num_kv_heads, total_tokens]` and MiniMax-M3's are `[tokens, num_kv_heads, topk]` — both
+choose per head. Serving them would need a resident set per `(request, layer, head)`, which
+multiplies the metadata and the reservation by the head count.
 
 **Scope is per request.** Two requests sharing a prefix do not share a cached copy. This
 matches HiSparse and closes a soundness hole by construction: entries are reachable only
@@ -359,57 +366,54 @@ KVCM2 buffers are raw bytes with no layout information, so locating a selection 
 one requires the owner's knowledge. Two mechanisms, chosen per buffer, serving two
 different situations.
 
-### Fast path: a layout value
+### Declaring where a unit sits
 
-`SelectionUnitLayout` is fixed per buffer and consumed once at configuration, so it needs
-no dispatch and is not an interface. It is a value on `BufferConfig`:
+A unit is the tokens it spans across *every* KV head, so where its bytes sit follows from
+two numbers on `BufferConfig`, both consumed once at configuration:
 
 ```cpp
-struct SelectionUnitLayout {   // buffer-relative
-    uint32_t numChunks;      // one per head; 1 for token-major
-    uint32_t chunkBytes;     // contiguous bytes of one unit within one chunk
-    uint32_t chunkStride;    // distance between chunks
-    uint32_t unitStride;     // distance between units within a chunk
-};
+std::optional<int> sparseSelectionUnitTokens;  // unset: a unit is a whole page
+int sparseUnitChunks = 1;                      // pieces a unit is gathered from
 ```
 
-It is **buffer-relative and carries no page offset**, for an ordering reason: `BufferConfig`
-is an input to the `KVCacheManager` constructor, while cold-page placement is not decided
-until the codec's `configure()` runs *during* construction. A cold-page offset could not be
-supplied there. It is also the only part the model integration knows — the internal shape of
-its own buffer.
+`sparseUnitChunks` is the page's dimension order expressed as a count:
 
-KVCM2 supplies the rest, and **this is independent of the codec**. Both sides of the copy
-are hot-layout: the source is a hot page, whose buffer sits at `BufferAttr::offset` within
-its slot, and the destination is a cache cell holding one buffer's worth of the same
-structure. The copy is therefore symmetric, one set of strides on both sides, differing only
-in unit index:
+- **1** for a sequence-major page (`[token][head][dim]`), where a unit's tokens carry their
+  heads with them and the whole unit is one contiguous range. Also 1 for any single-head
+  page — a compressed or pooled latent — where the two orders are the same bytes.
+- **numHeads** for a head-major page (`[head][token][dim]`), where each head contributes
+  its own run and a unit is that many strided pieces.
+
+Everything else follows, because a page is densely packed:
 
 ```
-src = hotSlotBase  + bufferOffset + c*chunkStride + srcUnit*unitStride
-dst = cellBase                    + c*chunkStride + dstUnit*unitStride
+unitsPerPage = tokens_per_block / sparseSelectionUnitTokens
+chunkStride  = size / sparseUnitChunks
+chunkBytes   = size / (sparseUnitChunks * unitsPerPage)
+unitStride   = chunkBytes
 ```
 
-The destination stays in natural layout rather than being repacked, so the attention kernel
-sees exactly what it sees for an ordinary page.
+The four-field `SelectionUnitLayout` the copy kernel reads is derived from these at
+configuration, so the kernel is unchanged and the config surface is two integers. The
+derivation assumes dense packing, so a page with an alignment gap — between heads, or
+between units — is not expressible; no model in this repository has one.
 
-That the codec does not enter here is the point of putting sparse history on the hot tier.
-An earlier revision read *cold* pages, whose layout is the codec's concat order rather than
-KVCM2's, which coupled the fetch to the codec and made compression unreachable — see
-*Migration state*.
+**Why this is not `tokens_per_block_override`.** That knob reinterprets a buffer's page for
+*storage*, and stretches its public page index space by the same factor. Sparse selection
+needs only the cache's own granularity, so it gets its own field and leaves the buffer's
+pages, page indices and index space on the manager's `tokens_per_block`. Setting both on
+one buffer is rejected. `units per page` and `PageIndexConverter`'s `expansion` are
+distinct quantities: the sparse code says `unitsPerPage`, and `expansion` belongs to the
+index converter alone.
 
-| cold layout | numChunks | chunkBytes | chunkStride |
-| --- | --- | --- | --- |
-| token-major, contiguous | 1 | `unit_tokens * bytes_per_token` | — |
-| HND `[heads][tokens][dim]` | `num_heads` | `unit_tokens * dim * esize` | `tokens_per_block * dim * esize` |
-
-One region suffices because block-quantisation scales are registered as a separate
-`DataRole`, hence a separate buffer with its own layout, size and cache entries. A buffer
-packing data and scales together would need a region array; the symmetric form above extends
-to that without redesign.
-
-Worth asserting at configuration: `numChunks * chunkBytes == BufferConfig.size`, which is
-already per-unit (`expandedSize = buf.size * exp`).
+**What `sparseUnitChunks > 1` is for.** Every sparse model in the repository today passes 1:
+DeepSeek V4 asserts `num_kv_heads == 1`, and GLM's kpool, QSA's index-K and MiniMax's
+index-K are all single-head and sequence-major. The field earns its place on QSA, whose
+selection is shared across heads (its index-K has one head) while the buffer attention then
+gathers from is head-major with ordinary GQA heads — the one combination that needs strided
+units. Rocket and MiniMax-M3 under MSA are also head-major with several heads, but both
+select *per head*, which this cache excludes for a different reason (see *Device-side
+cache*); strided units would not rescue them.
 
 ### The gather interface, and why there isn't one
 
@@ -517,6 +521,28 @@ first, then the selection. An in-flight unit differs in exactly one way — a mi
 its cell but never joins the copy list, because its host page holds nothing to fetch until
 the watermark passes it.
 
+### Writing the in-flight unit
+
+The unit between the two watermarks is the one the model is about to produce. `fetch_sparse_pages`
+makes it resident and pins it, but never reported *where*, so nothing could write it.
+`prepare_sparse_write_indices` closes that: it runs the resolve with no selection and converts
+the in-flight slot into the same index space the fetch produces.
+
+It is a separate call because the orders differ. A fetch needs the selection, which the
+indexer computes from the previous layer's output; a write needs only the watermarks, so it
+can run first — which is the order the model requires. Idempotent while the watermarks hold:
+the resolve probes residency before taking a victim, so the fetch's own resolve finds the
+entry and reuses it.
+
+Nothing is fetched for it. An in-flight unit's host page is not written until the watermark
+passes it, so the resolve excludes in-flight ordinals from the copy list (`ordinal <
+historyUnits`) — copying would read stale bytes over what the model just wrote.
+
+`out` is `[batch][buffers]`, one entry per request: `resize` bounds `capacity - history_length`
+to a token, so at most one unit is in flight. `BAD_PAGE_INDEX` is an ordinary outcome rather
+than an error — with 4-token units a unit completes one step in four, which is also the only
+step on which a ratio-4 compressor has produced anything to write.
+
 ### Supported scope: one query token per request
 
 The fetch is a decode-phase call. It resolves **one selection per request**, while a sparse
@@ -618,11 +644,12 @@ second accessor rather than overloading the first. The consumer's side is otherw
 unchanged: one base, one index list, the expanded index space `PageIndexConverter` already
 produces.
 
-Note that `tokens_per_block_override` is only an index-conversion mechanism: it yields
-`expansion = tokens_per_block / tokens_per_block_override` and scales `BufferConfig.size`
-accordingly (`storage/config.cpp:174-178`, `storage/config.h:169`). Allocation, locking and
-migration remain on the global `tokens_per_block`. It defines the selection unit's size and
-index space, not its physical granularity.
+`tokens_per_block_override` plays no part in this. It is the index converter's own
+mechanism: it scales `BufferConfig.size` and stretches the buffer's public page index space
+by `expansion`, while allocation, locking and migration stay on the global
+`tokens_per_block`. It is rejected on a sparse buffer, which says what it means with
+`sparse_selection_unit_tokens` and leaves its index space alone. `unitsPerPage` and
+`expansion` are distinct quantities and the sparse code never uses the latter.
 
 ## Batch
 
@@ -681,8 +708,8 @@ so `N` is sized by one demand rather than two: retention wants
 Declared or planned in `tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi`:
 
 - `BufferConfig.is_sparse: bool`, `BufferConfig.num_selected_blocks: int`, the reservation
-  bound, and `BufferConfig.sparse_unit_layout: SelectionUnitLayout | None` —
-  construction-time, per buffer.
+  bound, `BufferConfig.sparse_selection_unit_tokens: int | None` and
+  `BufferConfig.sparse_unit_chunks: int` — construction-time, per buffer.
 - `KVCacheManager.is_sparse(layer_id, data_role) -> bool`.
 - `Batch` — membership, row order, device arrays, `resize()`, dirty-row publication.
 - `KVCacheManager.fetch_sparse_pages(batch, buffers, selected, out, stream)`.
@@ -701,12 +728,11 @@ Slot release is already level-aware: `Page::~Page()` releases with the page's ow
 `cacheLevel`, and the `kHotLevel` in `ScratchSlotLock::unlock()` is correct, since SWA
 prefill scratch is GPU-only by definition.
 
-- **`_lockHeldBlocks`'s level hazard is gone, and so is the machinery for it.** The OOM
-  rollback for `resize` re-locks at the hot level. That used to corrupt a sparse page table,
-  whose entries were level-1 ids — a failure-path-only bug that survives happy-path testing.
-  With every page locking at the hot level there is nothing to mismatch, so `queryLockLevel`,
-  `BatchedLockTarget::cacheLevel`, `StaleBackup::cacheLevel` and `residencyLevel` have been
-  removed rather than left returning a constant.
+- **`_lockHeldBlocks` carries no level hazard.** The OOM rollback for `resize` re-locks at
+  the hot level, which is where every buffer locks,
+  so a page table's entries and the level its pages lock at cannot disagree. Nothing carries
+  a per-target lock level: there is no `queryLockLevel`, no `BatchedLockTarget::cacheLevel`,
+  no `StaleBackup::cacheLevel` and no `residencyLevel`.
 - **`_unlockStaleBlocks` is not the flush hook.** It exists for SWA blocks outside the
   window, whose content is *dead*; sparse history is live and will be read. Same trigger and
   range arithmetic, different disposition — routing sparse layers through it drops the data
@@ -763,94 +789,62 @@ Buffers sharing a pool must still share a selection unit layout. A pool fixes a 
 but not how its units are strided within it, and the copy walks a run with one set of
 strides; the check is per run rather than per life cycle.
 
-## Migration state
+## Where sparse data lives
 
-The design above is the target. The code is partway there, and this section is the only
-place that distinguishes the two; everything else describes the target as settled.
+A sparse buffer's pages are ordinary hot pages that happen to be host memory, device-mapped
+so the fetch reads them without a host round trip. Cells come from a per-life-cycle arena,
+leased per request; the fetch reads hot pages at `BufferAttr::offset`.
 
-**Where the code stands.** Steps 1 to 3 are done: cells come from a per-life-cycle arena,
-a sparse life cycle's hot pool group is host memory, `residencyLevel`'s sparse branch and
-`kSparseHistoryLevel` are gone, and the fetch reads hot pages at `BufferAttr::offset`.
-Compression (step 4) is unblocked but not turned on.
+A sparse deployment places no requirement on its cold tiers. History is hot, so level 1 may
+be host, disk, or absent.
 
-**Why it moved.** The codec is not the level 0 -> level 1 transform; it is the
-**hot <-> cold** transform. `StorageManager::migrate` computes
-`srcIsHot = srcLevel == kHotLevel` and performs a plain byte copy when source and
-destination are on the same side, invoking the codec only across that boundary. History
-locked at a cold level never crossed it, so no codec ever ran on it -- compression was not
-deferred, it was unreachable. Two cold levels would not have helped, for the same reason.
+Memory kind is a property of the **pool**, not of the level and not of the life cycle. The
+GPU tier allocates a sparse pool from host memory and a dense one from device memory, in the
+same group; `AttnLifeCycle` carries no `isSparse`.
 
-| # | step | state |
-| --- | --- | --- |
-| 1 | Cells from a dedicated GPU arena, leased per request; flat cell arithmetic | **done** |
-| 2 | Sparse hot pool group backed by host memory; `residencyLevel` sparse branch retired | **done** |
-| 3 | Fetch reads hot pages at `BufferAttr::offset`; cold-page offset machinery gone | **done** |
-| 4 | Compression, through the existing codec, with nothing sparse-specific | **reachable** |
+A layer may therefore hold both a sparse buffer and a dense one, which is what a model
+wants: an indexer and the data it selects over are one attention computation and belong in
+one layer. Sparsity constrains pool formation and nothing above it, so two layers differing
+only in sparsity share a life cycle — one layer group, one page table in `Batch`.
 
-A sparse deployment now places no requirement on its cold tiers: history is on a host-backed
-*hot* pool group, so level 1 may be host, disk, or absent. An earlier revision required level
-1 to be `HOST_MEM`, which was where sparse history then resided; that validation is gone.
-
-Memory kind is a property of the **pool group**, not the level: `PoolGroupBase::cacheTier()`
-is virtual, `GpuCacheLevelStorage` builds a `HostPoolGroup` for the indices it is told are
-host-backed, and `migrate` dispatches the copy engine on `cacheTier(level, poolGroup)`. This
-is well defined because pool-group formation already keys on `isSparse`
-(`storage/config.cpp`), so a group is uniformly sparse or dense.
-
-Step 1 deleted sub-slot addressing rather than adapting it: it existed only because the
-storage allocator deals in coalesced slots, and carrying it into an arena that has none
-would have preserved a workaround for a constraint that no longer exists. `SparseCacheView`
-lost `cachePages` and `numPages` and gained `leaseIndex`; the copy and index kernels each lost
-a page lookup; and the arena pre-allocates the per-request metadata, so a resume no longer
-pairs a device allocation with a free.
+**The codec is the hot↔cold transform**, not the level 0 → level 1 one.
+`StorageManager::migrate` computes `srcIsHot = srcLevel == kHotLevel` and performs a plain
+byte copy when source and destination are on the same side, invoking the codec only across
+that boundary. Sparse history is hot, so it crosses that boundary on its way to a cold tier
+like any other page: compression needs nothing sparse-specific.
 
 The arena is sized from `constraints`, which already declares the batch shape `Batch` derives
-its rows from. That makes the cells a static reservation rather than an on-demand draw on the
-shared pool -- a change in kind, and the one the *Sizing* section assumed all along.
+its rows from, so the cells are a static reservation rather than an on-demand draw on the
+shared pool.
 
-### Sizing a host-backed pool group
+### Sizing a host-backed pool
 
-It is **off-quota**: excluded from the level's byte budget, and sized from its constraint
-floor instead.
+Sparsity is a property of a **pool**, not of a life cycle or of a pool group. A pool is
+uniformly sparse or uniformly dense, because buffer grouping keys on `(size, isSparse)`;
+the GPU tier allocates the sparse ones from host memory, device-mapped, and reports
+`GPU_MEM` for the group either way.
 
-A level's quota measures one medium. Once a hot pool group is host memory it consumes none
-of the device bytes that quota counts, so drawing it from there would cap sparse history at a
-GPU-sized number -- the opposite of the point -- while leaving those device bytes unallocated.
-Attributing it to a *host tier's* quota instead was considered and rejected: `cacheTiers` is
-a positional list, so "the host tier" may be several or none, and a hot pool group's size
-would then change when someone added or removed a cold tier that has nothing to do with it.
+That it reports GPU is sound because nothing reads the hot side's tier. The codec path keeps
+only `coldTier = srcIsHot ? dstTier : srcTier`, and the copy-engine path needs both ends
+hot, which never happens; host memory is device-accessible, so a mixed group needs no second
+tier.
 
-The floor is the right size because it already says what the deployment declared:
-`computePoolGroupMinSlotsFromConstraints` derives it from `constraints`' capacity and scales
-it by `1/maxUtilForResume`, so a deployment running at its declared shape does not trip the
-resume guard. Sparse history then tracks declared context length rather than device memory.
+**A sparse pool's bytes are excluded from the quota, and its slot count is free.** A slot is
+one row spanning every pool of its group, so once a group holds at least one device-backed
+pool, the quota sizes that pool and the sparse pools inherit the same row count. The quota
+therefore charges only the non-sparse pools — a sparse pool's size enters the computation as
+zero — and nothing else is needed.
 
-`CacheLevelStorage::offQuotaPoolGroups()` identifies them by the only thing that matters --
-a pool group whose medium differs from its level's declared tier -- so construction and the
-adaptive path (`adjustCacheLevel` -> `computeSlotCountList`) get the same answer without
-either being told. That mattered: excluding only at construction would have let the first
-runtime rebalance undo it.
+This is why a pool group must hold **at least one non-sparse pool**: a wholly sparse group
+would have no chargeable bytes per slot and so no slot count to derive. That is a validation,
+not a heuristic.
 
-**Headroom above the floor.** A floor with no slack means every page that leaves is an
-encode and every page that returns a decode, so an off-quota group is scaled above its floor
-by the slack the *on-quota* groups were given:
-
-```
-headroom = clamp(quota / on_quota_min_quota, 1, K)
-```
-
-The same generosity, applied to a medium the quota does not measure. It needs no new config,
-because the operator already expressed it once in the gap between `constraints` and `quota`.
-
-`K` is clamped for two reasons, and is **provisional**. The raw ratio is driven by that gap,
-and `constraints` is a floor people deliberately set low, so it reaches tens in practice; and
-an over-large host allocation has no backstop the way a device allocation has the device. The
-quantity that would justify a value is encode/decode volume measured against headroom, which
-is not observable until a codec is configured -- so the low end of the considered range was
-taken, and raising it is a one-constant change.
-
-With no on-quota groups at all -- every attention layer sparse -- there is no ratio to take,
-and the bound stands in for one.
+A level's quota measures one medium, which is why host-backed bytes cannot be drawn from it:
+they consume none of the device bytes it counts, so charging them would cap sparse history at
+a GPU-sized number — the opposite of the point — while leaving those device bytes
+unallocated. Attributing them to a *host tier's* quota instead was considered and rejected:
+`cacheTiers` is a positional list, so "the host tier" may be several or none, and a hot
+pool's size would then change when someone added a cold tier that has nothing to do with it.
 
 **Coverage of the data path.** `TestSparseDataPath` asserts the bytes themselves on both
 sides of the copy: a pattern written to a hot page must appear in the cell the fetch names,
@@ -898,14 +892,13 @@ Recorded because each looks like an open question and is not:
   because unflushed blocks are not in the radix tree, and bounded to one by
   `max_input_length`. Ordering between the rest still comes from LRU recency alone.
 - **No stale-key invalidation.** Per-request cache scope makes it impossible.
-- **`tokens_per_block_override` is not a granularity lever.** See *One pool, one index
-  space*.
+- **`tokens_per_block_override` is not the sparse granularity lever**, and is rejected on a
+  sparse buffer. `sparse_selection_unit_tokens` is — see *Extraction interface*.
 
 ## Resolved
 
-- **This *is* decode-only, deliberately.** An earlier revision assumed prefill and decode
-  shared one manager, and sized the in-flight headroom for a whole prefill chunk. That was
-  wrong in kind, not in size: a sparse kernel indexes its selection per query token, and a
+- **This *is* decode-only, deliberately.** Sharing one manager between prefill and decode
+  is wrong in kind, not in size: a sparse kernel indexes its selection per query token, and a
   multi-token step's selections cannot all be made resident in one per-request cache. The
   decode instance of a disaggregated deployment is the supported target; see *Supported
   scope*.

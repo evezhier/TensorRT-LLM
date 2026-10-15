@@ -100,8 +100,8 @@ class CacheLevelManager
 public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
-        std::set<PoolGroupIndex> const& hostBacked = {});
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
+        PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
 
     // Compute pool size granularity for a given cache tier and quota.
     static size_t cacheTierGranularity(CacheTier tier, size_t quota);
@@ -312,6 +312,10 @@ public:
     //! on this, since it chooses the copy direction.
     CacheTier cacheTier(CacheLevel level, PoolGroupIndex pgIdx) const;
 
+    //! Whether this pool's pages are host memory rather than its tier's own medium: true
+    //! for a sparse pool of the GPU tier, which the sparse cache reads through.
+    [[nodiscard]] bool isSparsePool(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.
@@ -368,15 +372,13 @@ private:
         TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
         TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
-    //! `offQuota` names pool groups sized from their constraint floor rather than from
-    //! this level's quota -- a sparse life cycle's host-backed hot pages.
+    //! `slotSizeLists` omits sparse pools: their pages are host memory and are not charged
+    //! to this level's quota.
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-        std::set<PoolGroupIndex> const& offQuota = {}) const;
+        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-        std::set<PoolGroupIndex> const& offQuota = {}) const;
+        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
     // Internal helpers.
     // Register the slot descriptors for the next cache level and derive its slot-size table.
