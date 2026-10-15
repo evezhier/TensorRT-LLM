@@ -1058,9 +1058,9 @@ class KVCacheManager:
         :meth:`prepare_sparse_write_indices` before the model's KV writes to obtain its
         per-buffer physical write indices independently of the selection.
 
-        ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the
-        ``GPU_LEVEL`` index holding ``selected[b][k]`` for ``buffers[i]``, and
-        ``BAD_PAGE_INDEX`` where that slot carries no selection. Padding stays where the
+        ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the cache
+        index holding ``selected[b][k]`` for ``buffers[i]``, and ``BAD_PAGE_INDEX`` where
+        that slot carries no selection. Padding stays where the
         selection put it rather than being packed out, so slot ``k`` of ``out`` and slot
         ``k`` of ``selected`` describe the same unit.
 
@@ -1077,7 +1077,12 @@ class KVCacheManager:
         each buffer its own contiguous run of cells, so one selection resolves to a
         different index per buffer, and each needs its own row.
 
-        Indices are in the expanded index space :class:`PageIndexConverter` produces.
+        Indices are in the expanded index space :class:`PageIndexConverter` produces, and
+        are relative to :meth:`get_sparse_cache_base_address` for the buffer they were
+        fetched for -- **not** to :meth:`get_mem_pool_base_address`, and not to a cache
+        level. The pool names the buffer's pages, which for a sparse life cycle are host
+        memory; the cells a kernel reads live in a separate GPU arena, with a region per
+        pool. Pairing these indices with the pool base reads the wrong allocation.
 
         The selection is per layer, not per KV head: every head of a layer shares one
         resident set. Algorithms that let different KV heads select different units are

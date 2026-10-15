@@ -219,6 +219,10 @@ public:
     //! expanded index space getPageIndexConverter() produces: entry k is the index holding
     //! `selected[row][k]`, or kBadPageIndex where that slot carries no selection.
     //!
+    //! Relative to getSparseCacheBaseAddress() for the buffer, not getMemPoolBaseAddress()
+    //! and not a cache level: the pool names the buffer's pages, which are host memory for a
+    //! sparse life cycle, while the cells a kernel reads live in the arena.
+    //!
     //! Compact, in the selection's own order, rather than a table indexed by unit ordinal,
     //! because that is the shape sparse attention kernels take. See
     //! SPARSE_ATTENTION_DESIGN.md's "Fetch".

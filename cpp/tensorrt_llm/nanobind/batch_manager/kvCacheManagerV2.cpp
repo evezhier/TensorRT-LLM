@@ -2754,6 +2754,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "written in full in the expanded index space: entry k is the index holding "
             "selected[b][k], or BAD_PAGE_INDEX where that slot carries no selection. Compact, in "
             "the selection's own order, because that is the shape sparse attention kernels take.\n\n"
+            "Indices are relative to get_sparse_cache_base_address for the buffer, not to "
+            "get_mem_pool_base_address and not to a cache level: the pool names the buffer's "
+            "pages, which are host memory for a sparse life cycle, while the cells a kernel "
+            "reads live in the arena.\n\n"
             "Device-driven and stream-ordered: enqueues and returns, and every shape is static, "
             "so a CUDA graph can capture it.")
         .def(
