@@ -58,6 +58,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     PageIndexMode,
     ScratchDesc,
+    SparseCacheConfig,
     _KVCache,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
@@ -1124,22 +1125,20 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     "Sparse fp8_ds_mla compressed KV requires a selection layout with "
                     "separate data and footer-scale regions"
                 )
+            # `size` is the whole page, as for any other buffer; the layer's sparse_cache
+            # says how many selection units it divides into. num_kv_heads is 1 here, so a
+            # unit is one contiguous range and the default sparse_unit_chunks of 1 is right.
+            return BufferConfig(role=role, size=page_bytes, is_sparse=True)
+
+        def _sparse_cache_config() -> SparseCacheConfig:
             topk = self._sparse_offload_topk
             if topk is None or topk <= 0:
                 raise ValueError("Sparse compressed KV requires a positive index_topk")
-
-            # One selected row covers DEEPSEEK_V4_SPARSE_RATIO original tokens. `size` is
-            # the whole page, as for any other buffer; the sparse cache divides it.
-            # num_kv_heads is 1 here, so a row is one contiguous range and the default
-            # sparse_unit_chunks of 1 is right.
-            return BufferConfig(
-                role=role,
-                size=page_bytes,
-                is_sparse=True,
+            return SparseCacheConfig(
                 num_selected_blocks=topk,
-                # Retain history beyond the current selection and pin the in-flight row.
+                # Retain history beyond the current selection and pin the in-flight unit.
                 max_cached_units=2 * topk,
-                sparse_selection_unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
+                unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
             )
 
         def _add_layer(
@@ -1147,8 +1146,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             attention_types: List[DeepseekV4AttentionType],
             sliding_window_size: int | None,
             *,
-            is_sparse: bool = False,
+            sparse_roles: frozenset[DeepseekV4AttentionType] = frozenset(),
         ) -> None:
+            # Sparsity is per buffer, so one layer may hold the compressed KV the cache
+            # fetches through beside the indexer that selects over it -- they are one
+            # attention computation and belong together.
+            def _is_sparse(attn_type: DeepseekV4AttentionType) -> bool:
+                return attn_type in sparse_roles
+
             layer_id = LayerId(len(layers))
             for attn_type in attention_types:
                 layer_attn_to_layer_id[layer_idx, attn_type] = layer_id
@@ -1160,7 +1165,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             for attn_type in attention_types:
                 size = self._get_attn_bytes_per_block(attn_type, layer_idx)
                 buffers.append(
-                    _make_buffer_config(layer_idx, attn_type.role, size, is_sparse=is_sparse)
+                    _make_buffer_config(
+                        layer_idx, attn_type.role, size, is_sparse=_is_sparse(attn_type)
+                    )
                 )
             if self._use_nvfp4_compress and DeepseekV4AttentionType.COMPRESS in attention_types:
                 scale_page_size = (
@@ -1173,7 +1180,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                         layer_idx,
                         COMPRESS_BLOCK_SCALE_ROLE,
                         scale_page_size,
-                        is_sparse=is_sparse,
+                        is_sparse=_is_sparse(DeepseekV4AttentionType.COMPRESS),
                     )
                 )
                 # Reuse snapshots copy complete coalesced slots in 16-byte
@@ -1193,13 +1200,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                                 layer_idx,
                                 data_padding_role,
                                 data_page_size,
-                                is_sparse=is_sparse,
+                                is_sparse=_is_sparse(DeepseekV4AttentionType.COMPRESS),
                             ),
                             _make_buffer_config(
                                 layer_idx,
                                 scale_padding_role,
                                 scale_page_size,
-                                is_sparse=is_sparse,
+                                is_sparse=_is_sparse(DeepseekV4AttentionType.COMPRESS),
                             ),
                         ]
                     )
@@ -1209,6 +1216,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 buffers=buffers,
                 sliding_window_size=sliding_window_size,
                 num_sink_tokens=None,
+                sparse_cache=_sparse_cache_config() if sparse_roles else None,
             )
             layers.append(layer_config)
 
@@ -1227,18 +1235,21 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     [DeepseekV4AttentionType.SWA],
                     self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
                 )
-                if self._enable_kv_cache_offload:
-                    _add_layer(layer, [DeepseekV4AttentionType.COMPRESS], None, is_sparse=True)
-                    _add_layer(layer, [DeepseekV4AttentionType.INDEXER_COMPRESS], None)
-                else:
-                    _add_layer(
-                        layer,
-                        [
-                            DeepseekV4AttentionType.COMPRESS,
-                            DeepseekV4AttentionType.INDEXER_COMPRESS,
-                        ],
-                        None,
-                    )
+                # One layer either way. Only the compressed KV is fetched through the
+                # sparse cache; the indexer that selects over it stays device-resident.
+                _add_layer(
+                    layer,
+                    [
+                        DeepseekV4AttentionType.COMPRESS,
+                        DeepseekV4AttentionType.INDEXER_COMPRESS,
+                    ],
+                    None,
+                    sparse_roles=(
+                        frozenset({DeepseekV4AttentionType.COMPRESS})
+                        if self._enable_kv_cache_offload
+                        else frozenset()
+                    ),
+                )
                 _add_layer(
                     layer,
                     [
@@ -1975,13 +1986,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         sparse_pool_buffers: dict[tuple[LayerGroupId, int], list[BufferId]] = defaultdict(list)
         max_units_by_group: dict[LayerGroupId, int] = defaultdict(int)
         for layer_config in layer_configs.values():
+            cache = layer_config.sparse_cache
+            if cache is None:
+                continue
             group_id = self.impl.get_layer_group_id(layer_config.layer_id)
             for buffer in layer_config.buffers:
-                if buffer.is_sparse and buffer.max_cached_units > 0:
+                if buffer.is_sparse:
                     buffer_id = BufferId(layer_config.layer_id, buffer.role)
                     sparse_pool_buffers[group_id, pool_indices[buffer_id]].append(buffer_id)
                     max_units_by_group[group_id] = max(
-                        max_units_by_group[group_id], buffer.max_cached_units
+                        max_units_by_group[group_id], cache.max_cached_units
                     )
         arena_layouts = {
             buffer_id: (len(buffers), position)
@@ -2001,20 +2015,22 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 or self.tokens_per_block != units_per_page * DEEPSEEK_V4_SPARSE_RATIO
             ):
                 raise ValueError("Sparse offload requires one compressed row per selection unit")
-            buffers = []
-            for buffer in layer_configs[layer_id].buffers:
-                if not buffer.is_sparse:
-                    raise ValueError(
-                        "Sparse COMPRESS must have a separate lifecycle from ordinary cache buffers"
-                    )
-                if (
-                    buffer.max_cached_units <= 0
-                    or buffer.num_selected_blocks != self._sparse_offload_topk
-                ):
-                    raise ValueError(
-                        "Sparse buffers must configure the runtime's selection width and cache capacity"
-                    )
-                buffers.append(BufferId(layer_id, buffer.role))
+            # A layer holds the compressed KV beside the indexer that selects over it, so
+            # take only the sparse buffers: the dense ones are not fetched through the cache.
+            cache = layer_configs[layer_id].sparse_cache
+            if (
+                cache is None
+                or cache.max_cached_units <= 0
+                or (cache.num_selected_blocks != self._sparse_offload_topk)
+            ):
+                raise ValueError(
+                    "A sparse layer must configure the runtime's selection width and cache capacity"
+                )
+            buffers = [
+                BufferId(layer_id, buffer.role)
+                for buffer in layer_configs[layer_id].buffers
+                if buffer.is_sparse
+            ]
             if BufferId(layer_id, role) not in buffers:
                 raise ValueError(f"Layer {layer}'s sparse buffers must include COMPRESS")
             buffers.sort(key=pool_indices.__getitem__)
@@ -2067,14 +2083,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 padding_regions=tuple(padding_regions),
             )
 
-        sparse_groups = {descriptor.group_id for descriptor in descriptors.values()}
-        for (layer, attn_type), layer_id in self._layer_attn_to_layer_id.items():
-            if layer in descriptors and attn_type == DeepseekV4AttentionType.COMPRESS:
-                continue
-            if self.impl.get_layer_group_id(layer_id) in sparse_groups:
-                raise ValueError(
-                    "Sparse COMPRESS must have a separate lifecycle from ordinary cache buffers"
-                )
         return descriptors
 
     def _initialize_sparse_arena_buffers(

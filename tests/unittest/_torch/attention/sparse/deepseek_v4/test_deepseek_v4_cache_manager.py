@@ -69,6 +69,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     PageIndexMode,
+    SparseCacheConfig,
     _introspection,
 )
 
@@ -97,16 +98,11 @@ class _SparseRuntime:
         self.layers[layer_id] = AttentionLayerConfig(
             layer_id=layer_id,
             buffers=[
-                BufferConfig(
-                    role=role,
-                    size=1024,
-                    tokens_per_block_override=4,
-                    is_sparse=True,
-                    num_selected_blocks=8,
-                    max_cached_units=16,
-                )
-                for role, _ in roles_and_pools
+                BufferConfig(role=role, size=1024, is_sparse=True) for role, _ in roles_and_pools
             ],
+            sparse_cache=SparseCacheConfig(
+                num_selected_blocks=8, max_cached_units=16, unit_tokens=4
+            ),
         )
         for role, pool in roles_and_pools:
             self.pool_indices[BufferId(layer_id, role)] = pool
@@ -213,7 +209,9 @@ def test_sparse_offload_descriptors_use_runtime_ids(tokens_per_block):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "invalid",
-    ["expansion", "ordinary_group", "not_sparse", "unconfigured", "width", "mixed", "footer"],
+    # "mixed" is gone: a dense buffer beside a sparse one in the same layer is the
+    # supported shape, since only the sparse ones are fetched through the cache.
+    ["expansion", "ordinary_group", "not_sparse", "unconfigured", "width", "footer"],
 )
 def test_sparse_offload_rejects_incompatible_layout(invalid):
     manager = _manager()
@@ -227,16 +225,28 @@ def test_sparse_offload_rejects_incompatible_layout(invalid):
         manager.use_fp8_ds_mla = True
     else:
         config = manager.impl.layers[41]
-        buffers = config.buffers
         if invalid == "unconfigured":
-            buffers[0].max_cached_units = 0
+            config.sparse_cache = None
         elif invalid == "width":
-            buffers[0].num_selected_blocks += 1
-        else:
-            buffers.append(BufferConfig(role="ordinary", size=16))
-        config.buffers = buffers
+            cache = config.sparse_cache
+            cache.num_selected_blocks += 1
+            config.sparse_cache = cache
     with pytest.raises((ValueError, NotImplementedError)):
         manager.get_sparse_offload_descriptors()
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_accepts_a_dense_buffer_in_a_sparse_layer():
+    """An indexer sits beside the data it selects over; only the latter is fetched."""
+    manager = _manager()
+    config = manager.impl.layers[41]
+    buffers = config.buffers
+    buffers.append(BufferConfig(role="ordinary", size=16))
+    config.buffers = buffers
+    descriptors = manager.get_sparse_offload_descriptors()
+    assert descriptors
+    roles = {b.role for d in descriptors.values() for b in d.buffer_ids}
+    assert "ordinary" not in roles
 
 
 @pytest.mark.cpu_only
@@ -279,8 +289,10 @@ def test_sparse_arena_padding_initialization_covers_all_leases(row_sizes, max_un
         buffers = layer.buffers
         for buffer in buffers:
             buffer.size = row_sizes["scale" in buffer.role]
-            buffer.max_cached_units = max_units if layer.layer_id == 19 else 16
         layer.buffers = buffers
+        cache = layer.sparse_cache
+        cache.max_cached_units = max_units if layer.layer_id == 19 else 16
+        layer.sparse_cache = cache
     expansion = manager.tokens_per_block // 4
     rows = (max_units + expansion - 1) // expansion * expansion
     # Native constraints reserve six leases even though the runtime's batch limit
@@ -335,10 +347,9 @@ def test_sparse_arena_views_use_pool_capacity_and_share_storage(cache_dtype, max
         19, [(main, 1)] + ([(scale, 0)] if manager._use_nvfp4_compress else [])
     )
     config = manager.impl.layers[19]
-    buffers = config.buffers
-    for buffer in buffers:
-        buffer.max_cached_units = max_units
-    config.buffers = buffers
+    cache = config.sparse_cache
+    cache.max_cached_units = max_units
+    config.sparse_cache = cache
     manager.impl.get_sparse_cache_base_address = lambda layer, role: (
         8192 if "scale" in role else 4096
     )
@@ -400,8 +411,9 @@ def test_compress_storage_views_match_allocation_size(
     manager.impl.get_mem_pool_base_address = Mock(
         side_effect=lambda layer, role, mode: addresses[role]
     )
-    expansion = tokens_per_block // 4 if sparse else 1
-    manager.impl.get_page_index_upper_bound = Mock(return_value=3 * expansion)
+    # A sparse buffer no longer stretches its page index space, so the bound is pages
+    # either way and a page still holds compressed_block_size rows.
+    manager.impl.get_page_index_upper_bound = Mock(return_value=3)
     manager.compress_pool_ptrs = {4: addresses[main]}
     manager.compress_scale_pool_ptrs = {4: addresses[scale]}
     with patch.object(
@@ -413,10 +425,10 @@ def test_compress_storage_views_match_allocation_size(
         scales = manager.get_compress_scale_buffers(2)
         flat_data, flat_scales = manager.get_compress_pool_buffers(4)
 
-    rows_per_page = 1 if sparse else tokens_per_block // 4
+    rows_per_page = tokens_per_block // 4
     storage_dim = manager.head_dim + residual_dim
-    assert data.shape == (3 * expansion, rows_per_page, storage_dim // 2)
-    assert scales.shape == (3 * expansion, rows_per_page, storage_dim // 16)
+    assert data.shape == (3, rows_per_page, storage_dim // 2)
+    assert scales.shape == (3, rows_per_page, storage_dim // 16)
     assert data.dtype == torch.uint8
     assert scales.dtype == torch.float8_e4m3fn
     assert data.numel() == flat_data.numel() == 3 * (tokens_per_block // 4) * storage_dim // 2
@@ -1191,12 +1203,10 @@ def test_sparse_offload_cache_roles(
     assert result.tokens_per_block == tokens_per_block
     assert len(result.layers) == manager._num_manager_layers
     for layer in result.layers:
-        assert len({buffer.is_sparse for buffer in layer.buffers}) == 1
         for buffer in layer.buffers:
             if not buffer.is_sparse:
                 assert buffer.tokens_per_block_override is None
-                assert buffer.num_selected_blocks == buffer.max_cached_units == 0
-                assert buffer.sparse_unit_layout is None
+                assert buffer.sparse_unit_chunks == 1
     layers = {layer.layer_id: layer for layer in result.layers}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
         assert model_layer in pp_layers
@@ -1218,28 +1228,25 @@ def test_sparse_offload_cache_roles(
                 role_buffer = next(b for b in layers[layer_id].buffers if b.role == role)
                 if enabled and ratio == 4:
                     assert role_buffer.is_sparse
-                    assert role_buffer.tokens_per_block_override == 4
-                    assert role_buffer.size == row_bytes
-                    assert role_buffer.num_selected_blocks == index_topk
-                    assert role_buffer.max_cached_units == 2 * index_topk
-                    layout = role_buffer.sparse_unit_layout
-                    assert layout is not None
-                    assert layout.num_chunks == 1
-                    assert layout.chunk_bytes == layout.unit_stride == row_bytes
-                    assert layout.chunk_stride == 0
-                    # Both ends of the copy preserve the full compressed-page footprint.
-                    assert (compressed_rows - 1) * layout.unit_stride + layout.chunk_bytes == (
-                        compressed_rows * row_bytes
-                    )
-                    expansion = tokens_per_block // role_buffer.tokens_per_block_override
-                    assert role_buffer.size * expansion == compressed_rows * row_bytes
+                    # A sparse buffer's size is its whole page, as for any other buffer;
+                    # the layer's sparse_cache says how many units it divides into.
+                    assert role_buffer.tokens_per_block_override is None
+                    assert role_buffer.sparse_unit_chunks == 1
+                    assert role_buffer.size == compressed_rows * row_bytes
+                    cache = layers[layer_id].sparse_cache
+                    assert cache is not None
+                    assert cache.num_selected_blocks == index_topk
+                    assert cache.max_cached_units == 2 * index_topk
+                    assert cache.unit_tokens == 4
                 else:
                     assert role_buffer.size == compressed_rows * row_bytes
             if ratio == 4:
                 indexer_layer_id = manager._layer_attn_to_layer_id[
                     model_layer, DeepseekV4AttentionType.INDEXER_COMPRESS
                 ]
-                assert (layer_id != indexer_layer_id) is enabled
+                # COMPRESS and INDEXER_COMPRESS are one layer either way: they are one
+                # attention computation, and only the first is fetched through the cache.
+                assert layer_id == indexer_layer_id
 
 
 @pytest.mark.cpu_only
