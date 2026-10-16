@@ -883,16 +883,20 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         "larger cache keeps more history on the GPU between decode steps, so "
         "fewer units are fetched from host memory, at the cost of GPU memory per "
         "request.")
-    host_cache_size: Optional[NonNegativeInt] = Field(
+    host_history_size: Optional[NonNegativeInt] = Field(
         default=None,
         status="prototype",
         description=
-        "Host memory in bytes, per rank, that offloaded attention history may "
-        "take. Its pages share slots with the GPU KV cache pools, so the GPU KV "
-        "cache quota is lowered when needed to stay within it. When unset, it "
+        "Pinned host memory in bytes, per rank, for offloaded attention history "
+        "and the staging buffers that publish it to the GPU. History pages share "
+        "slots with the GPU KV cache pools, so the GPU KV cache quota is lowered "
+        "when needed to stay within it. It is separate from "
+        "kv_cache_config.host_cache_size, the host tier that evicted KV cache "
+        "pages move to, and the two together must fit this rank's share of "
+        "available host memory and the pinned-memory limit. When unset, it "
         "holds max_batch_size requests at kv_cache_config.avg_seq_len, or "
-        "max_seq_len when that is unset, capped by available host memory and "
-        "the pinned-memory limit.")
+        "max_seq_len when that is unset, capped by the host memory automatic "
+        "sizing may pin.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):

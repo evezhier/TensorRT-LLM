@@ -25,6 +25,9 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     cache_manager as deepseek_v4_cache,
 )
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.offload import (
+    SparseOffloadPaddingRegion,
+)
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
@@ -63,6 +66,7 @@ from tensorrt_llm.llmapi.llm_args import (
     DeepSeekV4SparseAttentionConfig,
     DraftTargetDecodingConfig,
     KvCacheConfig,
+    MTPDecodingConfig,
     SparseKvCacheOffloadConfig,
 )
 from tensorrt_llm.mapping import Mapping
@@ -278,6 +282,38 @@ def test_sparse_offload_descriptors_include_all_roles_in_native_order():
     assert descriptor.scale_buffer_index == 0
 
 
+@pytest.mark.cpu_only
+def test_sparse_offload_padding_regions_hold_units_not_pages():
+    manager = _manager()
+    manager._use_nvfp4_compress = True
+    main = DeepseekV4AttentionType.COMPRESS.role
+    scale = deepseek_v4_cache.COMPRESS_BLOCK_SCALE_ROLE
+    manager.impl.configure_buffers(
+        41, [(main, 1), (scale, 0), ("scale_padding", 0), ("data_padding", 1)]
+    )
+    manager.impl.configure_buffers(19, [(main, 1), (scale, 0)])
+    units_per_page = manager.tokens_per_block // 4
+    for layer in manager.impl.layers.values():
+        buffers = layer.buffers
+        for buffer in buffers:
+            # A sparse buffer's size is a whole page of 288-byte rows, or 36-byte scales.
+            buffer.size = (36 if "scale" in buffer.role else 288) * units_per_page
+        layer.buffers = buffers
+
+    descriptor = manager.get_sparse_offload_descriptors()[2]
+
+    # Sixteen cached units round up to one page of 32, and every lease holds one
+    # region per buffer of the pool: three here, the padding role second.
+    assert descriptor.padding_regions == tuple(
+        SparseOffloadPaddingRegion(
+            base_address=manager.impl.get_sparse_cache_base_address(41, role) + 32 * row_bytes,
+            bytes_per_lease=32 * row_bytes,
+            lease_stride=3 * 32 * row_bytes,
+        )
+        for role, row_bytes in (("scale_padding", 36), ("data_padding", 288))
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("row_sizes", [(256, 32), (288, 36)])
 @pytest.mark.parametrize("max_units", [16, 65])
@@ -292,15 +328,16 @@ def test_sparse_arena_padding_initialization_covers_all_leases(row_sizes, max_un
         41, [(main, 1), (scale, 0), ("scale_padding", 0), ("data_padding", 1)]
     )
     manager.impl.configure_buffers(19, [(main, 1), (scale, 0)])
+    expansion = manager.tokens_per_block // 4
     for layer in manager.impl.layers.values():
         buffers = layer.buffers
         for buffer in buffers:
-            buffer.size = row_sizes["scale" in buffer.role]
+            # A sparse buffer's size is a whole page of rows.
+            buffer.size = row_sizes["scale" in buffer.role] * expansion
         layer.buffers = buffers
         cache = layer.sparse_cache
         cache.max_cached_units = max_units if layer.layer_id == 19 else 16
         layer.sparse_cache = cache
-    expansion = manager.tokens_per_block // 4
     rows = (max_units + expansion - 1) // expansion * expansion
     # Native constraints reserve six leases even though the runtime's batch limit
     # in this fixture is four. Two model buffers and one padding buffer share each pool.
@@ -3702,6 +3739,29 @@ def test_sparse_offload_rejects_kv_pool_rebalance() -> None:
             vocab_size=128,
             mapping=Mapping(),
             sparse_attn_config=sparse_config,
+        )
+
+    initialize_cache.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_rejects_speculative_decoding() -> None:
+    sparse_config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+    with (
+        patch.object(deepseek_v4_cache.KVCacheManagerV2, "__init__") as initialize_cache,
+        pytest.raises(ValueError, match="does not support speculative decoding"),
+    ):
+        DeepseekV4CacheManager(
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+            kv_cache_type=CacheTypeCpp.SELFKONLY,
+            num_layers=len(sparse_config.compress_ratios),
+            max_batch_size=1,
+            tokens_per_block=128,
+            max_seq_len=256,
+            vocab_size=128,
+            mapping=Mapping(),
+            sparse_attn_config=sparse_config,
+            spec_config=MTPDecodingConfig(max_draft_len=1),
         )
 
     initialize_cache.assert_not_called()

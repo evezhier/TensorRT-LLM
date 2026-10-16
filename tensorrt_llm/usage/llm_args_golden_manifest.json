@@ -1410,7 +1410,7 @@
     {
       "capture_policy": "int|none",
       "kind": "value",
-      "path": "sparse_attention_config.kv_cache_offload_config.host_cache_size"
+      "path": "sparse_attention_config.kv_cache_offload_config.host_history_size"
     },
     {
       "capture_policy": "int|none",

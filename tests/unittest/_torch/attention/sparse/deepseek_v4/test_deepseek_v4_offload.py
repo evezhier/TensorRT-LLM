@@ -397,6 +397,50 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams():
 
 
 @pytest.mark.cpu_only
+def test_paired_write_check_needs_a_live_row():
+    manager = _manager()
+    descriptor = SimpleNamespace(data_buffer_index=2, scale_buffer_index=0)
+    idle = torch.full((4, 4), -1, dtype=torch.int32)
+
+    # Rows nothing writes to prove nothing, so the layer stays unchecked.
+    manager._check_paired_write_indices(idle, descriptor, 2)
+    assert manager._paired_write_layers == frozenset()
+    paired = idle.clone()
+    paired[0, [0, 2]] = 77
+    paired[0, 1] = 5  # A padding role has rows of its own.
+    manager._check_paired_write_indices(paired, descriptor, 2)
+    assert manager._paired_write_layers == {2}
+    assert _manager()._paired_write_layers == frozenset()
+    torn = paired.clone()
+    torn[0, 0] = 78
+    with pytest.raises(RuntimeError, match="layer 4: .* different arena rows"):
+        manager._check_paired_write_indices(torn, descriptor, 4)
+
+
+@_requires_cuda
+def test_compressor_writes_check_once_that_scales_share_the_data_row():
+    case = _fetch_case(multiple_roles=True)
+    descriptor = case.state.layers[2]
+    scale_row = {"value": 77}
+
+    def prepare(*, batch, buffers, out, stream):
+        out.fill_(-1)
+        out[0, descriptor.data_buffer_index] = 77
+        out[0, descriptor.scale_buffer_index] = scale_row["value"]
+
+    case.manager.impl.prepare_sparse_write_indices = prepare
+    case.manager.prepare_sparse_compressor_write_indices(case.state, 2)
+    assert case.manager._paired_write_layers == {2}
+    # A checked layer's indices are not read back on the host again.
+    scale_row["value"] = 78
+    with patch.object(torch.Tensor, "tolist", side_effect=AssertionError("host read")):
+        case.manager.prepare_sparse_compressor_write_indices(case.state, 2)
+    case.manager._paired_write_layers = frozenset()
+    with pytest.raises(RuntimeError, match="different arena rows"):
+        case.manager.prepare_sparse_compressor_write_indices(case.state, 2)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("nvfp4", [False, True])
 def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4):
     manager = _manager()

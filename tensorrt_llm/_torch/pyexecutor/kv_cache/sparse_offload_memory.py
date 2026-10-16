@@ -40,7 +40,7 @@ policy; and the capacity report and host admission.
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Sequence
 
@@ -277,6 +277,9 @@ class LifeCyclePage:
             as SSM layers do, rather than pages of tokens.
         device_bytes: Bytes of its dense buffers, which the device quota pays for.
         host_bytes: Bytes of its sparse buffers, which live in pinned host memory.
+        device_pool_bytes: Slot bytes of each device-backed pool, largest first.
+            The native manager gives a life cycle's dense buffers of one page
+            size a pool of their own, so these sum to ``device_bytes``.
     """
 
     window_size: int | None
@@ -284,6 +287,7 @@ class LifeCyclePage:
     is_state: bool
     device_bytes: int
     host_bytes: int
+    device_pool_bytes: tuple[int, ...]
 
     def pages_per_request(
         self, *, capacity: int, capacity_headroom: int, tokens_per_block: int
@@ -319,7 +323,7 @@ def life_cycle_pages(layers: Sequence[LayerConfig], tokens_per_block: int) -> li
             rejects such a life cycle too.
     """
     keys: list[tuple] = []
-    device_bytes: dict[tuple, int] = {}
+    device_pages: dict[tuple, Counter[int]] = {}
     host_bytes: dict[tuple, int] = {}
     pages: dict[tuple, tuple[int | None, int, bool]] = {}
     for layer in layers:
@@ -334,17 +338,20 @@ def life_cycle_pages(layers: Sequence[LayerConfig], tokens_per_block: int) -> li
         if key not in pages:
             keys.append(key)
             pages[key] = shape
-            device_bytes[key] = 0
+            device_pages[key] = Counter()
             host_bytes[key] = 0
         for buffer in layer.buffers:
             if buffer.is_sparse:
                 host_bytes[key] += buffer.size
-            else:
+            elif buffer.size:
                 override = buffer.tokens_per_block_override or tokens_per_block
-                device_bytes[key] += buffer.size * (tokens_per_block // override)
+                device_pages[key][buffer.size * (tokens_per_block // override)] += 1
     result = []
     for key in keys:
-        if host_bytes[key] and not device_bytes[key]:
+        device_pool_bytes = tuple(
+            sorted((size * count for size, count in device_pages[key].items()), reverse=True)
+        )
+        if host_bytes[key] and not device_pool_bytes:
             raise ValueError(
                 "A life cycle with sparse buffers must also hold a dense buffer: the native "
                 "KV cache manager sizes a pool group's slots from its device-backed pools."
@@ -355,8 +362,9 @@ def life_cycle_pages(layers: Sequence[LayerConfig], tokens_per_block: int) -> li
                 window_size=window,
                 num_sink_tokens=sink_tokens,
                 is_state=is_state,
-                device_bytes=device_bytes[key],
+                device_bytes=sum(device_pool_bytes),
                 host_bytes=host_bytes[key],
+                device_pool_bytes=device_pool_bytes,
             )
         )
     return result
@@ -550,9 +558,14 @@ def host_bounded_quota(
     """Return ``quota``, lowered so the host-backed pools it sizes fit in ``host_budget``.
 
     A life cycle gets the slots its share of the quota buys at its device bytes
-    per slot, and each of those slots also holds its host bytes. A pool group
-    can take up to one allocation granule more than its share, so a granule's
-    worth of host memory is held back per life cycle with host-backed pages.
+    per slot, and each of those slots also holds its host bytes. The native
+    manager splits the quota in whole granules: it rounds the quota up to one,
+    rounds each pool group's share to the nearest one, and gives the group with
+    the largest share every granule the others cannot fill with a whole slot.
+    A group leaves fewer granules unused than one more slot would take, at most
+    one per pool when slots are smaller than a granule. The host memory those
+    granules could buy is held back for every life cycle with host-backed pages,
+    so the pools stay within the budget whichever group takes them.
 
     Args:
         life_cycles: The manager's life cycles, in native order.
@@ -568,14 +581,22 @@ def host_bounded_quota(
             f"The pool ratio has {len(pool_ratio)} shares for {len(life_cycles)} life cycles"
         )
     granule_bytes = gpu_pool_granule_bytes(quota)
+    # The most granules each life cycle's pools can leave unused.
+    spare_granules = [
+        sum(ceil_div(pool_bytes, granule_bytes) for pool_bytes in life_cycle.device_pool_bytes)
+        for life_cycle in life_cycles
+    ]
     host_per_quota_byte = 0.0
     held_back = 0.0
-    for life_cycle, share in zip(life_cycles, pool_ratio):
+    for life_cycle, share, own_spare in zip(life_cycles, pool_ratio, spare_granules):
         if not life_cycle.host_bytes:
             continue
         host_per_device_byte = life_cycle.host_bytes / life_cycle.device_bytes
         host_per_quota_byte += share * host_per_device_byte
-        held_back += granule_bytes * host_per_device_byte
+        # The other groups' unused granules, and two for rounding the quota and
+        # this group's share.
+        extra_granules = 2 + sum(spare_granules) - own_spare
+        held_back += extra_granules * granule_bytes * host_per_device_byte
     if not host_per_quota_byte:
         return quota
     return min(quota, int(max(0.0, host_budget - held_back) / host_per_quota_byte))
@@ -583,26 +604,53 @@ def host_bounded_quota(
 
 def plan_host_history_bytes(
     *,
-    host_cache_size: int | None,
+    host_history_size: int | None,
     max_batch_size: int,
     host_bytes_per_request: int,
     pinnable_host_bytes: float,
+    staging_bytes: int,
 ) -> int:
-    """Return the host bytes offloaded history may take.
+    """Return the host bytes the host-backed history pools may take.
 
-    An explicit ``host_cache_size`` is the budget. Otherwise the budget holds
-    ``max_batch_size`` requests, capped by the host memory the rank may pin.
+    Offload also pins the sparse Batch's staging buffers, so they come out of
+    the same host memory. An explicit ``host_history_size`` covers both.
+    Otherwise the pools hold ``max_batch_size`` requests, capped so that pools
+    and staging fit in the host memory the rank may pin.
 
     Args:
-        host_cache_size: The configured size, or None to size automatically.
+        host_history_size: The configured size, or None to size automatically.
         max_batch_size: Requests the automatic budget holds.
         host_bytes_per_request: Host history bytes one request holds.
-        pinnable_host_bytes: Host bytes automatic sizing may pin; ``inf`` when
-            unknown.
+        pinnable_host_bytes: Host bytes automatic sizing may pin for offload;
+            ``inf`` when unknown.
+        staging_bytes: Pinned host bytes of the sparse Batch's staging buffers.
+
+    Raises:
+        ValueError: No host memory is left for the pools.
     """
-    if host_cache_size is not None:
-        return host_cache_size
-    return int(max(0, min(max_batch_size * host_bytes_per_request, pinnable_host_bytes)))
+    if host_history_size is not None:
+        budget = host_history_size - staging_bytes
+        if budget <= 0:
+            raise ValueError(
+                "sparse_attention_config.kv_cache_offload_config.host_history_size "
+                f"({host_history_size / _MIB:.1f}MiB) leaves no host memory for offloaded "
+                f"history: the sparse Batch's staging buffers take {staging_bytes / _MIB:.1f}MiB "
+                "of it."
+            )
+        return budget
+    if not host_bytes_per_request:
+        # This rank's layers offload no history.
+        return 0
+    budget = min(max_batch_size * host_bytes_per_request, pinnable_host_bytes - staging_bytes)
+    if budget <= 0:
+        raise ValueError(
+            "Sizing sparse KV cache offload automatically leaves no host memory for offloaded "
+            f"history: this rank may pin {max(0.0, pinnable_host_bytes) / _MIB:.1f}MiB, and the "
+            f"sparse Batch's staging buffers take {staging_bytes / _MIB:.1f}MiB. Set "
+            "sparse_attention_config.kv_cache_offload_config.host_history_size, or lower "
+            "kv_cache_config.host_cache_size."
+        )
+    return int(budget)
 
 
 # ---------------------------------------------------------------------------

@@ -4441,7 +4441,7 @@ class TestDeepSeekV4SparseAttentionConfig:
 
         assert config.kv_cache_offload_config == SparseKvCacheOffloadConfig()
         assert config.kv_cache_offload_config.gpu_cache_factor == 2.0
-        assert config.kv_cache_offload_config.host_cache_size is None
+        assert config.kv_cache_offload_config.host_history_size is None
         assert config.get_kv_cache_offload_config() is None
         # Defaults stay valid when a dump passes every field back explicitly.
         DeepSeekV4SparseAttentionConfig(**config.model_dump())
@@ -4450,7 +4450,8 @@ class TestDeepSeekV4SparseAttentionConfig:
         config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True,
                                                  kv_cache_offload_config={
                                                      "gpu_cache_factor": 3.0,
-                                                     "host_cache_size": 1 << 30
+                                                     "host_history_size":
+                                                     1 << 30
                                                  })
 
         restored = DeepSeekV4SparseAttentionConfig.model_validate_json(
@@ -4458,16 +4459,16 @@ class TestDeepSeekV4SparseAttentionConfig:
 
         assert restored.get_kv_cache_offload_config(
         ) == SparseKvCacheOffloadConfig(gpu_cache_factor=3.0,
-                                        host_cache_size=1 << 30)
+                                        host_history_size=1 << 30)
 
     @pytest.mark.parametrize("field, value", [("gpu_cache_factor", 0.5),
-                                              ("host_cache_size", -1)])
+                                              ("host_history_size", -1)])
     def test_kv_cache_offload_sizes_reject_out_of_range(self, field, value):
         with pytest.raises(ValidationError, match=field):
             SparseKvCacheOffloadConfig(**{field: value})
 
     @pytest.mark.parametrize("field, value", [("gpu_cache_factor", 3.0),
-                                              ("host_cache_size", 1 << 30)])
+                                              ("host_history_size", 1 << 30)])
     def test_kv_cache_offload_sizes_require_offload(self, field, value):
         with pytest.raises(ValidationError,
                            match="requires enable_kv_cache_offload"):

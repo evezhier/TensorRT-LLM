@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     sparse_offload_pool_ratio,
     sparse_units_per_page,
 )
+from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
@@ -46,6 +47,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     SparseCacheConfig,
     SsmLayerConfig,
+    _introspection,
 )
 
 TOKENS_PER_BLOCK = 128
@@ -258,15 +260,22 @@ def test_life_cycles_follow_native_numbering_and_split_bytes_by_memory() -> None
 
     assert life_cycles == [
         LifeCyclePage(
-            window_size=128, num_sink_tokens=0, is_state=False, device_bytes=65_536, host_bytes=0
+            window_size=128,
+            num_sink_tokens=0,
+            is_state=False,
+            device_bytes=65_536,
+            host_bytes=0,
+            device_pool_bytes=(65_536,),
         ),
-        # Both compressed layers and the ratio-128 layer share the no-window life cycle.
+        # Both compressed layers and the ratio-128 layer share the no-window life
+        # cycle, and the two indexers of one page size share a pool.
         LifeCyclePage(
             window_size=None,
             num_sink_tokens=0,
             is_state=False,
             device_bytes=2 * 2176 + 288 + 36,
             host_bytes=2 * (9216 + 1152),
+            device_pool_bytes=(2 * 2176, 288, 36),
         ),
         LifeCyclePage(
             window_size=8,
@@ -274,6 +283,7 @@ def test_life_cycles_follow_native_numbering_and_split_bytes_by_memory() -> None
             is_state=False,
             device_bytes=16_384 + 400,
             host_bytes=0,
+            device_pool_bytes=(16_384, 400),
         ),
     ]
     ssm = SsmLayerConfig(
@@ -281,6 +291,7 @@ def test_life_cycles_follow_native_numbering_and_split_bytes_by_memory() -> None
     )
     (state,) = life_cycle_pages([ssm], TOKENS_PER_BLOCK)
     assert state.is_state and state.device_bytes == 4096
+    assert state.device_pool_bytes == (4096,)
 
 
 @pytest.mark.cpu_only
@@ -311,6 +322,7 @@ def test_pages_a_decoding_request_holds(
         is_state=False,
         device_bytes=1,
         host_bytes=0,
+        device_pool_bytes=(1,),
     )
     assert (
         life_cycle.pages_per_request(
@@ -461,13 +473,14 @@ def test_host_bounded_quota_keeps_the_host_pools_within_budget() -> None:
     quota = host_bounded_quota(life_cycles, ratio, host_budget=budget, quota=1 << 50)
 
     # The no-window life cycle buys its share at 4,676 device bytes per slot, and
-    # every slot also holds 20,736 host bytes; a 32 MiB granule is held back.
-    usable = budget - (32 << 20) * 20_736 / 4676
+    # every slot also holds 20,736 host bytes. The other life cycles' three pools
+    # can leave a 32 MiB granule each unused, and two more go to rounding.
+    usable = budget - 5 * (32 << 20) * 20_736 / 4676
     assert ratio[1] * quota / 4676 * 20_736 <= usable
     assert ratio[1] * (quota + 1) / 4676 * 20_736 > usable
     # A quota the budget already covers is left alone.
     assert host_bounded_quota(life_cycles, ratio, host_budget=budget, quota=1 << 30) == 1 << 30
-    # A budget smaller than the held-back granule bounds the quota at zero.
+    # A budget smaller than the held-back granules bounds the quota at zero.
     assert host_bounded_quota(life_cycles, ratio, host_budget=1 << 20, quota=1 << 50) == 0
     # Without host pages, the host budget bounds nothing.
     dense_only = [life_cycles[0], life_cycles[2]]
@@ -477,26 +490,105 @@ def test_host_bounded_quota_keeps_the_host_pools_within_budget() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("budget_mib", range(100 << 10, (100 << 10) + 16 * 7, 7))
+def test_host_bounded_quota_holds_after_native_rounding(budget_mib: int) -> None:
+    # The history's one dense pool wastes little of its granules on whole slots,
+    # while the windowed life cycles have five pools that can each leave one.
+    layers = [
+        _layer(
+            0, ("key", 131_072, False), ("value", 65_536, False), ("x", 16_384, False), window=128
+        ),
+        _sparse_layer(1),
+        _layer(2, ("state", 65_536, False), ("score", 800, False), window=8),
+    ]
+    life_cycles = life_cycle_pages(layers, TOKENS_PER_BLOCK)
+    ratio = sparse_offload_pool_ratio(
+        life_cycles, capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
+    )
+    budget = budget_mib << 20
+
+    quota = host_bounded_quota(life_cycles, ratio, host_budget=budget, quota=1 << 40)
+
+    # The native manager rounds the quota up to a whole granule and splits it
+    # across pool groups, one per life cycle here. The history's has the largest
+    # share, so it also gets every granule the others leave unused.
+    granule = gpu_pool_granule_bytes(quota)
+    assert granule == 32 << 20
+    slots = _introspection.ratio_to_slot_count_list(
+        ceil_div(quota, granule) * granule,
+        [list(life_cycle.device_pool_bytes) for life_cycle in life_cycles],
+        ratio,
+        granule,
+        [1] * len(life_cycles),
+    )
+    history = life_cycles[1]
+    assert slots[1] * history.host_bytes <= budget
+    # Seven granules are held back: one per windowed pool, and two for rounding.
+    host_per_granule = granule * history.host_bytes / history.device_bytes
+    assert slots[1] * history.host_bytes > budget - 8 * host_per_granule
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("host_cache_size", "pinnable_host_bytes", "budget"),
+    ("host_history_size", "pinnable_host_bytes", "budget"),
     [
-        # An explicit size is the budget, whatever automatic sizing may pin.
-        (1 << 30, 0.0, 1 << 30),
-        # Otherwise the budget holds max_batch_size requests...
+        # An explicit size covers the staging buffers too, whatever automatic
+        # sizing may pin.
+        (1 << 30, 0.0, (1 << 30) - 4096),
+        # Otherwise the pools hold max_batch_size requests...
         (None, float("inf"), 256 * 1000),
-        # ...unless the host memory automatic sizing may pin holds fewer.
-        (None, 50_000.0, 50_000),
+        # ...unless they and the staging buffers outgrow what automatic sizing
+        # may pin.
+        (None, 50_000.0, 50_000 - 4096),
     ],
 )
-def test_host_budget(host_cache_size: int | None, pinnable_host_bytes: float, budget: int) -> None:
+def test_host_budget(
+    host_history_size: int | None, pinnable_host_bytes: float, budget: int
+) -> None:
     assert (
         plan_host_history_bytes(
-            host_cache_size=host_cache_size,
+            host_history_size=host_history_size,
             max_batch_size=256,
             host_bytes_per_request=1000,
             pinnable_host_bytes=pinnable_host_bytes,
+            staging_bytes=4096,
         )
         == budget
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("host_history_size", "pinnable_host_bytes", "match"),
+    [
+        (4096, float("inf"), "host_history_size .* leaves no host memory for offloaded history"),
+        (None, 4096.0, "automatically leaves no host memory for offloaded history"),
+    ],
+)
+def test_host_budget_must_leave_the_pools_room(
+    host_history_size: int | None, pinnable_host_bytes: float, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        plan_host_history_bytes(
+            host_history_size=host_history_size,
+            max_batch_size=256,
+            host_bytes_per_request=1000,
+            pinnable_host_bytes=pinnable_host_bytes,
+            staging_bytes=4096,
+        )
+
+
+@pytest.mark.cpu_only
+def test_host_budget_is_empty_on_a_rank_without_offloaded_history() -> None:
+    assert (
+        plan_host_history_bytes(
+            host_history_size=None,
+            max_batch_size=256,
+            host_bytes_per_request=0,
+            pinnable_host_bytes=0.0,
+            staging_bytes=0,
+        )
+        == 0
     )
 
 

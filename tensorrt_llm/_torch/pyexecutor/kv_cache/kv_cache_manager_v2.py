@@ -460,6 +460,7 @@ def _compute_auto_host_tier_quota(
     mem_available: float,
     memlock_limit: float,
     shares_device_memory: bool = False,
+    pins_offloaded_history: bool = False,
 ) -> int:
     """Compute the auto-provisioned host cache tier quota for a single rank.
 
@@ -484,10 +485,15 @@ def _compute_auto_host_tier_quota(
         shares_device_memory: Whether host and device memory are one physical
             pool (integrated GPU). Charges ``quota`` against ``mem_available``
             and allows a zero result.
+        pins_offloaded_history: Whether sparse KV cache offload pins host
+            memory beside the tier. ``mem_available`` and ``memlock_limit``
+            already exclude it, so falling back to the device quota could pin
+            past them; allows a zero result instead.
 
     Returns:
-        Host cache tier quota in bytes. Positive, except on integrated GPUs
-        with no headroom left, where 0 means "provision no host tier".
+        Host cache tier quota in bytes. Positive, except on integrated GPUs or
+        beside offloaded history with no headroom left, where 0 means
+        "provision no host tier".
     """
     if shares_device_memory and mem_available != float("inf"):
         mem_available = max(0.0, mem_available - quota)
@@ -510,6 +516,8 @@ def _compute_auto_host_tier_quota(
                 "free_gpu_memory_fraction, or set an explicit "
                 "kv_cache_config.host_cache_size."
             )
+            return 0
+        if pins_offloaded_history:
             return 0
         logger.warning(
             f"KV cache manager v2 auto host tier sizing computed a "
@@ -562,6 +570,34 @@ def _sync_kv_cache_manager_init_status(
             Distributed.get(mapping).allreduce(int(local_status), op=ReduceOp.MAX)
         )
     return local_status
+
+
+def _raise_on_every_rank(error: Optional[Exception], mapping: Mapping, what: str) -> None:
+    """Raise on every rank if a check failed on any rank, and on none otherwise.
+
+    A check that reads rank-local state, such as free memory, memory limits or
+    the rank's own layers, can fail on some ranks only. A rank that raised alone
+    would leave the others waiting in the next collective, so every rank calls
+    this at the same point with its own outcome.
+
+    Args:
+        error: This rank's error, or None if its check passed.
+        mapping: Parallelism mapping; ``world_size`` selects whether a
+            collective is needed.
+        what: What was checked, for the error the other ranks raise.
+
+    Raises:
+        Exception: ``error``, on a rank whose check failed.
+        RuntimeError: On the other ranks, when any rank's check failed.
+    """
+    failed_rank = mapping.rank if error is not None else mapping.world_size
+    if mapping.world_size > 1:
+        # The lowest failing rank, or world_size when every rank passed.
+        failed_rank = Distributed.get(mapping).allreduce(failed_rank, op=ReduceOp.MIN)
+    if error is not None:
+        raise error
+    if failed_rank < mapping.world_size:
+        raise RuntimeError(f"{what} failed on rank {failed_rank}; see that rank's log.")
 
 
 def _estimate_swa_cache_size(
@@ -1264,6 +1300,10 @@ class KVCacheManagerV2(BaseResourceManager):
     _sparse_kv_offload: Optional[SparseKvCacheOffloadConfig] = None
     # Host history pages admitted requests hold through their last token.
     _host_history_reservations: Optional[HostHistoryReservations] = None
+    # Host history pages the smallest rank's pool has for requests once dummy
+    # requests are set aside, the most one request can be given; None when no
+    # rank offloads sparse history.
+    _host_history_capacity_blocks: Optional[int] = None
     # Host bytes the host-backed sparse pools may take; 0 without offload.
     _host_history_budget: int = 0
     # Device bytes offload allocates once for max_batch_size rows, outside the
@@ -1314,7 +1354,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # A subclass that declares sparse buffers whose history lives in host
         # memory passes their sizing; the manager then accounts for that memory.
         if sparse_kv_offload_config is not None:
-            self._check_sparse_kv_offload_config(sparse_kv_offload_config, kv_cache_config, mapping)
+            self._check_sparse_kv_offload_config(
+                sparse_kv_offload_config, kv_cache_config, mapping, spec_config=spec_config
+            )
         self._sparse_kv_offload = sparse_kv_offload_config
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
@@ -1607,6 +1649,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         )
         reserved_bytes = reserved_arena_bytes + self._sparse_batch_buffer_bytes
+        offload_error: Optional[ValueError] = None
         if (
             kv_cache_config.max_gpu_total_bytes is not None
             and kv_cache_config.max_gpu_total_bytes > 0
@@ -1621,16 +1664,18 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"max_batch_size={self.max_batch_size}"
                 )
                 if reserved_bytes >= quota:
-                    raise ValueError(
+                    # Raised below, once every rank has sized its offload.
+                    offload_error = ValueError(
                         f"Sparse KV cache offload needs {reserved}, more than the "
                         f"{quota / (1 << 30):.2f}GiB device KV budget. Lower max_batch_size or "
                         "the sparse cache size, or raise the device KV budget."
                     )
-                quota -= reserved_bytes
-                logger.info(
-                    f"Reserved {reserved} from the device KV budget. "
-                    f"New quota is {quota / (1 << 30)}GiB"
-                )
+                else:
+                    quota -= reserved_bytes
+                    logger.info(
+                        f"Reserved {reserved} from the device KV budget. "
+                        f"New quota is {quota / (1 << 30)}GiB"
+                    )
         if kv_cache_config.max_tokens is not None:
             quota_from_max_tokens = int(
                 math.ceil(
@@ -1649,12 +1694,22 @@ class KVCacheManagerV2(BaseResourceManager):
             "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
         )
         if self._sparse_kv_offload is not None:
-            quota = self._bound_quota_by_host_history(
-                kv_cache_config,
-                quota,
-                tokens_per_block=tokens_per_block,
-                max_leases=index_mapper_capacity,
-            )
+            if offload_error is None:
+                try:
+                    quota = self._bound_quota_by_host_history(
+                        kv_cache_config,
+                        quota,
+                        tokens_per_block=tokens_per_block,
+                        max_leases=index_mapper_capacity,
+                    )
+                except ValueError as error:
+                    offload_error = error
+            # Each rank sizes offload from its own device budget, host memory and
+            # layers, so sizing can fail on some ranks only. A rank that raised
+            # alone would leave the rest waiting in the token sync below.
+            _raise_on_every_rank(offload_error, mapping, "Sizing sparse KV cache offload")
+        elif offload_error is not None:
+            raise offload_error
 
         # Sync resumable token capacity across ranks so the scheduler produces
         # identical batches. Normalize to tokens because cache costs vary
@@ -1720,6 +1775,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 mem_available,
                 memlock_limit,
                 shares_device_memory=is_device_integrated(),
+                pins_offloaded_history=self._sparse_kv_offload is not None,
             )
             logger.info(
                 f"KV cache manager v2 auto host tier sizing: "
@@ -1729,6 +1785,22 @@ class KVCacheManagerV2(BaseResourceManager):
             # Reduce the rank-local auto quota to the fleet minimum; see
             # _sync_host_tier_quota for why divergence wedges collectives.
             host_quota = _sync_host_tier_quota(host_quota, mapping)
+            disk_cache_size = kv_cache_config.disk_cache_size
+            if (
+                host_quota <= 0
+                and self._sparse_kv_offload is not None
+                and not (disk_cache_size is not None and disk_cache_size > 0)
+            ):
+                # Every rank holds the same synced quota, so every rank raises.
+                raise ValueError(
+                    "Sparse KV cache offload pins "
+                    f"{offload_pinned_bytes / (1 << 30):.2f}GiB of host memory on this rank, "
+                    "which leaves none for the host cache tier. Without a tier to evict to, "
+                    "suspending a request cannot free its KV cache pages, and a decode-only "
+                    "worker cannot recompute them, so scheduling can stall. Lower "
+                    "sparse_attention_config.kv_cache_offload_config.host_history_size, or set "
+                    "kv_cache_config.host_cache_size (0 runs without a host tier)."
+                )
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
@@ -1862,6 +1934,13 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_manager_py_config = config
         self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
+        if self._sparse_kv_offload is not None and not self.can_evict:
+            logger.warning(
+                "Sparse KV cache offload runs without a host or disk cache tier: suspending a "
+                "request cannot free its KV cache pages, and a decode-only worker cannot "
+                "recompute them, so scheduling can stall once the device KV cache is full. Set "
+                "kv_cache_config.host_cache_size to give evicted pages a host tier."
+            )
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group(
@@ -1964,7 +2043,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
         if self._sparse_kv_offload is not None:
-            self._setup_sparse_kv_offload(kv_cache_config)
+            self._setup_sparse_kv_offload(kv_cache_config, max_seq_len, num_reserved_index_slots)
 
         # Last: bind the publisher socket and start its thread only once every check
         # above has passed. Constructing the manager is side-effect free, so a failure
@@ -3200,12 +3279,16 @@ class KVCacheManagerV2(BaseResourceManager):
             max_leases=max_leases,
         )
         num_tokens = self._get_sparse_offload_seq_len(kv_cache_config)
+        # An explicit host cache tier is pinned too, beside the offloaded history.
+        host_tier_bytes = max(0, kv_cache_config.host_cache_size or 0)
         self._host_history_budget = plan_host_history_bytes(
-            host_cache_size=self._sparse_kv_offload.host_cache_size,
+            host_history_size=self._sparse_kv_offload.host_history_size,
             max_batch_size=self.max_batch_size,
             host_bytes_per_request=sparse_history_bytes_per_block(config.layers)
             * ceil_div(num_tokens, tokens_per_block),
-            pinnable_host_bytes=get_host_memory_limits(self.mapping).auto_pinnable_bytes,
+            pinnable_host_bytes=get_host_memory_limits(self.mapping).auto_pinnable_bytes
+            - host_tier_bytes,
+            staging_bytes=self._sparse_batch_staging_bytes,
         )
         bounded = host_bounded_quota(
             life_cycle_pages(config.layers, tokens_per_block),
@@ -4100,15 +4183,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
         With sparse KV cache offload, the request is admitted only if the host
         history pool holds its history through its last output token, so no
-        running request runs out of host pages.
+        running request runs out of host pages. A request larger than the pool
+        is rejected when it arrives; see ``get_request_kv_block_budget``.
         """
         reservations = self._host_history_reservations
         if reservations is None:
             return self._prepare_disagg_gen_init_cache(req)
-        num_blocks = ceil_div(
-            req.prompt_len + max(0, req.max_new_tokens) + self.num_extra_kv_tokens,
-            self.tokens_per_block,
-        )
+        num_blocks = self._get_host_history_blocks(req)
         if not reservations.can_reserve(req.py_request_id, num_blocks):
             if num_blocks > reservations.capacity_blocks:
                 logger.warning(
@@ -4121,6 +4202,13 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
         reservations.reserve(req.py_request_id, num_blocks)
         return True
+
+    def _get_host_history_blocks(self, req: LlmRequest) -> int:
+        """Return the host history pages ``req`` reaches by its last output token."""
+        return ceil_div(
+            req.prompt_len + max(0, req.max_new_tokens) + self.num_extra_kv_tokens,
+            self.tokens_per_block,
+        )
 
     def _prepare_disagg_gen_init_cache(self, req: LlmRequest) -> bool:
         """Allocate a disagg generation init request's cache; see ``prepare_disagg_gen_init``."""
@@ -5306,57 +5394,158 @@ class KVCacheManagerV2(BaseResourceManager):
         offload_config: SparseKvCacheOffloadConfig,
         kv_cache_config: KvCacheConfig,
         mapping: Mapping,
+        *,
+        spec_config: Optional["DecodingBaseConfig"],
     ) -> None:
-        """Reject sparse KV cache offload settings this rank cannot honor.
+        """Reject sparse KV cache offload settings any rank cannot honor.
+
+        Host memory differs by node, so every rank calls this at the same point,
+        and all of them raise when any rank cannot honor the settings.
 
         Raises:
-            ValueError: KV pool rebalancing is enabled, or the host history size
-                exceeds this rank's share of available host memory or the
-                pinned-memory limit.
+            ValueError: KV pool rebalancing or speculative decoding is enabled, or
+                the host history size, with an explicit host cache tier, exceeds
+                this rank's share of available host memory or the pinned-memory
+                limit.
+            RuntimeError: Another rank cannot honor the settings.
         """
+        error: Optional[ValueError] = None
+        host_history_size = offload_config.host_history_size
         if kv_cache_config.enable_kv_pool_rebalance:
-            raise ValueError(
+            error = ValueError(
                 "Sparse KV cache offload is incompatible with "
                 "kv_cache_config.enable_kv_pool_rebalance=True: host-backed history pools "
                 "take their pool group's slot count, so a rebalance would resize pinned host "
                 "memory outside the host budget."
             )
-        host_cache_size = offload_config.host_cache_size
-        if host_cache_size is None:
-            return
-        limits = get_host_memory_limits(mapping)
-        if host_cache_size > limits.rank_share:
-            raise ValueError(
-                f"The KV cache offload host_cache_size ({host_cache_size / (1 << 30):.2f}GiB) "
-                f"exceeds this rank's {limits.rank_share / (1 << 30):.2f}GiB share of available "
-                f"host memory ({limits.local_ranks} rank(s) on this node)."
+        elif spec_config is not None:
+            error = ValueError(
+                "Sparse KV cache offload does not support speculative decoding: a sparse cache "
+                "takes one input token per decode step. Remove speculative_config or disable "
+                "sparse_attention_config.enable_kv_cache_offload."
             )
-        if host_cache_size > limits.memlock_limit:
-            raise ValueError(
-                f"The KV cache offload host_cache_size ({host_cache_size / (1 << 30):.2f}GiB) "
-                f"exceeds the {limits.memlock_limit / (1 << 30):.2f}GiB RLIMIT_MEMLOCK limit."
+        elif host_history_size is not None:
+            limits = get_host_memory_limits(mapping)
+            # An explicit host cache tier is pinned beside the offloaded history;
+            # an automatic one is sized from what the history leaves.
+            host_tier_size = max(0, kv_cache_config.host_cache_size or 0)
+            pinned = (
+                f"The KV cache offload host_history_size ({host_history_size / (1 << 30):.2f}GiB)"
             )
+            if host_tier_size:
+                pinned += (
+                    f" plus kv_cache_config.host_cache_size ({host_tier_size / (1 << 30):.2f}GiB)"
+                )
+            if host_history_size + host_tier_size > limits.rank_share:
+                error = ValueError(
+                    f"{pinned} exceeds this rank's {limits.rank_share / (1 << 30):.2f}GiB share of "
+                    f"available host memory ({limits.local_ranks} rank(s) on this node)."
+                )
+            elif host_history_size + host_tier_size > limits.memlock_limit:
+                error = ValueError(
+                    f"{pinned} exceeds the {limits.memlock_limit / (1 << 30):.2f}GiB "
+                    "RLIMIT_MEMLOCK limit."
+                )
+        _raise_on_every_rank(error, mapping, "The sparse KV cache offload config check")
 
-    def _setup_sparse_kv_offload(self, kv_cache_config: KvCacheConfig) -> None:
-        """Start host admission accounting and report the capacity offload gives.
+    def _setup_sparse_kv_offload(
+        self, kv_cache_config: KvCacheConfig, max_seq_len: int, num_reserved_index_slots: int
+    ) -> None:
+        """Check the host-backed pools, start host admission and report the capacity.
 
-        A rank whose layers have no sparse buffers holds no host history.
+        A rank whose layers have no sparse buffers holds no host history. Every
+        rank calls this at the same point.
+
+        Args:
+            kv_cache_config: The KV cache configuration.
+            max_seq_len: The longest request the executor accepts, before this
+                manager clamps ``max_seq_len`` to what its pools hold.
+            num_reserved_index_slots: Index slots reserved for persistent dummy
+                requests, such as CUDA-graph padding.
+
+        Raises:
+            ValueError: This rank's host-backed pools exceed their host budget.
+            RuntimeError: Another rank's do.
         """
         host_pool_groups = self.get_host_backed_pool_groups()
+        host_pool_bytes = self._get_host_backed_pool_bytes() if host_pool_groups else 0
+        sizing_error: Optional[ValueError] = None
+        if host_pool_bytes > self._host_history_budget:
+            # The quota leaves room for how the native manager rounds its split,
+            # so only its slot floors can take the pools past the budget.
+            sizing_error = ValueError(
+                f"The host-backed sparse history pools take {host_pool_bytes / (1 << 30):.2f}GiB, "
+                f"more than their {self._host_history_budget / (1 << 30):.2f}GiB host budget: the "
+                "KV cache manager keeps a minimum number of slots in every pool group, and here "
+                "that minimum needs more host memory than the budget holds. Raise "
+                "sparse_attention_config.kv_cache_offload_config.host_history_size."
+            )
+        _raise_on_every_rank(sizing_error, self.mapping, "Sizing the host-backed history pools")
+        local_capacity_blocks = sys.maxsize
+        if host_pool_groups:
+            # Dummy requests hold history pages without a reservation, so
+            # admission keeps their pages out of what it can promise.
+            local_capacity_blocks = max(
+                0,
+                min(int(pool_group.num_slots) for pool_group in host_pool_groups)
+                - self._get_dummy_history_blocks(num_reserved_index_slots),
+            )
+        # The executor rejects a request on arrival when its history can never
+        # fit (get_request_kv_block_budget). Every rank must reject the same
+        # requests, so all of them judge against the smallest pool.
+        capacity_blocks = local_capacity_blocks
+        if self.mapping.world_size > 1:
+            capacity_blocks = Distributed.get(self.mapping).allreduce(
+                capacity_blocks, op=ReduceOp.MIN
+            )
+        if capacity_blocks < sys.maxsize:
+            self._host_history_capacity_blocks = capacity_blocks
+            if not self.is_estimating_kv_cache:
+                self._warn_if_host_history_rejects_requests(capacity_blocks, max_seq_len)
         if not host_pool_groups:
             return
-        self._host_history_reservations = HostHistoryReservations(
-            min(int(pool_group.num_slots) for pool_group in host_pool_groups)
-        )
-        host_pool_bytes = self._get_host_backed_pool_bytes()
-        if host_pool_bytes > self._host_history_budget:
-            # Constraint floors can hold a pool group above its share of the quota.
-            logger.warning(
-                f"The host-backed sparse history pools take {host_pool_bytes / (1 << 30):.2f}GiB, "
-                f"more than the {self._host_history_budget / (1 << 30):.2f}GiB host budget."
-            )
+        self._host_history_reservations = HostHistoryReservations(local_capacity_blocks)
         if not self.is_estimating_kv_cache:
             self._log_sparse_kv_offload_capacity(kv_cache_config)
+
+    def _get_dummy_history_blocks(self, num_reserved_index_slots: int) -> int:
+        """Return the history pages dummy requests may hold at once, outside admission.
+
+        These are the CUDA-graph padding dummies, one per reserved index slot,
+        an attention-DP dummy when attention DP is on, and the guard page when
+        it is held. Each holds one token plus its draft and extra tokens.
+        Offload rejects speculative decoding (``_check_sparse_kv_offload_config``),
+        so padding uses one draft length and needs one dummy; the count relies
+        on that.
+        """
+        num_dummies = (
+            num_reserved_index_slots
+            + int(self.mapping.enable_attention_dp)
+            + int(_GUARD_PAGE_REQUEST_ID in self.kv_cache_map)
+        )
+        tokens_per_dummy = 1 + 2 * self.max_total_draft_tokens + self.num_extra_kv_tokens
+        return num_dummies * ceil_div(tokens_per_dummy, self.tokens_per_block)
+
+    def _warn_if_host_history_rejects_requests(
+        self, capacity_blocks: int, max_seq_len: int
+    ) -> None:
+        """Warn when the smallest host history pool cannot hold a ``max_seq_len`` request.
+
+        Requests of up to ``max_seq_len`` tokens reach the executor, which
+        rejects on arrival those whose history does not fit.
+        """
+        needed_blocks = ceil_div(max_seq_len + self.num_extra_kv_tokens, self.tokens_per_block)
+        if capacity_blocks >= needed_blocks:
+            return
+        max_request_tokens = capacity_blocks * self.tokens_per_block - self.num_extra_kv_tokens
+        logger.warning(
+            f"Sparse KV cache offload rejects requests whose prompt and max_tokens exceed "
+            f"{max_request_tokens} tokens: the smallest host history pool has room for "
+            f"{capacity_blocks} blocks of {self.tokens_per_block} tokens, and a request of "
+            f"max_seq_len={max_seq_len} tokens needs {needed_blocks}. Raise "
+            "sparse_attention_config.kv_cache_offload_config.host_history_size or the device KV "
+            "cache budget, or lower max_seq_len."
+        )
 
     def _log_sparse_kv_offload_capacity(self, kv_cache_config: KvCacheConfig) -> None:
         """Log how many requests fit, which limit binds, and the batch size that fits."""
@@ -6155,6 +6344,23 @@ class KVCacheManagerV2(BaseResourceManager):
         #     remaining_tokens / self.tokens_per_block)
         # return need_blocks
         return 0
+
+    def kv_block_budget_applies(self) -> bool:
+        # Only offloaded sparse history has a request-level budget here.
+        return self._host_history_capacity_blocks is not None
+
+    def get_request_kv_block_budget(self, request: LlmRequest) -> Optional[Tuple[int, int]]:
+        """Return the host history pages ``request`` needs and the most it can be given.
+
+        With sparse KV cache offload, a request is admitted only once its host
+        history pages through its last output token can be reserved
+        (``prepare_disagg_gen_init``). A request that needs more pages than the
+        smallest rank's pool holds would wait forever, so the executor rejects
+        it when it arrives. Returns ``None`` without offload.
+        """
+        if self._host_history_capacity_blocks is None:
+            return None
+        return self._get_host_history_blocks(request), self._host_history_capacity_blocks
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic
     @classmethod
