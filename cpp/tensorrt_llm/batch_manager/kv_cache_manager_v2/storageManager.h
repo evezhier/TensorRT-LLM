@@ -316,6 +316,10 @@ public:
     //! for a sparse pool of the GPU tier, which the sparse cache reads through.
     [[nodiscard]] bool isSparsePool(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
+    //! Host bytes held for sparse pools, across every pool group of the hot level.
+    //! Only the hot level has them: sparsity is a property of a GPU-tier pool.
+    [[nodiscard]] size_t sparseHostBytes() const;
+
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.

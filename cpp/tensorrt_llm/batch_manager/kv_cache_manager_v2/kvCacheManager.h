@@ -190,6 +190,21 @@ public:
     int getPageStride(LayerId layerId, DataRole role) const;
     size_t getPageIndexUpperBound(LayerId layerId, DataRole role) const;
 
+    //! Whether this buffer was declared sparse, i.e. whether its pages are host memory
+    //! read through the sparse GPU cache rather than device memory read directly.
+    //!
+    //! Answered from the pool the buffer landed in, which is the same fact: buffers
+    //! coalesce only with others of matching size *and* sparsity, so a pool is uniformly
+    //! one or the other.
+    [[nodiscard]] bool isSparse(LayerId layerId, DataRole role) const;
+
+    //! Host bytes held on behalf of sparse buffers, across every pool group.
+    //!
+    //! The hot level alone: sparsity is a property of a GPU-tier pool. These bytes are not
+    //! drawn from that tier's quota -- they are a different medium -- so they appear in no
+    //! other total a caller can read. Reported so a deployment can count what it pins.
+    [[nodiscard]] size_t getSparseHostBytes() const;
+
     // Scale factor: base_page_index * scale → kernel page index.
     int getPageIndexScale(LayerId layerId, DataRole role) const;
 

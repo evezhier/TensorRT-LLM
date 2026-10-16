@@ -395,6 +395,21 @@ public:
         return total;
     }
 
+    //! The part of roundedNumBytes that is host memory: the sparse pools alone. The
+    //! complement of chargeableNumBytes.
+    size_t sparseNumBytes(size_t granularity) const noexcept
+    {
+        size_t total = 0;
+        for (PoolIndex pool{0}; pool < mPools.size(); ++pool)
+        {
+            if (isSparse(pool))
+            {
+                total += roundUp(mPools.at(pool)->numBytes(), granularity);
+            }
+        }
+        return total;
+    }
+
     //! The part of roundedNumBytes this tier's quota pays for: sparse pools are host memory
     //! and are not counted.
     size_t chargeableNumBytes(size_t granularity) const noexcept
@@ -540,6 +555,16 @@ public:
     MemAddress getBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotId slotId) const
     {
         return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
+    }
+
+    //! Host bytes this level holds for sparse pools, which its quota does not pay for.
+    size_t sparseHostBytes() const noexcept
+    {
+        size_t granularity = poolSizeGranularity();
+        size_t total = 0;
+        for (auto const& pg : mPoolGroups)
+            total += pg->sparseNumBytes(granularity);
+        return total;
     }
 
     //! Bytes this level's quota is paying for. Host-backed sparse pools are excluded: the

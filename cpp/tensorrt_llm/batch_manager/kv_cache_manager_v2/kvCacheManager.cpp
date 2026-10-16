@@ -792,6 +792,18 @@ MemAddress KvCacheManager::getMemPoolBaseAddress(
     return addr;
 }
 
+bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
+{
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    auto const pgIdx = mStorage->getPoolGroupIndex(kHotLevel, attr.lifeCycleId);
+    return mStorage->isSparsePool(kHotLevel, pgIdx, attr.poolIndex);
+}
+
+size_t KvCacheManager::getSparseHostBytes() const
+{
+    return mStorage->sparseHostBytes();
+}
+
 int KvCacheManager::getPageStride(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);

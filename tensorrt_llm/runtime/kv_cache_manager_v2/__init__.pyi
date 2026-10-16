@@ -931,7 +931,19 @@ class KVCacheManager:
         Distinct from :attr:`PageIndexConverter.expansion`, which is how much a buffer's page
         *index space* is stretched by ``tokens_per_block_override``. A sparse buffer does not
         stretch its index space -- that stays 1 -- while this counts the sparse cache's own
-        granularity, set by ``BufferConfig.sparse_selection_unit_tokens``.
+        granularity, set by the layer's ``sparse_cache.unit_tokens``.
+        """
+
+    def get_sparse_host_bytes(self) -> int:
+        """Host bytes held on behalf of sparse buffers, across every pool group.
+
+        The hot level alone: sparsity is a property of a GPU-tier pool. These bytes are a
+        different medium from the one :meth:`get_quota` measures, so they are drawn from no
+        quota and appear in no other total a caller can read -- report them separately when
+        accounting for what a deployment pins.
+
+        A sparse pool's row count follows from the device-backed pools of its group, since
+        a slot spans every pool, so this moves only when the hot level is resized.
         """
 
     def get_sparse_cache_buffer_count(self, layer_id: LayerId) -> int:
@@ -963,8 +975,8 @@ class KVCacheManager:
 
         Every buffer locks its pages at the hot level, sparse or not, so
         :meth:`_KVCache.get_base_page_indices` reports one level's numbering throughout.
-        What a sparse buffer changes is the *medium*: its life cycle's hot pool group is
-        host memory, device-mapped, rather than device memory.
+        What a sparse buffer changes is the *medium*: its pages are host memory,
+        device-mapped, in a pool of their own beside the layer's device-backed ones.
 
         That level is not what a caller addresses to read a unit resolved by
         :meth:`fetch_sparse_pages`. Those live in the request's lease on the life cycle's

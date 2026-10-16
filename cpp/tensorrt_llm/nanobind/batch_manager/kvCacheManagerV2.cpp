@@ -2664,6 +2664,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
+        .def("is_sparse", &kv::KvCacheManager::isSparse, nb::arg("layer_id"), nb::arg("data_role"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Whether this buffer was declared BufferConfig.is_sparse.\n\n"
+            "Every buffer locks its pages at the hot level, sparse or not. What a sparse buffer "
+            "changes is the medium: its pages are host memory, device-mapped, and are read through "
+            "the per-request GPU cache rather than directly.")
+        .def("get_sparse_host_bytes", &kv::KvCacheManager::getSparseHostBytes, nb::call_guard<nb::gil_scoped_release>(),
+            "Host bytes held on behalf of sparse buffers, across every pool group.\n\n"
+            "These are not drawn from the GPU tier's quota -- they are a different medium -- so "
+            "they appear in no other total a caller can read, and get_quota(GPU_LEVEL) excludes "
+            "them. Reported so a deployment can count what it is actually pinning.")
         .def(
             "prepare_sparse_write_indices",
             [](kv::KvCacheManager& self, kv::Batch& batch, std::vector<kv::BufferId> const& buffers,

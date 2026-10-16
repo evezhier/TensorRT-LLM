@@ -840,6 +840,11 @@ bool StorageManager::isSparsePool(CacheLevel level, PoolGroupIndex pgIdx, PoolIn
     return mLevels.at(level).storage->poolGroup(pgIdx).isSparse(poolIdx);
 }
 
+size_t StorageManager::sparseHostBytes() const
+{
+    return mLevels.at(kHotLevel).storage->sparseHostBytes();
+}
+
 void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 {
     PoolGroupIndex pg = getPoolGroupIndex(level, lc);
