@@ -41,6 +41,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     SPARSE_ARENA_ALIGNMENT,
     HostHistoryReservations,
+    host_bounded_quota,
+    life_cycle_pages,
     sparse_arena_bytes,
     sparse_arena_shapes,
     sparse_batch_shape,
@@ -3122,7 +3124,7 @@ def test_sparse_batch_buffers_come_from_a_provisional_config(offload: bool) -> N
     )
     assert batch.num_life_cycles == 2
     assert batch.selection_widths == (1,)
-    assert device_bytes == batch.mirror_bytes + batch.fetch_scratch_bytes + 1000
+    assert device_bytes == 2 * batch.mirror_bytes + batch.fetch_scratch_bytes + 1000
     assert staging_bytes == batch.staging_bytes == 4096
     get_scratch_bytes.assert_called_once_with(config)
     (gpu_tier,) = build.call_args.kwargs["cache_tiers"]
@@ -3588,8 +3590,10 @@ def test_device_quota_is_bounded_by_the_host_budget() -> None:
     assert manager._host_history_budget == 196 << 20
     # Each slot costs 256 quota bytes and 1 KiB of host memory. With no other
     # life cycle to leave granules unused, two 2 MiB granules' worth of host
-    # memory are held back for rounding.
+    # memory are held back for rounding, and with none to take the rest of the
+    # quota, the whole quota is lowered.
     assert quota == ((196 << 20) - 2 * 4 * (2 << 20)) // 4
+    assert manager._host_bounded_pool_ratio is None
     with build_base, build_cache:
         assert (
             manager._bound_quota_by_host_history(
@@ -3597,6 +3601,36 @@ def test_device_quota_is_bounded_by_the_host_budget() -> None:
             )
             == 1 << 20
         )
+
+
+@pytest.mark.cpu_only
+def test_host_bound_gives_device_only_life_cycles_the_rest_of_the_quota() -> None:
+    manager = _offload_manager(host_history_size=200 << 20)
+    build_base, build_cache = _base_config(_offload_layers())
+
+    with build_base, build_cache:
+        quota = manager._bound_quota_by_host_history(
+            KvCacheConfig(), 1 << 30, tokens_per_block=TOKENS_PER_BLOCK, max_leases=3
+        )
+        config = manager._build_manager_config(
+            KvCacheConfig(),
+            tokens_per_block=TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=quota)],
+            max_leases=3,
+        )
+
+    # The history's life cycle gets the device bytes the bounded quota would
+    # have given it, and the windowed one keeps everything else.
+    ratio = [1024 / 13_312, 12_288 / 13_312]
+    bounded = host_bounded_quota(
+        life_cycle_pages(_offload_layers(), TOKENS_PER_BLOCK),
+        ratio,
+        host_budget=200 << 20,
+        quota=1 << 30,
+    )
+    assert bounded < quota == 1 << 30
+    history_share = ratio[0] * bounded / quota
+    assert config.initial_pool_ratio == pytest.approx([history_share, 1 - history_share])
 
 
 @pytest.mark.cpu_only
@@ -4124,6 +4158,28 @@ def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) ->
     assert torch.isnan(buffer[guard_page]).all()  # sentinel survives the scrub
     assert torch.equal(buffer[0], torch.zeros(2))  # everything else is zeroed
     assert torch.equal(buffer[5], torch.zeros(2))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("offload", [False, True])
+def test_warmup_scan_leaves_host_backed_history_alone(offload: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.layer_offsets = {0: 0, 1: 1}
+    manager.layer_to_pool_mapping_dict = {0: 0, 1: 1}
+    manager.get_buffers = lambda layer_idx, kv_layout="NHD": torch.ones(2)
+    # Layer 0's KEY pages are offloaded history; layer 1's are device memory.
+    manager.kv_cache_manager_py_config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=_offload_layers(),
+    )
+    if offload:
+        manager._sparse_kv_offload = SparseKvCacheOffloadConfig()
+
+    scanned = [layer_id for layer_id, _ in manager._iter_cache_buffers_for_invalid_check()]
+
+    # Nothing reads host history before a transfer or a write-back fills it.
+    assert scanned == ([1] if offload else [0, 1])
 
 
 class _FakeLogger:

@@ -375,8 +375,9 @@ class SparseBatchShape:
     """The native Batch the sparse fetch reads, sized once for every step.
 
     It holds a page table per life cycle, two watermarks and a cache view per row,
-    in a device mirror and a pinned host staging copy, and the fetch's work arrays
-    on the device. Every step publishes the staging copy to the mirror.
+    in a device mirror, a pinned host staging copy and a device staging copy, and
+    the fetch's work arrays on the device. Every step uploads the host staging copy
+    to the device one, then copies that into the mirror.
 
     Attributes:
         num_life_cycles: Life cycles of the manager; each has a page table.
@@ -404,6 +405,12 @@ class SparseBatchShape:
     def staging_bytes(self) -> int:
         """Pinned host bytes of the staging copy of the mirror."""
         return pad_up(self.mirror_bytes, _HOST_PAGE_BYTES)
+
+    @property
+    def device_bytes(self) -> int:
+        """Device bytes of the Batch: the mirror, its device staging copy and the
+        fetch's work arrays."""
+        return 2 * self.mirror_bytes + self.fetch_scratch_bytes
 
     @property
     def fetch_scratch_bytes(self) -> int:
@@ -600,6 +607,44 @@ def host_bounded_quota(
     if not host_per_quota_byte:
         return quota
     return min(quota, int(max(0.0, host_budget - held_back) / host_per_quota_byte))
+
+
+def host_bounded_pool_ratio(
+    life_cycles: Sequence[LifeCyclePage],
+    pool_ratio: Sequence[float],
+    *,
+    bounded_quota: int,
+    quota: int,
+) -> list[float] | None:
+    """Return a split of ``quota`` that holds host-backed life cycles to ``bounded_quota``.
+
+    Lowering the whole quota to the :func:`host_bounded_quota` result shrinks
+    every life cycle with the host-backed ones. This split keeps ``quota``
+    instead. Each life cycle with host-backed pages gets the device bytes its
+    share of ``bounded_quota`` buys, so its host pools stay within their
+    budget, and the device-only life cycles divide the rest in proportion to
+    their shares.
+
+    Args:
+        life_cycles: The manager's life cycles, in native order.
+        pool_ratio: The split ``bounded_quota`` was computed for.
+        bounded_quota: The quota at which the host-backed pools fit.
+        quota: The device quota to split.
+
+    Returns:
+        One positive share per life cycle, summing to 1; None when no life cycle
+        is device-only or nothing fits.
+    """
+    host_share = sum(share for lc, share in zip(life_cycles, pool_ratio) if lc.host_bytes)
+    device_share = sum(share for lc, share in zip(life_cycles, pool_ratio) if not lc.host_bytes)
+    if bounded_quota <= 0 or device_share <= 0:
+        return None
+    host_scale = bounded_quota / quota
+    device_scale = (1.0 - host_share * host_scale) / device_share
+    return [
+        share * (host_scale if life_cycle.host_bytes else device_scale)
+        for life_cycle, share in zip(life_cycles, pool_ratio)
+    ]
 
 
 def plan_host_history_bytes(

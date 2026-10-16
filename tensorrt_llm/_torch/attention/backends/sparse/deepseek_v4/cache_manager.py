@@ -2620,7 +2620,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
     def _iter_cache_cleanup_buffers(self) -> Iterable[tuple[torch.Tensor, int | None]]:
-        """Yield storage and arena views with their optional storage guard-page index."""
+        """Yield device storage and arena views with their optional storage guard-page index.
+
+        Host-backed sparse history is left out. Nothing reads a row of it before
+        a transfer or a write-back fills it, and walking it would cross PCIe for
+        every page of the host budget.
+        """
         buffers_handled = set()
 
         # Handle each attention buffer from start to end to traverse the whole
@@ -2638,6 +2643,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 if buffer_key in buffers_handled:
                     continue
                 buffers_handled.add(buffer_key)
+                if self._enable_kv_cache_offload and self.impl.is_sparse(*buffer_key):
+                    continue
                 yield buffer, self._guard_page_by_layer.get(buffer_key)
 
         # Arena views span complete GPU pools and can be shared by several layers.
@@ -2653,7 +2660,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     @torch.inference_mode()
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
         if self._enable_kv_cache_offload:
-            # Finish cache-stream writeback before scanning or clearing either tier.
+            # Finish cache-stream writeback, which reads the arenas, before
+            # scanning or clearing them.
             torch.cuda.current_stream(self._stream.device).wait_stream(self._stream)
         some_checks_unavailable = False
         has_invalid_values = torch.tensor(

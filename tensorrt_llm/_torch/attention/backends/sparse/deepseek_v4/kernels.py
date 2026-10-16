@@ -14,7 +14,7 @@ import triton.language as tl
 ########################################################
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["sparse_num_lengths"])
 def _deepseek_v4_local_to_global_kernel(
     req_id_ptr,
     block_table_swa_ptr,
@@ -69,7 +69,7 @@ def _deepseek_v4_local_to_global_kernel(
     length_stride,
     MERGE_SPARSE_INDICES: tl.constexpr,
     SPARSE_BATCH_SIZE: tl.constexpr,
-    SPARSE_NUM_LENGTHS: tl.constexpr,
+    sparse_num_lengths,
     UNIT_TOKENS: tl.constexpr,
 ):
     """
@@ -113,7 +113,7 @@ def _deepseek_v4_local_to_global_kernel(
         active = tl.load(active_request_count_ptr)
         live = (token_id < active) & (req >= 0) & (req < active)
     if MERGE_SPARSE_INDICES:
-        live = live & (req < SPARSE_BATCH_SIZE) & (req < SPARSE_NUM_LENGTHS)
+        live = live & (req < SPARSE_BATCH_SIZE) & (req < sparse_num_lengths)
 
     # Load all SWA local indices for this token
     swa_ids = tl.arange(0, num_swa_indices)
@@ -509,7 +509,7 @@ def deepseek_v4_local_to_global_indices(
         length_stride=length_stride,
         MERGE_SPARSE_INDICES=merge_sparse_indices,
         SPARSE_BATCH_SIZE=sparse_batch_size,
-        SPARSE_NUM_LENGTHS=sparse_num_lengths,
+        sparse_num_lengths=sparse_num_lengths,
         UNIT_TOKENS=compress_ratio,
         launch_pdl=launch_with_pdl,
     )
@@ -528,7 +528,7 @@ def _check_sparse_offload_tensor(
         raise ValueError(f"{name} must be on CUDA device {device}")
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_lengths"])
 def _select_sparse_history_units_kernel(
     topk_ptr,
     request_rows_ptr,
@@ -544,7 +544,7 @@ def _select_sparse_history_units_kernel(
     out_stride0,
     out_stride1,
     NUM_REQUESTS: tl.constexpr,
-    NUM_LENGTHS: tl.constexpr,
+    num_lengths,
     TOPK: tl.constexpr,
     UNIT_TOKENS: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -553,7 +553,7 @@ def _select_sparse_history_units_kernel(
     active_count = tl.load(active_request_count_ptr)
     request = tl.load(request_rows_ptr + query * request_rows_stride)
     active = (query < active_count) & (request >= 0) & (request < active_count)
-    active = active & (request < NUM_REQUESTS) & (request < NUM_LENGTHS)
+    active = active & (request < NUM_REQUESTS) & (request < num_lengths)
     length = tl.load(compressed_lengths_ptr + request * compressed_lengths_stride, active, other=0)
     history = tl.load(history_lengths_ptr + request * history_lengths_stride, active, other=0)
     k = tl.arange(0, BLOCK_K)
@@ -637,7 +637,7 @@ def select_sparse_history_units(
             history_lengths.stride(0),
             *out.stride(),
             NUM_REQUESTS=num_requests,
-            NUM_LENGTHS=compressed_lengths.numel(),
+            num_lengths=compressed_lengths.numel(),
             TOPK=topk,
             UNIT_TOKENS=unit_tokens,
             BLOCK_K=triton.next_power_of_2(topk),

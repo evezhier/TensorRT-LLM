@@ -492,7 +492,7 @@ def test_compress_storage_views_match_allocation_size(
 )
 @pytest.mark.parametrize("nvfp4", [False, True])
 @pytest.mark.parametrize("fill_with_zero", [False, True])
-def test_sparse_warmup_cleanup_covers_storage_and_shared_arenas(
+def test_sparse_warmup_cleanup_covers_arenas_and_leaves_host_history(
     monkeypatch: pytest.MonkeyPatch, device: str, nvfp4: bool, fill_with_zero: bool
 ) -> None:
     manager = _manager()
@@ -567,18 +567,16 @@ def test_sparse_warmup_cleanup_covers_storage_and_shared_arenas(
         assert manager.check_invalid_values_in_kv_cache(fill_with_zero) == (not nvfp4)
     if device == "cpu":
         cleanup_stream.wait_stream.assert_called_once_with(manager._stream)
+    scanned = [call.args[0].data_ptr() for call in isnan.call_args_list]
     for arena in (arena_data, arena_scales):
         if arena is not None:
-            assert (
-                sum(call.args[0].data_ptr() == arena.data_ptr() for call in isnan.call_args_list)
-                == 1
-            )
+            assert scanned.count(arena.data_ptr()) == 1
+    # Nothing reads host history before a transfer or a write-back fills it, so
+    # the scan neither reads nor clears it, guard page included.
+    assert not {buffer.data_ptr() for buffer in storage.values()} & set(scanned)
     for buffer, original in zip(buffers, originals):
-        expected = original
-        if fill_with_zero:
-            expected = torch.zeros_like(original)
-            if buffer is storage[41, main]:
-                expected[5] = torch.full_like(buffer[5], 0x7F if nvfp4 else 17).view(torch.uint8)
+        cleared = fill_with_zero and all(buffer is not host for host in storage.values())
+        expected = torch.zeros_like(original) if cleared else original
         torch.testing.assert_close(buffer.view(torch.uint8), expected)
     for backing, edges in backings:
         torch.testing.assert_close(backing[[0, -1]].view(torch.uint8), edges.view(torch.uint8))
