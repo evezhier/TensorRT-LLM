@@ -3821,6 +3821,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
         assert kv_cache.beam_width <= self.max_beam_width
+        if kv_cache.batch_row >= 0:
+            # A member's page indices belong to its Batch row; binding a second buffer
+            # would take the writes with it and strand that row at whatever it held when
+            # the cache joined. When the Batch borrows this tensor the row is the one this
+            # method would have bound, so nothing is lost by leaving it alone.
+            return
         index = self.index_mapper.get_index(request_id)
         for beam_idx in range(int(kv_cache.beam_width)):
             for pool_idx in range(self.num_pools):

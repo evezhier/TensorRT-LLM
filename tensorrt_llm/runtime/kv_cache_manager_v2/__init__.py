@@ -152,6 +152,7 @@ ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 ScratchDesc = _cpp.ScratchDesc
 Batch = _cpp.Batch
+ExternalPageTable = _cpp.ExternalPageTable
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
 SsmLayerConfig = _cpp.SsmLayerConfig
@@ -256,6 +257,7 @@ __all__ = [
     "ReuseScope",
     "ScratchDesc",
     "Batch",
+    "ExternalPageTable",
     "KVCacheIterationStatsDelta",
     "ReusedBlocksByLevel",
     "KVCacheStatsDelta",

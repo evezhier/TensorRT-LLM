@@ -50,8 +50,9 @@ std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
 
 } // namespace
 
-Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq)
+Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std::optional<ExternalPageTable> pageTable)
     : mManager(&manager)
+    , mPageTable(pageTable)
 {
     auto const [derivedRows, derivedBlocks] = deriveBounds(manager.config());
     mMaxBatchSize = maxBatchSize > 0 ? maxBatchSize : derivedRows;
@@ -65,14 +66,30 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq)
     mNumLayerGroups = manager.storage().numLifeCycles();
     mRows.assign(static_cast<size_t>(mMaxBatchSize), nullptr);
 
+    if (mPageTable)
+    {
+        if (mPageTable->host == nullptr || mPageTable->device == 0)
+        {
+            throw std::invalid_argument("Batch: a borrowed page table needs both a host and a device side");
+        }
+        if (mPageTable->rowStride < mMaxBlocksPerSeq
+            || mPageTable->layerGroupStride < mPageTable->rowStride * mMaxBatchSize)
+        {
+            throw std::invalid_argument("Batch: borrowed page table strides are too small for its rows");
+        }
+    }
+
     // Page tables and watermarks share one block, so one transfer publishes a consistent
     // pair. Splitting them would let a kernel read one step's table beside another step's
-    // lengths, which is an out-of-range read rather than a stale answer.
+    // lengths, which is an out-of-range read rather than a stale answer. A borrowed table
+    // is split by construction, so its owner carries that ordering instead.
     auto const elements = _totalElements();
     mStaging = std::make_unique<HostMem>(_totalBytes());
     auto* staging = reinterpret_cast<int32_t*>(mStaging->address());
     // A row that no member occupies must still read as "no such block" rather than as slot
-    // zero, since the fetch has no other way to tell them apart.
+    // zero, since the fetch has no other way to tell them apart. A borrowed table is left
+    // alone: its rows belong to their owner until a member takes one, and the rows this
+    // Batch never seats serve that owner's other requests.
     std::fill(staging, staging + _historyOffset(), kBadPageIndex.value());
     // Watermarks of a free row are zero: a request with nothing eligible.
     std::fill(staging + _historyOffset(), staging + elements, 0);
@@ -172,9 +189,20 @@ size_t Batch::_rowElements() const noexcept
     return static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
 }
 
+int64_t Batch::_pageTableRowStride() const noexcept
+{
+    return mPageTable ? mPageTable->rowStride : static_cast<int64_t>(mMaxBlocksPerSeq);
+}
+
+int64_t Batch::_pageTableGroupStride() const noexcept
+{
+    return mPageTable ? mPageTable->layerGroupStride : static_cast<int64_t>(_rowElements());
+}
+
 size_t Batch::_historyOffset() const noexcept
 {
-    return _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
+    // A borrowed table occupies none of the staged block, so the watermarks start it.
+    return mPageTable ? 0 : _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
 }
 
 size_t Batch::_capacityOffset() const noexcept
@@ -229,17 +257,22 @@ void Batch::_stageRowState()
 
 int32_t* Batch::_stagingRow(LayerGroupId layerGroupId, int row) const
 {
-    auto* base = reinterpret_cast<int32_t*>(mStaging->address());
+    auto* base = mPageTable ? mPageTable->host : reinterpret_cast<int32_t*>(mStaging->address());
     auto const offset
-        = _rowElements() * static_cast<size_t>(layerGroupId.value()) + static_cast<size_t>(row) * mMaxBlocksPerSeq;
+        = _pageTableGroupStride() * layerGroupId.value() + _pageTableRowStride() * static_cast<int64_t>(row);
     return base + offset;
 }
 
-int Batch::addKvCache(KvCache& kvCache)
+int Batch::addKvCache(KvCache& kvCache, int requestedRow)
 {
     if (kvCache.mBatch != nullptr)
     {
         throw LogicError("A KvCache belongs to at most one Batch");
+    }
+    if (mPageTable && requestedRow < 0)
+    {
+        // Choosing one would address whichever request the lender seated there.
+        throw LogicError("A Batch borrowing a page table must be told which row a member occupies");
     }
     if (kvCache.beamWidth() != BeamIndex{1})
     {
@@ -247,25 +280,41 @@ int Batch::addKvCache(KvCache& kvCache)
         // and have every beam read them. Refusing beats a wrong answer nothing would notice.
         throw LogicError("Batch does not support beam search yet; a member must have beam width 1");
     }
-    // setBasePageIndexBuf writes this row, so the last publish must be done reading it.
+    // Binding a row writes it, so the last publish must be done reading it.
     waitPublished();
-    auto const free = std::find(mRows.begin(), mRows.end(), nullptr);
-    if (free == mRows.end())
+    int row = requestedRow;
+    if (row < 0)
     {
-        throw LogicError("Batch is full; it was sized for max_batch_size rows");
+        auto const free = std::find(mRows.begin(), mRows.end(), nullptr);
+        if (free == mRows.end())
+        {
+            throw LogicError("Batch is full; it was sized for max_batch_size rows");
+        }
+        row = static_cast<int>(std::distance(mRows.begin(), free));
     }
-    auto const row = static_cast<int>(std::distance(mRows.begin(), free));
+    else
+    {
+        if (row >= mMaxBatchSize)
+        {
+            throw std::out_of_range("Batch::addKvCache: row is beyond max_batch_size");
+        }
+        if (mRows[static_cast<size_t>(row)] != nullptr)
+        {
+            throw LogicError("Batch::addKvCache: row is already occupied");
+        }
+    }
 
-    // Point every layer group's index table at this row. setBasePageIndexBuf copies the
-    // current indices in and keeps writing there, so the staging row needs no refresh of
-    // its own afterwards.
+    // Point every layer group's index table at this row. The bind copies the current
+    // indices in and keeps writing there, so the row needs no refresh of its own
+    // afterwards -- and keeps doing so until the member leaves, which is why a step that
+    // only advances its members has nothing to rebind.
     for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
     {
         // Beam 0 only; addKvCache rejects anything wider.
-        kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lg, _stagingRow(lg, row), mMaxBlocksPerSeq);
+        kvCache._bindBasePageIndexBuf(kDefaultBeamIndex, lg, _stagingRow(lg, row), mMaxBlocksPerSeq);
     }
 
-    *free = &kvCache;
+    mRows[static_cast<size_t>(row)] = &kvCache;
     kvCache.mBatch = this;
     kvCache.mBatchRow = row;
     return row;
@@ -282,7 +331,7 @@ void Batch::removeKvCache(KvCache& kvCache)
     for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
     {
         // Hands the indices back to the cache's own storage before the row is reused.
-        kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lg, nullptr, 0);
+        kvCache._bindBasePageIndexBuf(kDefaultBeamIndex, lg, nullptr, 0);
         auto* staged = _stagingRow(lg, row);
         std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
     }
@@ -372,10 +421,11 @@ PageTableView Batch::pageTable(LayerGroupId layerGroupId) const
         throw std::out_of_range("Batch::pageTable: unknown layer group");
     }
     PageTableView view;
-    view.data = reinterpret_cast<CUdeviceptr>(mDevice.get())
-        + sizeof(int32_t) * _rowElements() * static_cast<size_t>(layerGroupId.value());
+    auto const base = mPageTable ? mPageTable->device : reinterpret_cast<CUdeviceptr>(mDevice.get());
+    view.data = base + sizeof(int32_t) * _pageTableGroupStride() * layerGroupId.value();
     view.numRows = mMaxBatchSize;
     view.blocksPerRow = mMaxBlocksPerSeq;
+    view.rowStride = static_cast<int32_t>(_pageTableRowStride());
     return view;
 }
 

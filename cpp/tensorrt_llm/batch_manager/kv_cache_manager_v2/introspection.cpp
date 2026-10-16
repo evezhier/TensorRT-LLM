@@ -132,8 +132,14 @@ int KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId, 
 std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, int layerGroupId)
 {
     auto const view = batch.pageTable(LayerGroupId{layerGroupId});
+    // Packed, whatever the table's own stride: callers index this by row * blocksPerRow.
     std::vector<int32_t> out(static_cast<size_t>(view.numRows) * view.blocksPerRow);
-    cuCheck(cuMemcpyDtoH(out.data(), view.data, sizeof(int32_t) * out.size()));
+    for (int32_t row = 0; row < view.numRows; ++row)
+    {
+        cuCheck(cuMemcpyDtoH(out.data() + static_cast<size_t>(row) * view.blocksPerRow,
+            view.data + sizeof(int32_t) * static_cast<size_t>(row) * view.rowStride,
+            sizeof(int32_t) * view.blocksPerRow));
+    }
     return out;
 }
 

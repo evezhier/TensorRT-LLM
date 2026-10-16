@@ -263,6 +263,11 @@ public:
     // Zero-copy page index buffer: copy current base indices into [buf, buf+len)
     // and arrange that future updateBasePageIndex calls write there too.
     // Pass buf=nullptr / len=0 to revert to the internal vector.
+    //
+    // Refused while this cache belongs to a Batch: membership binds every layer group to a
+    // row of the Batch's table, and a second buffer would take the writes with it, leaving
+    // that row holding whatever it held when the cache joined. Remove it from the Batch
+    // first, or let the Batch be the one holding the buffer worth writing to.
     void setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len);
 
     // ---- Introspection -----------------------------------------------------
@@ -270,6 +275,15 @@ public:
     Status status() const noexcept
     {
         return mStatus;
+    }
+
+    // Row this cache occupies in its Batch, or -1 when it belongs to none.
+    //
+    // Also the answer to who owns its page index buffers: a member's are the Batch's rows,
+    // so setBasePageIndexBuf refuses, and suspend() leaves them bound.
+    int batchRow() const noexcept
+    {
+        return mBatchRow;
     }
 
     CommitState commitState() const noexcept
@@ -482,6 +496,9 @@ public:
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
 
     int updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value);
+
+    // setBasePageIndexBuf without the membership check, for the Batch that owns the binding.
+    void _bindBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len);
 
     std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
 

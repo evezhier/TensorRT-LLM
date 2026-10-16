@@ -624,7 +624,7 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
         copy.views = views;
         copy.numRows = numRows;
         copy.pageTable = reinterpret_cast<int32_t const*>(table.data);
-        copy.pageTableStride = table.blocksPerRow;
+        copy.pageTableStride = table.rowStride;
         copy.numBlocks = table.blocksPerRow;
         copy.pageTableBase = 0;
         copy.direction = SparseCopyDirection::kFetch;

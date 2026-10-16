@@ -48,6 +48,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
+        ExternalPageTable,
         GpuCacheTierConfig,
         HostCacheTierConfig,
         KVCacheDesc,
@@ -101,6 +102,7 @@ else:
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
+        ExternalPageTable,
         GpuCacheTierConfig,
         HostCacheTierConfig,
         KVCacheDesc,
@@ -1504,6 +1506,176 @@ class TestSparseFetch(unittest.TestCase):
                 manager.fetch_sparse_pages(
                     batch, self._buffers(roles), selected, self._out(torch, 2, 1), handle
                 )
+
+
+class TestBorrowedPageTable(unittest.TestCase):
+    """Batch(page_table=...): page indices written into storage someone else owns.
+
+    The runtime already holds a table of these numbers and uploads it every step, so a
+    Batch that keeps its own stages and publishes the same values twice -- and leaves a
+    member's indices with two places to live, which is what forces the binding to be
+    handed back and forth within a step. Borrowing collapses both.
+    """
+
+    ROWS = 2
+    BLOCKS = 4
+    GROUPS = 1
+    # Wider than the part the Batch describes, as a plane of the runtime's tensor is: its
+    # rows carry a key/value dimension this table does not use.
+    ROW_STRIDE = 2 * BLOCKS
+    GROUP_STRIDE = ROWS * ROW_STRIDE
+    #: Neither a page index nor BAD_PAGE_INDEX, so "the lender still owns this" is visible.
+    UNTOUCHED = 12345
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    def _torch(self):
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to lend device memory")
+        return torch
+
+    @contextlib.contextmanager
+    def _fixture(self, *, borrow: bool = True):
+        """A manager and a Batch, lending it a table unless asked not to."""
+        torch = self._torch()
+        manager = TestSparseFetch._manager(("key",))
+        host = device = None
+        try:
+            elements = self.GROUPS * self.GROUP_STRIDE
+            host = torch.full((elements,), self.UNTOUCHED, dtype=torch.int32).pin_memory()
+            device = torch.full((elements,), self.UNTOUCHED, dtype=torch.int32, device="cuda")
+            table = (
+                ExternalPageTable(
+                    host=host.data_ptr(),
+                    device=device.data_ptr(),
+                    layer_group_stride=self.GROUP_STRIDE,
+                    row_stride=self.ROW_STRIDE,
+                )
+                if borrow
+                else None
+            )
+            batch = Batch(
+                manager,
+                max_batch_size=self.ROWS,
+                max_blocks_per_seq=self.BLOCKS,
+                page_table=table,
+            )
+            yield torch, manager, batch, host, device
+        finally:
+            manager.shutdown()
+
+    def _row(self, host, row: int, group: int = 0):
+        beg = group * self.GROUP_STRIDE + row * self.ROW_STRIDE
+        return host[beg : beg + self.ROW_STRIDE].tolist()
+
+    @contextlib.contextmanager
+    def _member(self, manager, batch, row: int, handle):
+        """A resumed cache seated in `row`, with two whole blocks of history."""
+        cache = manager.create_kv_cache()
+        try:
+            batch.add_kv_cache(cache, row)
+            self.assertTrue(cache.resume(handle))
+            tokens = 2 * TestSparseFetch.TOKENS_PER_BLOCK
+            sizes = [None] * self.ROWS
+            sizes[row] = tokens
+            batch.resize(list(sizes), list(sizes), handle)
+            yield cache
+        finally:
+            if batch.row_of(cache) >= 0:
+                batch.remove_kv_cache(cache)
+            cache.close()
+
+    def test_a_member_writes_its_indices_into_the_row_it_was_given(self):
+        """The lender chose the row, so the indices must land in that one and no other."""
+        with self._fixture() as (torch, manager, batch, host, _device):
+            lg = manager.get_layer_group_id(0)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                with self._member(manager, batch, 1, handle) as cache:
+                    expected = [int(x) for x in cache.get_base_page_indices(lg)][: self.BLOCKS]
+                    self.assertEqual(self._row(host, 1)[: self.BLOCKS], expected)
+                    # A page index, not the fill: the member really has pages here.
+                    self.assertNotEqual(expected[0], self.UNTOUCHED)
+
+    def test_the_lender_keeps_every_element_the_batch_was_not_given(self):
+        """Everything outside a member's own row stays as the lender left it.
+
+        Row 0 serves one of the lender's own requests, and the columns past
+        max_blocks_per_seq are its key/value half. Writing either would corrupt a request
+        this Batch has never heard of.
+        """
+        with self._fixture() as (torch, manager, batch, host, _device):
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                with self._member(manager, batch, 1, handle):
+                    self.assertEqual(self._row(host, 0), [self.UNTOUCHED] * self.ROW_STRIDE)
+                    self.assertEqual(
+                        self._row(host, 1)[self.BLOCKS :],
+                        [self.UNTOUCHED] * (self.ROW_STRIDE - self.BLOCKS),
+                    )
+
+    def test_publish_leaves_a_borrowed_table_to_its_lender(self):
+        """The page indices travel in the lender's transfer, not in this one.
+
+        That is the whole point of borrowing: the lender already uploads these bytes, so a
+        second transfer of them is the cost this removes.
+        """
+        with self._fixture() as (torch, manager, batch, _host, device):
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                with self._member(manager, batch, 1, handle):
+                    marker = torch.arange(device.numel(), dtype=torch.int32, device="cuda")
+                    device.copy_(marker)
+                    batch.publish(handle)
+                    torch.cuda.synchronize()
+                    self.assertTrue(bool((device == marker).all()))
+
+    def test_a_borrowed_batch_refuses_to_choose_a_row(self):
+        """Choosing one would address whichever request the lender seated there."""
+        with self._fixture() as (torch, manager, batch, _host, _device):
+            cache = manager.create_kv_cache()
+            try:
+                with self.assertRaises(Exception) as caught:
+                    batch.add_kv_cache(cache)
+                self.assertIn("must be told which row", str(caught.exception))
+            finally:
+                cache.close()
+
+    def test_a_member_refuses_a_second_page_index_buffer(self):
+        """Its indices live in the Batch's row, so a second buffer is refused.
+
+        That buffer would take the writes with it and strand the row at whatever it held
+        when the cache joined -- silently, which is the one outcome worth a hard failure.
+        """
+        with self._fixture(borrow=False) as (torch, manager, batch, _host, _device):
+            lg = manager.get_layer_group_id(0)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                with self._member(manager, batch, 0, handle) as cache:
+                    self.assertEqual(cache.batch_row, 0)
+                    spare = array.array("i", [BAD_PAGE_INDEX] * self.BLOCKS)
+                    with self.assertRaises(Exception) as caught:
+                        cache.set_base_page_index_buf(DEFAULT_BEAM_INDEX, lg, memoryview(spare))
+                    self.assertIn("Batch member", str(caught.exception))
+
+    def test_suspending_a_member_leaves_its_row_bound(self):
+        """A suspended member's row reads as absent, not as pages it has released.
+
+        Reverting to the cache's own storage would leave the row holding indices of pages
+        it no longer owns; the unlocks write BAD_PAGE_INDEX through the binding instead.
+        """
+        with self._fixture() as (torch, manager, batch, host, _device):
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                with self._member(manager, batch, 1, handle) as cache:
+                    cache.suspend()
+                    self.assertEqual(cache.batch_row, 1)
+                    self.assertEqual(
+                        self._row(host, 1)[: self.BLOCKS], [BAD_PAGE_INDEX] * self.BLOCKS
+                    )
 
 
 class TestSparseDataPath(unittest.TestCase):

@@ -590,7 +590,14 @@ class _KVCache:
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
-    ) -> None: ...
+    ) -> None:
+        """Write page indices through ``buf`` instead of this cache's own storage.
+
+        Raises while this cache belongs to a :class:`Batch`: membership already binds every
+        layer group to a row of the batch's table, and a second buffer would take the writes
+        with it, leaving that row holding whatever it held when the cache joined. Remove it
+        from the batch first, or give the batch the buffer worth writing to.
+        """
     @property
     def manager(self) -> "KVCacheManager": ...
     @property
@@ -599,6 +606,14 @@ class _KVCache:
     def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
     def num_blocks(self) -> int: ...
+    @property
+    def batch_row(self) -> int:
+        """Row this cache occupies in its :class:`Batch`, or ``-1`` when it belongs to none.
+
+        Also the answer to who owns its page index buffers: a member's are the batch's
+        rows, so :meth:`set_base_page_index_buf` refuses and ``suspend()`` leaves them
+        bound rather than copying them back out.
+        """
     def commit_pending_stats(self) -> KVCacheStatsDelta: ...
     def discard_pending_stats(self) -> None: ...
     def close(self) -> None: ...
@@ -791,6 +806,41 @@ def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
     consumes an explicitly supplied codec, including an attempt that fails.
     """
 
+class ExternalPageTable:
+    """Page-index storage a :class:`Batch` writes through instead of keeping its own.
+
+    The runtime already holds one of these per step -- the host block-offsets tensor the
+    dense attention path fills and uploads -- and its rows carry exactly the numbers a
+    ``Batch`` would otherwise stage and upload a second time. Lending it leaves one buffer
+    with one writer, so a member's page indices need no mirroring and its binding survives
+    the whole decode rather than being rebound each step.
+
+    ``host`` and ``device`` are addresses of ``int32`` arrays laid out as
+    ``[layer_group][row][block]`` with the given element strides. A row is longer than
+    ``max_blocks_per_seq`` when the table is a plane of a wider array, which is the usual
+    case: the runtime's tensor carries a key/value dimension the ``Batch`` does not use.
+
+    The lender owns the transfer. It must carry the host side to the device side on the
+    step's stream before that step's kernels run, since the watermarks
+    :meth:`Batch.publish` sends bound which of these entries those kernels read.
+
+    It also owns the rows. A row no member occupies is left untouched, because it is
+    serving one of the lender's other requests; and a member must be removed from the
+    ``Batch`` before the lender reassigns the row it sits in.
+    """
+
+    def __init__(
+        self,
+        host: int,
+        device: int,
+        layer_group_stride: int,
+        row_stride: int,
+    ) -> None: ...
+    @property
+    def layer_group_stride(self) -> int: ...
+    @property
+    def row_stride(self) -> int: ...
+
 class Batch:
     """The ``_KVCache`` objects stepped together, and their device-side mirror.
 
@@ -815,20 +865,30 @@ class Batch:
         manager: KVCacheManager,
         max_batch_size: int = 0,
         max_blocks_per_seq: int = 0,
+        page_table: ExternalPageTable | None = None,
     ) -> None:
         """Bound the device arrays, whose shape must not change between steps.
 
         Neither can be grown later, so neither is inferred: zero derives it from the
         manager's ``constraints``, which fails when none were declared. A pool-sizing hint
         is a default, never a substitute for a batch bound.
+
+        ``page_table`` borrows the page-index storage instead of allocating it, which
+        leaves one buffer with one writer and takes the page indices out of
+        :meth:`publish`. Its rows then belong to the lender, so :meth:`add_kv_cache` has to
+        be told which one a member occupies.
         """
 
-    def add_kv_cache(self, kv_cache: _KVCache) -> int:
-        """Take the lowest free row, returning it.
+    def add_kv_cache(self, kv_cache: _KVCache, row: int = -1) -> int:
+        """Seat a cache in ``row``, or in the lowest free row when it is negative.
 
-        Raises if the batch is full, if the cache already belongs to a batch, or if its
-        beam width exceeds one -- only beam 0 is mirrored, so a wider request would have
-        every beam read beam 0's pages.
+        Returns the row. Raises if the row is taken or out of range, if the batch is full,
+        if the cache already belongs to a batch, or if its beam width exceeds one -- only
+        beam 0 is mirrored, so a wider request would have every beam read beam 0's pages.
+
+        A batch borrowing a page table requires ``row``: its rows are indexed by whatever
+        slot the lender gave the request, and one chosen here would address a different
+        request's entries.
         """
 
     def remove_kv_cache(self, kv_cache: _KVCache) -> None:
@@ -855,13 +915,17 @@ class Batch:
         """
 
     def publish(self, stream: CudaStream) -> None:
-        """Copy the staged page indices and watermarks to the device, enqueuing on ``stream``.
+        """Copy the staged rows to the device, enqueuing on ``stream``.
 
         Page indices are published as stored -- level-relative, unscaled, and with
         ``BAD_PAGE_INDEX`` preserved rather than folded to a safe slot. A sparse table
         numbers pure-history and input-token entries in different levels' pools, so only
         the sentinel separates an absent block from slot zero; the dense path's scaled
         block offsets cannot serve here for that reason.
+
+        A borrowed page table is **not** carried by this call -- its lender uploads it, and
+        must do so on this same stream and before the step's kernels, since the watermarks
+        published here bound which of its entries those kernels read.
         """
 
     def wait_published(self) -> None:
@@ -881,8 +945,12 @@ class Batch:
     def page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
         """``int32[max_batch, max_blocks_per_seq]`` base page indices for one group.
 
-        A DLPack array over memory the ``Batch`` owns; it keeps the ``Batch`` alive for as
-        long as the array exists. An unoccupied row reads as ``BAD_PAGE_INDEX`` throughout.
+        A DLPack array over memory the ``Batch`` or its lender owns; it keeps the ``Batch``
+        alive for as long as the array exists. A borrowed table's rows are wider than the
+        part described here, so the array is strided rather than contiguous.
+
+        An unoccupied row reads as ``BAD_PAGE_INDEX`` throughout when the ``Batch`` owns
+        the table. A borrowed one holds whatever its lender put there.
         """
 
     def history_lengths(self) -> DeviceArray:

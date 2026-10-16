@@ -41,7 +41,31 @@ struct PageTableView
 {
     CUdeviceptr data = 0;
     int32_t numRows = 0;
+    //! Entries of a row this table describes.
     int32_t blocksPerRow = 0;
+    //! Elements between consecutive rows. Larger than `blocksPerRow` when the table is a
+    //! plane of a wider array, which is what borrowing the runtime's offsets tensor gives.
+    int32_t rowStride = 0;
+};
+
+//! A page-index table owned by someone else, which a Batch writes through instead of
+//! keeping its own.
+//!
+//! The runtime already holds one of these per step -- the host offsets tensor the dense
+//! attention path fills and uploads -- and its rows carry exactly the numbers a Batch would
+//! otherwise stage and upload a second time. Borrowing it leaves one buffer with one writer,
+//! so a member's page indices need no mirroring and its binding survives the whole decode.
+//!
+//! Host and device sides must describe the same elements in the same order; the Batch
+//! writes the host side and reads the device side, and relies on the owner to carry one to
+//! the other before the step's kernels run.
+struct ExternalPageTable
+{
+    int32_t* host = nullptr;
+    CUdeviceptr device = 0;
+    //! Elements between consecutive layer groups, and between consecutive rows of one.
+    int64_t layerGroupStride = 0;
+    int64_t rowStride = 0;
 };
 
 //! Device scratch one layer group's fetch resolves into, before the copy and the index
@@ -99,16 +123,30 @@ public:
     //! be grown later. Pass 0 to derive from the manager's `constraints`, which fails when
     //! none were declared -- a pool-sizing hint is not a batch bound, so it is only a
     //! default, never an inference.
-    explicit Batch(KvCacheManager& manager, int maxBatchSize = 0, int maxBlocksPerSeq = 0);
+    //!
+    //! @param pageTable borrowed page-index storage. When absent the Batch allocates and
+    //! publishes its own, which is what a caller with no runtime tensor to share wants.
+    //! When present its rows must be addressable for every (layer group, row) this Batch
+    //! can reach, and the rows become the owner's -- so addKvCache needs to be told which
+    //! one a member occupies rather than choosing.
+    explicit Batch(KvCacheManager& manager, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
+        std::optional<ExternalPageTable> pageTable = std::nullopt);
     ~Batch();
 
     Batch(Batch const&) = delete;
     Batch& operator=(Batch const&) = delete;
 
-    //! Take the lowest free row. Throws when the batch is full, the cache already belongs to
-    //! a batch, or its beam width exceeds one -- only beam 0 is mirrored, so a wider request
-    //! would have every beam read beam 0's pages.
-    int addKvCache(KvCache& kvCache);
+    //! Seat a cache in `row`, or in the lowest free row when it is negative.
+    //!
+    //! A borrowed page table makes the row the owner's to choose: its rows are indexed by
+    //! whatever slot the owner assigned the request, and a row this Batch picked for itself
+    //! would address a different request's entries. So `row` is required in that case and
+    //! refused in neither -- passing one is always allowed.
+    //!
+    //! Throws when the row is taken or out of range, the batch is full, the cache already
+    //! belongs to a batch, or its beam width exceeds one -- only beam 0 is mirrored, so a
+    //! wider request would have every beam read beam 0's pages.
+    int addKvCache(KvCache& kvCache, int row = -1);
 
     //! Free the cache's row, leaving a hole. Throws when it is not a member.
     void removeKvCache(KvCache& kvCache);
@@ -130,11 +168,15 @@ public:
     std::vector<bool> resize(std::vector<std::optional<int>> const& capacities,
         std::vector<std::optional<int>> const& historyLengths, CUstream stream);
 
-    //! Copy the staged page indices to the device, enqueuing on `stream`.
+    //! Copy the staged rows to the device, enqueuing on `stream`.
     //!
     //! The staging rows are written by the members themselves, so they are always current;
     //! what this adds is a stream-ordered snapshot. Without it the host would be mutating
     //! the table a previously enqueued fetch is still reading.
+    //!
+    //! A borrowed page table is **not** carried by this call -- its owner uploads it, and
+    //! must do so on the same stream and before the step's kernels, since the watermarks
+    //! published here bound which of its entries those kernels read.
     //!
     //! The copy is asynchronous and reads pinned memory, so it is still in flight when this
     //! returns. **Every later host write to a member's page indices must be separated from
@@ -199,8 +241,13 @@ private:
     //! Called by a member being destroyed, so its row does not dangle.
     void _detach(KvCache& kvCache) noexcept;
 
-    //! Host-side row for one (layer group, row), inside the pinned staging block.
+    //! Host-side page-index row for one (layer group, row): inside the pinned staging block
+    //! when the table is this Batch's, inside the lender's when it is borrowed.
     [[nodiscard]] int32_t* _stagingRow(LayerGroupId layerGroupId, int row) const;
+
+    //! Element strides of the page-index table, whoever owns it.
+    [[nodiscard]] int64_t _pageTableRowStride() const noexcept;
+    [[nodiscard]] int64_t _pageTableGroupStride() const noexcept;
 
     [[nodiscard]] size_t _rowElements() const noexcept;
 
@@ -226,6 +273,10 @@ private:
     LifeCycleId mNumLayerGroups{0};
 
     std::vector<KvCache*> mRows;
+
+    //! Set when the page-index table is borrowed, in which case mStaging and mDevice hold
+    //! only the watermarks and cache views.
+    std::optional<ExternalPageTable> mPageTable;
 
     //! Pinned so the members' index writes land here with no extra copy, and so the
     //! publish is a single asynchronous transfer per layer group.

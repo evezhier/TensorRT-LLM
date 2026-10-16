@@ -764,10 +764,18 @@ void KvCache::suspend()
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
-    for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
-        for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
-            if (std::holds_alternative<Span<int>>(mBasePageIndices[bi][lcId]))
-                setBasePageIndexBuf(bi, lcId, nullptr, 0);
+    //
+    // A Batch member keeps its binding instead: its row is the Batch's to hand out, and the
+    // page unlocks below write kBadPageIndex through the Span, which is what that row should
+    // read while the member holds nothing. Reverting would leave the row holding indices of
+    // pages this cache no longer owns.
+    if (mBatch == nullptr)
+    {
+        for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
+            for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
+                if (std::holds_alternative<Span<int>>(mBasePageIndices[bi][lcId]))
+                    _bindBasePageIndexBuf(bi, lcId, nullptr, 0);
+    }
 
     // Record event scope — mirrors Python's `with self._record_event()`.
     // SharedPageLock destructors inside the scope use finishEvent() to synchronize.
@@ -3026,6 +3034,17 @@ std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex 
 }
 
 void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len)
+{
+    if (mBatch != nullptr)
+    {
+        throw LogicError(
+            "setBasePageIndexBuf: this KvCache is a Batch member, so its page index buffer is the Batch's row; "
+            "remove it from the Batch first");
+    }
+    _bindBasePageIndexBuf(beamIdx, lgId, buf, len);
+}
+
+void KvCache::_bindBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len)
 {
     auto& slot = mBasePageIndices[beamIdx][lgId];
     BlockOrdinal const numBlocks = mBlocks.size();
