@@ -195,6 +195,12 @@ public:
     //! it by waitPublished()** -- a resize(), a commit(), a beam fork, an SWA recycle,
     //! anything that locks or unlocks a page. Writing sooner races the copy and publishes a
     //! torn table.
+    //!
+    //! Throws when the previous publish has not been waited on, which is how that rule is
+    //! enforced: this call stages the watermarks and views itself, so it would be writing
+    //! into the same hazard. It refuses rather than waiting because a wait here covers only
+    //! its own write -- a member mutated before the call has already raced by then, and
+    //! waiting would hide it.
     void publish(CUstream stream);
 
     //! Block until the last publish() has finished reading the staging rows.

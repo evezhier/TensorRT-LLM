@@ -404,10 +404,14 @@ std::vector<bool> Batch::resize(std::vector<std::optional<int>> const& capacitie
 
 void Batch::publish(CUstream stream)
 {
-    // A publish already in flight is reading the same staging rows this one will, and the
-    // copies are ordered on the stream anyway; waiting keeps the event meaning "the staging
-    // rows are free" rather than "the last of several copies finished".
-    waitPublished();
+    // Refusing rather than waiting, because by this point a wait would be too late to help.
+    // Everything that writes the staged rows has to be separated from the copy reading them:
+    // the members' own mutations, which happened before this call, and the watermarks and
+    // views staged just below. Waiting here would cover only the second, and would do it
+    // while quietly hiding that the first had already raced.
+    TLLM_CHECK_WITH_INFO(mPublished.isClosed(),
+        "Batch::publish: the previous publish is still reading the staged rows; call waitPublished() before "
+        "mutating any member or publishing again");
 
     // The members write their own page indices, but not their watermarks; collect those
     // now so the single transfer below carries a matched pair.

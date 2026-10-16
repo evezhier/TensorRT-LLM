@@ -932,6 +932,13 @@ class Batch:
         layer group instead of one linear transfer for all of them, because the lender's
         rows are further apart than they are wide.
 
+        Raises if the previous publish has not been waited on. This call stages the
+        watermarks and views itself, so it would be writing into the same hazard it is
+        meant to close. It refuses rather than waiting because a wait here covers only its
+        own write: a member mutated before the call has already raced by then, and waiting
+        would hide that. :meth:`resize` publishes, so republishing after one needs
+        :meth:`wait_published` in between.
+
         **Must be ordered after the kernels that read the previous publish.** Those live in
         a captured graph, so the device table cannot be double-buffered out of the hazard --
         the capture baked its address. Issuing this on the stream the graph replays on is

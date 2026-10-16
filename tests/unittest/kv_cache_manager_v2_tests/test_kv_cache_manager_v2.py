@@ -1356,10 +1356,10 @@ class TestSparseFetch(unittest.TestCase):
                 self.assertTrue(cache.resume(handle))
                 # Two whole blocks of history, so ordinals 0 and 1 are eligible.
                 tokens = 2 * self.TOKENS_PER_BLOCK
+                # resize() publishes, so the batch is already current here.
                 self.assertEqual(
                     batch.resize([tokens, None], [tokens, None], handle), [True, False]
                 )
-                batch.publish(handle)
                 yield torch, manager, batch, cache, handle
         finally:
             if cache is not None:
@@ -1628,6 +1628,8 @@ class TestBorrowedPageTable(unittest.TestCase):
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 with self._member(manager, batch, 1, handle):
+                    # _member's resize() already published; republishing needs the wait.
+                    batch.wait_published()
                     batch.publish(handle)
                     torch.cuda.synchronize()
                     table = _introspection.batch_page_table(batch, lg)
@@ -1639,6 +1641,26 @@ class TestBorrowedPageTable(unittest.TestCase):
                     # requests: skipping them would cost a transfer each. Nothing reads
                     # them, because a free row's cache view has no residency.
                     self.assertEqual(table[: self.BLOCKS], [self.UNTOUCHED] * self.BLOCKS)
+
+    def test_publishing_over_a_publish_in_flight_is_refused(self):
+        """A wait here would be too late, so it is the caller's to make.
+
+        Everything that writes the staged rows has to be separated from the copy reading
+        them: the members' own mutations, and the watermarks and views publish() stages
+        itself. Waiting inside publish() would cover only the second, and would do it while
+        hiding that a member mutated before the call had already raced.
+        """
+        with self._fixture(borrow=False) as (torch, manager, batch, _host):
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                with self._member(manager, batch, 0, handle):
+                    # _member's resize() published and nobody has waited on it.
+                    with self.assertRaises(Exception) as caught:
+                        batch.publish(handle)
+                    self.assertIn("still reading the staged rows", str(caught.exception))
+
+                    batch.wait_published()
+                    batch.publish(handle)
 
     def test_a_borrowed_batch_refuses_to_choose_a_row(self):
         """Choosing one would address whichever request the lender seated there."""
