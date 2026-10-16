@@ -92,6 +92,17 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggSchedul
 if TYPE_CHECKING:
     from .bounce import Config
 
+
+def _expose_chunk_external_accesses(session, task, chunk: Chunk) -> None:
+    """Root all KVCM claims in the physical task before exposing any address."""
+    accesses = getattr(chunk, "native_accesses", ())
+    session._external_accesses.extend(
+        (access.cache, access.access_id, task) for access in accesses
+    )
+    for access in accesses:
+        access.cache.expose_external_access(access.access_id)
+
+
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
@@ -2573,6 +2584,7 @@ class TxSession(TxSessionBase):
             task._unique_rid = self.disagg_request_id
             task.bind_logical_outcomes(self._logical_outcomes)
             self.kv_tasks.append(task)
+            _expose_chunk_external_accesses(self, task, chunk)
             self._has_last_slice |= chunk.is_last
             if self._retirement is not None and self._has_last_slice:
                 if not self._need_aux or self.aux_task is not None:
@@ -3979,6 +3991,7 @@ class RxSession(RxSessionBase):
             task.bind_logical_outcomes(self._logical_outcomes)
             task.begin_publication()
             self._kv_tasks.append(task)
+            _expose_chunk_external_accesses(self, task, chunk)
             if self._retirement is not None and chunk.is_last:
                 self._logical_outcomes.seal()
             return task

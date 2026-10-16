@@ -640,6 +640,66 @@ def _aggregate_kvcm_transfer(cfg: dict) -> list[dict]:
     return _aggregate_transfer_evidence(cfg, "kvcm_transfer_benchmark", "kvcm_transfer")
 
 
+def _aggregate_pd_host_aware(cfg: dict) -> list[dict]:
+    if not cfg.get("pd_host_aware_benchmark", {}).get("enabled", False):
+        return []
+    result = []
+    for sweep_idx, sweep in enumerate(cfg["ucx_env_sweep"]):
+        path = os.path.join(
+            cfg["environment"]["work_dir"],
+            "pd_host_aware",
+            f"gen_sweep{sweep_idx}.jsonl",
+        )
+        records = []
+        if os.path.exists(path):
+            with open(path) as file:
+                records = [json.loads(line) for line in file if line.strip()]
+        log_glob = os.path.join(
+            cfg["environment"]["work_dir"], "logs", f"pd{sweep_idx}_*_rank*.log"
+        )
+        transports = _parse_proto_info_by_case(log_glob, kv_only=True)
+        modes = []
+        for mode_idx, mode in enumerate(
+            cfg["pd_host_aware_benchmark"].get("modes", ["gpu", "host"])
+        ):
+            samples = [
+                row for row in records if row.get("sweep") == sweep_idx and row["mode"] == mode
+            ]
+            rates = [row["effective_gbps"] for row in samples if row.get("verified")]
+            modes.append(
+                {
+                    "mode": mode,
+                    "status": (
+                        "PASS"
+                        if len(rates) == cfg["pd_host_aware_benchmark"].get("samples", 3)
+                        else "NO_DATA"
+                    ),
+                    "median_GBps": statistics.median(rates) if rates else None,
+                    "median_handoff_ms": statistics.median(
+                        row["handoff_seconds"] * 1000 for row in samples
+                    ) if samples else None,
+                    "payload_bytes": samples[0]["payload_bytes"] if samples else None,
+                    "torch_peak_gpu_bytes": (
+                        max(row["torch_peak_gpu_bytes"] for row in samples) if samples else None
+                    ),
+                    "registered_gpu_pool_bytes": (
+                        samples[0]["registered_gpu_pool_bytes"] if samples else None
+                    ),
+                    "registered_host_pool_bytes": (
+                        samples[0]["registered_host_pool_bytes"] if samples else None
+                    ),
+                    "selected_transport": ",".join(transports.get(mode_idx, [])),
+                }
+            )
+        baseline = next((item["median_GBps"] for item in modes if item["mode"] == "gpu"), None)
+        for item in modes:
+            item["ratio_to_gpu"] = (
+                item["median_GBps"] / baseline if item["median_GBps"] and baseline else None
+            )
+        result.append({"sweep": sweep.get("name", str(sweep_idx)), "modes": modes})
+    return result
+
+
 def aggregate(cfg, out_path, require_kv_transport=False):
     work_dir = cfg["environment"]["work_dir"]
     cases = build_cases(cfg)
@@ -732,6 +792,7 @@ def aggregate(cfg, out_path, require_kv_transport=False):
         "by_combination": by_combination,
         "host_transfer_benchmark": _aggregate_host_transfer(cfg),
         "kvcm_transfer_benchmark": _aggregate_kvcm_transfer(cfg),
+        "pd_host_aware_benchmark": _aggregate_pd_host_aware(cfg),
     }
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)

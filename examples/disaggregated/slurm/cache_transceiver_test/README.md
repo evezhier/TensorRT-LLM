@@ -164,6 +164,26 @@ are excluded from bandwidth statistics. Existing result files without staging
 timings retain transport-only values and report `null` for GPU-ready values.
 `kvcm_transfer_benchmark` reports only transport-only rates.
 
+## Synthetic PD host-aware handoff
+
+Set `pd_host_aware_benchmark.enabled: true`, `hardware.gpus_per_node: 1`, and
+both `parallel.*_tp: 1` in the config before running `python3 submit.py -c
+config.yaml`. With `pd_host_aware_benchmark.only: true`, the older matrices
+are skipped. Set `kv_cache.num_layers` to at least three: all but the last
+synthetic layer use host-backed sparse hot pages in the `host` mode, while
+the last layer uses GPU hot pages. `prompt_tokens` must be a multiple of
+`kv_cache.tokens_per_block`. The same job also runs a GPU-only mode as its
+baseline. The two ranks exchange generation-first request metadata and execute
+the production Python transceiver, native KVCM V2 external-access API, and
+NIXL path. No model forward runs.
+
+The gen rank verifies every byte in every hot page after the transceiver
+finalizes receive reservations. Timed records are written to
+`pd_host_aware/gen_sweep<i>.jsonl`; `results.json` includes their median handoff time,
+effective GB/s, and GPU-only ratio. A failed ownership or byte check terminates
+the two-rank run. The host-aware mode requires the compiled NIXL agent and
+`TRTLLM_DISAGG_NO_RETRY=1`, which the driver sets for its own process.
+
 ## Notes & limitations
 
 - Requires a **symmetric** layout (`ctx_tp == gen_tp`, `ctx_pp == gen_pp`, both

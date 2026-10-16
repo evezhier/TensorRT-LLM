@@ -8,7 +8,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.transfer import RxSession, TxSession
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    RxSession,
+    TxSession,
+    _expose_chunk_external_accesses,
+)
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import _CacheReuseAdapterV2
 
 pytestmark = pytest.mark.cpu_only
@@ -107,3 +111,22 @@ def test_session_retains_multiple_claims_until_every_owner_drains(session_type):
     second.resources_drained = True
     assert session.close()
     assert [args.args for args in cache.end_external_access.call_args_list] == [(11,), (12,)]
+
+
+@pytest.mark.parametrize("session_type", [TxSession, RxSession])
+def test_chunk_claims_survive_cancel_and_delayed_physical_completion(session_type):
+    session = make_session(session_type)
+    cache = Mock()
+    owner = SimpleNamespace(resources_drained=False)
+    chunk = SimpleNamespace(
+        native_accesses=[SimpleNamespace(cache=cache, access_id=11)]
+    )
+
+    _expose_chunk_external_accesses(session, owner, chunk)
+    cache.expose_external_access.assert_called_once_with(11)
+    session._logical_outcomes.terminal = "cancelled"
+    assert not session.close()
+    cache.end_external_access.assert_not_called()
+    owner.resources_drained = True
+    assert session.close()
+    cache.end_external_access.assert_called_once_with(11)

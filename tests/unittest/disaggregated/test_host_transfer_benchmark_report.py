@@ -61,6 +61,40 @@ def _write(root: Path, directory: str, mode: str, samples: list[dict]) -> None:
     (target / f"sweep0_rank0_{mode}.json").write_text(json.dumps({"samples": samples}))
 
 
+def test_pd_host_aware_report_requires_verified_samples_and_compares_gpu(tmp_path: Path) -> None:
+    report = _report_module()
+    directory = tmp_path / "pd_host_aware"
+    directory.mkdir()
+    records = [
+        {
+            "sweep": 0,
+            "mode": mode,
+            "role": "gen",
+            "sample": 0,
+            "payload_bytes": 1_000_000_000,
+            "handoff_seconds": seconds,
+            "effective_gbps": 1 / seconds,
+            "torch_peak_gpu_bytes": 10,
+            "registered_gpu_pool_bytes": 20,
+            "registered_host_pool_bytes": 30 if mode == "host" else 0,
+            "verified": True,
+        }
+        for mode, seconds in (("gpu", 1), ("host", 2))
+    ]
+    (directory / "gen_sweep0.jsonl").write_text("".join(json.dumps(row) + "\n" for row in records))
+    config = {
+        "environment": {"work_dir": str(tmp_path)},
+        "ucx_env_sweep": [{"name": "all"}],
+        "pd_host_aware_benchmark": {"enabled": True, "modes": ["gpu", "host"], "samples": 1},
+    }
+
+    modes = report._aggregate_pd_host_aware(config)[0]["modes"]
+
+    assert modes[0]["status"] == modes[1]["status"] == "PASS"
+    assert modes[1]["ratio_to_gpu"] == 0.5
+    assert modes[1]["registered_host_pool_bytes"] == 30
+
+
 @pytest.mark.parametrize(
     "section,directory",
     [

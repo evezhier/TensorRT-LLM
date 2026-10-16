@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
 
@@ -55,7 +56,11 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_physical_pool,
+    get_pool_bytes,
+    get_pool_view_slot_bytes,
+)
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -74,12 +79,37 @@ from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
 if TYPE_CHECKING:
     from mpi4py import MPI
 
 _FP4_MLA_OWNERSHIP_BRIDGE_ENV = "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE"
+_HOST_AWARE_TRANSFER_ENV = "TRTLLM_ENABLE_HOST_AWARE_KV_TRANSFER"
 _FATAL_LOG_JOIN_TIMEOUT_S = 0.5
+
+
+@dataclass(frozen=True)
+class _NativeExternalAccess:
+    cache: object
+    access_id: int
+    valid_tokens: int | None = None
+
+
+@dataclass
+class _NativeTransferChunk(Chunk):
+    native_accesses: list[_NativeExternalAccess] = field(default_factory=list)
+
+
+def _release_unowned_native_accesses(chunk: Chunk, session: object | None) -> None:
+    """Settle claims when admission failed before a session could own them."""
+    owned = {
+        (id(cache), access_id)
+        for cache, access_id, _task in getattr(session, "_external_accesses", ())
+    }
+    for access in getattr(chunk, "native_accesses", ()):
+        if (id(access.cache), access.access_id) not in owned:
+            access.cache.end_external_access(access.access_id)
 
 
 def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
@@ -230,6 +260,40 @@ def _validate_fp4_mla_bridge_profile(
     return True
 
 
+def _validate_host_aware_transfer_profile(
+    mapping: Mapping,
+    kv_cache_manager: KVCacheManager,
+    cache_transceiver_config: CacheTransceiverConfig,
+) -> bool:
+    if os.getenv(_HOST_AWARE_TRANSFER_ENV, "0") != "1":
+        return False
+    if not isinstance(kv_cache_manager, KVCacheManagerV2) or not kv_cache_manager.is_disagg:
+        raise ValueError("Host-aware KV transfer requires a disaggregated KVCM V2")
+    hot_groups = kv_cache_manager.impl.get_life_cycle_pool_group_indices(0)
+    if not any(
+        kv_cache_manager.impl.pool_group_descs[group].memory_tier == CacheTier.HOST_MEM
+        for group in hot_groups
+    ):
+        raise ValueError("Host-aware KV transfer requires a host-backed hot pool")
+    supported = (
+        os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
+        and not use_pure_python_transfer_agent()
+        and cache_transceiver_config.kv_transfer_timeout_ms is not None
+        and cache_transceiver_config.kv_transfer_timeout_ms > 0
+        and mapping.world_size == 1
+        and cache_transceiver_config.kv_cache_bounce_size_mb == 0
+        and not cache_transceiver_config.enable_pipelined_transfer
+        and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
+    )
+    if not supported:
+        raise ValueError(
+            "Host-aware KV transfer currently requires TP1/PP1/CP1, no retry, "
+            "the C++ NIXL agent, a finite timeout, async monolithic transfer, "
+            "and bounce disabled"
+        )
+    return True
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
     @property
     def consumes_transfer_buffer(self) -> bool:
@@ -261,12 +325,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
-        enforce_physical_ownership = _validate_fp4_mla_bridge_profile(
+        fp4_bridge = _validate_fp4_mla_bridge_profile(
             mapping, kv_cache_manager, cache_transceiver_config
         )
+        self._native_host_transfer_enabled = _validate_host_aware_transfer_profile(
+            mapping, kv_cache_manager, cache_transceiver_config
+        )
+        enforce_physical_ownership = fp4_bridge or self._native_host_transfer_enabled
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
         self._retirement_mpi_comm = (
-            _retirement_executor_comm(mapping) if enforce_physical_ownership else None
+            _retirement_executor_comm(mapping)
+            if enforce_physical_ownership and not self._native_host_transfer_enabled
+            else None
         )
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
@@ -321,9 +391,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
         if enforce_physical_ownership:
             logger.info(
-                "FP4 MLA KV ownership bridge ENABLED: "
+                "KV physical ownership ENABLED: "
                 f"rank={rank}/{mapping.world_size}, backend=NIXL, runtime=PYTHON, "
-                "request_schedule_required=GENERATION_FIRST, attention_dp=True, pp=1, cp=1, "
+                "request_schedule_required=GENERATION_FIRST, pp=1, cp=1, "
                 "retry=False, async=True, layerwise=False, bounce_mb=0, "
                 "unproven_retirement=fail_stop, termination_scope=mpi_job_or_launcher, "
                 f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}"
@@ -532,6 +602,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         the already-cached prefix is masked so the sender skips it. A STATE group carries one
         slot, or nothing when this rank has none.
         """
+        if getattr(self, "_native_host_transfer_enabled", False):
+            return self._describe_native_host_local(req)
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
@@ -565,6 +637,119 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             kind_per_layer_group=kinds,
             token_range=TokenRange(start=0, end=req.prompt_len),
             is_last=True,
+        )
+
+    def _native_slots_from_pages(
+        self, group: int, pages: list, expected_ordinals: set[int], prompt_blocks: int
+    ) -> np.ndarray:
+        """Resolve one claimed hot pool group to its registered positional slots."""
+        page_table = self._page_table
+        layer_group = page_table.layer_groups[group]
+        pool_group = page_table.pool_groups[layer_group.pool_group_idx]
+        by_ordinal: dict[int, dict[int, object]] = defaultdict(dict)
+        for page in pages:
+            ordinal, pool_index = int(page.ordinal), int(page.pool_index)
+            if ordinal not in expected_ordinals or pool_index in by_ordinal[ordinal]:
+                raise ValueError("Native KV claim has an unexpected or duplicate page")
+            if pool_index < 0 or pool_index >= len(pool_group.pools):
+                raise ValueError("Native KV claim refers to an unregistered pool")
+            pool = get_physical_pool(page_table, group, pool_index)
+            if page.memory_tier not in (CacheTier.HOST_MEM, CacheTier.GPU_MEM):
+                raise ValueError("Native KV claim has an unsupported hot memory tier")
+            memory_type = "DRAM" if page.memory_tier == CacheTier.HOST_MEM else "VRAM"
+            slot = int(page.slot_id)
+            if (
+                int(page.cache_level) != 0
+                or memory_type != pool.memory_type
+                or int(page.pool_base_address) != pool.base_address
+                or int(page.pool_bytes) != get_pool_bytes(pool)
+                or int(page.bytes) != pool.slot_bytes
+                or int(page.valid_tokens) != self._reuse_adapter.tokens_per_block
+                or slot < 0
+                or slot >= pool.num_slots
+                or int(page.address) != pool.base_address + slot * pool.slot_stride_bytes
+            ):
+                raise ValueError("Native KV claim does not match the registered hot pool")
+            by_ordinal[ordinal][pool_index] = page
+        slots = np.full(prompt_blocks, -1, dtype=np.int64)
+        for ordinal in expected_ordinals:
+            pool_pages = by_ordinal.get(ordinal, {})
+            if len(pool_pages) != len(pool_group.pools):
+                raise ValueError("Native KV claim does not cover every pool of a page")
+            page_slots = {int(page.slot_id) for page in pool_pages.values()}
+            if len(page_slots) != 1:
+                raise ValueError("Native KV claim has inconsistent pool slots")
+            slots[ordinal] = page_slots.pop()
+        return slots
+
+    def _describe_native_host_local(self, req: LlmRequest) -> Chunk:
+        """Claim hot KVCM pages before publishing their host/GPU addresses."""
+        if req.prompt_len <= 0 or req.prompt_len % self._reuse_adapter.tokens_per_block:
+            raise ValueError("Host-aware PD handoff currently requires a block-aligned prompt")
+        page_table = self._page_table
+        if any(group.kind != CacheKind.PAGED for group in page_table.layer_groups):
+            raise ValueError("Host-aware PD handoff currently supports attention pages only")
+        if any(
+            group.sliding_window_size is not None
+            and group.sliding_window_size < req.prompt_len
+            for group in page_table.layer_groups
+        ):
+            raise ValueError("Host-aware PD handoff currently requires full-context groups")
+        cache = self._kv_cache_manager.kv_cache_map[req.py_request_id]
+        prompt_blocks = req.prompt_len // self._reuse_adapter.tokens_per_block
+        is_receive = req.is_generation_only_request
+        cached = (
+            self._reuse_adapter.get_cached_token_count_per_layer_group(
+                req, page_table.layer_groups
+            )
+            if is_receive
+            else [0] * len(page_table.layer_groups)
+        )
+        accesses: list[_NativeExternalAccess] = []
+        groups: list[np.ndarray] = []
+        try:
+            if is_receive:
+                cache.suspend()
+                for group in range(len(page_table.layer_groups)):
+                    cached_blocks = cached[group] // self._reuse_adapter.tokens_per_block
+                    expected = set(range(cached_blocks, prompt_blocks))
+                    pages = []
+                    for ordinal in sorted(expected):
+                        access_id = cache.reserve_external_receive(group, ordinal, 0)
+                        accesses.append(
+                            _NativeExternalAccess(
+                                cache, access_id, self._reuse_adapter.tokens_per_block
+                            )
+                        )
+                        cache.wait_external_access_ready(access_id)
+                        pages.extend(cache.get_external_access_pages(access_id))
+                    groups.append(
+                        self._native_slots_from_pages(group, pages, expected, prompt_blocks)
+                    )
+            else:
+                group_ids = list(range(len(page_table.layer_groups)))
+                access_id = cache.begin_external_read(group_ids, req.prompt_len)
+                accesses.append(_NativeExternalAccess(cache, access_id))
+                cache.wait_external_access_ready(access_id)
+                pages = cache.get_external_access_pages(access_id)
+                for group in group_ids:
+                    expected = set(range(prompt_blocks))
+                    group_pages = [page for page in pages if int(page.layer_group_id) == group]
+                    groups.append(
+                        self._native_slots_from_pages(
+                            group, group_pages, expected, prompt_blocks
+                        )
+                    )
+        except Exception:
+            for access in accesses:
+                access.cache.end_external_access(access.access_id)
+            raise
+        return _NativeTransferChunk(
+            block_ids_per_layer_groups=groups,
+            kind_per_layer_group=[CacheKind.PAGED] * len(groups),
+            token_range=TokenRange(start=0, end=req.prompt_len),
+            is_last=True,
+            native_accesses=accesses,
         )
 
     @staticmethod
@@ -637,7 +822,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             or rid < 0
         ):
             logger.error(
-                "FP4 MLA lifecycle bridge requires async generation-first requests "
+                "Physical KV ownership requires async generation-first requests "
                 "with a non-negative integer disagg_request_id"
             )
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -1070,6 +1255,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # to publish KV or auxiliary memory afterward.
             if session.has_failed():
                 return
+        chunk = None
         try:
             if self.pipeline_transfer_enabled:
                 extent = self._build_prefill_extent(req)
@@ -1090,6 +1276,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         except Exception as error:
             if bridge_enabled:
+                if chunk is not None:
+                    _release_unowned_native_accesses(chunk, session)
                 cast(Any, session).set_exception(f"transfer admission failed: {error}")
             raise
 
@@ -1204,8 +1392,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
             if self._legacy_session(fetches) is None:
+                _release_unowned_native_accesses(extent.local, None)
                 del self._recv_reqs[rid]
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            else:
+                _release_unowned_native_accesses(
+                    extent.local, self._legacy_session(fetches)
+                )
             raise
         finally:
             # The session exists even when publication failed, and the legacy sweep owns it.
@@ -1360,6 +1553,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled, failed, completed, verified = self._gen_consensus_outcome(
             to_process, cancelled, failed, completed, locally_verified
         )
+        if self._native_host_transfer_enabled:
+            incomplete = set(completed) - set(verified)
+            completed = [rid for rid in completed if rid not in incomplete]
+            failed.extend(sorted(incomplete))
 
         cancelled_reqs = []
         for rid in cancelled:
@@ -1386,6 +1583,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
+            if self._native_host_transfer_enabled:
+                try:
+                    stream = torch.cuda.current_stream().cuda_stream
+                    for task in session._kv_tasks:
+                        for access in getattr(task._chunk, "native_accesses", ()):
+                            access.cache.finalize_external_receive(
+                                access.access_id, access.valid_tokens, stream
+                            )
+                except Exception as error:
+                    logger.error(f"Host-aware receive finalization failed for rid={rid}: {error}")
+                    session.fail_admission(error)
+                    failed.append(rid)
+                    continue
             # Stamp the write-verification verdict on the request before the
             # session is closed and dropped: commit_blocks_for_reuse runs
             # later (batch preparation) and gates reuse admission on it.
@@ -1399,6 +1609,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+        if failed:
+            failed_ids = set(failed)
+            completed = [rid for rid in completed if rid not in failed_ids]
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "

@@ -41,7 +41,7 @@ import pickle
 import signal
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, List, Optional, Sequence
 
 import torch
@@ -64,6 +64,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestSta
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -143,7 +144,22 @@ def local_layer_count(num_layers, pp, pp_rank):
     return _layers_per_pp(num_layers, pp)[pp_rank]
 
 
-def build_kv_cache_manager(cfg_kv, mapping, use_v2):
+class SyntheticSparseKVCacheManager(KVCacheManagerV2):
+    """Keep one dense layer on GPU and place the other layers on host."""
+
+    def _build_cache_config(self, config):
+        layers = list(config.layers)
+        for index, layer in enumerate(layers[:-1]):
+            layers[index] = AttentionLayerConfig(
+                layer_id=layer.layer_id,
+                buffers=[BufferConfig(b.role, b.size, is_sparse=True) for b in layer.buffers],
+                sliding_window_size=layer.sliding_window_size,
+                num_sink_tokens=layer.num_sink_tokens,
+            )
+        return replace(config, layers=layers)
+
+
+def build_kv_cache_manager(cfg_kv, mapping, use_v2, host_sparse=False, is_disagg=False):
     dtype = DTYPE_MAP[cfg_kv["dtype"].upper()]
     tpb = cfg_kv["tokens_per_block"]
     max_req = cfg_kv["_max_request_len"]
@@ -162,12 +178,14 @@ def build_kv_cache_manager(cfg_kv, mapping, use_v2):
         dtype=dtype,
     )
     if use_v2:
-        return KVCacheManagerV2(
+        manager_type = SyntheticSparseKVCacheManager if host_sparse else KVCacheManagerV2
+        return manager_type(
             KvCacheConfigV2(
                 max_tokens=max_tokens, enable_block_reuse=False, max_attention_window=[max_seq_len]
             ),
             CacheTypeCpp.SELF,
             vocab_size=cfg_kv.get("vocab_size", 32000),
+            is_disagg=is_disagg,
             **common,
         )
     return KVCacheManager(

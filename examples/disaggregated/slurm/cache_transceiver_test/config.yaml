@@ -87,6 +87,17 @@ kvcm_transfer_benchmark:
   delayed_completion_ms: 100
   timeout_ms: 30000
 
+pd_host_aware_benchmark:
+  # Synthetic generation-first PD handoff through the production Python
+  # transceiver. Set hardware.gpus_per_node=1 and both parallel TP values=1.
+  enabled: false
+  only: true # skip the older transport matrices when enabled
+  modes: ["gpu", "host"]
+  prompt_tokens: 8192 # must be divisible by kv_cache.tokens_per_block
+  warmup: 1
+  samples: 3
+  timeout_ms: 30000
+
 kv_cache:
   # KV cache geometry. Sized so transfers are large enough to measure bandwidth.
   num_layers: 32
