@@ -41,10 +41,16 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_q
     Nvfp4ColdPageQuantizationCompression,
 )
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
     BlockReusePolicy,
     KVCacheManagerV2,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
+    sparse_arena_bytes,
+    sparse_arena_shapes,
+    sparse_history_bytes_per_block,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -57,6 +63,7 @@ from tensorrt_llm.llmapi.llm_args import (
     DeepSeekV4SparseAttentionConfig,
     DraftTargetDecodingConfig,
     KvCacheConfig,
+    SparseKvCacheOffloadConfig,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -1225,10 +1232,14 @@ def _cache_config_case(
     nvfp4_residual_dim: int = 0,
     index_topk: int | None = 512,
     indexer_k_dtype: str = "fp8",
+    cache_factor: float = 2.0,
 ) -> tuple[DeepseekV4CacheManager, KVCacheManagerConfig]:
     manager = object.__new__(DeepseekV4CacheManager)
     manager._enable_kv_cache_offload = enabled
     manager._sparse_offload_topk = index_topk
+    manager._sparse_kv_offload = (
+        SparseKvCacheOffloadConfig(gpu_cache_factor=cache_factor) if enabled else None
+    )
     manager.pp_layers = [0, 1, 2, 3] if pp_layers is None else pp_layers
     manager._compress_ratios = [1, 4, 128, 4]
     manager.compressed_block_sizes = [tokens_per_block // r for r in manager._compress_ratios]
@@ -1329,7 +1340,10 @@ def test_sparse_offload_cache_roles(
                     cache = layers[layer_id].sparse_cache
                     assert cache is not None
                     assert cache.num_selected_blocks == index_topk
-                    assert cache.max_cached_units == 2 * index_topk
+                    # Two selections plus the row being written, in whole pages of
+                    # compressed rows.
+                    cells = -(-(2 * index_topk + 1) // compressed_rows)
+                    assert cache.max_cached_units == cells * compressed_rows
                     assert cache.unit_tokens == 4
                 else:
                     assert role_buffer.size == compressed_rows * row_bytes
@@ -1354,6 +1368,21 @@ def test_sparse_offload_cache_config_footer_layout(enabled: bool, pp_layers: lis
     else:
         result = manager._build_cache_config(config)
         assert all(not buffer.is_sparse for layer in result.layers for buffer in layer.buffers)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("cache_factor", "rows_per_layer"), [(1.0, 544), (1.5, 800), (3.0, 1568)])
+def test_sparse_offload_cache_factor_scales_whole_cells(
+    cache_factor: float, rows_per_layer: int
+) -> None:
+    manager, config = _cache_config_case(enabled=True, cache_factor=cache_factor)
+    result = manager._build_cache_config(config)
+
+    caches = [layer.sparse_cache for layer in result.layers if layer.sparse_cache is not None]
+    assert caches
+    # The factor scales the 512 selected rows, the row being written adds one, and
+    # the total rounds up to cells of 32 rows.
+    assert {cache.max_cached_units for cache in caches} == {rows_per_layer}
 
 
 @pytest.mark.cpu_only
@@ -3544,6 +3573,197 @@ class TestDeepseekV4CacheManager:
                     cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
             finally:
                 cache_manager.shutdown()
+
+
+# Offload memory accounting.
+
+V4_FLASH_COMPRESS_RATIOS = [1, 1] + [4, 128] * 20 + [4]
+
+
+def _v4_flash_offload_manager(
+    *, max_batch_size: int = 256, cache_factor: float = 2.0
+) -> DeepseekV4CacheManager:
+    manager, _ = _cache_config_case(
+        enabled=True,
+        pp_layers=list(range(len(V4_FLASH_COMPRESS_RATIOS))),
+        dtype=DataType.NVFP4,
+        nvfp4_residual_dim=64,
+        indexer_k_dtype="fp4",
+        cache_factor=cache_factor,
+    )
+    manager._compress_ratios = V4_FLASH_COMPRESS_RATIOS
+    manager.compressed_block_sizes = [
+        manager.tokens_per_block // r for r in V4_FLASH_COMPRESS_RATIOS
+    ]
+    manager.max_batch_size = max_batch_size
+    manager._max_num_tokens = 8192
+    manager.enable_swa_scratch_reuse = False
+    manager._generation_kv_capacity_headroom = 1
+    return manager
+
+
+def _v4_flash_offload_config(manager: DeepseekV4CacheManager) -> KVCacheManagerConfig:
+    """Return the manager's cache config with 513 leases."""
+    return manager._build_cache_config(
+        KVCacheManagerConfig(
+            tokens_per_block=manager.tokens_per_block,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
+            layers=[],
+            constraints=[BatchDesc([KVCacheDesc(capacity=0, history_length=0)] * 513)],
+        )
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("cache_factor", "lease_bytes"), [(1.0, 3_794_560), (2.0, 7_364_224)])
+def test_offload_splits_v4_flash_nvfp4_history_by_memory_kind(
+    cache_factor: float, lease_bytes: int
+) -> None:
+    manager = _v4_flash_offload_manager(cache_factor=cache_factor)
+    config = _v4_flash_offload_config(manager)
+
+    # 21 CSA layers keep 81 B per token in host memory: 288 B of NVFP4 data and
+    # 36 B of scales per row of four tokens.
+    assert sparse_history_bytes_per_block(config.layers) == 128 * 21 * 81
+    # The GPU keeps the MXFP4 indexer keys (17 B per token) and the HCA history
+    # (324 B per 128 tokens): 407.625 B per token, reported in whole bytes.
+    assert manager.get_cache_bytes_per_token() == 408
+    (arena,) = sparse_arena_shapes(config.layers, tokens_per_block=manager.tokens_per_block)
+    assert arena.lease_bytes == lease_bytes
+    assert sparse_arena_bytes(config) == arena.arena_bytes(513)
+
+    manager._enable_kv_cache_offload = False
+    config = _v4_flash_offload_config(manager)
+    assert manager.get_cache_bytes_per_token() == 2098
+    assert sparse_history_bytes_per_block(config.layers) == 0
+    assert sparse_arena_bytes(config) == 0
+
+
+@pytest.mark.cpu_only
+def test_offload_scratch_counts_both_attention_metadata_copies() -> None:
+    manager = _v4_flash_offload_manager()
+    config = _v4_flash_offload_config(manager)
+
+    # A copy holds 64 MiB of FP8 rows dequantized from NVFP4, [256, 512, 512], and
+    # int32 indices: the selections [256, 512], the fetch outputs [256, 2, 512] and
+    # write destinations [256, 2] of the data and scale buffers, the scatter start
+    # positions [256] and the active count.
+    per_copy = 256 * 512 * 512 + 4 * (256 * 512 + 256 * 2 * 512 + 256 * 2 + 256 + 1)
+    assert per_copy == 68_684_804
+    # The eager attention metadata holds one, and the CUDA graph metadata share one.
+    assert manager.get_sparse_offload_scratch_bytes(config) == 2 * per_copy
+
+    manager._enable_kv_cache_offload = False
+    assert manager.get_sparse_offload_scratch_bytes(_v4_flash_offload_config(manager)) == 0
+
+
+@pytest.mark.cpu_only
+def test_offload_counts_gpu_history_and_window_pages_exactly() -> None:
+    manager = _v4_flash_offload_manager()
+    max_tokens = 1 << 20
+
+    # Every window can span two pages: 43 SWA layers, 21 CSA and 20 HCA
+    # compressor states.
+    assert manager._get_cache_bytes_for_tokens(0, context=False) == 81_657_856
+    # 52,176 GPU bytes per 128 tokens, with no row rounded down.
+    assert manager._get_cache_bytes_for_tokens(max_tokens, context=False) == (
+        max_tokens * 52_176 // 128 + 81_657_856
+    )
+    assert manager.get_request_device_bytes(max_tokens) == (
+        manager._get_cache_bytes_for_tokens(max_tokens, context=False)
+    )
+    quota = manager._get_quota_from_max_tokens(max_tokens)
+    assert manager._get_max_tokens_from_quota(quota) == pytest.approx(max_tokens)
+
+    # Without offload the estimates are unchanged: whole bytes per token and one
+    # page per window.
+    manager._enable_kv_cache_offload = False
+    assert manager.get_cache_bytes_per_token() == 2098
+    assert manager._get_cache_bytes_for_tokens(0, context=False) == 40_828_928
+    assert manager._get_cache_bytes_for_tokens(max_tokens, context=False) == (
+        max_tokens * 2098 + 40_828_928
+    )
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_rejects_kv_pool_rebalance() -> None:
+    sparse_config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+    with (
+        patch.object(deepseek_v4_cache.KVCacheManagerV2, "__init__") as initialize_cache,
+        pytest.raises(ValueError, match="enable_kv_pool_rebalance"),
+    ):
+        DeepseekV4CacheManager(
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False, enable_kv_pool_rebalance=True),
+            kv_cache_type=CacheTypeCpp.SELFKONLY,
+            num_layers=len(sparse_config.compress_ratios),
+            max_batch_size=1,
+            tokens_per_block=128,
+            max_seq_len=256,
+            vocab_size=128,
+            mapping=Mapping(),
+            sparse_attn_config=sparse_config,
+        )
+
+    initialize_cache.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_offload_capacity_report_names_the_binding_limit() -> None:
+    manager = _v4_flash_offload_manager()
+    manager.max_seq_len = 1 << 17
+    manager.mapping = Mapping()
+    manager.kv_cache_manager_py_config = _v4_flash_offload_config(manager)
+    manager.max_admissible_sequences = 512
+    # Half of a 100 GiB share of host memory, the automatic budget on a node of
+    # four ranks with 400 GiB available.
+    manager._host_history_budget = 50 << 30
+    # The native group holds 4,096 slots: four requests of 128K tokens. Its pool of
+    # sparse pages holds 217,728 host bytes per slot; its indexer pool is on the GPU.
+    sparse_layer = next(
+        layer for layer in manager.kv_cache_manager_py_config.layers if layer.sparse_cache
+    )
+    sparse_buffer = next(buffer for buffer in sparse_layer.buffers if buffer.is_sparse)
+    dense_buffer = next(buffer for buffer in sparse_layer.buffers if not buffer.is_sparse)
+    host_pool = SimpleNamespace(
+        num_slots=4096,
+        slot_desc=SimpleNamespace(
+            variants=[
+                SimpleNamespace(
+                    coalesced_buffers=[
+                        SimpleNamespace(
+                            buffer_ids=[
+                                SimpleNamespace(layer_id=sparse_layer.layer_id, role=buffer.role)
+                            ]
+                        )
+                        for buffer in (sparse_buffer, dense_buffer)
+                    ]
+                )
+            ]
+        ),
+        pools=[
+            SimpleNamespace(pool_index=0, slot_bytes=217_728),
+            SimpleNamespace(pool_index=1, slot_bytes=52_176),
+        ],
+    )
+    manager.get_host_backed_pool_groups = lambda: [host_pool]
+    # The device quota counts only device-backed pools.
+    manager.impl = SimpleNamespace(get_quota=lambda level: 100 << 30)
+
+    with (
+        patch.object(kv_cache_v2_module.logger, "info") as info,
+        patch.object(kv_cache_v2_module.logger, "warning") as warning,
+    ):
+        manager._log_sparse_kv_offload_capacity(KvCacheConfig())
+
+    report = info.call_args.args[0]
+    # The DeepSeek-V4 estimator sizes each 128K-token request at 128.8 MiB of GPU pools.
+    assert "128.8MiB per request" in report
+    assert "4 by host" in report
+    assert "limited by host" in report
+    assert "513 leases" in report
+    # The 50 GiB host budget holds 240 requests of 128K tokens.
+    assert "A max_batch_size of 240 fits" in report
+    assert "Only 4 of max_batch_size=256" in warning.call_args.args[0]
 
 
 if __name__ == "__main__":

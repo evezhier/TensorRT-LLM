@@ -15,7 +15,7 @@
 
 from collections import defaultdict
 from dataclasses import replace
-from math import gcd
+from math import ceil, gcd
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -28,7 +28,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     GPU_LEVEL,
     KVCacheManagerV2,
     _fill_kv_pages,
+    _get_generation_kv_capacity,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -43,6 +45,7 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeC
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
@@ -80,6 +83,9 @@ if TYPE_CHECKING:
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
 KV_CACHE_COPY_ALIGNMENT = 16
+# Attention metadata holding a SparseOffloadState: the eager one, and the CUDA
+# graph metadata, which share theirs through the graph buffer pool.
+SPARSE_OFFLOAD_STATE_COPIES = 2
 NVFP4_VECTOR_SIZE = 16
 
 
@@ -175,10 +181,24 @@ def _estimate_non_sliding_attn_size_per_token(
     use_fp8_ds_mla: bool = False,
     has_nvfp4_compress: bool = False,
     nvfp4_residual_dim: int | None = None,
-) -> int:
+    offload_sparse_history: bool = False,
+) -> float:
+    """Return the GPU bytes per token of compressed-layer history.
+
+    With ``offload_sparse_history``, size a worker that offloads ratio-4
+    history: leave out the offloaded rows and count the rest at their exact
+    bytes per token instead of rounding each down to whole bytes.
+    """
     total_bytes = 0
     for compress_ratio in compress_ratios:
         for attn_type in DEEPSEEK_V4_NON_SLIDING_ATTENTION:
+            if (
+                offload_sparse_history
+                and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
+                and attn_type == DeepseekV4AttentionType.COMPRESS
+            ):
+                # Offloaded history lives in host memory.
+                continue
             if compress_ratio_has_attention(compress_ratio, attn_type):
                 total_bytes += _get_attn_bytes_per_token(
                     head_dim,
@@ -190,6 +210,7 @@ def _estimate_non_sliding_attn_size_per_token(
                     use_fp8_ds_mla=use_fp8_ds_mla,
                     has_nvfp4_compress=has_nvfp4_compress,
                     nvfp4_residual_dim=nvfp4_residual_dim,
+                    exact=offload_sparse_history,
                 )
     return total_bytes
 
@@ -206,7 +227,15 @@ def _estimate_swa_cache_size(
     scratch: bool,
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
+    generation_capacity_headroom: int | None = None,
 ) -> Tuple[int, int]:
+    """Return the sliding-window bytes per token and per request.
+
+    By default a window costs one page per ``tokens_per_block`` tokens of
+    window. With ``generation_capacity_headroom``, the tokens a generation step
+    reserves above history, it costs the most pages its live interval touches
+    at any page offset, which is what the cache manager holds.
+    """
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
     size_per_request = 0
@@ -224,9 +253,15 @@ def _estimate_swa_cache_size(
                 window_size = state_factor * compress_ratio
             if window_size <= 0:
                 continue
-            window_tokens = (
-                (int(window_size) + tokens_per_block - 1) // tokens_per_block
-            ) * tokens_per_block
+            if generation_capacity_headroom is None:
+                window_pages = ceil_div(int(window_size), tokens_per_block)
+            else:
+                # The live interval spans window + headroom - 1 tokens.
+                window_pages = (
+                    ceil_div(int(window_size) + generation_capacity_headroom - 2, tokens_per_block)
+                    + 1
+                )
+            window_tokens = window_pages * tokens_per_block
             token_bytes = _get_attn_bytes_per_token(
                 head_dim,
                 index_head_dim,
@@ -260,7 +295,13 @@ def _get_attn_bytes_per_token(
     use_fp8_ds_mla: bool = False,
     has_nvfp4_compress: bool = False,
     nvfp4_residual_dim: int | None = None,
-) -> int:
+    exact: bool = False,
+) -> float:
+    """Return the bytes one token adds to a buffer.
+
+    A compressed row covers ``compress_ratio`` tokens, so its bytes are divided
+    among them: rounded down to whole bytes, or exactly when ``exact`` is set.
+    """
     token_bytes = get_token_bytes(
         head_dim,
         index_head_dim,
@@ -273,6 +314,8 @@ def _get_attn_bytes_per_token(
         nvfp4_residual_dim=nvfp4_residual_dim,
     )
     if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
+        if exact:
+            return token_bytes / compress_ratio
         token_bytes //= compress_ratio
     return token_bytes
 
@@ -342,7 +385,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._sparse_batch: Batch | None = None
         self._sparse_batch_members: dict[int, _KVCache] = {}
         self._sparse_batch_prepared = False
-        if self._enable_kv_cache_offload:
+        sparse_kv_offload_config = sparse_attn_config.get_kv_cache_offload_config()
+        if sparse_kv_offload_config is not None:
+            # Report configuration errors before refusing to run.
+            self._check_sparse_kv_offload_config(sparse_kv_offload_config, kv_cache_config, mapping)
             # Inference requires compressor/attention arena addressing and a
             # prefill-to-decode handoff in addition to the decode fetch adapter.
             raise NotImplementedError(
@@ -424,6 +470,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             mapping=mapping,
             dtype=cache_dtype,
             max_num_tokens=max_num_tokens,
+            sparse_kv_offload_config=sparse_kv_offload_config,
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
@@ -965,6 +1012,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             kv_cache.get_scratch_desc(pool_id),
         )
 
+    def _get_window_page_headroom(self) -> int | None:
+        """Headroom for counting the pages a window holds with offload, else None."""
+        if not self._enable_kv_cache_offload:
+            return None
+        return self._generation_kv_capacity_headroom
+
     def _get_extra_quota_padding(self) -> int:
         """Ensure each attention type has minimal space when max_tokens is small."""
         return len(DeepseekV4AttentionType) * (2 << 20)
@@ -981,6 +1034,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
             nvfp4_residual_dim=self.nvfp4_residual_dim,
+            offload_sparse_history=self._enable_kv_cache_offload,
         )
         (
             context_swa_size_per_token,
@@ -996,6 +1050,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         (
             generation_swa_size_per_token,
@@ -1011,6 +1066,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         max_context_tokens = (
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
@@ -1038,6 +1094,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
             nvfp4_residual_dim=self.nvfp4_residual_dim,
+            offload_sparse_history=self._enable_kv_cache_offload,
         )
         context_swa_size_per_token, _ = _estimate_swa_cache_size(
             self.head_dim,
@@ -1050,6 +1107,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         (
             generation_swa_size_per_token,
@@ -1065,6 +1123,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         padding = self._get_extra_quota_padding()
         size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
@@ -1134,11 +1193,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             topk = self._sparse_offload_topk
             if topk is None or topk <= 0:
                 raise ValueError("Sparse compressed KV requires a positive index_topk")
-            return SparseCacheConfig(
-                num_selected_blocks=topk,
-                # Retain history beyond the current selection and pin the in-flight unit.
-                max_cached_units=2 * topk,
+            # A selection names compressed rows of four original tokens each.
+            return sparse_cache_config(
+                num_selected_units=topk,
                 unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
+                tokens_per_block=self.tokens_per_block,
+                gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
             )
 
         def _add_layer(
@@ -1454,15 +1514,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """Get the average cache bytes per token for DeepSeek-V4."""
         has_fp8_kv_cache = self.dtype == DataType.FP8
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        return _estimate_non_sliding_attn_size_per_token(
-            self.head_dim,
-            self.index_head_dim,
-            compress_ratios,
-            has_fp8_kv_cache,
-            indexer_k_dtype=self._indexer_k_dtype,
-            use_fp8_ds_mla=self.use_fp8_ds_mla,
-            has_nvfp4_compress=self._use_nvfp4_compress,
-            nvfp4_residual_dim=self.nvfp4_residual_dim,
+        return ceil(
+            _estimate_non_sliding_attn_size_per_token(
+                self.head_dim,
+                self.index_head_dim,
+                compress_ratios,
+                has_fp8_kv_cache,
+                indexer_k_dtype=self._indexer_k_dtype,
+                use_fp8_ds_mla=self.use_fp8_ds_mla,
+                has_nvfp4_compress=self._use_nvfp4_compress,
+                nvfp4_residual_dim=self.nvfp4_residual_dim,
+                offload_sparse_history=self._enable_kv_cache_offload,
+            )
         )
 
     def get_max_resource_count(self) -> int:
@@ -1509,6 +1572,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=self.use_fp8_ds_mla,
             has_nvfp4_compress=self._use_nvfp4_compress,
             nvfp4_residual_dim=self.nvfp4_residual_dim,
+            offload_sparse_history=self._enable_kv_cache_offload,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             self.head_dim,
@@ -1521,10 +1585,34 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            generation_capacity_headroom=self._get_window_page_headroom(),
         )
         return int(
             total_tokens * (non_sliding_attn_size_per_token + swa_size_per_token)
             + swa_size_per_request
+        )
+
+    def get_request_device_bytes(self, num_tokens: int) -> int:
+        """Return the device pool bytes one decoding request of ``num_tokens`` tokens holds."""
+        return self._get_cache_bytes_for_tokens(num_tokens, context=False)
+
+    def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfigPy) -> int:
+        """Return the device bytes of the attention metadata's sparse offload state.
+
+        Counts a copy for the CUDA graph metadata even when graphs are off.
+        """
+        buffer_counts = {
+            sum(buffer.is_sparse for buffer in layer.buffers)
+            for layer in config.layers
+            if getattr(layer, "sparse_cache", None) is not None
+        }
+        if not buffer_counts:
+            return 0
+        return SPARSE_OFFLOAD_STATE_COPIES * SparseOffloadState.device_bytes(
+            max_batch_size=self.max_batch_size,
+            topk=self._sparse_offload_topk,
+            buffer_counts=buffer_counts,
+            nvfp4_head_dim=self.head_dim if self._use_nvfp4_compress else None,
         )
 
     def get_needed_resource_to_completion(self, request: llm_request.LlmRequest) -> int:
@@ -2392,6 +2480,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             kv_cache_config is not None
             and getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
         )
+        offload = model_config.sparse_attention_config.enable_kv_cache_offload
         non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
             head_dim,
             index_head_dim,
@@ -2400,7 +2489,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=indexer_k_dtype,
             use_fp8_ds_mla=use_fp8_ds_mla,
             has_nvfp4_compress=has_nvfp4_compress,
+            offload_sparse_history=offload,
         )
+        generation_capacity_headroom = None
+        if offload:
+            _, generation_capacity_headroom = _get_generation_kv_capacity(
+                kwargs.get("spec_config"), is_draft=kwargs.get("is_draft", False)
+            )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             head_dim,
             index_head_dim,
@@ -2412,10 +2507,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=indexer_k_dtype,
             use_fp8_ds_mla=use_fp8_ds_mla,
+            generation_capacity_headroom=generation_capacity_headroom,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
         return (
-            non_sliding_attn_size_per_token + swa_size_per_token,
+            ceil(non_sliding_attn_size_per_token + swa_size_per_token),
             swa_size_per_request * max_batch_size,
         )
 

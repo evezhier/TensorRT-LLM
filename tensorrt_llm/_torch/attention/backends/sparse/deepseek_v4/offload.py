@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Collection
 
 import torch
 
@@ -108,3 +108,31 @@ class SparseOffloadState:
     prepared: bool = False
     is_prefill: bool = False
     write_layer: int | None = None
+
+    @staticmethod
+    def device_bytes(
+        *,
+        max_batch_size: int,
+        topk: int,
+        buffer_counts: Collection[int],
+        nvfp4_head_dim: int | None,
+    ) -> int:
+        """Return the device bytes one instance allocates.
+
+        Mirrors the allocations of the attention metadata's
+        ``_init_sparse_offload_state``.
+
+        Args:
+            max_batch_size: Rows B, the native Batch capacity.
+            topk: Units one row selects, K.
+            buffer_counts: The distinct sparse buffer counts F of the layers.
+            nvfp4_head_dim: Head dim of the dequantized rows with NVFP4, else None.
+        """
+        # The active count, the selections and the scatter start positions, then
+        # the fetch outputs and write destinations of each buffer count.
+        index_entries = 1 + max_batch_size * topk + max_batch_size
+        index_entries += sum(max_batch_size * count * (topk + 1) for count in buffer_counts)
+        nvfp4_bytes = 0
+        if nvfp4_head_dim is not None:
+            nvfp4_bytes = max_batch_size * topk * nvfp4_head_dim * torch.float8_e4m3fn.itemsize
+        return index_entries * torch.int32.itemsize + nvfp4_bytes

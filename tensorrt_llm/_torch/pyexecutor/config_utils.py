@@ -10,7 +10,6 @@ import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
-                                          DeepSeekV4SparseAttentionConfig,
                                           SparseAttentionConfig)
 from tensorrt_llm.logger import logger
 
@@ -458,13 +457,12 @@ def is_decode_only(
         sparse_attention_config: Optional[SparseAttentionConfig]) -> bool:
     """True when the sparse attention config restricts the worker to decode.
 
-    DeepSeek-V4 KV cache offload keeps compressed attention history in host
-    memory and admits one query token per request per step, so its worker
-    serves the decode phase of disaggregated serving and never runs a context
-    batch.
+    Sparse KV cache offload keeps attention history in host memory and admits
+    one query token per request per step, so an offloading worker serves the
+    decode phase of disaggregated serving and never runs a context batch.
     """
-    return (isinstance(sparse_attention_config, DeepSeekV4SparseAttentionConfig)
-            and sparse_attention_config.enable_kv_cache_offload)
+    return (sparse_attention_config is not None and
+            sparse_attention_config.get_kv_cache_offload_config() is not None)
 
 
 def is_qwen3_next(config):

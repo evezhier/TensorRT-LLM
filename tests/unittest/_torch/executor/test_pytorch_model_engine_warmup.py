@@ -46,12 +46,14 @@ from tensorrt_llm._torch.speculative.utils import resolve_draft_len, update_draf
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
+    BaseSparseAttentionConfig,
     DecodingBaseConfig,
     DeepSeekSparseAttentionConfig,
     DeepSeekV4SparseAttentionConfig,
     DraftTargetDecodingConfig,
     PARDDecodingConfig,
     PrefillCudaGraphBackend,
+    SparseKvCacheOffloadConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
@@ -1537,6 +1539,15 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method.needs_native_autotune)
 
 
+class _OffloadingSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Any sparse attention algorithm that offloads KV history to host memory."""
+
+    algorithm: str = "offloading"
+
+    def get_kv_cache_offload_config(self) -> SparseKvCacheOffloadConfig:
+        return SparseKvCacheOffloadConfig()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("config", "expected"),
@@ -1545,8 +1556,9 @@ class TestWarmupCleanup(unittest.TestCase):
         (DeepSeekSparseAttentionConfig(), False),
         (DeepSeekV4SparseAttentionConfig(), False),
         (DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True), True),
+        (_OffloadingSparseAttentionConfig(), True),
     ],
-    ids=["none", "dsa", "dsv4", "dsv4_offload"],
+    ids=["none", "dsa", "dsv4", "dsv4_offload", "any_offload"],
 )
 def test_only_kv_cache_offload_makes_a_worker_decode_only(config, expected: bool) -> None:
     assert is_decode_only(config) is expected

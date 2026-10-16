@@ -865,6 +865,36 @@ class GuidedDecodingConfig(StrictBaseModel):
         description="The stop token ids for guided decoding config.")
 
 
+class SparseKvCacheOffloadConfig(StrictBaseModel):
+    """Memory sizing for sparse attention KV cache offload.
+
+    With offload, the KV history a sparse attention layer selects from lives in
+    host memory, and each request keeps a GPU cache of the units its selections
+    name.
+    """
+    gpu_cache_factor: float = Field(
+        default=2.0,
+        ge=1.0,
+        status="prototype",
+        description=
+        "Size of each request's GPU cache for offloaded attention history, in "
+        "selections: the cache holds this many times the units one decode step "
+        "selects, plus the unit being written, rounded up to whole pages. A "
+        "larger cache keeps more history on the GPU between decode steps, so "
+        "fewer units are fetched from host memory, at the cost of GPU memory per "
+        "request.")
+    host_cache_size: Optional[NonNegativeInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Host memory in bytes, per rank, that offloaded attention history may "
+        "take. Its pages share slots with the GPU KV cache pools, so the GPU KV "
+        "cache quota is lowered when needed to stay within it. When unset, it "
+        "holds max_batch_size requests at kv_cache_config.avg_seq_len, or "
+        "max_seq_len when that is unset, capped by available host memory and "
+        "the pinned-memory limit.")
+
+
 class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
@@ -874,6 +904,14 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        """Return the KV cache offload sizing, or None without offload.
+
+        Override in algorithms that can offload attention history to host memory.
+        """
+        return None
 
     def to_sparse_params(self, **kwargs):
         """Lower user-facing config into SparseParams."""
@@ -1550,6 +1588,11 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         "KV cache manager v2. The indexer and sliding-window caches remain on "
         "GPU. This feature is under development and currently cannot be "
         "enabled for inference.")
+    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
+        default_factory=SparseKvCacheOffloadConfig,
+        status="prototype",
+        description="Memory sizing for KV cache offload. Applies only with "
+        "enable_kv_cache_offload.")
 
     @field_validator("index_head_dim")
     @classmethod
@@ -1579,7 +1622,16 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
                 raise ValueError(
                     "DeepSeek-V4 KV cache offload requires a positive index_topk."
                 )
+        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
+            raise ValueError("kv_cache_offload_config requires "
+                             "enable_kv_cache_offload=True.")
         return self
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        if not self.enable_kv_cache_offload:
+            return None
+        return self.kv_cache_offload_config
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
