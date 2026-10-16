@@ -350,9 +350,6 @@ static kv::KvCache::PriorityCb castPriorityCallback(kv::KvCacheManager const& ma
 //! stops the underlying allocation vanishing beneath it.
 using DeviceArray1D = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 using DeviceArray2D = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
-//! A 2-D view whose rows may be further apart than they are wide, which is what a plane of
-//! a wider array gives.
-using DeviceStridedArray2D = nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda>;
 using DeviceArray3D = nb::ndarray<int32_t, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
 
 static int currentCudaDevice()
@@ -368,11 +365,10 @@ static DeviceArray1D makeDeviceArray1D(CUdeviceptr data, int32_t count, nb::hand
         nb::device::cuda::value, currentCudaDevice()};
 }
 
-static DeviceStridedArray2D makeDeviceArray2D(
-    CUdeviceptr data, int32_t rows, int32_t cols, int64_t rowStride, nb::handle owner)
+static DeviceArray2D makeDeviceArray2D(CUdeviceptr data, int32_t rows, int32_t cols, nb::handle owner)
 {
-    return DeviceStridedArray2D{reinterpret_cast<void*>(data), {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-        owner, {rowStride, 1}, nb::dtype<int32_t>(), nb::device::cuda::value, currentCudaDevice()};
+    return DeviceArray2D{reinterpret_cast<void*>(data), {static_cast<size_t>(rows), static_cast<size_t>(cols)}, owner,
+        {}, nb::dtype<int32_t>(), nb::device::cuda::value, currentCudaDevice()};
 }
 
 static nb::tuple bufferIdTuple(kv::BufferId const& self)
@@ -2441,18 +2437,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(nb::init<>())
         .def(
             "__init__",
-            [](kv::ExternalPageTable* self, std::uintptr_t host, std::uintptr_t device, std::int64_t layerGroupStride,
-                std::int64_t rowStride)
+            [](kv::ExternalPageTable* self, std::uintptr_t host, std::int64_t layerGroupStride, std::int64_t rowStride)
             {
-                new (self) kv::ExternalPageTable{reinterpret_cast<std::int32_t*>(host),
-                    static_cast<CUdeviceptr>(device), layerGroupStride, rowStride};
+                new (self) kv::ExternalPageTable{reinterpret_cast<std::int32_t*>(host), layerGroupStride, rowStride};
             },
-            nb::arg("host"), nb::arg("device"), nb::arg("layer_group_stride"), nb::arg("row_stride"),
-            "Page-index storage a Batch writes through instead of keeping its own.\n\n"
-            "`host` and `device` are addresses of int32 arrays laid out as "
-            "[layer_group][row][block] with the given element strides; the row is longer than "
-            "blocks_per_seq when the table is a plane of a wider array. The owner must carry the "
-            "host side to the device side on the step's stream before its kernels run.")
+            nb::arg("host"), nb::arg("layer_group_stride"), nb::arg("row_stride"),
+            "Host page-index storage a Batch's members write into instead of staging of its "
+            "own.\n\n"
+            "`host` addresses an int32 array laid out as [layer_group][row][block] with the "
+            "given element strides; a row is longer than blocks_per_seq when the table is a "
+            "plane of a wider array. Only the host side is lent: the device table stays the "
+            "Batch's, because publish() has to produce a snapshot the host is free to write "
+            "behind.")
         .def_rw("layer_group_stride", &kv::ExternalPageTable::layerGroupStride)
         .def_rw("row_stride", &kv::ExternalPageTable::rowStride);
 
@@ -2464,9 +2460,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "max_batch_size and max_blocks_per_seq bound device arrays whose shape must not change "
             "between steps, so neither can be grown later. Zero derives them from the manager's "
             "constraints, which fails when none were declared.\n\n"
-            "`page_table` borrows the page-index storage rather than allocating it, which leaves "
-            "one buffer with one writer and takes the page indices out of publish(). Its rows "
-            "then belong to the lender, so add_kv_cache must be told which one a member occupies.")
+            "`page_table` borrows the host page-index storage rather than staging its own, which "
+            "leaves one buffer with one writer so a member's binding survives the whole decode. "
+            "Its rows then belong to the lender, so add_kv_cache must be told which one a member "
+            "occupies. publish() then costs one strided transfer per layer group.")
         .def("add_kv_cache", &kv::Batch::addKvCache, nb::arg("kv_cache"), nb::arg("row") = -1, nb::keep_alive<1, 2>(),
             "Seat a cache in `row`, or in the lowest free row when it is negative, returning the "
             "row. Raises when the row is taken or out of range, the batch is full, or the cache "
@@ -2524,10 +2521,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             {
                 auto const& batch = nb::cast<kv::Batch const&>(self);
                 auto const view = batch.pageTable(kv::LayerGroupId{layerGroupId});
-                // The Batch or its lender owns the memory; self keeps it alive for the array's
-                // lifetime. A borrowed table's rows are wider than the part this describes, so
-                // the row stride travels with the shape rather than being assumed from it.
-                return makeDeviceArray2D(view.data, view.numRows, view.blocksPerRow, view.rowStride, self);
+                // The Batch owns the memory; self keeps it alive for the array's lifetime.
+                return makeDeviceArray2D(view.data, view.numRows, view.blocksPerRow, self);
             },
             nb::arg("layer_group_id"),
             "int32[max_batch, max_blocks_per_seq] base page indices for one layer group, as a "

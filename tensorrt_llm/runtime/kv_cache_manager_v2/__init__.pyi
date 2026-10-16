@@ -807,32 +807,35 @@ def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
     """
 
 class ExternalPageTable:
-    """Page-index storage a :class:`Batch` writes through instead of keeping its own.
+    """Host page-index storage a :class:`Batch`'s members write into.
 
-    The runtime already holds one of these per step -- the host block-offsets tensor the
-    dense attention path fills and uploads -- and its rows carry exactly the numbers a
-    ``Batch`` would otherwise stage and upload a second time. Lending it leaves one buffer
-    with one writer, so a member's page indices need no mirroring and its binding survives
-    the whole decode rather than being rebound each step.
+    The runtime already holds one of these -- the host block-offsets tensor the dense
+    attention path fills -- and its rows carry exactly the numbers a member would otherwise
+    write somewhere else as well. A ``_KVCache`` can write to only one buffer at a time, so
+    two of them means handing the binding back and forth every step. Pointing the member at
+    the runtime's row instead leaves one buffer with one writer, and the binding survives
+    the whole decode.
 
-    ``host`` and ``device`` are addresses of ``int32`` arrays laid out as
-    ``[layer_group][row][block]`` with the given element strides. A row is longer than
-    ``max_blocks_per_seq`` when the table is a plane of a wider array, which is the usual
-    case: the runtime's tensor carries a key/value dimension the ``Batch`` does not use.
+    ``host`` addresses an ``int32`` array laid out as ``[layer_group][row][block]`` with the
+    given element strides. A row is longer than ``max_blocks_per_seq`` when the table is a
+    plane of a wider array, which is the usual case: the runtime's tensor carries a
+    key/value dimension the ``Batch`` does not use.
 
-    The lender owns the transfer. It must carry the host side to the device side on the
-    step's stream before that step's kernels run, since the watermarks
-    :meth:`Batch.publish` sends bound which of these entries those kernels read.
+    Only the host side is lent. The device table stays the ``Batch``'s own, because
+    :meth:`Batch.publish` has to produce a snapshot: without one the host could not write a
+    row until every kernel reading it had retired, which for a captured graph means the end
+    of the forward. The lender's own device mirror is no substitute either -- no captured
+    kernel reads it today, which is what lets its upload overlap the previous step, and
+    sharing it would give that up.
 
-    It also owns the rows. A row no member occupies is left untouched, because it is
-    serving one of the lender's other requests; and a member must be removed from the
-    ``Batch`` before the lender reassigns the row it sits in.
+    The lender owns the rows. A row no member occupies is left as the lender had it,
+    because it is serving one of the lender's other requests; and a member must be removed
+    from the ``Batch`` before the lender reassigns the row it sits in.
     """
 
     def __init__(
         self,
         host: int,
-        device: int,
         layer_group_stride: int,
         row_stride: int,
     ) -> None: ...
@@ -923,9 +926,17 @@ class Batch:
         the sentinel separates an absent block from slot zero; the dense path's scaled
         block offsets cannot serve here for that reason.
 
-        A borrowed page table is **not** carried by this call -- its lender uploads it, and
-        must do so on this same stream and before the step's kernels, since the watermarks
-        published here bound which of its entries those kernels read.
+        A borrowed page table is copied too, not read in place: the snapshot is the whole
+        point, since the host has to be free to write the next step's rows long before the
+        kernels reading this step's have retired. Borrowing costs one strided transfer per
+        layer group instead of one linear transfer for all of them, because the lender's
+        rows are further apart than they are wide.
+
+        **Must be ordered after the kernels that read the previous publish.** Those live in
+        a captured graph, so the device table cannot be double-buffered out of the hazard --
+        the capture baked its address. Issuing this on the stream the graph replays on is
+        what provides that today. A torn publish is not a stale answer: the cache views
+        carry pointers, so it can pair one request's residency with another's lease.
         """
 
     def wait_published(self) -> None:
@@ -945,12 +956,13 @@ class Batch:
     def page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
         """``int32[max_batch, max_blocks_per_seq]`` base page indices for one group.
 
-        A DLPack array over memory the ``Batch`` or its lender owns; it keeps the ``Batch``
-        alive for as long as the array exists. A borrowed table's rows are wider than the
-        part described here, so the array is strided rather than contiguous.
+        A DLPack array over memory the ``Batch`` owns; it keeps the ``Batch`` alive for as
+        long as the array exists. Always packed, whatever the host rows it was published
+        from look like.
 
-        An unoccupied row reads as ``BAD_PAGE_INDEX`` throughout when the ``Batch`` owns
-        the table. A borrowed one holds whatever its lender put there.
+        An unoccupied row reads as ``BAD_PAGE_INDEX`` throughout until the first publish.
+        With a borrowed table it then holds whatever the lender had in that row, since the
+        transfer carries every row rather than paying for one per member.
         """
 
     def history_lengths(self) -> DeviceArray:

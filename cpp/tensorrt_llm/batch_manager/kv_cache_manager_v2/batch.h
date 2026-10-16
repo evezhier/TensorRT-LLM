@@ -36,33 +36,38 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class KvCache;
 class KvCacheManager;
 
-//! One layer group's page table as the device sees it.
+//! One layer group's page table as the device sees it. Always packed: the Batch allocates
+//! it, so a row is exactly `blocksPerRow` entries.
 struct PageTableView
 {
     CUdeviceptr data = 0;
     int32_t numRows = 0;
-    //! Entries of a row this table describes.
     int32_t blocksPerRow = 0;
-    //! Elements between consecutive rows. Larger than `blocksPerRow` when the table is a
-    //! plane of a wider array, which is what borrowing the runtime's offsets tensor gives.
-    int32_t rowStride = 0;
 };
 
-//! A page-index table owned by someone else, which a Batch writes through instead of
-//! keeping its own.
+//! Host page-index storage owned by someone else, which a Batch's members write into
+//! instead of into staging of its own.
 //!
-//! The runtime already holds one of these per step -- the host offsets tensor the dense
-//! attention path fills and uploads -- and its rows carry exactly the numbers a Batch would
-//! otherwise stage and upload a second time. Borrowing it leaves one buffer with one writer,
-//! so a member's page indices need no mirroring and its binding survives the whole decode.
+//! The runtime already holds one of these -- the host offsets tensor the dense attention
+//! path fills -- and its rows carry exactly the numbers a member would otherwise write
+//! somewhere else as well. Since a KvCache can write to only one buffer at a time, having
+//! two means handing the binding back and forth every step. Pointing the member at the
+//! runtime's row instead leaves one buffer with one writer, and the binding then survives
+//! the whole decode.
 //!
-//! Host and device sides must describe the same elements in the same order; the Batch
-//! writes the host side and reads the device side, and relies on the owner to carry one to
-//! the other before the step's kernels run.
+//! Only the host side is borrowed. The device table stays the Batch's own, because
+//! publish() must produce a snapshot: without one the host could not write a row until
+//! every kernel that reads it had finished, which for a captured graph means the end of the
+//! forward. The lender's own device mirror is no substitute -- it is read by no captured
+//! kernel today, which is what lets its upload overlap the previous step, and sharing it
+//! would give that up.
+//!
+//! Rows are laid out `[layer_group][row][block]` with the strides below. A row is usually
+//! longer than the Batch's `blocksPerRow`, since the lender's tensor carries a key/value
+//! dimension this table does not use.
 struct ExternalPageTable
 {
     int32_t* host = nullptr;
-    CUdeviceptr device = 0;
     //! Elements between consecutive layer groups, and between consecutive rows of one.
     int64_t layerGroupStride = 0;
     int64_t rowStride = 0;
@@ -124,11 +129,11 @@ public:
     //! none were declared -- a pool-sizing hint is not a batch bound, so it is only a
     //! default, never an inference.
     //!
-    //! @param pageTable borrowed page-index storage. When absent the Batch allocates and
-    //! publishes its own, which is what a caller with no runtime tensor to share wants.
-    //! When present its rows must be addressable for every (layer group, row) this Batch
-    //! can reach, and the rows become the owner's -- so addKvCache needs to be told which
-    //! one a member occupies rather than choosing.
+    //! @param pageTable borrowed host page-index storage. When absent the Batch stages its
+    //! own, which is what a caller with no runtime tensor to share wants. When present its
+    //! rows must be addressable for every (layer group, row) this Batch can reach, and the
+    //! rows become the lender's -- so addKvCache needs to be told which one a member
+    //! occupies rather than choosing. The device table is the Batch's either way.
     explicit Batch(KvCacheManager& manager, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
         std::optional<ExternalPageTable> pageTable = std::nullopt);
     ~Batch();
@@ -172,11 +177,18 @@ public:
     //!
     //! The staging rows are written by the members themselves, so they are always current;
     //! what this adds is a stream-ordered snapshot. Without it the host would be mutating
-    //! the table a previously enqueued fetch is still reading.
+    //! the table a previously enqueued fetch is still reading. That snapshot is why a
+    //! borrowed table is still copied rather than read in place: the host has to be free to
+    //! write the next step's rows long before the kernels reading this step's have retired.
     //!
-    //! A borrowed page table is **not** carried by this call -- its owner uploads it, and
-    //! must do so on the same stream and before the step's kernels, since the watermarks
-    //! published here bound which of its entries those kernels read.
+    //! Borrowing costs one strided transfer per layer group instead of one linear transfer
+    //! for all of them, because the lender's rows are further apart than they are wide.
+    //!
+    //! **Must be ordered after the kernels that read the previous publish.** Those live in
+    //! a captured graph, so the device table cannot be double-buffered out of the hazard --
+    //! the capture baked its address. Issuing this on the stream the graph replays on is
+    //! what provides that today. A torn publish is not a stale answer: the cache views
+    //! carry pointers, so it can pair one request's residency with another's lease.
     //!
     //! The copy is asynchronous and reads pinned memory, so it is still in flight when this
     //! returns. **Every later host write to a member's page indices must be separated from
@@ -245,9 +257,14 @@ private:
     //! when the table is this Batch's, inside the lender's when it is borrowed.
     [[nodiscard]] int32_t* _stagingRow(LayerGroupId layerGroupId, int row) const;
 
-    //! Element strides of the page-index table, whoever owns it.
+    //! Element strides of the host page-index rows, whoever owns them.
     [[nodiscard]] int64_t _pageTableRowStride() const noexcept;
     [[nodiscard]] int64_t _pageTableGroupStride() const noexcept;
+
+    //! Bytes the device page table occupies ahead of the row state, when the staged block
+    //! does not carry one. Zero otherwise, so every staging offset reaches its device
+    //! counterpart by adding this and nothing else.
+    [[nodiscard]] size_t _deviceBias() const noexcept;
 
     [[nodiscard]] size_t _rowElements() const noexcept;
 

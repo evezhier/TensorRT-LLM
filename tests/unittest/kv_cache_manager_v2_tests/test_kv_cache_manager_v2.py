@@ -1542,15 +1542,12 @@ class TestBorrowedPageTable(unittest.TestCase):
         """A manager and a Batch, lending it a table unless asked not to."""
         torch = self._torch()
         manager = TestSparseFetch._manager(("key",))
-        host = device = None
         try:
             elements = self.GROUPS * self.GROUP_STRIDE
             host = torch.full((elements,), self.UNTOUCHED, dtype=torch.int32).pin_memory()
-            device = torch.full((elements,), self.UNTOUCHED, dtype=torch.int32, device="cuda")
             table = (
                 ExternalPageTable(
                     host=host.data_ptr(),
-                    device=device.data_ptr(),
                     layer_group_stride=self.GROUP_STRIDE,
                     row_stride=self.ROW_STRIDE,
                 )
@@ -1563,7 +1560,7 @@ class TestBorrowedPageTable(unittest.TestCase):
                 max_blocks_per_seq=self.BLOCKS,
                 page_table=table,
             )
-            yield torch, manager, batch, host, device
+            yield torch, manager, batch, host
         finally:
             manager.shutdown()
 
@@ -1590,7 +1587,7 @@ class TestBorrowedPageTable(unittest.TestCase):
 
     def test_a_member_writes_its_indices_into_the_row_it_was_given(self):
         """The lender chose the row, so the indices must land in that one and no other."""
-        with self._fixture() as (torch, manager, batch, host, _device):
+        with self._fixture() as (torch, manager, batch, host):
             lg = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
@@ -1607,7 +1604,7 @@ class TestBorrowedPageTable(unittest.TestCase):
         max_blocks_per_seq are its key/value half. Writing either would corrupt a request
         this Batch has never heard of.
         """
-        with self._fixture() as (torch, manager, batch, host, _device):
+        with self._fixture() as (torch, manager, batch, host):
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 with self._member(manager, batch, 1, handle):
@@ -1617,25 +1614,35 @@ class TestBorrowedPageTable(unittest.TestCase):
                         [self.UNTOUCHED] * (self.ROW_STRIDE - self.BLOCKS),
                     )
 
-    def test_publish_leaves_a_borrowed_table_to_its_lender(self):
-        """The page indices travel in the lender's transfer, not in this one.
+    def test_publish_packs_the_borrowed_rows_into_the_device_table(self):
+        """The device table is the Batch's own and packed, whatever the host rows look like.
 
-        That is the whole point of borrowing: the lender already uploads these bytes, so a
-        second transfer of them is the cost this removes.
+        It is copied rather than read in place because publish() is a snapshot: the host
+        has to be free to write the next step's rows long before the kernels reading this
+        step's have retired. Row 1 of a row_stride-wide source must land at row 1 of a
+        blocks_per_seq-wide destination, so a publish that ignored the source pitch would
+        put a member's indices in some other member's row.
         """
-        with self._fixture() as (torch, manager, batch, _host, device):
+        with self._fixture() as (torch, manager, batch, host):
+            lg = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 with self._member(manager, batch, 1, handle):
-                    marker = torch.arange(device.numel(), dtype=torch.int32, device="cuda")
-                    device.copy_(marker)
                     batch.publish(handle)
                     torch.cuda.synchronize()
-                    self.assertTrue(bool((device == marker).all()))
+                    table = _introspection.batch_page_table(batch, lg)
+                    self.assertEqual(len(table), self.ROWS * self.BLOCKS)
+                    expected = self._row(host, 1)[: self.BLOCKS]
+                    self.assertEqual(table[self.BLOCKS : 2 * self.BLOCKS], expected)
+                    self.assertNotEqual(expected[0], self.UNTOUCHED)
+                    # Every row travels, including ones the lender keeps for its own
+                    # requests: skipping them would cost a transfer each. Nothing reads
+                    # them, because a free row's cache view has no residency.
+                    self.assertEqual(table[: self.BLOCKS], [self.UNTOUCHED] * self.BLOCKS)
 
     def test_a_borrowed_batch_refuses_to_choose_a_row(self):
         """Choosing one would address whichever request the lender seated there."""
-        with self._fixture() as (torch, manager, batch, _host, _device):
+        with self._fixture() as (torch, manager, batch, _host):
             cache = manager.create_kv_cache()
             try:
                 with self.assertRaises(Exception) as caught:
@@ -1650,7 +1657,7 @@ class TestBorrowedPageTable(unittest.TestCase):
         That buffer would take the writes with it and strand the row at whatever it held
         when the cache joined -- silently, which is the one outcome worth a hard failure.
         """
-        with self._fixture(borrow=False) as (torch, manager, batch, _host, _device):
+        with self._fixture(borrow=False) as (torch, manager, batch, _host):
             lg = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
@@ -1667,7 +1674,7 @@ class TestBorrowedPageTable(unittest.TestCase):
         Reverting to the cache's own storage would leave the row holding indices of pages
         it no longer owns; the unlocks write BAD_PAGE_INDEX through the binding instead.
         """
-        with self._fixture() as (torch, manager, batch, host, _device):
+        with self._fixture() as (torch, manager, batch, host):
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 with self._member(manager, batch, 1, handle) as cache:
