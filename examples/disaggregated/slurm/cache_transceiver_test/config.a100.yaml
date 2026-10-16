@@ -1,0 +1,157 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# A100 configuration for the shared 2-node transceiver and transfer benchmarks.
+#
+# Run with:
+#     ./submit.py -c config.a100.yaml
+#
+# The job allocates 2 nodes; one runs the context (ctx) group, the other the
+# generation (gen) group, each using `hardware.gpus_per_node` GPUs. For every
+# UCX env-var set, the harness runs the transceiver, host transfer, KVCM
+# transfer, and synthetic PD handoff benchmarks.
+
+slurm:
+  partition: "a100-pcie-40gb@cr+mp/x11spgtf/1gpu-24cpu-32gb"
+  account: "dtcomp_fallback"
+  job_time: "02:00:00"
+  job_name: "kvxfer_tune"
+  extra_args: "--gres=gpu:1" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
+
+hardware:
+  # GPUs per node. N = gpus_per_node is the per-instance world size (ctx and gen
+  # each use N GPUs on their own node).
+  gpus_per_node: 1
+
+environment:
+  # Container image with a TensorRT-LLM build (wheel pre-installed, or installed
+  # below via trtllm_wheel_path / build_wheel).
+  container_image: "nvcr.io/nvidia/tensorrt-llm/devel:1.4.0rc0.dev202610070001"
+  # Comma-separated bind mounts, format: src:dst,src:dst
+  container_mount: "/home/scratch.okozlova_gpu_1:/home/scratch.okozlova_gpu_1"
+  # Mounted path of this TensorRT-LLM repo inside the container ("" to skip).
+  trtllm_repo: "/home/scratch.okozlova_gpu_1/indexer/TensorRT-LLM"
+  # Writable output directory for logs, per-rank CSVs and results.json.
+  work_dir: "/home/scratch.okozlova_gpu_1/indexer/TensorRT-LLM/build/cache_transceiver_retry_4813249"
+
+  # --- TensorRT-LLM install selection (same precedence as benchmark/disaggr_torch.slurm) ---
+  # 1) If trtllm_wheel_path is set: `pip install <wheel>[devel]`.
+  trtllm_wheel_path: "/home/scratch.okozlova_gpu_1/indexer/TensorRT-LLM/build/tensorrt_llm-1.4.0rc0-cp312-cp312-linux_x86_64.whl"
+  # 2) Else if build_wheel is true: build from trtllm_repo then `pip install -e .[devel]`.
+  build_wheel: false
+  # Optional CUDA arch filter for build_wheel (e.g. "90-real;100-real"). Empty = all.
+  cuda_architectures: ""
+  # 3) If neither is set: use the TensorRT-LLM already installed in the container.
+
+test_matrix:
+  # Transceiver implementations to test. runtime "CPP" -> C++ transceiver,
+  # "PYTHON" -> Python transceiver (only NIXL / DEFAULT backend supported).
+  combinations:
+    - {backend: "UCX", runtime: "CPP"}
+    - {backend: "NIXL", runtime: "CPP"}
+    - {backend: "NIXL", runtime: "PYTHON"}
+  # KV cache manager versions to test. The full matrix is combinations x versions;
+  # the V2 manager only supports the Python transceiver, so V2+CPP is skipped.
+  cache_manager_versions: ["V1", "V2"]
+  # Request lengths (prompt tokens) to transfer.
+  request_lengths: [100, 1000, 8000]
+  # Number of timed requests per length (bandwidth is aggregated over these).
+  num_requests_per_length: 8
+  # Warmup requests per (combination, length); excluded from bandwidth stats.
+  warmup_requests: 2
+
+host_transfer_benchmark:
+  # NIXL payload benchmark on the same two nodes and UCX sweep. Reports both
+  # transport-only and GPU-ready (including staging) rates, with "gpu" as baseline.
+  enabled: true
+  modes: ["gpu", "host", "host_to_gpu", "gpu_to_host"]
+  bytes_per_transfer: 16777216
+  warmup: 2
+  samples: 8
+  # Keep registrations live for this interval after submission in the delayed
+  # completion and logical cancellation cases; exclude these from bandwidth.
+  delayed_completion_ms: 100
+  timeout_ms: 30000
+
+kvcm_transfer_benchmark:
+  # Native KVCM V2 sparse pages, including actual GPU→host offload and detached
+  # receive reservations. The same NIXL path is used for every mode.
+  enabled: true
+  modes: ["gpu", "host", "host_to_gpu", "gpu_to_host", "mixed"]
+  page_bytes: 1048576
+  pages: 16
+  tokens_per_block: 32
+  warmup: 2
+  samples: 8
+  delayed_completion_ms: 100
+  timeout_ms: 30000
+
+pd_host_aware_benchmark:
+  # Synthetic PD handoff uses the same two nodes and one GPU per node.
+  enabled: true
+  modes: ["gpu", "host"]
+  prompt_tokens: 8192 # must be divisible by kv_cache.tokens_per_block
+  warmup: 1
+  samples: 3
+  timeout_ms: 30000
+
+kv_cache:
+  # KV cache geometry. Sized so transfers are large enough to measure bandwidth.
+  num_layers: 32
+  num_kv_heads: 8        # per instance; must be divisible by tensor_parallel size
+  head_dim: 128
+  tokens_per_block: 32
+  dtype: "HALF"          # one of FP8 | HALF | BF16
+  # Transceiver buffer budget; MUST be >= max(request_lengths).
+  max_tokens_in_buffer: 16384
+
+parallel:
+  # Per-instance parallelism. ctx_tp*ctx_pp and gen_tp*gen_pp must both equal
+  # hardware.gpus_per_node. The harness requires a symmetric layout
+  # (ctx_tp == gen_tp and ctx_pp == gen_pp) for its local verification.
+  ctx_tp: 1
+  ctx_pp: 1
+  gen_tp: 1
+  gen_pp: 1
+
+ucx_env_sweep:
+  # Each entry is one full relaunch of both srun steps with the given UCX env
+  # vars exported. Add/edit entries to explore transports on your cluster.
+  - name: "all"
+    env:
+      UCX_TLS: "all"
+  - name: "cuda_ipc_and_tcp"
+    env:
+      UCX_TLS: "cuda_ipc,cuda_copy,sm,self,tcp"
+
+  - name: "put_zcopy"
+    env:
+      UCX_TLS: "all"
+      UCX_RNDV_SCHEME: "put_zcopy"
+      UCX_CUDA_IPC_ENABLE_MNNVL: "n"
+  - name: 'disable_ib'
+    env:
+      UCX_TLS: "^ib"
+
+
+run:
+  # Per (combination, request_length) cell hard limit; must be >5 seconds. The
+  # Python sender deadline is set 5 seconds lower so it can return and complete
+  # the CTX/GEN ownership handshake first. The alarm remains the C++ path's
+  # per-cell bound. If quiescence is still unproven, the harness records the
+  # remaining cells and hard-aborts this sweep without reusing KV memory.
+  timeout_per_cell_s: 180
+  # Hard wall-clock cap for ONE full sweep (all cases x request lengths). The
+  # outer `timeout` around each srun enforces this, so a hung sweep can never
+  # block the others: it is killed and the loop advances to the next UCX env
+  # set. Default 180 = 3 minutes (a healthy sweep finishes in ~1 min; raise this
+  # if you add many cases/sweeps or use slow links).
+  max_sweep_s: 900
+  # Controls UCX_PROTO_INFO (the per-transfer transport shown as
+  # selected_transport in results.json). Accepts:
+  #   true  -> UCX_PROTO_INFO=used: compact/quiet (default). Requires UCX >= 1.21
+  #            to emit the selected transport while keeping rank logs small.
+  #   false -> do not set UCX_PROTO_INFO at all.
+  #   "y"   -> UCX_PROTO_INFO=y: full per-size protocol tables. Fills
+  #            selected_transport but is very verbose (~50x larger rank logs).
+  capture_proto_info: true

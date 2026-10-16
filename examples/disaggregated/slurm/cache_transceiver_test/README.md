@@ -120,6 +120,7 @@ results.json                    # full results, grouped per combination (longest
 results.best.json               # best UCX env per combination (the deliverable)
 host_transfer/sweep<i>_rank<r>_<mode>.json # verified physical transfer samples
 kvcm_transfer/sweep<i>_rank<r>_<mode>.json # verified native-page transfer samples
+pd_host_aware/gen_sweep<i>.jsonl   # verified synthetic PD handoff samples
 ```
 
 `results.json` is organized **per combination** (`by_combination`); under each combination every
@@ -166,10 +167,12 @@ timings retain transport-only values and report `null` for GPU-ready values.
 
 ## Synthetic PD host-aware handoff
 
-Set `pd_host_aware_benchmark.enabled: true`, `hardware.gpus_per_node: 1`, and
-both `parallel.*_tp: 1` in the config before running `python3 submit.py -c
-config.yaml`. With `pd_host_aware_benchmark.only: true`, the older matrices
-are skipped. Set `kv_cache.num_layers` to at least three: all but the last
+The synthetic PD benchmark runs with the transceiver, host transfer, and KVCM
+transfer benchmarks in each UCX sweep of `config.yaml`. It uses one GPU on each
+of the two allocated nodes, even when `hardware.gpus_per_node` is greater than
+one. For a two-node A100 allocation with one GPU per node, use
+`./submit.py -c config.a100.yaml` after setting its cluster paths and matching
+TensorRT-LLM wheel. Set `kv_cache.num_layers` to at least three: all but the last
 synthetic layer use host-backed sparse hot pages in the `host` mode, while
 the last layer uses GPU hot pages. `prompt_tokens` must be a multiple of
 `kv_cache.tokens_per_block`. The same job also runs a GPU-only mode as its

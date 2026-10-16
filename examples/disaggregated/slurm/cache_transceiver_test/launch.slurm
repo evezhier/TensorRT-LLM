@@ -42,11 +42,6 @@ KVCM_DRIVER="python3 ${HERE}/run_kvcm_transfer_benchmark.py"
 KVCM_ENABLED="$(python3 -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1])); print(int(c.get("kvcm_transfer_benchmark", {}).get("enabled", False)))' "${CONFIG}")"
 PD_DRIVER="python3 ${HERE}/run_pd_host_aware_benchmark.py"
 PD_ENABLED="$(python3 -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1])); print(int(c.get("pd_host_aware_benchmark", {}).get("enabled", False)))' "${CONFIG}")"
-PD_ONLY="$(python3 -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1])); p=c.get("pd_host_aware_benchmark", {}); print(int(p.get("enabled", False) and p.get("only", False)))' "${CONFIG}")"
-if [ "${PD_ENABLED}" = "1" ] && [ "${N}" -ne 1 ]; then
-    echo "ERROR: pd_host_aware_benchmark currently requires hardware.gpus_per_node=1" >&2
-    exit 1
-fi
 
 echo "ctx_node=${CTX_NODE} gen_node=${GEN_NODE} zmq_port=${ZMQ_PORT}"
 
@@ -124,7 +119,6 @@ export UCX_PROTO_INFO=${PROTO_INFO_VALUE}"
     # a single hung sweep would prevent every later UCX env set from running.
     # One combined log per rank: omit --error so srun merges stderr into
     # --output (stdout + stderr, incl. UCX_PROTO_INFO, in a single .log file).
-    if [ "${PD_ONLY}" != "1" ]; then
     timeout -k 60 --signal=TERM "${PER_SWEEP_TIMEOUT}" srun ${COMMON} --export="${EXPORTS}" \
         --nodelist="${CTX_NODE}" -N1 --ntasks-per-node="${N}" \
         --output="${WORK}/logs/sweep${SWEEP_IDX}_ctx_rank%t.log" \
@@ -187,8 +181,6 @@ ${KVCM_DRIVER} --role gen" &
         fi
         echo "KVCM sweep ${SWEEP_IDX} done (ctx_rc=${KVCM_CTX_RC} gen_rc=${KVCM_GEN_RC})"
     fi
-    fi
-
     if [ "${PD_ENABLED}" = "1" ]; then
         timeout -k 60 --signal=TERM "${PER_SWEEP_TIMEOUT}" srun ${COMMON} --export="${EXPORTS}" \
             --nodelist="${CTX_NODE}" -N1 --ntasks-per-node=1 \
