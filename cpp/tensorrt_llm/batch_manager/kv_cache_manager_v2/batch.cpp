@@ -97,17 +97,29 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std
     auto const numViews = static_cast<size_t>(mNumLayerGroups.value()) * static_cast<size_t>(mMaxBatchSize);
     std::fill(views, views + numViews, SparseCacheView{});
 
+    // The staging mirrors the device block exactly, so publishing it is one linear copy.
+    // It also doubles what a Batch costs in device memory, which is the price of letting
+    // the host-to-device crossing overlap the previous step; a caller that already holds a
+    // buffer of this shape could lend it instead.
     CUdeviceptr device = 0;
-    cuCheck(cuMemAlloc(&device, _deviceBias() + _totalBytes()));
+    cuCheck(cuMemAlloc(&device, _deviceBytes()));
     mDevice = CudaUniqPtr{reinterpret_cast<std::byte*>(device)};
-    if (auto const bias = _deviceBias(); bias > 0)
+    CUdeviceptr deviceStaging = 0;
+    cuCheck(cuMemAlloc(&deviceStaging, _deviceBytes()));
+    mDeviceStaging = CudaUniqPtr{reinterpret_cast<std::byte*>(deviceStaging)};
+
+    for (auto const base : {device, deviceStaging})
     {
-        // The borrowed rows are the lender's until a member takes one, so there is nothing
-        // to copy in yet; the table still has to read as absent until the first publish.
-        cuCheck(cuMemsetD32(device, static_cast<unsigned int>(kBadPageIndex.value()),
-            _rowElements() * static_cast<size_t>(mNumLayerGroups.value())));
+        if (_deviceBias() > 0)
+        {
+            // The borrowed rows are the lender's until a member takes one, so there is
+            // nothing to copy in yet; the table still has to read as absent until the
+            // first publish.
+            cuCheck(cuMemsetD32(base, static_cast<unsigned int>(kBadPageIndex.value()),
+                _rowElements() * static_cast<size_t>(mNumLayerGroups.value())));
+        }
+        cuCheck(cuMemcpyHtoD(base + _deviceBias(), staging, _totalBytes()));
     }
-    cuCheck(cuMemcpyHtoD(device + _deviceBias(), staging, _totalBytes()));
 
     _allocateFetchScratch();
 }
@@ -176,6 +188,8 @@ SparseFetchScratch const& Batch::sparseFetchScratch(LayerGroupId layerGroupId) c
 
 Batch::~Batch()
 {
+    // Both buffers are about to go, and transfers on the upload stream still name them.
+    _drain();
     KVCM2_POISON_ON_EXCEPT(
         [this]
         {
@@ -215,6 +229,25 @@ size_t Batch::_deviceBias() const noexcept
     auto const bytes = sizeof(int32_t) * _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
     auto const align = alignof(SparseCacheView);
     return (bytes + align - 1) / align * align;
+}
+
+size_t Batch::_deviceBytes() const noexcept
+{
+    return _deviceBias() + _totalBytes();
+}
+
+void Batch::_drain() noexcept
+{
+    KVCM2_POISON_ON_EXCEPT(
+        [this]
+        {
+            waitPublished();
+            if (!mStagingRead.isClosed())
+            {
+                mStagingRead.synchronize();
+                mStagingRead.close();
+            }
+        });
 }
 
 size_t Batch::_historyOffset() const noexcept
@@ -417,7 +450,16 @@ void Batch::publish(CUstream stream)
     // now so the single transfer below carries a matched pair.
     _stageRowState();
 
-    auto const base = reinterpret_cast<CUdeviceptr>(mDevice.get());
+    auto const staging = reinterpret_cast<CUdeviceptr>(mDeviceStaging.get());
+    auto* const upload = mUploadStream.handle();
+
+    // The fill below overwrites what the previous step's copy read into the final tables.
+    // Those run on different streams, so nothing but this event orders them.
+    if (!mStagingRead.isClosed())
+    {
+        mStagingRead.waitInStream(reinterpret_cast<CudaStream>(upload));
+        mStagingRead.close();
+    }
 
     // Whole-table for now. Refreshing only the rows whose locks moved is an optimisation
     // the design allows for: it degrades into a slower step, never a wrong answer.
@@ -434,16 +476,22 @@ void Batch::publish(CUstream stream)
             copy.srcHost = _stagingRow(lg, 0);
             copy.srcPitch = sizeof(int32_t) * static_cast<size_t>(_pageTableRowStride());
             copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-            copy.dstDevice = base + sizeof(int32_t) * _rowElements() * static_cast<size_t>(lg.value());
+            copy.dstDevice = staging + sizeof(int32_t) * _rowElements() * static_cast<size_t>(lg.value());
             copy.dstPitch = sizeof(int32_t) * static_cast<size_t>(mMaxBlocksPerSeq);
             copy.WidthInBytes = sizeof(int32_t) * static_cast<size_t>(mMaxBlocksPerSeq);
             copy.Height = static_cast<size_t>(mMaxBatchSize);
-            cuCheck(cuMemcpy2DAsync(&copy, stream));
+            cuCheck(cuMemcpy2DAsync(&copy, upload));
         }
     }
-    cuCheck(
-        cuMemcpyHtoDAsync(base + _deviceBias(), reinterpret_cast<void*>(mStaging->address()), _totalBytes(), stream));
-    mPublished = CachedCudaEvent{reinterpret_cast<CudaStream>(stream)};
+    cuCheck(cuMemcpyHtoDAsync(
+        staging + _deviceBias(), reinterpret_cast<void*>(mStaging->address()), _totalBytes(), upload));
+    mPublished = mUploadStream.recordEvent();
+
+    // The staging now holds this step's tables, so carrying them across is all that is
+    // left on the caller's stream -- one copy, because the two layouts match.
+    mPublished.waitInStream(reinterpret_cast<CudaStream>(stream));
+    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _deviceBytes(), stream));
+    mStagingRead = CachedCudaEvent{reinterpret_cast<CudaStream>(stream)};
 }
 
 void Batch::waitPublished()

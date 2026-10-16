@@ -932,6 +932,12 @@ class Batch:
         layer group instead of one linear transfer for all of them, because the lender's
         rows are further apart than they are wide.
 
+        Two stages. The host-to-device fill runs on a stream of the batch's own, so it
+        overlaps the previous step -- the host enqueues this while that step's forward is
+        still executing. ``stream`` then carries one linear device-to-device copy into the
+        tables the fetch reads. Everything expensive is in the first stage, and only the
+        second waits for anything.
+
         Raises if the previous publish has not been waited on. This call stages the
         watermarks and views itself, so it would be writing into the same hazard it is
         meant to close. It refuses rather than waiting because a wait here covers only its
@@ -939,10 +945,11 @@ class Batch:
         would hide that. :meth:`resize` publishes, so republishing after one needs
         :meth:`wait_published` in between.
 
-        **Must be ordered after the kernels that read the previous publish.** Those live in
-        a captured graph, so the device table cannot be double-buffered out of the hazard --
-        the capture baked its address. Issuing this on the stream the graph replays on is
-        what provides that today. A torn publish is not a stale answer: the cache views
+        **The second stage must be ordered after the kernels that read the previous
+        publish.** Those live in a captured graph, so the tables cannot be double-buffered
+        out of the hazard -- the capture baked their addresses, which is why the staging
+        sits upstream of them instead. Issuing this on the stream the graph replays on is
+        what provides that ordering today. A torn publish is not a stale answer: the cache views
         carry pointers, so it can pair one request's residency with another's lease.
         """
 

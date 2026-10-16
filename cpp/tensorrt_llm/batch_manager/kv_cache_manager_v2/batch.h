@@ -184,11 +184,17 @@ public:
     //! Borrowing costs one strided transfer per layer group instead of one linear transfer
     //! for all of them, because the lender's rows are further apart than they are wide.
     //!
-    //! **Must be ordered after the kernels that read the previous publish.** Those live in
-    //! a captured graph, so the device table cannot be double-buffered out of the hazard --
-    //! the capture baked its address. Issuing this on the stream the graph replays on is
-    //! what provides that today. A torn publish is not a stale answer: the cache views
-    //! carry pointers, so it can pair one request's residency with another's lease.
+    //! Two stages. The host-to-device fill runs on a stream of this Batch's own, so it can
+    //! overlap the previous step; `stream` then carries one linear device-to-device copy
+    //! into the tables the fetch reads. Everything expensive is in the first stage, and
+    //! only the second has to wait for anything.
+    //!
+    //! **The second stage must be ordered after the kernels that read the previous
+    //! publish.** Those live in a captured graph, so the tables cannot be double-buffered
+    //! out of the hazard -- the capture baked their addresses, which is why the staging
+    //! sits upstream of them instead. Issuing this on the stream the graph replays on is
+    //! what provides that ordering today. A torn publish is not a stale answer: the cache
+    //! views carry pointers, so it can pair one request's residency with another's lease.
     //!
     //! The copy is asynchronous and reads pinned memory, so it is still in flight when this
     //! returns. **Every later host write to a member's page indices must be separated from
@@ -272,6 +278,12 @@ private:
     //! counterpart by adding this and nothing else.
     [[nodiscard]] size_t _deviceBias() const noexcept;
 
+    //! Bytes of a device block: the page table, the row state and the views.
+    [[nodiscard]] size_t _deviceBytes() const noexcept;
+
+    //! Block until every transfer this Batch issued has retired, so its buffers can go.
+    void _drain() noexcept;
+
     [[nodiscard]] size_t _rowElements() const noexcept;
 
     //! Element offset of the watermark regions within the staged block.
@@ -304,15 +316,36 @@ private:
     //! Pinned so the members' index writes land here with no extra copy, and so the
     //! publish is a single asynchronous transfer per layer group.
     std::unique_ptr<HostMem> mStaging;
+
+    //! What the fetch reads. Its address is baked into a captured graph, so it is written
+    //! only on the caller's stream, after the replay that read the previous publish.
     CudaUniqPtr mDevice;
+
+    //! A device-side copy of the same layout, filled from the host ahead of time.
+    //!
+    //! Nothing captured reads it, so its fill is free to overlap the previous step --
+    //! which is the only way the host-to-device crossing can overlap compute at all. With
+    //! one buffer the crossing has to follow the previous replay, since the kernels
+    //! reading the table are inside it and the table's address is fixed by capture.
+    //! Double-buffering the table itself cannot work for that same reason, so the second
+    //! buffer goes upstream of the fixed address instead.
+    CudaUniqPtr mDeviceStaging;
+
+    //! Carries the host-to-device fill, off the caller's stream so it can run early.
+    CachedCudaStream mUploadStream;
 
     //! One allocation holding every layer group's fetch scratch, carved per group.
     CudaUniqPtr mFetchScratch;
     TypedVec<LifeCycleId, SparseFetchScratch> mScratch;
 
-    //! Recorded after the publish copy, so the host can tell when the staging rows are
-    //! free to write again. Null when no publish is in flight.
+    //! Recorded after the host-to-device fill, so the host can tell when the staged rows
+    //! are free to write again. Null when no publish is in flight.
     CachedCudaEvent mPublished = CachedCudaEvent::makeNull();
+
+    //! Recorded after the device staging has been read into the final tables. The next
+    //! fill must wait on it, since that fill runs on another stream and would otherwise
+    //! overwrite the staging while this step's copy is still reading it.
+    CachedCudaEvent mStagingRead = CachedCudaEvent::makeNull();
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
