@@ -267,6 +267,10 @@ public:
     //! kBadPageIndex where the row holds no reservation or has nothing in flight.
     void prepareSparseWriteIndices(Batch& batch, std::vector<BufferId> const& buffers, int32_t* out, CUstream stream);
 
+    //! Write back every row's crossed units for one life cycle, from the ranges the Batch
+    //! staged. One scan over (layer, row), then one copy per pool covering the whole batch.
+    void writeBackSparseUnits(Batch& batch, LifeCycleId lifeCycle, CUstream stream);
+
     // Group a set of BufferIds into contiguous AggregatedPageDesc descriptors.
     // Mirrors Python's KVCacheManager.get_aggregated_pages().
     std::vector<AggregatedPageDesc> getAggregatedPages(std::vector<BufferId> const& buffers) const;

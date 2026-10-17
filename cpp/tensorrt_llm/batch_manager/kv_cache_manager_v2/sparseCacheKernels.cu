@@ -516,10 +516,27 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
 //! reverse map finds them without a probe index.
 __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushListArgs args)
 {
+    int32_t const row = static_cast<int32_t>(blockIdx.y);
+    SparseCacheView const view = args.views[row];
+    if (view.residentOrdinal == nullptr)
+    {
+        // A free row, or a member that has suspended: no reservation to write back from.
+        return;
+    }
     int32_t const layer = static_cast<int32_t>(blockIdx.x);
-    int32_t const entries = args.cache.entriesPerLayer;
-    int32_t const from = *args.fromUnits;
-    int32_t const to = *args.toUnits;
+    int32_t const entries = view.entriesPerLayer;
+    int32_t const from = args.fromUnits[row];
+    int32_t const to = args.toUnits[row];
+    if (from >= to)
+    {
+        // This row's watermark did not move, so nothing of its crossed, but the grid is
+        // sized for the widest row.
+        if (threadIdx.x == 0)
+        {
+            args.outCount[static_cast<ptrdiff_t>(row) * args.numLayers + layer] = 0;
+        }
+        return;
+    }
 
     __shared__ int32_t count;
     if (threadIdx.x == 0)
@@ -528,9 +545,11 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
     }
     __syncthreads();
 
-    int32_t const* residentOrdinal = args.cache.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
-    int32_t* outOrdinal = args.outOrdinal + static_cast<ptrdiff_t>(layer) * args.maxFlushUnits;
-    int32_t* outSlot = args.outSlot + static_cast<ptrdiff_t>(layer) * args.maxFlushUnits;
+    int32_t const* residentOrdinal = view.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
+    auto const listBase
+        = (static_cast<ptrdiff_t>(row) * args.numLayers + layer) * static_cast<ptrdiff_t>(args.maxFlushUnits);
+    int32_t* outOrdinal = args.outOrdinal + listBase;
+    int32_t* outSlot = args.outSlot + listBase;
 
     for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
     {
@@ -553,7 +572,7 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
         // A resident unit the watermark crossed must have been in flight before the move,
         // so the crossed set is bounded by the in-flight headroom this was sized from.
         KVCM2_SPARSE_REQUIRE(count <= args.maxFlushUnits);
-        args.outCount[layer] = count;
+        args.outCount[static_cast<ptrdiff_t>(row) * args.numLayers + layer] = count;
     }
 }
 
@@ -589,16 +608,21 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
 
 void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
 {
-    if (args.cache.numLayers <= 0 || args.cache.entriesPerLayer <= 0 || args.maxFlushUnits <= 0)
+    if (args.numRows <= 0 || args.numLayers <= 0)
     {
-        throw std::invalid_argument("launchSparseFlushList: layers, entries and flush bound must be positive");
+        throw std::invalid_argument("launchSparseFlushList: rows and layers must be positive");
     }
-    if (args.fromUnits == nullptr || args.toUnits == nullptr || args.outOrdinal == nullptr || args.outSlot == nullptr
-        || args.outCount == nullptr)
+    if (args.views == nullptr || args.fromUnits == nullptr || args.toUnits == nullptr || args.outOrdinal == nullptr
+        || args.outSlot == nullptr || args.outCount == nullptr)
     {
         throw std::invalid_argument("launchSparseFlushList: every device array must be provided");
     }
-    sparseFlushListKernel<<<args.cache.numLayers, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
+    if (args.maxFlushUnits <= 0)
+    {
+        throw std::invalid_argument("launchSparseFlushList: the flush bound must be positive");
+    }
+    dim3 const grid(static_cast<unsigned>(args.numLayers), static_cast<unsigned>(args.numRows));
+    sparseFlushListKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

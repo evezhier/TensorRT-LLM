@@ -267,105 +267,6 @@ std::vector<KvCache::SparseBufferRef> KvCache::_sparseBuffers(LifeCycleId lifeCy
     return refs;
 }
 
-std::vector<SparseUnitCopyArgs> KvCache::_sparseCopyArgs(LifeCycleId lifeCycle) const
-{
-    // The pools and the layouts are the manager's, since they follow from configuration.
-    // What a request adds is its own reservation, and the whole-life-cycle work shape a
-    // write-back uses.
-    auto args = mManager->sparseCopyTemplates(lifeCycle);
-
-    auto const& state = mSparseCache[lifeCycle];
-    auto const& view = state.view();
-    for (auto& one : args)
-    {
-        // One row: a write-back is per request. A batched fetch passes the batch's view array.
-        one.views = state.deviceView();
-        one.numRows = 1;
-        one.workRowBase = 0;
-        one.workRowStride = view.numLayers;
-    }
-    return args;
-}
-
-int KvCache::_sparseUnitsCrossed(LifeCycleId lifeCycle, int fromHistory, int toHistory) const
-{
-    if (lifeCycle >= mSparseCache.size() || mSparseCache[lifeCycle].empty())
-    {
-        return 0;
-    }
-    int const unitTokens = mTokensPerBlock / mManager->sparseCacheUnitsPerPage(lifeCycle);
-    return toHistory / unitTokens - fromHistory / unitTokens;
-}
-
-void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnits)
-{
-    auto const& state = mSparseCache[lifeCycle];
-    TLLM_CHECK_DEBUG(!state.empty() && toUnits > fromUnits);
-    auto const& view = state.view();
-    auto const stream = reinterpret_cast<CUstream>(cudaStream());
-    int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lifeCycle);
-
-    // Which blocks the crossed units live in, as a half-open range.
-    int const firstBlock = fromUnits / unitsPerPage;
-    int const lastBlock = (toUnits - 1) / unitsPerPage;
-    int const numBlocks = lastBlock - firstBlock + 1;
-    if (numBlocks > view.maxFlushBlocks)
-    {
-        throw LogicError("A watermark move crossed more blocks than the cache's in-flight headroom allows");
-    }
-
-    // Upload the watermark range. Synchronous because the source is a host temporary, and
-    // cheap because the span is bounded by max_input_length rather than by the context.
-    std::array<int32_t, 2> const range{fromUnits, toUnits};
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(view.flushRange), range.data(), sizeof(range)));
-
-    // A write-back reads the same converted indices the fetch does, so it needs a Batch to
-    // have converted them. Nothing else knows where this request's row is.
-    //
-    // The table it reads is the last publish's, which is current enough because the move is
-    // clamped to the capacity this resize started from: those blocks were allocated by an
-    // earlier resize, and Batch::resize publishes at the end of every call. A caller that
-    // resizes a member directly, without publishing in between, breaks that and would write
-    // back through stale indices.
-    TLLM_CHECK_WITH_INFO(mBatch != nullptr,
-        "A sparse KvCache must belong to a Batch before its watermark moves: the write-back reads the converted "
-        "page indices the Batch publishes");
-
-    SparseFlushListArgs listArgs;
-    listArgs.cache = view;
-    listArgs.fromUnits = view.flushRange;
-    listArgs.toUnits = view.flushRange + 1;
-    listArgs.outOrdinal = view.flushOrdinal;
-    listArgs.outSlot = view.flushSlot;
-    listArgs.outCount = view.flushCount;
-    listArgs.maxFlushUnits = view.maxFlushUnits;
-    launchSparseFlushList(listArgs, stream);
-
-    // One pass per pool, each covering every layer: the flush list is per layer and a
-    // template's buffer run already spans as many of them as share its pool.
-    auto const plan = mManager->sparseBufferPlan(lifeCycle);
-    for (auto copyArgs : _sparseCopyArgs(lifeCycle))
-    {
-        auto const& first = plan[static_cast<size_t>(copyArgs.bufferBase)].id;
-        auto const run = mBatch->sparseIndexRun(first.layerId, first.role);
-        copyArgs.hostBase = static_cast<CUdeviceptr>(run.base);
-        // One row, this request's, so the table is positioned at it and the kernel's own
-        // row index is zero. The entries still stride by the whole table's rows.
-        copyArgs.pageTable = reinterpret_cast<int32_t const*>(
-            run.table + sizeof(int32_t) * static_cast<size_t>(mBatchRow) * run.rowStride);
-        copyArgs.pageTableStride = run.rowStride;
-        copyArgs.pageTableEntryStride = run.entryStride;
-        copyArgs.numBlocks = lastBlock + 1;
-        copyArgs.pageTableBase = 0;
-        copyArgs.direction = SparseCopyDirection::kWriteBack;
-        copyArgs.workOrdinal = view.flushOrdinal;
-        copyArgs.workSlot = view.flushSlot;
-        copyArgs.workCount = view.flushCount;
-        copyArgs.workWidth = view.maxFlushUnits;
-        launchSparseUnitCopy(copyArgs, stream);
-    }
-}
-
 int KvCache::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const
 {
     return mManager->sparseCacheSubSlotsPerBuffer(lifeCycle);
@@ -1330,6 +1231,37 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     if (newCap < newHist)
         throw std::invalid_argument("History length cannot exceed capacity");
 
+    // A block must be in its host page before it can be selected, and selectable means
+    // below the watermark. The write-back is the Batch's, so this only checks that one has
+    // covered the move.
+    //
+    // Only a unit that was in flight has its one copy in a cell, and in flight means below
+    // the capacity this resize starts from -- so a request arriving with a history, whose
+    // units reached their host pages directly, crosses nothing and needs no flush. That is
+    // also what lets a cache be seeded before it joins a Batch.
+    if (newHist > mHistoryLength)
+    {
+        bool crosses = false;
+        for (LifeCycleId lc{0}; lc < mSparseCache.size() && !crosses; ++lc)
+        {
+            if (mSparseCache[lc].empty())
+            {
+                continue;
+            }
+            int const unitTokens = mTokensPerBlock / mManager->sparseCacheUnitsPerPage(lc);
+            crosses = std::min(newHist, mCapacity) / unitTokens > mHistoryLength / unitTokens;
+        }
+        if (crosses)
+        {
+            // Not equality: a step may resize a row more than once, and a row whose growth
+            // failed rolls back to a history below the one flushed for it.
+            int const flushed = mBatch != nullptr ? mBatch->flushedHistory(mBatchRow) : 0;
+            TLLM_CHECK_WITH_INFO(newHist <= flushed,
+                "A sparse KvCache cannot advance history past what has been written back; call "
+                "Batch::flushSparseUnits() with the new history first");
+        }
+    }
+
     // Blocks above the watermark are in flight: their data lives only in sparse cache cells,
     // so the gap cannot exceed what the reservation can pin. The host-side counterpart of
     // the resolve kernel's in-flight overflow report.
@@ -1586,32 +1518,6 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         TLLM_CHECK_DEBUG(std::all_of(slots.begin(), slots.end(), [](auto const& vec) { return vec.empty(); }));
     }
 
-    // Write back before the watermark moves: a block must be in its host page before it can
-    // be selected, and selectable means below the watermark. Enqueued on this request's
-    // stream, so a later fetch reading those pages is ordered after it. A copy enqueued for a
-    // resize that then fails is harmless -- the unit stays in flight, its cell still holds
-    // the data, and the host page merely holds a copy nothing is allowed to read yet.
-    for (LifeCycleId lc{0}; lc < mSparseCache.size(); ++lc)
-    {
-        if (_sparseUnitsCrossed(lc, mHistoryLength, newHist) == 0)
-        {
-            continue;
-        }
-        int const unitTokens = mTokensPerBlock / mManager->sparseCacheUnitsPerPage(lc);
-        // Only a unit that was in flight can hold its one copy in a cell, and in flight
-        // means below the capacity this resize started from. A unit at or above that was
-        // not in the cache at all, so history reaching it writes nothing back: this is the
-        // ordinary shape of a resumed request, whose history arrives in one step already
-        // written to its host pages. Clamping here is what bounds the move by the in-flight
-        // headroom rather than by how far the watermark travelled.
-        int const toUnits = std::min(newHist, mCapacity) / unitTokens;
-        int const fromUnits = mHistoryLength / unitTokens;
-        if (toUnits > fromUnits)
-        {
-            _flushSparseUnits(lc, fromUnits, toUnits);
-        }
-    }
-
     mCapacity = newCap;
     mHistoryLength = newHist;
     _refreshGenerationAllocReady();
@@ -1668,13 +1574,6 @@ bool KvCache::_shortcutSetHistoryLength(int newHist)
                 else
                 {
                     static_assert(std::is_same_v<T, AttnLifeCycle>);
-                    // The shortcut skips resize()'s body, where the write-back happens, so a
-                    // move that strands cells holding the only copy of their data has to take
-                    // the long path. The stale-range test below cannot stand in for this: it
-                    // is vacuous for a full-attention life cycle, which is what a sparse one
-                    // normally is.
-                    if (_sparseUnitsCrossed(lcId, mHistoryLength, newHist) > 0)
-                        return true;
                     if (!v.windowSize.has_value())
                         return false;
                     return v.getStaleRange(newHist, mTokensPerBlock)

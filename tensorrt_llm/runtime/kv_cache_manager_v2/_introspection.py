@@ -225,10 +225,13 @@ def sparse_cache_base_cell(kv_cache: Any, lc_id: int, pool: int = 0) -> int:
 
 
 def sparse_flush_counts(kv_cache: Any, lc_id: int) -> list[int]:
-    """Units the last write-back moved, per sparse buffer.
+    """Units the last write-back moved for this cache's row, per layer.
 
-    -1 where no write-back has run for that buffer, which distinguishes "never flushed"
+    -1 where no write-back has run for that layer, which distinguishes "never flushed"
     from "flushed and found nothing resident".
+
+    The lists belong to the Batch rather than the request -- one scan covers every row --
+    so this reads the cache's own row out of it, and an unbatched cache has none.
     """
     return list(_cpp().sparse_flush_counts(kv_cache, lc_id))
 
@@ -266,17 +269,6 @@ def batch_watermarks(batch: Any) -> tuple[list[int], list[int]]:
     Reads the device copy, so it shows what the last publish() put there. Synchronises.
     """
     history, capacity = _cpp().batch_watermarks(batch)
-    return list(history), list(capacity)
-
-
-def batch_previous_watermarks(batch: Any) -> tuple[list[int], list[int]]:
-    """The same pair as of the publish before this one.
-
-    A write-back needs both ends of a watermark move: the units to write are those between
-    the two history watermarks, and only a unit below the previous capacity was in flight
-    and so has a cell holding its one copy. Synchronises.
-    """
-    history, capacity = _cpp().batch_previous_watermarks(batch)
     return list(history), list(capacity)
 
 

@@ -299,23 +299,31 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream);
 //! ordinal range, and the map has to be read in full either way.
 struct SparseFlushListArgs
 {
-    SparseCacheView cache;
+    //! [numRows] per-row cache state. A row with a null residentOrdinal holds no
+    //! reservation and is skipped, as in the fetch.
+    SparseCacheView const* views = nullptr;
+    int32_t numRows = 0;
+    //! Layers of this life cycle. The grid needs it on the host, where the views are not
+    //! readable, and every row of one life cycle has the same count.
+    int32_t numLayers = 0;
 
-    //! [1] and [1]: the unit ordinals the watermark moved across, as [from, to). Device
-    //! resident for the same reason the resolve's watermarks are.
+    //! [numRows] each: the unit ordinals that row's watermark moved across, as [from, to).
+    //! Device resident for the same reason the resolve's watermarks are.
     int32_t const* fromUnits = nullptr;
     int32_t const* toUnits = nullptr;
 
-    //! [numLayers][maxFlushUnits] units to write back and the entries holding them.
+    //! [numRows][numLayers][maxFlushUnits] units to write back and the entries holding
+    //! them, and [numRows][numLayers] how many. Batch-owned, so one launch covering every
+    //! row hands the copy one pointer -- the reservation in a row's lease is its own, but
+    //! this is the step's.
     int32_t* outOrdinal = nullptr;
     int32_t* outSlot = nullptr;
-    //! [numLayers] how many.
     int32_t* outCount = nullptr;
     //! Bound on one watermark move, which cannot exceed the in-flight headroom.
     int32_t maxFlushUnits = 0;
 };
 
-//! Launch the flush-list scan. One CTA per layer.
+//! Launch the flush-list scan. One CTA per (layer, row).
 void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream);
 
 //! Launch the resolve. One CTA per layer; enqueues and returns.

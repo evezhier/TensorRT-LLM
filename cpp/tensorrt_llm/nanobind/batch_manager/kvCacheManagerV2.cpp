@@ -2208,16 +2208,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("batch"));
     mIntrospection.def(
-        "batch_previous_watermarks",
-        [](kv::Batch const& batch)
-        {
-            auto r = kv::KvCacheIntrospection::batchPreviousWatermarks(batch);
-            return std::make_tuple(std::move(r.first), std::move(r.second));
-        },
-        nb::arg("batch"),
-        "The (history_length, capacity) pair each row carried at the publish before this one. A write-back "
-        "needs both ends of the move, and only a unit below the previous capacity has a cell holding it.");
-    mIntrospection.def(
         "sparse_resolve",
         [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
             int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
@@ -2577,6 +2567,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "after it. A row whose growth fails still takes its history advance, which needs no "
             "slots and lets the units below it be written back; its result is still 0, since the "
             "row is not at the state that was asked for.")
+        .def(
+            "flush_sparse_units",
+            [](kv::Batch& self, std::vector<int> const& newHistoryLengths)
+            {
+                nb::gil_scoped_release rel;
+                self.flushSparseUnits(newHistoryLengths);
+            },
+            nb::arg("new_history_lengths"),
+            "Write back the units each row's watermark is about to pass, given the history you are about "
+            "to set. One per row; a row may repeat its current history, which asks for nothing.\n\n"
+            "Call this before advancing history, not after: a block must be in its host page before it can "
+            "be selected, and resize() refuses a history this has not covered. Bounded by the capacity each "
+            "row started from, so a resumed request moving history across a whole prompt writes back "
+            "nothing. Reads the index table as of the last publish.")
+        .def("flushed_history", &kv::Batch::flushedHistory, nb::arg("row"),
+            "The history a row has been written back to. A row that has never needed a flush reads its own "
+            "history, so a caller may always compare against it.")
         .def(
             "publish",
             [](kv::Batch& self)

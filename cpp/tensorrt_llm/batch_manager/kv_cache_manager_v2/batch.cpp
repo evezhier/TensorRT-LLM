@@ -17,6 +17,8 @@
 
 #include "kv_cache_manager_v2/batch.h"
 
+#include "kv_cache_manager_v2/batchedPageCopy.h"
+
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/indexConversionKernels.h"
 #include "kv_cache_manager_v2/kvCache.h"
@@ -137,7 +139,8 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
         cuCheck(cuMemcpyHtoD(base + _deviceBias(), staging, _totalBytes()));
     }
 
-    _allocateFetchScratch();
+    _allocateStepScratch();
+    _allocateFlushRanges();
 
     // After the modes: a request's offsets depend on where its life cycle puts the base.
     _buildIndexTables(indexTables);
@@ -145,9 +148,9 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
     _allocateIndexTables();
 }
 
-void Batch::_allocateFetchScratch()
+void Batch::_allocateStepScratch()
 {
-    mScratch = TypedVec<LifeCycleId, SparseFetchScratch>(mNumLayerGroups, SparseFetchScratch{});
+    mScratch = TypedVec<LifeCycleId, SparseStepScratch>(mNumLayerGroups, SparseStepScratch{});
 
     // Sized up front from configuration, so no step has to allocate. Laid out as one block
     // because a per-group allocation would be a dozen tiny ones serving the same lifetime.
@@ -163,7 +166,13 @@ void Batch::_allocateFetchScratch()
         auto& scratch = mScratch[lcId];
         scratch.selectionWidth = width;
         scratch.maxInFlightUnits = mManager->sparseCacheMaxInFlightUnits(lcId);
+        // A move cannot carry more units out of flight than the reservation pinned, which
+        // is what bounds a row's flush list.
+        scratch.maxFlushUnits = scratch.maxInFlightUnits;
+        scratch.numLayers = mManager->sparseCacheLayerCount(lcId);
+        auto const layers = static_cast<size_t>(scratch.numLayers);
         total += rows * (3 * static_cast<size_t>(width) + 1 + static_cast<size_t>(scratch.maxInFlightUnits));
+        total += rows * layers * (2 * static_cast<size_t>(scratch.maxFlushUnits) + 1);
     }
     if (total == 0)
     {
@@ -172,7 +181,7 @@ void Batch::_allocateFetchScratch()
 
     CUdeviceptr base = 0;
     cuCheck(cuMemAlloc(&base, sizeof(int32_t) * total));
-    mFetchScratch = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
+    mStepScratch = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
 
     auto* cursor = reinterpret_cast<int32_t*>(base);
     auto carve = [&cursor](size_t count)
@@ -194,15 +203,24 @@ void Batch::_allocateFetchScratch()
         scratch.missSlot = carve(rows * width);
         scratch.missCount = carve(rows);
         scratch.inFlightSlot = carve(rows * static_cast<size_t>(scratch.maxInFlightUnits));
+
+        auto const layers = static_cast<size_t>(scratch.numLayers);
+        auto const flush = static_cast<size_t>(scratch.maxFlushUnits);
+        scratch.flushOrdinal = carve(rows * layers * flush);
+        scratch.flushSlot = carve(rows * layers * flush);
+        scratch.flushCount = carve(rows * layers);
+        // -1 so that "no write-back has run" stays distinguishable from "one ran and found
+        // nothing to move", which is what lets a test tell the two apart.
+        cuCheck(cuMemsetD32(reinterpret_cast<CUdeviceptr>(scratch.flushCount), 0xFFFFFFFFU, rows * layers));
     }
 }
 
-SparseFetchScratch const& Batch::sparseFetchScratch(LayerGroupId layerGroupId) const
+SparseStepScratch const& Batch::sparseStepScratch(LayerGroupId layerGroupId) const
 {
     LifeCycleId const lcId{layerGroupId.value()};
     if (lcId >= mScratch.size())
     {
-        throw std::out_of_range("Batch::sparseFetchScratch: no such layer group");
+        throw std::out_of_range("Batch::sparseStepScratch: no such layer group");
     }
     return mScratch[lcId];
 }
@@ -328,6 +346,138 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
                 "A buffer appears in two index table requests that resolved differently");
         }
     }
+}
+
+void Batch::_allocateFlushRanges()
+{
+    mFlushedHistory.assign(static_cast<size_t>(mMaxBatchSize), 0);
+
+    bool anySparse = false;
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        anySparse = anySparse || mManager->sparseCacheMaxUnits(lcId) > 0;
+    }
+    if (!anySparse)
+    {
+        return;
+    }
+
+    auto const elements = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mNumLayerGroups.value());
+    CUdeviceptr base = 0;
+    cuCheck(cuMemAlloc(&base, sizeof(int32_t) * elements));
+    mFlushRanges = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
+    // An empty range asks for nothing, which is what a row that never flushes should read.
+    cuCheck(cuMemsetD32(base, 0, elements));
+    mFlushRangeStaging.assign(elements, 0);
+}
+
+int32_t const* Batch::flushRangeRow(LifeCycleId lifeCycle) const
+{
+    auto* base = reinterpret_cast<int32_t*>(mFlushRanges.get());
+    return base + 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lifeCycle.value());
+}
+
+int Batch::flushedHistory(int row) const
+{
+    if (row < 0 || row >= mMaxBatchSize)
+    {
+        throw std::out_of_range("Batch::flushedHistory: row is beyond max_batch_size");
+    }
+    return mFlushedHistory[static_cast<size_t>(row)];
+}
+
+void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
+{
+    if (newHistoryLengths.size() != mRows.size())
+    {
+        throw std::invalid_argument("Batch::flushSparseUnits: one history length per row");
+    }
+    if (!mFlushRanges)
+    {
+        // No sparse life cycle, so nothing is ever in flight and the record is vacuous.
+        for (size_t row = 0; row < mRows.size(); ++row)
+        {
+            mFlushedHistory[row] = newHistoryLengths[row];
+        }
+        return;
+    }
+
+    // Every row is checked before any work is issued, so a move no reservation could cover
+    // leaves the batch as it was.
+    bool anyWork = false;
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
+        if (mManager->sparseCacheMaxUnits(lcId) <= 0 || unitsPerPage <= 0)
+        {
+            continue;
+        }
+        int const unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
+        auto const base = static_cast<size_t>(2 * mMaxBatchSize * lcId.value());
+
+        for (size_t row = 0; row < mRows.size(); ++row)
+        {
+            auto const* kvCache = mRows[row];
+            int fromUnit = 0;
+            int toUnit = 0;
+            if (kvCache != nullptr)
+            {
+                if (newHistoryLengths[row] < kvCache->historyLength())
+                {
+                    throw std::invalid_argument("Batch::flushSparseUnits: history length cannot be decreased");
+                }
+                // Clamped to the capacity this row starts from: a unit at or above it was
+                // never in flight, so it has no cell and nothing to write back.
+                fromUnit = kvCache->historyLength() / unitTokens;
+                toUnit = std::min(newHistoryLengths[row], kvCache->capacity()) / unitTokens;
+                toUnit = std::max(toUnit, fromUnit);
+
+                int const headroom = mManager->sparseCacheMaxInFlightUnits(lcId);
+                if (toUnit - fromUnit > headroom)
+                {
+                    throw std::invalid_argument(
+                        "Batch::flushSparseUnits: a watermark move crossed more units than the reservation can "
+                        "hold in flight, so the row's flush list could not name them all");
+                }
+                anyWork = anyWork || toUnit > fromUnit;
+            }
+            mFlushRangeStaging[base + row] = fromUnit;
+            mFlushRangeStaging[base + static_cast<size_t>(mMaxBatchSize) + row] = toUnit;
+        }
+    }
+
+    for (size_t row = 0; row < mRows.size(); ++row)
+    {
+        mFlushedHistory[row] = newHistoryLengths[row];
+    }
+    if (!anyWork)
+    {
+        // Nothing crossed anywhere, so the ranges on the device are stale but unread.
+        return;
+    }
+
+    auto* const upload = mUploadStream.handle();
+    if (!mFlushRead.isClosed())
+    {
+        // The previous step's write-back read these same ranges; its reads must retire
+        // before the copy below overwrites them.
+        mFlushRead.waitInStream(reinterpret_cast<CudaStream>(upload));
+        mFlushRead.close();
+    }
+    detail::copyFlushRangesToDevice(reinterpret_cast<CUdeviceptr>(mFlushRanges.get()), mFlushRangeStaging.data(),
+        mFlushRangeStaging.size(), upload);
+    auto staged = mUploadStream.recordEvent();
+    staged.waitInStream(reinterpret_cast<CudaStream>(mCudaStream));
+
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        if (mManager->sparseCacheMaxUnits(lcId) <= 0)
+        {
+            continue;
+        }
+        mManager->writeBackSparseUnits(*this, lcId, mCudaStream);
+    }
+    mFlushRead = CachedCudaEvent{reinterpret_cast<CudaStream>(mCudaStream)};
 }
 
 void Batch::_checkSparseRunsAreAddressable() const
@@ -667,19 +817,9 @@ size_t Batch::_capacityOffset() const noexcept
     return _historyOffset() + static_cast<size_t>(mMaxBatchSize);
 }
 
-size_t Batch::_prevHistoryOffset() const noexcept
-{
-    return _capacityOffset() + static_cast<size_t>(mMaxBatchSize);
-}
-
-size_t Batch::_prevCapacityOffset() const noexcept
-{
-    return _prevHistoryOffset() + static_cast<size_t>(mMaxBatchSize);
-}
-
 size_t Batch::_totalElements() const noexcept
 {
-    return _prevCapacityOffset() + static_cast<size_t>(mMaxBatchSize);
+    return _capacityOffset() + static_cast<size_t>(mMaxBatchSize);
 }
 
 size_t Batch::_viewsOffsetBytes() const noexcept
@@ -703,18 +843,11 @@ void Batch::_stageRowState()
     auto* base = reinterpret_cast<int32_t*>(bytes);
     auto* history = base + _historyOffset();
     auto* capacity = base + _capacityOffset();
-    auto* prevHistory = base + _prevHistoryOffset();
-    auto* prevCapacity = base + _prevCapacityOffset();
     auto* views = reinterpret_cast<SparseCacheView*>(bytes + _viewsOffsetBytes());
 
     for (size_t row = 0; row < mRows.size(); ++row)
     {
         auto const* kvCache = mRows[row];
-        // The staging holds the last published pair until it is overwritten just below, so
-        // carrying it across here is what makes the published block self-describing: a
-        // write-back reads both ends of the move from one transfer.
-        prevHistory[row] = history[row];
-        prevCapacity[row] = capacity[row];
         history[row] = kvCache == nullptr ? 0 : kvCache->historyLength();
         capacity[row] = kvCache == nullptr ? 0 : kvCache->capacity();
 
@@ -735,8 +868,6 @@ void Batch::_seedRowWatermarks(int row, int historyLength, int capacity)
     auto const index = static_cast<size_t>(row);
     base[_historyOffset() + index] = historyLength;
     base[_capacityOffset() + index] = capacity;
-    base[_prevHistoryOffset() + index] = historyLength;
-    base[_prevCapacityOffset() + index] = capacity;
 }
 
 int32_t* Batch::_stagingRow(LayerGroupId layerGroupId, int row) const
@@ -1040,8 +1171,6 @@ WatermarkView Batch::watermarks() const
     WatermarkView view;
     view.historyLength = base + sizeof(int32_t) * _historyOffset();
     view.capacity = base + sizeof(int32_t) * _capacityOffset();
-    view.previousHistoryLength = base + sizeof(int32_t) * _prevHistoryOffset();
-    view.previousCapacity = base + sizeof(int32_t) * _prevCapacityOffset();
     view.numRows = mMaxBatchSize;
     return view;
 }

@@ -354,8 +354,6 @@ void KvCacheManager::_buildSparseArenas()
         shape.numBuffers = sparseCacheBufferCount(lcId);
         shape.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lcId);
         shape.entriesPerLayer = shape.cellsPerBuffer * sparseCacheUnitsPerPage(lcId);
-        shape.maxFlushUnits = sparseCacheMaxInFlightUnits(lcId);
-        shape.maxFlushBlocks = divUp(shape.maxFlushUnits, sparseCacheUnitsPerPage(lcId)) + 1;
 
         // The arena mirrors the hot pool group: one region per pool the life cycle's sparse
         // buffers draw on, sized by that pool's cell and the buffers sharing it.
@@ -518,7 +516,7 @@ void KvCacheManager::prepareSparseWriteIndices(
     LifeCycleId const lcId = span.lifeCycle;
 
     LayerGroupId const lgId{lcId.value()};
-    auto const& scratch = batch.sparseFetchScratch(lgId);
+    auto const& scratch = batch.sparseStepScratch(lgId);
     if (scratch.inFlightSlot == nullptr)
     {
         throw std::invalid_argument("prepareSparseWriteIndices: this layer group carries no sparse cache");
@@ -584,6 +582,55 @@ void KvCacheManager::prepareSparseWriteIndices(
     }
 }
 
+void KvCacheManager::writeBackSparseUnits(Batch& batch, LifeCycleId lifeCycle, CUstream stream)
+{
+    LayerGroupId const lgId{lifeCycle.value()};
+    auto const views = reinterpret_cast<SparseCacheView const*>(batch.sparseCacheViews(lgId));
+    auto const numRows = batch.maxBatchSize();
+
+    // Which units each row crossed. One scan covers every (layer, row); a row whose
+    // watermark did not move reports none.
+    auto const& scratch = batch.sparseStepScratch(lgId);
+    SparseFlushListArgs listArgs;
+    listArgs.views = views;
+    listArgs.numRows = numRows;
+    listArgs.numLayers = scratch.numLayers;
+    listArgs.fromUnits = batch.flushRangeRow(lifeCycle);
+    listArgs.toUnits = listArgs.fromUnits + numRows;
+    listArgs.outOrdinal = scratch.flushOrdinal;
+    listArgs.outSlot = scratch.flushSlot;
+    listArgs.outCount = scratch.flushCount;
+    listArgs.maxFlushUnits = scratch.maxFlushUnits;
+    launchSparseFlushList(listArgs, stream);
+
+    // One pass per pool, each covering every layer of every row: a flush list is per layer,
+    // and a template's buffer run already spans as many layers as share its pool.
+    auto const plan = sparseBufferPlan(lifeCycle);
+    for (auto copy : sparseCopyTemplates(lifeCycle))
+    {
+        auto const& first = plan[static_cast<size_t>(copy.bufferBase)].id;
+        auto const run = batch.sparseIndexRun(first.layerId, first.role);
+        copy.hostBase = static_cast<CUdeviceptr>(run.base);
+        copy.pageTable = reinterpret_cast<int32_t const*>(run.table);
+        copy.pageTableStride = run.rowStride;
+        copy.pageTableEntryStride = run.entryStride;
+        copy.numBlocks = run.rowStride;
+        copy.pageTableBase = 0;
+        copy.views = views;
+        copy.numRows = numRows;
+        copy.direction = SparseCopyDirection::kWriteBack;
+        // The work list is every layer of this row, which is what a write-back crosses at
+        // once -- unlike a fetch, which resolves one layer across the batch.
+        copy.workOrdinal = scratch.flushOrdinal;
+        copy.workSlot = scratch.flushSlot;
+        copy.workCount = scratch.flushCount;
+        copy.workWidth = scratch.maxFlushUnits;
+        copy.workRowStride = scratch.numLayers;
+        copy.workRowBase = 0;
+        launchSparseUnitCopy(copy, stream);
+    }
+}
+
 void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
     int selectionWidth, int32_t* out, CUstream stream)
 {
@@ -598,7 +645,7 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     auto const numBuffers = span.numBuffers;
     auto const layerInGroup = span.layerInGroup;
 
-    auto const& scratch = batch.sparseFetchScratch(LayerGroupId{lcId.value()});
+    auto const& scratch = batch.sparseStepScratch(LayerGroupId{lcId.value()});
     if (scratch.outSlot == nullptr)
     {
         throw std::invalid_argument("fetchSparsePages: this layer group carries no sparse cache");

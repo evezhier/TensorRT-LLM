@@ -184,6 +184,13 @@ namespace detail
 //! moves the array that *describes* the copy, not the pages themselves.
 void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t numPageIndices, CUstream stream);
 
+//! Stages a small int32 array into device memory, consuming the source before returning.
+//!
+//! The source need not be pinned or kept alive: the driver reads it during the call. That
+//! is also why callers issue this on a helper stream -- on a stream that is busy replaying
+//! the previous step, the call could not complete until the stream reached it.
+void copyFlushRangesToDevice(CUdeviceptr dst, int32_t const* src, size_t count, CUstream stream);
+
 #if CUDA_VERSION < 12080
 //! Kernel fallback used when cuMemcpyBatchAsync is unavailable. Exposed for focused testing.
 void copyPageIndicesToDeviceWithKernel(

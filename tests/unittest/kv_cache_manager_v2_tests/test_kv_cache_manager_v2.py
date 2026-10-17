@@ -701,23 +701,21 @@ class TestSparseCacheReservation(unittest.TestCase):
         which is a span no reservation could cover.
         """
         manager = self._manager(max_cached_units=4)
+        cache = None
         try:
             cache = manager.create_kv_cache()
-            try:
-                with TemporaryCudaStream([]) as stream:
-                    self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
-                    lc_id = manager.get_layer_group_id(0)
-                    # Far more blocks than the cache could hold in flight.
-                    self.assertTrue(cache.resize(4096, 4096))
-                    self.assertEqual(cache.history_length, 4096)
-                    self.assertEqual(
-                        _introspection.sparse_flush_counts(cache, lc_id),
-                        [-1],
-                        "no write-back should have run at all",
-                    )
-            finally:
-                cache.close()
+            with TemporaryCudaStream([]) as stream:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                # Far more blocks than the cache could hold in flight, and no Batch at all.
+                # Both are the point: nothing was ever in flight, so no write-back is owed,
+                # and resize() may take the move without one. That is what lets a resumed
+                # request be seeded before it joins a Batch -- which it must be, since a
+                # Batch will not accept a history beyond the capacity its row already had.
+                self.assertTrue(cache.resize(4096, 4096))
+                self.assertEqual(cache.history_length, 4096)
         finally:
+            if cache is not None:
+                cache.close()
             manager.shutdown()
 
     def test_cache_state_starts_free(self):
@@ -918,11 +916,6 @@ class TestSparseCacheReservation(unittest.TestCase):
                 )
                 self.assertTrue(cache.resume(handle))
                 lc_id = manager.get_layer_group_id(0)
-                self.assertEqual(
-                    _introspection.sparse_flush_counts(cache, lc_id),
-                    [-1],
-                    "no write-back should have run yet",
-                )
                 # tokens_per_block is 128 and the unit is a whole block. Reach the end of
                 # unit 0 with the last token still in flight, so that the next step's
                 # watermark move genuinely carries a unit from in-flight to history --
@@ -938,8 +931,11 @@ class TestSparseCacheReservation(unittest.TestCase):
                 self.assertEqual(
                     _introspection.sparse_flush_counts(cache, lc_id),
                     [-1],
-                    "nothing has left the in-flight span yet",
+                    "no write-back has run for this row yet",
                 )
+                # Before the move, not after: the unit has to reach its host page while it
+                # is still below capacity and above history.
+                batch.flush_sparse_units([128])
                 self.assertEqual(list(batch.resize([129], [128])), [1])
                 self.assertEqual(cache.history_length, 128)
                 self.assertEqual(
@@ -954,20 +950,90 @@ class TestSparseCacheReservation(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_one_flush_covers_every_row_that_moved(self):
+        """The write-back is the step's, not a request's: one call serves the batch.
+
+        Rows move independently, and a row standing still must not be given a stale range
+        from whichever row did move.
+        """
+        manager = self._manager(max_cached_units=4)
+        caches = []
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=3,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
+                lc_id = manager.get_layer_group_id(0)
+                for _ in range(2):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(handle))
+                    self.assertTrue(cache.resize(128, 127))
+                    batch.add_kv_cache(cache)
+                batch.publish()
+
+                # Row 0 crosses unit 0; row 1 stays put; row 2 is free.
+                batch.flush_sparse_units([128, 127, 0])
+                self.assertEqual(
+                    _introspection.sparse_flush_counts(caches[0], lc_id),
+                    [0],
+                    "the row that moved was scanned",
+                )
+                self.assertEqual(
+                    _introspection.sparse_flush_counts(caches[1], lc_id),
+                    [0],
+                    "a row that did not move reports none rather than keeping a stale count",
+                )
+
+                # Only the row the flush covered may advance.
+                self.assertEqual(list(batch.resize([129, 128, None], [128, 127, None])), [1, 1, 0])
+                with self.assertRaisesRegex(Exception, "written back"):
+                    caches[1].resize(129, 128)
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
     def test_a_move_inside_one_unit_still_takes_the_shortcut(self):
         manager = self._manager(max_cached_units=4)
+        cache = None
+        batch = None
         try:
-            cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
-                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
+                cache = manager.create_kv_cache()
+                self.assertTrue(cache.resume(handle))
                 lc_id = manager.get_layer_group_id(0)
-                cache.resize(64, 64)
+                self.assertTrue(cache.resize(64, 63))
+                batch.add_kv_cache(cache)
+                batch.publish()
+
+                batch.flush_sparse_units([64])
+                self.assertEqual(list(batch.resize([64], [64])), [1])
                 self.assertEqual(cache.history_length, 64)
                 # Still -1: no unit boundary was crossed, so there was nothing to write back
                 # and the shortcut was free to take the move.
                 self.assertEqual(_introspection.sparse_flush_counts(cache, lc_id), [-1])
-                cache.close()
         finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
             manager.shutdown()
 
     def test_unconfigured_life_cycle_has_no_cache_state(self):
@@ -2387,7 +2453,10 @@ class TestSparseDataPath(unittest.TestCase):
                 self.assertEqual(int(err), 0)
 
                 batch.wait_published()
-                # The watermark crosses unit 0, so its cell is written back.
+                # The watermark crosses unit 0, so its cell is written back. The flush runs
+                # before the move, since a block must reach its host page before it becomes
+                # selectable.
+                batch.flush_sparse_units([self.TPB])
                 self.assertTrue(cache.resize(self.TPB + 1, self.TPB))
                 torch.cuda.synchronize()
 
@@ -2507,7 +2576,10 @@ class TestSparseWriteIndices(unittest.TestCase):
                 self.assertEqual(int(err), 0)
 
                 batch.wait_published()
-                # The watermark crosses unit 0, so its cell is written back.
+                # The watermark crosses unit 0, so its cell is written back. The flush runs
+                # before the move, since a block must reach its host page before it becomes
+                # selectable.
+                batch.flush_sparse_units([self.TPB])
                 self.assertTrue(cache.resize(self.TPB + 1, self.TPB))
                 torch.cuda.synchronize()
 
@@ -3027,7 +3099,10 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                     self.assertEqual(int(err), 0, role)
 
                 batch.wait_published()
-                # The watermark crosses unit 0, so both pools' cells are written back.
+                # The watermark crosses unit 0, so both pools' cells are written back. The
+                # flush runs before the move, since a block must reach its host page before
+                # it becomes selectable.
+                batch.flush_sparse_units([self.TPB])
                 self.assertTrue(cache.resize(self.TPB + 1, self.TPB))
                 torch.cuda.synchronize()
 
@@ -3502,8 +3577,8 @@ class TestBatch(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def test_previous_watermarks_lag_the_current_pair_by_one_publish(self):
-        """A write-back reads both ends of a move, so both have to travel together."""
+    def test_a_joining_member_publishes_its_own_watermarks(self):
+        """A row holds whatever its last occupant left until the new one seeds it."""
         manager = self._manager()
         cache = None
         batch = None
@@ -3513,59 +3588,15 @@ class TestBatch(unittest.TestCase):
                 batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
-                # Seeded before joining: the Batch only accepts a history its row already
-                # had the capacity for.
-                self.assertTrue(cache.resize(256, 128))
-                batch.add_kv_cache(cache)
-
-                batch.resize([256], [128])
-                self.assertEqual(_introspection.batch_watermarks(batch), ([128], [256]))
-                self.assertEqual(
-                    _introspection.batch_previous_watermarks(batch),
-                    ([128], [256]),
-                    "the row was seeded at join, so its first publish moved nothing",
-                )
-
-                batch.resize([384], [256])
-                self.assertEqual(_introspection.batch_watermarks(batch), ([256], [384]))
-                self.assertEqual(
-                    _introspection.batch_previous_watermarks(batch),
-                    ([128], [256]),
-                    "the previous pair must be the one published before, not two steps back",
-                )
-
-                batch.resize([512], [384])
-                self.assertEqual(_introspection.batch_previous_watermarks(batch), ([256], [384]))
-        finally:
-            if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
-                    batch.remove_kv_cache(cache)
-                cache.close()
-            manager.shutdown()
-
-    def test_a_joining_member_reports_no_watermark_movement(self):
-        """Its history was written before it had a row, so no cell here holds those units."""
-        manager = self._manager()
-        cache = None
-        batch = None
-        try:
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
-                cache = manager.create_kv_cache()
-                self.assertTrue(cache.resume(handle))
-                # Advanced while unbatched, which is what makes the row's own history stale.
+                # Advanced while unbatched, which is what makes the row's own state stale.
                 self.assertTrue(cache.resize(256, 128))
 
                 batch.add_kv_cache(cache)
                 batch.publish()
-                current = _introspection.batch_watermarks(batch)
-                self.assertEqual(current, ([128], [256]))
                 self.assertEqual(
-                    _introspection.batch_previous_watermarks(batch),
-                    current,
-                    "a delta taken against the row's old contents would name units this "
-                    "member never wrote",
+                    _introspection.batch_watermarks(batch),
+                    ([128], [256]),
+                    "the row must describe the member that now occupies it",
                 )
         finally:
             if cache is not None:

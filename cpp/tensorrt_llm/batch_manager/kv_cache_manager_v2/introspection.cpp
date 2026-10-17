@@ -173,24 +173,21 @@ std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batc
     return {std::move(history), std::move(capacity)};
 }
 
-std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batchPreviousWatermarks(Batch const& batch)
-{
-    auto const view = batch.watermarks();
-    std::vector<int32_t> history(static_cast<size_t>(view.numRows));
-    std::vector<int32_t> capacity(static_cast<size_t>(view.numRows));
-    cuCheck(cuMemcpyDtoH(history.data(), view.previousHistoryLength, sizeof(int32_t) * history.size()));
-    cuCheck(cuMemcpyDtoH(capacity.data(), view.previousCapacity, sizeof(int32_t) * capacity.size()));
-    return {std::move(history), std::move(capacity)};
-}
-
 std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};
-    if (id >= kvCache.mSparseCache.size())
+    if (id >= kvCache.mSparseCache.size() || kvCache.mBatch == nullptr)
     {
         return {};
     }
-    return kvCache.mSparseCache[id].readFlushCounts();
+    // The lists are the step's, not the request's, so this reads the Batch's row for it.
+    auto const& scratch = kvCache.mBatch->sparseStepScratch(LayerGroupId{lcId});
+    auto const layers = static_cast<size_t>(scratch.numLayers);
+    std::vector<int32_t> out(layers);
+    cuCheck(cuMemcpyDtoH(out.data(),
+        reinterpret_cast<CUdeviceptr>(scratch.flushCount + static_cast<size_t>(kvCache.mBatchRow) * layers),
+        sizeof(int32_t) * layers));
+    return out;
 }
 
 namespace
@@ -416,10 +413,20 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     auto outSlot = deviceCopy(std::vector<int32_t>(listCount, kNoSparseSlot));
     auto outCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
 
+    // The scan spans the batch, so the hook stands one row in for a single request.
+    SparseCacheView view;
+    view.residentOrdinal = reinterpret_cast<int32_t*>(resident.get());
+    view.numLayers = numLayers;
+    view.entriesPerLayer = entriesPerLayer;
+    CUdeviceptr viewPtr = 0;
+    cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView)));
+    CudaUniqPtr viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
+    cuCheck(cuMemcpyHtoD(viewPtr, &view, sizeof(SparseCacheView)));
+
     SparseFlushListArgs args;
-    args.cache.residentOrdinal = reinterpret_cast<int32_t*>(resident.get());
-    args.cache.numLayers = numLayers;
-    args.cache.entriesPerLayer = entriesPerLayer;
+    args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
+    args.numRows = 1;
+    args.numLayers = numLayers;
     args.fromUnits = reinterpret_cast<int32_t const*>(from.get());
     args.toUnits = reinterpret_cast<int32_t const*>(to.get());
     args.outOrdinal = reinterpret_cast<int32_t*>(outOrdinal.get());

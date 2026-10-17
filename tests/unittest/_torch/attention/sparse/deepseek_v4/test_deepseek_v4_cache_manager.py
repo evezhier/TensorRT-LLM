@@ -782,6 +782,19 @@ class _SchedulingBatch:
         self.rows = [None] * max_batch_size
         self.snapshots = []
         self.upload_pending = False
+        self.flushes = []
+
+    def row_of(self, cache):
+        return self.rows.index(cache) if cache in self.rows else -1
+
+    def flush_sparse_units(self, new_history_lengths):
+        # Recorded rather than performed: what matters here is that the write-back is asked
+        # for while the members are still seated, and with each row's own next history.
+        assert len(new_history_lengths) == self.max_batch_size
+        for row, cache in enumerate(self.rows):
+            if cache is not None:
+                assert new_history_lengths[row] >= cache.history_length
+        self.flushes.append(list(new_history_lengths))
 
     def add_kv_cache(self, cache):
         assert not self.upload_pending

@@ -539,16 +539,6 @@ private:
     //! yields exactly this many cells per buffer.
     [[nodiscard]] int _sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const;
 
-    //! Selection units the watermark crosses for this life cycle, zero when it caches
-    //! nothing. Non-zero means those cells hold the only copy of their data and must reach
-    //! their host pages before the move can be reported.
-    [[nodiscard]] int _sparseUnitsCrossed(LifeCycleId lifeCycle, int fromHistory, int toHistory) const;
-
-    //! Assemble the addressing shared by both copy directions: the pool and arena bases,
-    //! the per-buffer page offsets, the cell geometry and the unit layout. The work list and
-    //! the direction are the caller's to fill in.
-    [[nodiscard]] std::vector<SparseUnitCopyArgs> _sparseCopyArgs(LifeCycleId lifeCycle) const;
-
     //! One sparse buffer of a life cycle, in the order SparseCacheView indexes them.
     struct SparseBufferRef
     {
@@ -562,7 +552,6 @@ private:
     //! request's stream. Enqueues and returns: stream order is what guarantees a later fetch
     //! reads the written-back page, and a copy that fails is a broken invariant, not a
     //! recoverable condition.
-    void _flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnits);
 
     // Whether any life cycle has a configured sparse fetch path, and so whether
     // max_input_length is required.

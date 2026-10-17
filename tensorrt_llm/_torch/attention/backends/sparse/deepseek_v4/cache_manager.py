@@ -2037,6 +2037,26 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if not self._enable_kv_cache_offload or not scheduled_batch.generation_requests:
             return
         wait_for_input_copy()
+        # Before the batch is released and before any history moves: the write-back reads
+        # the converted indices the Batch published, so it has to run while the members are
+        # still seated. A row that is not advancing repeats its own history, which asks for
+        # nothing.
+        batch = self._sparse_batch
+        if batch is not None:
+            histories = [0] * batch.max_batch_size
+            for cache in self._sparse_batch_members.values():
+                row = batch.row_of(cache)
+                if row >= 0:
+                    histories[row] = cache.history_length
+            for request in scheduled_batch.generation_requests:
+                cache = self.kv_cache_map.get(request.py_request_id)
+                if cache is None or not cache.is_active:
+                    continue
+                row = batch.row_of(cache)
+                if row >= 0:
+                    histories[row] = cache.history_length + 1
+            batch.flush_sparse_units(histories)
+
         self._release_sparse_batch()
         self._order_sparse_history_update(scheduled_batch.generation_requests)
         for request in scheduled_batch.generation_requests:

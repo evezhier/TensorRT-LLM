@@ -78,13 +78,18 @@ struct ExternalPageTable
 //! Identifies one converted index table of a Batch.
 using IndexTableId = StrongIndex<int, struct IndexTableIdTag>;
 
-//! Device scratch one layer group's fetch resolves into, before the copy and the index
-//! scatter read it back.
+//! Device scratch one layer group's step works through: what a fetch resolves into before
+//! the copy and the index scatter read it back, and what a write-back lists before its own
+//! copy reads it.
+//!
+//! Batch-owned rather than per request, because both consumers are one launch spanning
+//! every row and a kernel takes one pointer. The reservation in a request's lease is its
+//! own; this is the step's.
 //!
 //! Owned by Batch rather than allocated per call because every extent is a configuration
 //! constant -- rows, selection width, in-flight headroom -- so one allocation serves every
 //! step, and a step that allocates nothing is a step a CUDA graph can capture.
-struct SparseFetchScratch
+struct SparseStepScratch
 {
     int32_t* outSlot = nullptr;      //!< [numRows][selectionWidth]
     int32_t* missOrdinal = nullptr;  //!< [numRows][selectionWidth]
@@ -93,6 +98,15 @@ struct SparseFetchScratch
     int32_t* inFlightSlot = nullptr; //!< [numRows][maxInFlightUnits]
     int32_t selectionWidth = 0;
     int32_t maxInFlightUnits = 0;
+
+    //! The write-back's counterpart of the miss lists. A fetch resolves one layer across
+    //! the batch; a write-back crosses every layer of a row at once, so these carry the
+    //! layer dimension the miss lists fold away.
+    int32_t* flushOrdinal = nullptr; //!< [numRows][numLayers][maxFlushUnits]
+    int32_t* flushSlot = nullptr;    //!< [numRows][numLayers][maxFlushUnits]
+    int32_t* flushCount = nullptr;   //!< [numRows][numLayers]
+    int32_t maxFlushUnits = 0;
+    int32_t numLayers = 0;
 };
 
 //! Per-row watermarks, in tokens. Everything a step needs about how far a request has got
@@ -106,17 +120,10 @@ struct SparseFetchScratch
 //! are per-layer-group constants a kernel already has.
 //!
 //! A free row reads zero, so it describes a request with nothing eligible.
-//!
-//! The previous pair is what the same row carried at the publish before this one. A
-//! write-back needs both ends: the units it must move are those between the two history
-//! watermarks, and only a unit that was already in flight -- below the previous capacity --
-//! has a cell holding its one copy.
 struct WatermarkView
 {
     CUdeviceptr historyLength = 0;
     CUdeviceptr capacity = 0;
-    CUdeviceptr previousHistoryLength = 0;
-    CUdeviceptr previousCapacity = 0;
     int32_t numRows = 0;
 };
 
@@ -289,6 +296,31 @@ public:
     //! waiting would hide it.
     void publish();
 
+    //! Write back the units each row's watermark is about to pass, given the history the
+    //! caller is about to set. One per row; a row may repeat its current history, which
+    //! asks for nothing.
+    //!
+    //! **Call this before advancing history, not after.** A block must be in its host page
+    //! before it can be selected, and selectable means below the watermark; resize() refuses
+    //! a history this has not covered.
+    //!
+    //! Bounded by the capacity each row started from, not by how far history travels: only
+    //! a unit that was in flight has a cell holding its one copy, so a resumed request
+    //! moving history across a whole prompt writes back nothing. A move wider than the
+    //! in-flight headroom is refused, because the per-row flush list is sized for one.
+    //!
+    //! Reads the index table as of the last publish, which covers the blocks in range for
+    //! the same reason -- they were allocated by an earlier step.
+    void flushSparseUnits(std::vector<int> const& newHistoryLengths);
+
+    //! The history each row has been written back to. A row that has never needed a flush
+    //! reads its own history, so a caller may always compare against it.
+    [[nodiscard]] int flushedHistory(int row) const;
+
+    //! Where one life cycle's staged [from] units start; its [to] units follow maxBatchSize
+    //! later. Written by flushSparseUnits(), read by the scan it launches.
+    [[nodiscard]] int32_t const* flushRangeRow(LifeCycleId lifeCycle) const;
+
     //! Block until the last publish() has finished reading the staging rows.
     //!
     //! Cheap once complete, and a no-op when nothing is in flight, so a caller may use it
@@ -318,7 +350,7 @@ public:
 
     //! Scratch for one layer group's fetch. Null pointers when the group carries no sparse
     //! cache, which is what makes "nothing to fetch here" cheap to detect.
-    [[nodiscard]] SparseFetchScratch const& sparseFetchScratch(LayerGroupId layerGroupId) const;
+    [[nodiscard]] SparseStepScratch const& sparseStepScratch(LayerGroupId layerGroupId) const;
 
     //! Row of a member, or -1.
     [[nodiscard]] int rowOf(KvCache const& kvCache) const;
@@ -369,13 +401,10 @@ private:
     //! Element offset of the watermark regions within the staged block.
     [[nodiscard]] size_t _historyOffset() const noexcept;
     [[nodiscard]] size_t _capacityOffset() const noexcept;
-    [[nodiscard]] size_t _prevHistoryOffset() const noexcept;
-    [[nodiscard]] size_t _prevCapacityOffset() const noexcept;
     [[nodiscard]] size_t _totalElements() const noexcept;
 
-    //! Seed a row's staged watermarks so its next publish reports no movement. A row holds
-    //! whatever its last occupant left, and a delta taken against that would name units the
-    //! new member never wrote.
+    //! Seed a row's staged watermarks, so a row reads as its occupant rather than as
+    //! whatever the last one left.
     void _seedRowWatermarks(int row, int historyLength, int capacity);
 
     //! Refresh the staged watermarks and cache views from the members. Cheap, and it keeps
@@ -383,7 +412,21 @@ private:
     //! setBasePageIndexBuf.
     void _stageRowState();
 
-    void _allocateFetchScratch();
+    void _allocateStepScratch();
+
+    //! Device room for the per-row unit ranges a write-back reads:
+    //! [life cycle][2][maxBatchSize], as [from][to]. Allocated with the fetch scratch
+    //! because it has the same lifetime and the same reason to exist -- a step that
+    //! allocates nothing is a step a graph can capture.
+    void _allocateFlushRanges();
+
+    CudaUniqPtr mFlushRanges;
+    //! Staged host-side, then handed to a copy that consumes it before returning.
+    std::vector<int32_t> mFlushRangeStaging;
+    //! Per row, the history its units have been written back to.
+    std::vector<int> mFlushedHistory;
+    //! Recorded after the write-back, so the next call's staging can wait for its reads.
+    CachedCudaEvent mFlushRead = CachedCudaEvent::makeNull();
 
     //! Byte offset of the cache view region within the staged block.
     [[nodiscard]] size_t _viewsOffsetBytes() const noexcept;
@@ -497,8 +540,8 @@ private:
     CachedCudaStream mUploadStream;
 
     //! One allocation holding every layer group's fetch scratch, carved per group.
-    CudaUniqPtr mFetchScratch;
-    TypedVec<LifeCycleId, SparseFetchScratch> mScratch;
+    CudaUniqPtr mStepScratch;
+    TypedVec<LifeCycleId, SparseStepScratch> mScratch;
 
     //! Recorded after the host-to-device fill, so the host can tell when the staged rows
     //! are free to write again. Null when no publish is in flight.

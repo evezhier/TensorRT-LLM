@@ -49,26 +49,20 @@ struct LeaseLayout
 {
     size_t ordinal = 0;
     size_t lru = 0;
-    size_t flushList = 0;
-    size_t count = 0;
-    size_t range = 0;
     size_t view = 0;
 
     [[nodiscard]] size_t total() const noexcept
     {
-        return ordinal + lru + 2 * flushList + count + range + view;
+        return ordinal + lru + view;
     }
 };
 
-LeaseLayout leaseLayout(SparseCacheInit const& shape, int32_t maxFlushUnits, int32_t maxFlushBlocks)
+LeaseLayout leaseLayout(SparseCacheInit const& shape)
 {
     auto const entries = static_cast<size_t>(shape.numLayers) * shape.entriesPerLayer;
     LeaseLayout out;
     out.ordinal = alignedBytes(sizeof(int32_t) * entries);
     out.lru = alignedBytes(sizeof(int32_t) * entries);
-    out.flushList = alignedBytes(sizeof(int32_t) * static_cast<size_t>(shape.numLayers) * maxFlushUnits);
-    out.count = alignedBytes(sizeof(int32_t) * static_cast<size_t>(shape.numLayers));
-    out.range = alignedBytes(sizeof(int32_t) * 2);
     out.view = alignedBytes(sizeof(SparseCacheView));
     return out;
 }
@@ -117,10 +111,7 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
         }
     }
 
-    mShape.maxFlushUnits = std::max(shape.maxFlushUnits, 1);
-    mShape.maxFlushBlocks = std::max(shape.maxFlushBlocks, 1);
-
-    auto const layout = leaseLayout(mShape, mShape.maxFlushUnits, mShape.maxFlushBlocks);
+    auto const layout = leaseLayout(mShape);
     mMetadataBytes = layout.total();
 
     // One region per pool, each aligned so that a buffer's cell indices stay relative to its own
@@ -184,7 +175,7 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     int const index = mFree.back();
     mFree.pop_back();
 
-    auto const layout = leaseLayout(mShape, mShape.maxFlushUnits, mShape.maxFlushBlocks);
+    auto const layout = leaseLayout(mShape);
     auto* bytes = mMetadataBase + static_cast<size_t>(index) * mMetadataBytes;
     size_t carved = 0;
     auto carve = [&](size_t size)
@@ -202,17 +193,11 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     view.numLayers = mShape.numLayers;
     view.numBuffers = mShape.numBuffers;
     view.entriesPerLayer = mShape.entriesPerLayer;
-    view.maxFlushUnits = mShape.maxFlushUnits;
-    view.maxFlushBlocks = mShape.maxFlushBlocks;
     view.leaseIndex = index;
     view.bufferLayer = mSharedLayer;
     view.bufferSlotInPool = mSharedSlotInPool;
     view.residentOrdinal = carve(layout.ordinal);
     view.lruOrder = carve(layout.lru);
-    view.flushOrdinal = carve(layout.flushList);
-    view.flushSlot = carve(layout.flushList);
-    view.flushCount = carve(layout.count);
-    view.flushRange = carve(layout.range);
     lease.mDeviceView = reinterpret_cast<SparseCacheView*>(bytes + carved);
 
     auto const entries = static_cast<size_t>(view.numEntries());
@@ -221,10 +206,6 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
         static_cast<unsigned int>(kBadBlockOrdinal.value()), entries, stream));
     cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(view.lruOrder), reinterpret_cast<CUdeviceptr>(mIdentity),
         sizeof(int32_t) * entries, stream));
-    // -1 so that "no write-back has run" is distinguishable from "one ran and found nothing
-    // to move", which is what lets a test tell the two apart.
-    cuCheck(cuMemsetD32Async(
-        reinterpret_cast<CUdeviceptr>(view.flushCount), 0xFFFFFFFFU, static_cast<size_t>(view.numLayers), stream));
     // Last, so that it captures the carved pointers rather than a half-built view.
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(lease.mDeviceView), &view, sizeof(SparseCacheView)));
     return lease;
@@ -282,17 +263,6 @@ void SparseCacheLease::release() noexcept
         mView = SparseCacheView{};
         mDeviceView = nullptr;
     }
-}
-
-std::vector<int32_t> SparseCacheLease::readFlushCounts() const
-{
-    if (empty())
-    {
-        return {};
-    }
-    std::vector<int32_t> out(static_cast<size_t>(mView.numLayers));
-    cuCheck(cuMemcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(mView.flushCount), sizeof(int32_t) * out.size()));
-    return out;
 }
 
 std::vector<int32_t> SparseCacheLease::readResidentOrdinals() const

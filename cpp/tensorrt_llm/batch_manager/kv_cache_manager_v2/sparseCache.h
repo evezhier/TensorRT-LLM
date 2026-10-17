@@ -62,16 +62,6 @@ struct SparseCacheView
     //! pool's region has its own cells-per-lease, which the copy supplies per launch.
     int32_t leaseIndex = 0;
 
-    //! Scratch for one write-back: the units a watermark move crossed, the cells holding
-    //! them, and the watermark scalars the scan reads. Sized once, because a single move
-    //! cannot cross more units than the reservation's in-flight headroom.
-    int32_t* flushOrdinal = nullptr; //!< [numLayers][maxFlushUnits]
-    int32_t* flushSlot = nullptr;    //!< [numLayers][maxFlushUnits]
-    int32_t* flushCount = nullptr;   //!< [numLayers]
-    int32_t* flushRange = nullptr;   //!< [2], the half-open unit range
-    int32_t maxFlushUnits = 0;
-    int32_t maxFlushBlocks = 0;
-
     //! [numBuffers] each buffer's index among those sharing its pool: where its cells sit
     //! inside that pool's arena region.
     int32_t* bufferSlotInPool = nullptr;
@@ -114,9 +104,6 @@ struct SparseCacheInit
     std::vector<int32_t> bufferSlotInPool;
     //! One entry per pool of the life cycle: cell size, and buffers drawing on it.
     std::vector<std::pair<uint64_t, int32_t>> pools;
-    //! Bounds on one watermark move, from the in-flight headroom the reservation leaves.
-    int32_t maxFlushUnits = 0;
-    int32_t maxFlushBlocks = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -167,7 +154,6 @@ public:
 
     //! Copy the per-layer write-back counts back to the host, -1 where no write-back has
     //! run. Test and debug use only; synchronises.
-    [[nodiscard]] std::vector<int32_t> readFlushCounts() const;
 
 private:
     friend class SparseCellArena;
