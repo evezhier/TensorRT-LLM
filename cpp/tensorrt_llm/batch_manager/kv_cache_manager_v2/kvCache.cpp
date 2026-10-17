@@ -314,23 +314,22 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
         throw LogicError("A watermark move crossed more blocks than the cache's in-flight headroom allows");
     }
 
-    // Upload the watermark range and the page slots of the blocks it touched. Synchronous
-    // because both sources are host temporaries, and cheap because the span is bounded by
-    // max_input_length rather than by the context.
+    // Upload the watermark range. Synchronous because the source is a host temporary, and
+    // cheap because the span is bounded by max_input_length rather than by the context.
     std::array<int32_t, 2> const range{fromUnits, toUnits};
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(view.flushRange), range.data(), sizeof(range)));
 
-    auto const indices = getBasePageIndices(LayerGroupId{lifeCycle.value()});
-    std::vector<int32_t> slice(static_cast<size_t>(numBlocks), kBadPageIndex.value());
-    for (int block = firstBlock; block <= lastBlock; ++block)
-    {
-        if (block < static_cast<int>(indices.len))
-        {
-            slice[static_cast<size_t>(block - firstBlock)] = static_cast<int32_t>(indices[block]);
-        }
-    }
-    cuCheck(
-        cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(view.flushPageSlice), slice.data(), sizeof(int32_t) * slice.size()));
+    // A write-back reads the same converted indices the fetch does, so it needs a Batch to
+    // have converted them. Nothing else knows where this request's row is.
+    //
+    // The table it reads is the last publish's, which is current enough because the move is
+    // clamped to the capacity this resize started from: those blocks were allocated by an
+    // earlier resize, and Batch::resize publishes at the end of every call. A caller that
+    // resizes a member directly, without publishing in between, breaks that and would write
+    // back through stale indices.
+    TLLM_CHECK_WITH_INFO(mBatch != nullptr,
+        "A sparse KvCache must belong to a Batch before its watermark moves: the write-back reads the converted "
+        "page indices the Batch publishes");
 
     SparseFlushListArgs listArgs;
     listArgs.cache = view;
@@ -344,12 +343,20 @@ void KvCache::_flushSparseUnits(LifeCycleId lifeCycle, int fromUnits, int toUnit
 
     // One pass per pool, each covering every layer: the flush list is per layer and a
     // template's buffer run already spans as many of them as share its pool.
+    auto const plan = mManager->sparseBufferPlan(lifeCycle);
     for (auto copyArgs : _sparseCopyArgs(lifeCycle))
     {
-        copyArgs.pageTable = view.flushPageSlice;
-        copyArgs.pageTableStride = numBlocks;
-        copyArgs.numBlocks = numBlocks;
-        copyArgs.pageTableBase = firstBlock;
+        auto const& first = plan[static_cast<size_t>(copyArgs.bufferBase)].id;
+        auto const run = mBatch->sparseIndexRun(first.layerId, first.role);
+        copyArgs.hostBase = static_cast<CUdeviceptr>(run.base);
+        // One row, this request's, so the table is positioned at it and the kernel's own
+        // row index is zero. The entries still stride by the whole table's rows.
+        copyArgs.pageTable = reinterpret_cast<int32_t const*>(
+            run.table + sizeof(int32_t) * static_cast<size_t>(mBatchRow) * run.rowStride);
+        copyArgs.pageTableStride = run.rowStride;
+        copyArgs.pageTableEntryStride = run.entryStride;
+        copyArgs.numBlocks = lastBlock + 1;
+        copyArgs.pageTableBase = 0;
         copyArgs.direction = SparseCopyDirection::kWriteBack;
         copyArgs.workOrdinal = view.flushOrdinal;
         copyArgs.workSlot = view.flushSlot;

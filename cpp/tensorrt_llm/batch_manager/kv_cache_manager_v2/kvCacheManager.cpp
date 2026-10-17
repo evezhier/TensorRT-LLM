@@ -294,6 +294,32 @@ std::vector<BufferId> KvCacheManager::sparseBufferIds(LifeCycleId lifeCycle) con
     return ids;
 }
 
+std::vector<IndexTableRequest> KvCacheManager::sparseIndexTableRequests() const
+{
+    std::vector<IndexTableRequest> requests;
+    for (LifeCycleId lcId{0}; lcId < mStorage->numLifeCycles(); ++lcId)
+    {
+        auto const plan = sparseBufferPlan(lcId);
+        for (size_t begin = 0; begin < plan.size();)
+        {
+            size_t end = begin;
+            while (end < plan.size() && plan[end].poolIndex == plan[begin].poolIndex
+                && plan[end].layerRow == plan[begin].layerRow)
+            {
+                ++end;
+            }
+            IndexTableRequest request;
+            for (size_t i = begin; i < end; ++i)
+            {
+                request.buffers.push_back(plan[i].id);
+            }
+            requests.push_back(std::move(request));
+            begin = end;
+        }
+    }
+    return requests;
+}
+
 void KvCacheManager::_buildSparseArenas()
 {
     LifeCycleId const numLc = mStorage->numLifeCycles();
@@ -341,7 +367,6 @@ void KvCacheManager::_buildSparseArenas()
         shape.pools.assign(numPools, {0, 0});
         for (auto const& entry : plan)
         {
-            shape.pageBufferOffset.push_back(entry.pageOffset);
             shape.bufferLayer.push_back(entry.layerRow);
             shape.bufferSlotInPool.push_back(entry.slotInPool);
             auto& [cellBytes, buffers] = shape.pools[static_cast<size_t>(entry.poolIndex.value())];
@@ -366,7 +391,6 @@ std::vector<SparseUnitCopyArgs> KvCacheManager::sparseCopyTemplates(LifeCycleId 
 {
     auto const plan = sparseBufferPlan(lifeCycle);
     TLLM_CHECK(!plan.empty());
-    PoolGroupIndex const hotPg = mStorage->getPoolGroupIndex(kHotLevel, lifeCycle);
     auto const& arena = mSparseArenas[lifeCycle];
 
     std::vector<SparseUnitCopyArgs> templates;
@@ -393,12 +417,16 @@ std::vector<SparseUnitCopyArgs> KvCacheManager::sparseCopyTemplates(LifeCycleId 
         }
 
         SparseUnitCopyArgs args;
-        // The page side is the life cycle's own hot pool, in ordinary slot layout. It is host
-        // memory, registered device-mapped, so the kernel addresses it directly; but its layout
-        // is KVCM2's rather than a codec's, which is what keeps the fetch independent of
-        // whatever a codec does on the way to level 1.
-        args.hostBase = static_cast<CUdeviceptr>(mStorage->getMemPoolBaseAddress(hotPg, pool));
-        args.hostPageStride = mStorage->slotSize(hotPg).at(pool);
+        // The page side is the life cycle's own hot pool. It is host memory, registered
+        // device-mapped, so the kernel addresses it directly; but its layout is KVCM2's
+        // rather than a codec's, which is what keeps the fetch independent of whatever a
+        // codec does on the way to level 1.
+        //
+        // A converted index counts whole buffers, not coalesced slots, so the stride is one
+        // buffer and the pool's slot size never enters. The base belongs to the index table
+        // the run was declared in, which only the caller's Batch knows, so it is left unset
+        // here.
+        args.hostPageStride = plan[begin].size;
         // The hot side is the cache arena, not a storage pool: a cell is the only GPU-resident
         // copy a kernel can read, and the arena is where cells live.
         args.deviceBase = arena.base(pool);
@@ -611,6 +639,7 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     //
     // One pass per pool: a pool fixes the cell size and the slot stride, so each is its own
     // launch. The templates span the life cycle, so each is clipped to this layer's buffers.
+    auto const plan = sparseBufferPlan(lcId);
     for (auto copy : sparseCopyTemplates(lcId))
     {
         auto const runBase = std::max(copy.bufferBase, bufferBase);
@@ -623,8 +652,14 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
         copy.numBuffers = runEnd - runBase;
         copy.views = views;
         copy.numRows = numRows;
-        copy.pageTable = reinterpret_cast<int32_t const*>(table.data);
-        copy.pageTableStride = table.blocksPerRow;
+        // The run's buffers sit at consecutive entries of one request, so naming its first
+        // buffer positions the table for all of them.
+        auto const& first = plan[static_cast<size_t>(runBase)].id;
+        auto const run = batch.sparseIndexRun(first.layerId, first.role);
+        copy.hostBase = static_cast<CUdeviceptr>(run.base);
+        copy.pageTable = reinterpret_cast<int32_t const*>(run.table);
+        copy.pageTableStride = run.rowStride;
+        copy.pageTableEntryStride = run.entryStride;
         copy.numBlocks = table.blocksPerRow;
         copy.pageTableBase = 0;
         copy.direction = SparseCopyDirection::kFetch;

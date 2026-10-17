@@ -77,6 +77,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BufferConfig,
     BufferId,
     GpuCacheTierConfig,
+    IndexTableRequest,
     KVCacheDesc,
     KVCacheManagerConfig,
     PageIndexMode,
@@ -104,6 +105,17 @@ class _SparseRuntime:
         self.layers = {}
         for layer_id in (41, 19):
             self.configure_buffers(layer_id, [(DeepseekV4AttentionType.COMPRESS.role, 0)])
+
+    def sparse_index_table_requests(self):
+        """One request per (layer, pool) run, as the native manager derives them.
+
+        The fake's sparse buffers are one per layer, so each is its own run.
+        """
+        return [
+            IndexTableRequest([BufferId(layer_id, role)])
+            for layer_id in sorted(self.sparse)
+            for role in (DeepseekV4AttentionType.COMPRESS.role,)
+        ]
 
     def configure_buffers(self, layer_id, roles_and_pools):
         self.layers[layer_id] = AttentionLayerConfig(
@@ -762,10 +774,11 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
 class _SchedulingBatch:
     """Model native Batch's exclusive page-index ownership and published snapshots."""
 
-    def __init__(self, manager, cuda_stream, max_batch_size, max_blocks_per_seq):
+    def __init__(self, manager, cuda_stream, max_batch_size, max_blocks_per_seq, index_tables=()):
         self.cuda_stream = cuda_stream
         self.max_batch_size = max_batch_size
         self.max_blocks_per_seq = max_blocks_per_seq
+        self.index_tables = list(index_tables)
         self.rows = [None] * max_batch_size
         self.snapshots = []
         self.upload_pending = False
@@ -853,9 +866,19 @@ def test_sparse_batch_publishes_schedule_and_reuses_allocation(sparse_scheduling
     manager.prepare_resources(case.scheduled)
     assert manager.get_sparse_batch([10, 20]) is batch
     assert [row[0] for row in batch.snapshots[-1]] == [10, 20, None, None]
-    case.create_batch.assert_called_once_with(
-        manager.impl, manager._stream.cuda_stream, max_batch_size=4, max_blocks_per_seq=6
-    )
+    call = case.create_batch.call_args
+    assert call.args == (manager.impl, manager._stream.cuda_stream)
+    assert call.kwargs["max_batch_size"] == 4
+    assert call.kwargs["max_blocks_per_seq"] == 6
+    # By content: IndexTableRequest has no value equality, so comparing against a freshly
+    # derived list would only ever compare object identity and never hold.
+    assert [
+        [(buffer.layer_id, buffer.role) for buffer in request.buffers]
+        for request in call.kwargs["index_tables"]
+    ] == [
+        [(layer_id, DeepseekV4AttentionType.COMPRESS.role)]
+        for layer_id in sorted(manager.impl.sparse)
+    ]
     assert case.restore_buffers.call_count == 2
 
 

@@ -1897,6 +1897,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 CudaStream(self._stream.cuda_stream),
                 max_batch_size=self.max_batch_size,
                 max_blocks_per_seq=self.max_blocks_per_seq,
+                # The fetch and the write-back read converted indices, so every sparse
+                # buffer needs a table. Their shape follows from the pool layout.
+                index_tables=self.impl.sparse_index_table_requests(),
             )
         batch = self._sparse_batch
         try:

@@ -88,6 +88,20 @@ struct BufferId
     }
 };
 
+//! Buffers a consumer must address from one table, under one base pointer.
+//!
+//! This states a kernel's requirement, not a preference: some attention ops take a single
+//! block table covering K and V rather than one each. Order defines the table's buffer
+//! dimension, so a kernel reads buffer `i` of this request at entry `i`.
+//!
+//! Every buffer must share a life cycle and a page-index scale, since no one table can
+//! serve buffers whose converted indices differ. A request that spans either is refused
+//! when the Batch is constructed.
+struct IndexTableRequest
+{
+    std::vector<BufferId> buffers;
+};
+
 struct BufferIdHash
 {
     size_t operator()(BufferId const& id) const noexcept

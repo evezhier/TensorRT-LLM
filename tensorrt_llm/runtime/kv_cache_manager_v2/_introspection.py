@@ -298,7 +298,7 @@ def sparse_unit_copy(
     page_table: list[int],
     device_arena: bytes | list[int],
     base_cell: int,
-    page_buffer_offset: list[int],
+    num_blocks: int,
     cells_per_buffer: int,
     buffer_bytes: int,
     num_chunks: int,
@@ -318,6 +318,10 @@ def sparse_unit_copy(
     Exercises the copy's address arithmetic against a known byte pattern. Returns the
     destination pool: the cache pool when fetching, the cold pool when writing back.
 
+    ``page_table`` holds converted indices, [num_buffers][num_blocks]: one entry per
+    buffer, each counting whole buffers rather than coalesced slots, so a buffer's offset
+    within its page is already in the value and ``host_page_stride`` is one buffer.
+
     ``buffer_layer`` maps each buffer to the work-list row it reads, so buffers of one
     layer share a list; its length is the number of buffers copied. Synchronises.
     """
@@ -328,7 +332,7 @@ def sparse_unit_copy(
             page_table,
             list(device_arena),
             base_cell,
-            page_buffer_offset,
+            num_blocks,
             cells_per_buffer,
             buffer_bytes,
             num_chunks,

@@ -62,21 +62,15 @@ struct SparseCacheView
     //! pool's region has its own cells-per-lease, which the copy supplies per launch.
     int32_t leaseIndex = 0;
 
-    //! Scratch for one write-back: the units a watermark move crossed and the cells holding
-    //! them, the watermark scalars the scan reads, the page slots of the blocks touched, and
-    //! Sized once, because a single move cannot cross more units than the reservation's
-    //! in-flight headroom.
-    int32_t* flushOrdinal = nullptr;   //!< [numLayers][maxFlushUnits]
-    int32_t* flushSlot = nullptr;      //!< [numLayers][maxFlushUnits]
-    int32_t* flushCount = nullptr;     //!< [numLayers]
-    int32_t* flushRange = nullptr;     //!< [2], the half-open unit range
-    int32_t* flushPageSlice = nullptr; //!< [maxFlushBlocks]
+    //! Scratch for one write-back: the units a watermark move crossed, the cells holding
+    //! them, and the watermark scalars the scan reads. Sized once, because a single move
+    //! cannot cross more units than the reservation's in-flight headroom.
+    int32_t* flushOrdinal = nullptr; //!< [numLayers][maxFlushUnits]
+    int32_t* flushSlot = nullptr;    //!< [numLayers][maxFlushUnits]
+    int32_t* flushCount = nullptr;   //!< [numLayers]
+    int32_t* flushRange = nullptr;   //!< [2], the half-open unit range
     int32_t maxFlushUnits = 0;
     int32_t maxFlushBlocks = 0;
-
-    //! [numBuffers] byte offset of each buffer within its hot slot. A lookup only because
-    //! the kernel walks buffers; the value is BufferAttr's own offset, so no codec enters.
-    uint32_t* pageBufferOffset = nullptr;
 
     //! [numBuffers] each buffer's index among those sharing its pool: where its cells sit
     //! inside that pool's arena region.
@@ -114,8 +108,6 @@ struct SparseCacheInit
     //! Cells one buffer gets, i.e. entriesPerLayer / unitsPerPage. A lease is this many cells
     //! per buffer, laid out buffer-major.
     int32_t cellsPerBuffer = 0;
-    //! [numBuffers] byte offset of each buffer within a cold page.
-    std::vector<uint32_t> pageBufferOffset;
     //! [numBuffers] the layer each buffer belongs to, non-decreasing.
     std::vector<int32_t> bufferLayer;
     //! [numBuffers] each buffer's index among those sharing its pool.
@@ -269,7 +261,6 @@ private:
     std::byte* mMetadataBase = nullptr;
 
     //! Shared by every lease of the life cycle, so a resume copies neither.
-    uint32_t* mSharedOffset = nullptr;
     int32_t* mSharedLayer = nullptr;
     int32_t* mSharedSlotInPool = nullptr;
     int32_t* mIdentity = nullptr;

@@ -78,20 +78,6 @@ struct ExternalPageTable
 //! Identifies one converted index table of a Batch.
 using IndexTableId = StrongIndex<int, struct IndexTableIdTag>;
 
-//! Buffers a consumer must address from one table, under one base pointer.
-//!
-//! This states a kernel's requirement, not a preference: some attention ops take a single
-//! block table covering K and V rather than one each. Order defines the table's buffer
-//! dimension, so a kernel reads buffer `i` of this request at entry `i`.
-//!
-//! Every buffer must share a life cycle and a page-index scale, since no one table can
-//! serve buffers whose converted indices differ. A request that spans either is refused
-//! when the Batch is constructed.
-struct IndexTableRequest
-{
-    std::vector<BufferId> buffers;
-};
-
 //! Device scratch one layer group's fetch resolves into, before the copy and the index
 //! scatter read it back.
 //!
@@ -205,6 +191,23 @@ public:
     //! Where one table's converted indices live: int32[entries][max_batch][blocks].
     //! Stable for the Batch's lifetime, so a captured graph may bake it.
     [[nodiscard]] CUdeviceptr indexTableAddress(IndexTableId tableId) const;
+
+    //! How a sparse copy addresses a run of buffers that begins at `first`.
+    //!
+    //! The run's buffers occupy consecutive entries of one request, which construction
+    //! checked, so naming the first is enough: the rest follow by entry.
+    struct SparseIndexRun
+    {
+        //! The run's first entry, for row zero.
+        CUdeviceptr table = 0;
+        //! What a converted index is added to. Shared by the whole run.
+        MemAddress base = 0;
+        //! Elements between consecutive entries, and between consecutive rows.
+        int entryStride = 0;
+        int rowStride = 0;
+    };
+
+    [[nodiscard]] SparseIndexRun sparseIndexRun(LayerId layerId, DataRole const& role) const;
     ~Batch();
 
     Batch(Batch const&) = delete;
@@ -428,6 +431,15 @@ private:
     //! Validate the requests, merge those whose converted indices coincide, and record
     //! where each buffer landed.
     void _buildIndexTables(std::vector<IndexTableRequest> const& requests);
+
+    //! Refuse a sparse life cycle whose buffers no single launch can address.
+    //!
+    //! A sparse copy walks one (layer, pool) run of buffers per launch, from one base
+    //! pointer, so that run has to sit at consecutive entries of one request. Splitting it
+    //! across requests would need two bases in one launch; declaring only part of it would
+    //! leave the rest with no converted indices at all. Checked here because a run that
+    //! cannot be addressed produces wrong page addresses at step time rather than an error.
+    void _checkSparseRunsAreAddressable() const;
 
     //! Allocate the tables and the device-side descriptors the conversion reads.
     void _allocateIndexTables();

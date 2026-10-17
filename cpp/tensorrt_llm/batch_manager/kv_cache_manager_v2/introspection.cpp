@@ -319,11 +319,11 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
 }
 
 std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
-    std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& deviceArena, int baseCell,
-    std::vector<uint32_t> const& coldBufferOffset, int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks,
-    uint32_t chunkBytes, uint32_t chunkStride, uint32_t unitStride, int unitsPerPage,
-    std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
-    std::vector<int32_t> const& missCount, int selectionWidth, std::vector<int32_t> const& bufferLayer, bool writeBack)
+    std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& deviceArena, int baseCell, int numBlocks,
+    int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
+    uint32_t unitStride, int unitsPerPage, std::vector<int32_t> const& missOrdinal,
+    std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
+    std::vector<int32_t> const& bufferLayer, bool writeBack)
 {
     CUdeviceptr hostPtr = 0;
     cuCheck(cuMemAlloc(&hostPtr, hostPool.size()));
@@ -339,7 +339,6 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     auto missOrd = deviceCopy(missOrdinal);
     auto missSlotBuf = deviceCopy(missSlot);
     auto missCountBuf = deviceCopy(missCount);
-    auto coldOffsets = deviceCopyU32(coldBufferOffset);
     auto bufferLayerBuf = deviceCopy(bufferLayer);
 
     // The kernel reads the lease and the per-buffer maps through a view, so the hook
@@ -350,7 +349,6 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     // The probe drives one pool, so a lease of one cell and a buffer-slot identity reproduce
     // the address the production path computes from a lease index and a pool slot.
     view.leaseIndex = baseCell;
-    view.pageBufferOffset = reinterpret_cast<uint32_t*>(coldOffsets.get());
     view.bufferLayer = reinterpret_cast<int32_t*>(bufferLayerBuf.get());
     std::vector<int32_t> slotInPool(bufferLayer.size());
     std::iota(slotInPool.begin(), slotInPool.end(), 0);
@@ -367,8 +365,11 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.hostBase = hostPtr;
     args.hostPageStride = hostPageStride;
     args.pageTable = reinterpret_cast<int32_t const*>(table.get());
-    args.pageTableStride = static_cast<int32_t>(pageTable.size());
-    args.numBlocks = static_cast<int32_t>(pageTable.size());
+    // [numBuffers][numBlocks], as the conversion emits: one entry per buffer, the
+    // buffer's own offset already folded into the value.
+    args.pageTableStride = numBlocks;
+    args.pageTableEntryStride = numBlocks;
+    args.numBlocks = numBlocks;
     args.deviceBase = devicePtr;
     args.cellsPerBuffer = cellsPerBuffer;
     args.cellsPerLease = 1;

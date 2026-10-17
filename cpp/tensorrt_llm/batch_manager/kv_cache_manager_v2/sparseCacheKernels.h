@@ -159,18 +159,23 @@ struct SparseUnitCopyArgs
     SparseCacheView const* views = nullptr;
     int32_t numRows = 0;
 
-    //! Pool holding the cold pages. Device-mapped host memory, so the kernel addresses it
-    //! directly and no host round trip is needed.
+    //! Base of this call's buffers, as an index table's entries are relative to. Every
+    //! buffer of the run shares it: the converted index already carries the buffer's own
+    //! offset within the coalesced page, which is why the pool's slot size plays no part
+    //! here and the stride below is one buffer.
     CUdeviceptr hostBase = 0;
     uint64_t hostPageStride = 0;
-    //! [numRows][pageTableStride] host page slot per block, indexed by block ordinal minus
-    //! pageTableBase.
+    //! Converted page indices, [entries][rows][pageTableStride], positioned at the entry
+    //! and row this call starts from. Buffer `b` of the run reads entry `b - bufferBase`.
     //!
-    //! A fetch passes the batch's whole table and leaves the base at zero. A flush is
-    //! host-initiated and touches one contiguous span of blocks, so it passes just that
-    //! slice rather than requiring the full table to be device-resident.
+    //! A fetch spans the batch and starts at row zero; a write-back serves one request and
+    //! starts at its own row. Both read the same table, because a converted index means the
+    //! same thing to either.
     int32_t const* pageTable = nullptr;
     int32_t pageTableStride = 0;
+    //! Elements between consecutive entries, which is the whole table's rows times its
+    //! blocks -- not this call's rows, since a write-back passes only one of them.
+    int32_t pageTableEntryStride = 0;
     int32_t numBlocks = 0;
     int32_t pageTableBase = 0;
 

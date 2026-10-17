@@ -483,6 +483,15 @@ public:
     //! Just their ids, in the same order.
     [[nodiscard]] std::vector<BufferId> sparseBufferIds(LifeCycleId lifeCycle) const;
 
+    //! The index table requests every sparse life cycle needs, one per (layer, pool) run.
+    //!
+    //! A Batch still has to be given these: it refuses a sparse buffer it was told nothing
+    //! about, because a fetch with no converted indices would read the wrong pages rather
+    //! than fail. But their shape is not a choice -- a copy walks one run per launch from
+    //! one base pointer, so the run is the request -- and this is that shape, so a caller
+    //! need not re-derive the pool layout to restate it.
+    [[nodiscard]] std::vector<IndexTableRequest> sparseIndexTableRequests() const;
+
     //! Everything a sparse copy needs that follows from configuration alone: the two pools,
     //! the unit layout and the cell geometry. A caller fills in whose cache it is copying
     //! into and which work list to read.

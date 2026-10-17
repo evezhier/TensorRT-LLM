@@ -52,12 +52,11 @@ struct LeaseLayout
     size_t flushList = 0;
     size_t count = 0;
     size_t range = 0;
-    size_t slice = 0;
     size_t view = 0;
 
     [[nodiscard]] size_t total() const noexcept
     {
-        return ordinal + lru + 2 * flushList + count + range + slice + view;
+        return ordinal + lru + 2 * flushList + count + range + view;
     }
 };
 
@@ -70,7 +69,6 @@ LeaseLayout leaseLayout(SparseCacheInit const& shape, int32_t maxFlushUnits, int
     out.flushList = alignedBytes(sizeof(int32_t) * static_cast<size_t>(shape.numLayers) * maxFlushUnits);
     out.count = alignedBytes(sizeof(int32_t) * static_cast<size_t>(shape.numLayers));
     out.range = alignedBytes(sizeof(int32_t) * 2);
-    out.slice = alignedBytes(sizeof(int32_t) * static_cast<size_t>(maxFlushBlocks));
     out.view = alignedBytes(sizeof(SparseCacheView));
     return out;
 }
@@ -91,10 +89,6 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     if (shape.pools.empty() || maxLeases <= 0)
     {
         throw std::invalid_argument("SparseCellArena requires at least one pool and a positive lease count");
-    }
-    if (shape.pageBufferOffset.size() != static_cast<size_t>(shape.numBuffers))
-    {
-        throw std::invalid_argument("SparseCellArena requires one page offset per buffer");
     }
     if (shape.bufferLayer.size() != static_cast<size_t>(shape.numBuffers))
     {
@@ -140,11 +134,10 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     }
 
     auto const entries = static_cast<size_t>(mShape.numLayers) * mShape.entriesPerLayer;
-    size_t const offsetBytes = alignedBytes(sizeof(uint32_t) * static_cast<size_t>(mShape.numBuffers));
     size_t const layerBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numBuffers));
     size_t const slotBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numBuffers));
     size_t const identityBytes = alignedBytes(sizeof(int32_t) * entries);
-    size_t const sharedBytes = offsetBytes + layerBytes + slotBytes + identityBytes;
+    size_t const sharedBytes = layerBytes + slotBytes + identityBytes;
 
     CUdeviceptr base = 0;
     cuCheck(cuMemAlloc(&base, cellBytes + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes));
@@ -155,14 +148,11 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
         mPoolBase.push_back(base + offset);
     }
     auto* shared = reinterpret_cast<std::byte*>(base) + cellBytes;
-    mSharedOffset = reinterpret_cast<uint32_t*>(shared);
-    mSharedLayer = reinterpret_cast<int32_t*>(shared + offsetBytes);
-    mSharedSlotInPool = reinterpret_cast<int32_t*>(shared + offsetBytes + layerBytes);
-    mIdentity = reinterpret_cast<int32_t*>(shared + offsetBytes + layerBytes + slotBytes);
+    mSharedLayer = reinterpret_cast<int32_t*>(shared);
+    mSharedSlotInPool = reinterpret_cast<int32_t*>(shared + layerBytes);
+    mIdentity = reinterpret_cast<int32_t*>(shared + layerBytes + slotBytes);
     mMetadataBase = shared + sharedBytes;
 
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedOffset), mShape.pageBufferOffset.data(),
-        sizeof(uint32_t) * mShape.pageBufferOffset.size()));
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedLayer), mShape.bufferLayer.data(),
         sizeof(int32_t) * mShape.bufferLayer.size()));
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedSlotInPool), mShape.bufferSlotInPool.data(),
@@ -215,7 +205,6 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     view.maxFlushUnits = mShape.maxFlushUnits;
     view.maxFlushBlocks = mShape.maxFlushBlocks;
     view.leaseIndex = index;
-    view.pageBufferOffset = mSharedOffset;
     view.bufferLayer = mSharedLayer;
     view.bufferSlotInPool = mSharedSlotInPool;
     view.residentOrdinal = carve(layout.ordinal);
@@ -224,7 +213,6 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     view.flushSlot = carve(layout.flushList);
     view.flushCount = carve(layout.count);
     view.flushRange = carve(layout.range);
-    view.flushPageSlice = carve(layout.slice);
     lease.mDeviceView = reinterpret_cast<SparseCacheView*>(bytes + carved);
 
     auto const entries = static_cast<size_t>(view.numEntries());

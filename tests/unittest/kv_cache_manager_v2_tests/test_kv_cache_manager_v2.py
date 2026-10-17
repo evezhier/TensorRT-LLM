@@ -901,10 +901,22 @@ class TestSparseCacheReservation(unittest.TestCase):
         assembled without error, and the launches are accepted.
         """
         manager = self._manager(max_cached_units=4)
+        cache = None
+        batch = None
         try:
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
-                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                handle = cast(CudaStream, stream.handle)
+                # Driven through a Batch because the write-back reads the converted indices
+                # a publish produces, and Batch::resize publishes at the end of every call.
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
+                self.assertTrue(cache.resume(handle))
                 lc_id = manager.get_layer_group_id(0)
                 self.assertEqual(
                     _introspection.sparse_flush_counts(cache, lc_id),
@@ -914,22 +926,32 @@ class TestSparseCacheReservation(unittest.TestCase):
                 # tokens_per_block is 128 and the unit is a whole block. Reach the end of
                 # unit 0 with the last token still in flight, so that the next step's
                 # watermark move genuinely carries a unit from in-flight to history --
-                # which is the only way a write-back has anything to consider.
+                # which is the only way a write-back has anything to consider. Seeded
+                # before joining, since a Batch only accepts a history its row already had
+                # the capacity for; no unit is crossed getting here, so nothing is written
+                # back yet and no published table is needed.
                 self.assertTrue(cache.resize(128, 127))
+                batch.add_kv_cache(cache)
+                # The crossing below writes back block 0, so its converted index has to
+                # exist by then.
+                batch.publish()
                 self.assertEqual(
                     _introspection.sparse_flush_counts(cache, lc_id),
                     [-1],
                     "nothing has left the in-flight span yet",
                 )
-                self.assertTrue(cache.resize(129, 128))
+                self.assertEqual(list(batch.resize([129], [128])), [1])
                 self.assertEqual(cache.history_length, 128)
                 self.assertEqual(
                     _introspection.sparse_flush_counts(cache, lc_id),
                     [0],
                     "a write-back ran and found nothing resident to move",
                 )
-                cache.close()
         finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
             manager.shutdown()
 
     def test_a_move_inside_one_unit_still_takes_the_shortcut(self):
@@ -1153,7 +1175,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             # A non-zero lease base: entry 0 belongs to the second cell of the arena, which
             # is what every request past the first gets.
             base_cell=1,
-            page_buffer_offset=[0],
+            num_blocks=len(page_table),
             cells_per_buffer=1,
             buffer_bytes=page_stride,
             num_chunks=1,
@@ -1185,7 +1207,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             page_table=[0],
             device_arena=[0] * (page_stride),
             base_cell=0,
-            page_buffer_offset=[0],
+            num_blocks=1,
             cells_per_buffer=1,
             buffer_bytes=page_stride,
             num_chunks=chunks,
@@ -1211,16 +1233,18 @@ class TestSparseUnitCopy(unittest.TestCase):
     def test_layers_land_in_their_own_sub_slot(self):
         # A cold page concatenates two layers' buffers; the cache cell is derived.
         unit, layers = 16, 2
-        page_stride = unit * layers
-        host = self._pattern(page_stride)
+        host = self._pattern(unit * layers)
         result = _introspection.sparse_unit_copy(
             host_pool=host,
-            host_page_stride=page_stride,
-            page_table=[0],
-            device_arena=[0] * (page_stride),
+            # One buffer, not the coalesced page: a converted index counts whole buffers.
+            host_page_stride=unit,
+            # Deliberately crossed, which is now the table's doing rather than a separate
+            # offset array: slot 0 of a pool coalescing two buffers converts to index 0 or
+            # 1, and layer 0 is given the second.
+            page_table=[1, 0],
+            device_arena=[0] * (unit * layers),
             base_cell=0,
-            # Deliberately crossed: layer 0's buffer is second in the cold page.
-            page_buffer_offset=[unit, 0],
+            num_blocks=1,
             cells_per_buffer=1,
             buffer_bytes=unit,
             num_chunks=1,
@@ -1234,8 +1258,8 @@ class TestSparseUnitCopy(unittest.TestCase):
             selection_width=1,
             buffer_layer=list(range(layers)),
         )
-        # The cold offset is a lookup and the hot cell is arithmetic on the sub-slot, so
-        # layer 0 reads the second cold buffer into cell 0, and layer 1 the reverse.
+        # The cold page comes from the entry and the hot cell is arithmetic on the sub-slot,
+        # so layer 0 reads the second cold buffer into cell 0, and layer 1 the reverse.
         self.assertEqual(result[:unit], host[unit:])
         self.assertEqual(result[unit:], host[:unit])
 
@@ -1248,7 +1272,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             page_table=[0],
             device_arena=[0] * (unit),
             base_cell=0,
-            page_buffer_offset=[0],
+            num_blocks=1,
             cells_per_buffer=1,
             buffer_bytes=unit,
             num_chunks=1,
@@ -1274,7 +1298,7 @@ class TestSparseUnitCopy(unittest.TestCase):
             page_table=[0],
             device_arena=[0] * (unit * 2),
             base_cell=0,
-            page_buffer_offset=[0],
+            num_blocks=1,
             cells_per_buffer=1,
             buffer_bytes=unit * 2,
             num_chunks=1,
@@ -1357,7 +1381,13 @@ class TestSparseFetch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=rows, max_blocks_per_seq=blocks)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=rows,
+                    max_blocks_per_seq=blocks,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
                 # Two whole blocks of history, so ordinals 0 and 1 are eligible.
@@ -2057,6 +2087,7 @@ class TestBorrowedPageTable(unittest.TestCase):
                     handle,
                     max_batch_size=self.ROWS,
                     max_blocks_per_seq=self.BLOCKS,
+                    index_tables=manager.sparse_index_table_requests(),
                     page_table=table,
                 )
                 yield torch, manager, batch, host, handle
@@ -2269,7 +2300,13 @@ class TestSparseDataPath(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(4 * self.TPB, 4 * self.TPB))
@@ -2317,7 +2354,13 @@ class TestSparseDataPath(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 # Capacity one token past a watermark that has not reached unit 0, so unit 0
@@ -2433,7 +2476,13 @@ class TestSparseWriteIndices(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 # Capacity one token past a history that has not reached unit 0, so unit 0
@@ -2480,7 +2529,13 @@ class TestSparseWriteIndices(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
@@ -2509,7 +2564,13 @@ class TestSparseWriteIndices(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=2,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(self.TPB, self.TPB))
@@ -2576,7 +2637,13 @@ class TestSparseWriteIndices(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
@@ -2642,7 +2709,13 @@ class TestSparseWriteIndices(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
@@ -2699,7 +2772,13 @@ class TestSparseWriteIndices(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 # resize() bounds capacity - history to one token, so a unit is in flight
@@ -2839,7 +2918,13 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(4 * self.TPB, 4 * self.TPB))
@@ -2899,7 +2984,13 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 # Capacity one token past a watermark that has not reached unit 0, so unit 0
@@ -2999,7 +3090,7 @@ class TestSparseFlush(unittest.TestCase):
             host_page_stride=page_stride,
             page_table=[0],
             base_cell=0,
-            page_buffer_offset=[0],
+            num_blocks=1,
             cells_per_buffer=1,
             buffer_bytes=page_stride,
             num_chunks=1,
@@ -3037,7 +3128,7 @@ class TestSparseFlush(unittest.TestCase):
             page_table=[0],
             device_arena=[0] * (page_stride),
             base_cell=0,
-            page_buffer_offset=[0],
+            num_blocks=1,
             cells_per_buffer=1,
             buffer_bytes=page_stride,
             num_chunks=1,
@@ -3144,7 +3235,13 @@ class TestBatch(unittest.TestCase):
             lg_id = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=2,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 # Before anyone resumes, no reservation exists, so no view does either.
                 batch.publish()
                 self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])

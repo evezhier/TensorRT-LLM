@@ -141,6 +141,7 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
 
     // After the modes: a request's offsets depend on where its life cycle puts the base.
     _buildIndexTables(indexTables);
+    _checkSparseRunsAreAddressable();
     _allocateIndexTables();
 }
 
@@ -329,6 +330,49 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
     }
 }
 
+void Batch::_checkSparseRunsAreAddressable() const
+{
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        auto const plan = mManager->sparseBufferPlan(lcId);
+        if (plan.empty())
+        {
+            continue;
+        }
+        for (size_t begin = 0; begin < plan.size();)
+        {
+            size_t end = begin;
+            while (end < plan.size() && plan[end].poolIndex == plan[begin].poolIndex
+                && plan[end].layerRow == plan[begin].layerRow)
+            {
+                ++end;
+            }
+
+            auto const slotOf = [this](SparseBufferPlan const& entry)
+            {
+                auto const found = mBufferSlots.find(std::make_pair(entry.id.layerId, entry.id.role));
+                TLLM_CHECK_WITH_INFO(found != mBufferSlots.end(),
+                    "A sparse buffer has no index table request; the fetch reads converted indices, so every "
+                    "sparse buffer needs one");
+                return found->second;
+            };
+
+            auto const first = slotOf(plan[begin]);
+            for (size_t i = begin + 1; i < end; ++i)
+            {
+                auto const slot = slotOf(plan[i]);
+                TLLM_CHECK_WITH_INFO(slot.table == first.table && slot.base == first.base,
+                    "Sparse buffers sharing a pool are copied in one launch, from one base pointer, so they must "
+                    "share one index table request");
+                TLLM_CHECK_WITH_INFO(slot.entry == first.entry + static_cast<int>(i - begin),
+                    "Sparse buffers sharing a pool must sit at consecutive entries of their request, in the order "
+                    "the pool holds them");
+            }
+            begin = end;
+        }
+    }
+}
+
 void Batch::_allocateIndexTables()
 {
     if (mIndexTables.empty())
@@ -477,6 +521,17 @@ CUdeviceptr Batch::indexTableAddress(IndexTableId tableId) const
     }
     return reinterpret_cast<CUdeviceptr>(mIndexTableMemory.get())
         + sizeof(int32_t) * mIndexTables[static_cast<size_t>(tableId.value())].elementOffset;
+}
+
+Batch::SparseIndexRun Batch::sparseIndexRun(LayerId layerId, DataRole const& role) const
+{
+    auto const [tableId, entry] = indexTableSlot(layerId, role);
+    SparseIndexRun run;
+    run.rowStride = mMaxBlocksPerSeq;
+    run.entryStride = mMaxBatchSize * mMaxBlocksPerSeq;
+    run.table = indexTableAddress(tableId) + sizeof(int32_t) * static_cast<size_t>(entry) * run.entryStride;
+    run.base = indexTableBase(layerId, role);
+    return run;
 }
 
 size_t Batch::_scratchElements() const noexcept

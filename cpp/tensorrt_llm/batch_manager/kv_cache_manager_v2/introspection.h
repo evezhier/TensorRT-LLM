@@ -97,12 +97,11 @@ public:
     // arithmetic can be checked against a known byte pattern. Returns the destination pool
     // after the copy. Synchronises.
     static std::vector<uint8_t> sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
-        std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& deviceArena, int baseCell,
-        std::vector<uint32_t> const& coldBufferOffset, int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks,
-        uint32_t chunkBytes, uint32_t chunkStride, uint32_t unitStride, int unitsPerPage,
-        std::vector<int32_t> const& missOrdinal, std::vector<int32_t> const& missSlot,
-        std::vector<int32_t> const& missCount, int selectionWidth, std::vector<int32_t> const& bufferLayer,
-        bool writeBack);
+        std::vector<int32_t> const& pageTable, std::vector<uint8_t> const& deviceArena, int baseCell, int numBlocks,
+        int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
+        uint32_t unitStride, int unitsPerPage, std::vector<int32_t> const& missOrdinal,
+        std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
+        std::vector<int32_t> const& bufferLayer, bool writeBack);
 
     // White-box hook: the entries holding units a watermark move has just passed.
     // Synchronises.

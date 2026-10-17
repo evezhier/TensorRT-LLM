@@ -454,13 +454,16 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     auto const cell = static_cast<uint64_t>(view.leaseIndex * args.cellsPerLease
         + view.bufferSlotInPool[buffer] * args.cellsPerBuffer + slot / args.unitsPerPage);
 
-    auto const hostPage
-        = static_cast<uint64_t>(args.pageTable[static_cast<ptrdiff_t>(row) * args.pageTableStride + block]);
+    // Each buffer of the run has its own entry, differing only by the offset the conversion
+    // baked in -- which is what replaces adding the buffer's offset within the page here.
+    auto const entry = static_cast<ptrdiff_t>(buffer - args.bufferBase);
+    auto const hostPage = static_cast<uint64_t>(
+        args.pageTable[entry * args.pageTableEntryStride + static_cast<ptrdiff_t>(row) * args.pageTableStride + block]);
 
     // The cold side is reached by ordinal through the page table, the hot side by entry
     // index through the cache page list. Direction only chooses which one is read.
-    auto* cold = reinterpret_cast<char*>(args.hostBase + hostPage * args.hostPageStride + view.pageBufferOffset[buffer]
-        + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
+    auto* cold = reinterpret_cast<char*>(
+        args.hostBase + hostPage * args.hostPageStride + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
     auto* hot = reinterpret_cast<char*>(
         args.deviceBase + cell * args.bufferBytes + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
     bool const fetching = args.direction == SparseCopyDirection::kFetch;
