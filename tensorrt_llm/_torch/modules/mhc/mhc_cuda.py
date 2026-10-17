@@ -17,6 +17,7 @@ all available backends (FMA, DeepGEMM split-K, DeepGEMM no-split) at warmup.
 Falls back to FMA when DeepGEMM is unavailable or autotuner cache misses.
 """
 
+import os
 from functools import lru_cache, partial
 from typing import Any, List
 
@@ -774,11 +775,17 @@ _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
 
 
-def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
+def _get_fused_hc_fallback_tactic(
+    hidden_size: int | None = None, *, deterministic: bool = False
+) -> tuple[str, int, int, int, int]:
     mma_ok = _fused_hc_mma_supported()
     if hidden_size is not None:
         mma_ok = mma_ok and hidden_size in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES
-    return _FUSED_HC_FALLBACK_TACTIC_MMA if mma_ok else _FUSED_HC_FALLBACK_TACTIC_FMA
+    if mma_ok:
+        if deterministic:
+            return ("fused_half_mma", 0, 1, 0, 1)
+        return _FUSED_HC_FALLBACK_TACTIC_MMA
+    return _FUSED_HC_FALLBACK_TACTIC_FMA
 
 
 class MhcFusedHcRunner(TunableRunner):
@@ -802,6 +809,9 @@ class MhcFusedHcRunner(TunableRunner):
 
     Fallback (-1): delegates to the C++ heuristic (fused_half_mma + auto ks
     + auto bs).
+
+    ``FORCE_DETERMINISTIC=1`` or ``FORCE_MHC_KERNEL_DETERMINISTIC=1`` uses a
+    fixed half-fused tactic with one K split for tuned and fallback execution.
     """
 
     tuning_config = TuningConfig(
@@ -835,6 +845,10 @@ class MhcFusedHcRunner(TunableRunner):
     ):
         self.n = n
         self.hidden_size = hidden_size
+        self._force_deterministic = (
+            os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+            or os.getenv("FORCE_MHC_KERNEL_DETERMINISTIC", "0") == "1"
+        )
         self.rms_eps = rms_eps
         self.hc_pre_eps = hc_pre_eps
         self.hc_sinkhorn_eps = hc_sinkhorn_eps
@@ -842,9 +856,13 @@ class MhcFusedHcRunner(TunableRunner):
         self.sinkhorn_repeat = sinkhorn_repeat
 
     def unique_id(self):
+        if self._force_deterministic:
+            return (self.n, self.hidden_size, "deterministic")
         return (self.n, self.hidden_size)
 
     def get_valid_tactics(self, inputs, profile: OptimizationProfile, **kwargs):
+        if self._force_deterministic:
+            return [_get_fused_hc_fallback_tactic(self.hidden_size, deterministic=True)]
         M = inputs[0].shape[0]
         tactics = []
         seen = set()
@@ -916,8 +934,12 @@ class MhcFusedHcRunner(TunableRunner):
         hc_scale_cur = hc_scale_cur.to(torch.float32).contiguous()
         hc_base_cur = hc_base_cur.to(torch.float32).contiguous()
 
-        if tactic == -1:
-            tactic = _get_fused_hc_fallback_tactic(self.hidden_size)
+        if self._force_deterministic or tactic == -1:
+            # One fixed tactic avoids both atomic split-K reductions and
+            # arithmetic changes from independently tuned rank/process choices.
+            tactic = _get_fused_hc_fallback_tactic(
+                self.hidden_size, deterministic=self._force_deterministic
+            )
         backend, tile_n, num_k_splits, bigfuse_bs, tile_m = tactic
         backend_code = _FUSED_HC_BACKEND_CODE[backend]
 
