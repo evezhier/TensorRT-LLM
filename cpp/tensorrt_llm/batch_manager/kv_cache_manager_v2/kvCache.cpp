@@ -3126,6 +3126,16 @@ bool KvCache::supportsIndexMode(PageIndexMode mode) const
     return false;
 }
 
+bool KvCache::supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const
+{
+    switch (mode)
+    {
+    case PageIndexMode::PER_LAYER: return true;
+    case PageIndexMode::SHARED: return mScratchSlots.at(lcId).empty();
+    }
+    return false;
+}
+
 HalfOpenRange<BlockOrdinal> KvCache::_getScratchRange(
     LifeCycle const& lc, std::optional<int> hlOverride, std::optional<int> capOverride) const
 {

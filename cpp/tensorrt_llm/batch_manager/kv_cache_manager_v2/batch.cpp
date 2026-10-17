@@ -50,7 +50,8 @@ std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
 
 } // namespace
 
-Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std::optional<ExternalPageTable> pageTable)
+Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std::optional<ExternalPageTable> pageTable,
+    std::optional<PageIndexMode> mode)
     : mManager(&manager)
     , mPageTable(pageTable)
 {
@@ -65,6 +66,17 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std
 
     mNumLayerGroups = manager.storage().numLifeCycles();
     mRows.assign(static_cast<size_t>(mMaxBatchSize), nullptr);
+
+    // Prefer SHARED: one table per life cycle rather than one per layer. The manager
+    // answers from configuration alone, so this cannot drift with what a member is doing.
+    mIndexModes = TypedVec<LifeCycleId, PageIndexMode>(mNumLayerGroups, PageIndexMode::PER_LAYER);
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        mIndexModes[lcId]
+            = mode.value_or(manager.supportsIndexMode(PageIndexMode::SHARED, lcId) == std::optional<bool>(true)
+                    ? PageIndexMode::SHARED
+                    : PageIndexMode::PER_LAYER);
+    }
 
     if (mPageTable)
     {
@@ -206,6 +218,15 @@ Batch::~Batch()
 size_t Batch::_rowElements() const noexcept
 {
     return static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
+}
+
+PageIndexMode Batch::indexMode(LayerGroupId layerGroupId) const
+{
+    if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
+    {
+        throw std::out_of_range("Batch::indexMode: unknown layer group");
+    }
+    return mIndexModes[layerGroupId];
 }
 
 int64_t Batch::_pageTableRowStride() const noexcept
@@ -445,6 +466,25 @@ void Batch::publish(CUstream stream)
     TLLM_CHECK_WITH_INFO(mPublished.isClosed(),
         "Batch::publish: the previous publish is still reading the staged rows; call waitPublished() before "
         "mutating any member or publishing again");
+
+    // A SHARED life cycle gives every layer the same converted indices, which only holds
+    // while no member substitutes scratch slots there. Prefill acquires those and decode
+    // does not, so a batch that mixes them would have been given PER_LAYER; reaching here
+    // means the phases were mixed after the mode was fixed.
+    for (auto const* kvCache : mRows)
+    {
+        if (kvCache == nullptr)
+        {
+            continue;
+        }
+        for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+        {
+            TLLM_CHECK_WITH_INFO(
+                mIndexModes[lcId] != PageIndexMode::SHARED || kvCache->supportsIndexMode(PageIndexMode::SHARED, lcId),
+                "Batch::publish: a member holds scratch slots in a SHARED life cycle; its layers no longer share "
+                "one converted index table");
+        }
+    }
 
     // The members write their own page indices, but not their watermarks; collect those
     // now so the single transfer below carries a matched pair.

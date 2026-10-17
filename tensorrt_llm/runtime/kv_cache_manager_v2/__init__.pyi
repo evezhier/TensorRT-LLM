@@ -30,6 +30,7 @@ from typing import (
     Type,
     TypeAlias,
     Union,
+    overload,
 )
 
 # From _common.py
@@ -699,7 +700,12 @@ class _KVCache:
     def text_only(self) -> bool: ...
     @text_only.setter
     def text_only(self, text_only: bool) -> None: ...
+    # Per life cycle, which is where the scratch slots live. The one-argument form
+    # collapses them, so one life cycle's scratch makes it answer False for every other.
+    @overload
     def supports_index_mode(self, mode: PageIndexMode) -> bool: ...
+    @overload
+    def supports_index_mode(self, mode: PageIndexMode, layer_group_id: LayerGroupId) -> bool: ...
     @property
     def status(self) -> _Status: ...
     @property
@@ -869,6 +875,7 @@ class Batch:
         max_batch_size: int = 0,
         max_blocks_per_seq: int = 0,
         page_table: ExternalPageTable | None = None,
+        mode: PageIndexMode | None = None,
     ) -> None:
         """Bound the device arrays, whose shape must not change between steps.
 
@@ -880,6 +887,11 @@ class Batch:
         leaves one buffer with one writer and takes the page indices out of
         :meth:`publish`. Its rows then belong to the lender, so :meth:`add_kv_cache` has to
         be told which one a member occupies.
+
+        ``mode`` applies to every life cycle. Left unset, each takes the smaller table:
+        ``SHARED`` where the manager reports it always available, ``PER_LAYER`` otherwise.
+        It is fixed here because a converted table's shape is baked into a captured graph,
+        so it cannot follow a member's scratch state.
         """
 
     def add_kv_cache(self, kv_cache: _KVCache, row: int = -1) -> int:
@@ -896,6 +908,15 @@ class Batch:
 
     def remove_kv_cache(self, kv_cache: _KVCache) -> None:
         """Free the cache's row, leaving a hole for reuse."""
+
+    def index_mode(self, layer_group_id: LayerGroupId) -> PageIndexMode:
+        """Page index mode of one life cycle, as chosen at construction.
+
+        Left unset at construction, each life cycle takes the smaller table: ``SHARED``
+        where the manager reports it always available, ``PER_LAYER`` otherwise. Fixed here
+        because a converted table's shape is baked into a captured graph, so it cannot
+        follow a member's scratch state.
+        """
 
     def row_of(self, kv_cache: _KVCache) -> int:
         """Row of a member, or ``-1``."""
@@ -1332,7 +1353,15 @@ class KVCacheManager:
     def enable_partial_match(self) -> bool: ...
     @property
     def enable_partial_commit(self) -> bool: ...
-    def supports_index_mode(self, mode: PageIndexMode) -> bool | None: ...
+    def supports_index_mode(
+        self, mode: PageIndexMode, layer_group_id: LayerGroupId | None = None
+    ) -> bool | None:
+        """``None`` means it depends on the request.
+
+        Given a layer group the answer is definitive for every life cycle that cannot hold
+        scratch slots -- anything without a sliding window -- which the collapsing form
+        cannot express. Configuration only, so it never varies with what a request is doing.
+        """
     @property
     def num_layers(self) -> int: ...
     @property

@@ -1898,7 +1898,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release release;
                 self.setTextOnly(textOnly);
             })
-        .def("supports_index_mode", &kv::KvCache::supportsIndexMode, nb::arg("mode"))
+        .def("supports_index_mode",
+            static_cast<bool (kv::KvCache::*)(kv::PageIndexMode) const>(&kv::KvCache::supportsIndexMode),
+            nb::arg("mode"))
+        .def(
+            "supports_index_mode",
+            [](kv::KvCache const& self, kv::PageIndexMode mode, int layerGroupId)
+            { return self.supportsIndexMode(mode, kv::LayerGroupId{layerGroupId}); },
+            nb::arg("mode"), nb::arg("layer_group_id"),
+            "Per life cycle, which is where the scratch slots live. The one-argument form "
+            "collapses them, so one life cycle's scratch makes it answer False for every other.")
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
@@ -2453,9 +2462,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("row_stride", &kv::ExternalPageTable::rowStride);
 
     nb::class_<kv::Batch>(m, "Batch")
-        .def(nb::init<kv::KvCacheManager&, int, int, std::optional<kv::ExternalPageTable>>(), nb::arg("manager"),
-            nb::arg("max_batch_size") = 0, nb::arg("max_blocks_per_seq") = 0, nb::arg("page_table") = nb::none(),
-            nb::keep_alive<1, 2>(),
+        .def(nb::init<kv::KvCacheManager&, int, int, std::optional<kv::ExternalPageTable>,
+                 std::optional<kv::PageIndexMode>>(),
+            nb::arg("manager"), nb::arg("max_batch_size") = 0, nb::arg("max_blocks_per_seq") = 0,
+            nb::arg("page_table") = nb::none(), nb::arg("mode") = nb::none(), nb::keep_alive<1, 2>(),
             "The KV caches stepped together, and their device-side page tables.\n\n"
             "max_batch_size and max_blocks_per_seq bound device arrays whose shape must not change "
             "between steps, so neither can be grown later. Zero derives them from the manager's "
@@ -2472,6 +2482,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "whatever slot the lender gave the request.")
         .def("remove_kv_cache", &kv::Batch::removeKvCache, nb::arg("kv_cache"),
             "Free the cache's row, leaving a hole for reuse.")
+        .def(
+            "index_mode",
+            [](kv::Batch const& self, int layerGroupId) { return self.indexMode(kv::LayerGroupId{layerGroupId}); },
+            nb::arg("layer_group_id"),
+            "Page index mode of one life cycle, as chosen at construction.\n\n"
+            "Unset at construction, each life cycle takes the smaller table: SHARED where the "
+            "manager reports it always available, PER_LAYER otherwise.")
         .def(
             "resize",
             [](kv::Batch& self, std::vector<std::optional<int>> const& capacities,
@@ -2942,14 +2959,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KvCacheManager::isSwaScratchReuseEnabled)
         .def(
             "supports_index_mode",
-            [](kv::KvCacheManager const& self, kv::PageIndexMode mode) -> nb::object
+            [](kv::KvCacheManager const& self, kv::PageIndexMode mode, std::optional<int> layerGroupId) -> nb::object
             {
-                auto result = self.supportsIndexMode(mode);
+                auto result = layerGroupId.has_value() ? self.supportsIndexMode(mode, kv::LayerGroupId{*layerGroupId})
+                                                       : self.supportsIndexMode(mode);
                 if (!result.has_value())
                     return nb::none();
                 return nb::cast(*result);
             },
-            nb::arg("mode"))
+            nb::arg("mode"), nb::arg("layer_group_id") = nb::none(),
+            "None means it depends on the request. Given a layer group, the answer is definitive "
+            "for every life cycle that cannot hold scratch slots, which the collapsing form cannot "
+            "express.")
         .def_prop_ro("commit_min_snapshot", &kv::KvCacheManager::commitMinSnapshot)
         .def_prop_ro("num_layers", &kv::KvCacheManager::numLayers)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)

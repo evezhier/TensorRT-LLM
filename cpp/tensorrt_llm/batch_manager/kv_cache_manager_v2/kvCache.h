@@ -493,6 +493,11 @@ public:
     // Whether the given page index mode is supported (SHARED requires no scratch slots).
     bool supportsIndexMode(PageIndexMode mode) const;
 
+    // The same question for one life cycle, which is where the scratch slots actually live.
+    // The overload above collapses them, so one life cycle's scratch makes it answer false
+    // for every other.
+    bool supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const;
+
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
 
     int updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value);

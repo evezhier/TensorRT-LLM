@@ -134,8 +134,18 @@ public:
     //! rows must be addressable for every (layer group, row) this Batch can reach, and the
     //! rows become the lender's -- so addKvCache needs to be told which one a member
     //! occupies rather than choosing. The device table is the Batch's either way.
+    //!
+    //! @param mode page index mode, applied to every life cycle. Left unset, each life
+    //! cycle takes the smaller table -- SHARED where the manager says it is always
+    //! available, PER_LAYER otherwise.
+    //!
+    //! The mode is fixed here because a converted table's shape is baked into a captured
+    //! graph. It cannot follow a member's scratch state, which varies per step.
     explicit Batch(KvCacheManager& manager, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
-        std::optional<ExternalPageTable> pageTable = std::nullopt);
+        std::optional<ExternalPageTable> pageTable = std::nullopt, std::optional<PageIndexMode> mode = std::nullopt);
+
+    //! Page index mode of one life cycle, as chosen at construction.
+    [[nodiscard]] PageIndexMode indexMode(LayerGroupId layerGroupId) const;
     ~Batch();
 
     Batch(Batch const&) = delete;
@@ -308,6 +318,11 @@ private:
     LifeCycleId mNumLayerGroups{0};
 
     std::vector<KvCache*> mRows;
+
+    //! Per life cycle, fixed at construction. Only scratch-slot substitution can make one
+    //! layer's indices differ from another's in the same life cycle, so a life cycle that
+    //! cannot hold scratch takes SHARED and the single smaller table that implies.
+    TypedVec<LifeCycleId, PageIndexMode> mIndexModes;
 
     //! Set when the page-index table is borrowed, in which case mStaging and mDevice hold
     //! only the watermarks and cache views.

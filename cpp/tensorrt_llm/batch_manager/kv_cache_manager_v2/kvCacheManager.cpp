@@ -849,6 +849,27 @@ std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode) const
     return std::nullopt;
 }
 
+std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const
+{
+    switch (mode)
+    {
+    case PageIndexMode::PER_LAYER: return true;
+    case PageIndexMode::SHARED:
+    {
+        if (!mConfig.enableSwaScratchReuse())
+        {
+            return true;
+        }
+        // A life cycle with no sliding window yields an empty scratch range whatever the
+        // watermarks, so no request can ever hold scratch slots for it.
+        auto const* attn = std::get_if<AttnLifeCycle>(&lifeCycles().getLifeCycle(lcId));
+        bool const mayHoldScratch = attn != nullptr && attn->windowSize.has_value();
+        return mayHoldScratch ? std::optional<bool>(std::nullopt) : true;
+    }
+    }
+    return std::nullopt;
+}
+
 // ---- getAggregatedPages ---------------------------------------------------
 
 std::vector<AggregatedPageDesc> KvCacheManager::getAggregatedPages(std::vector<BufferId> const& buffers) const

@@ -1508,6 +1508,104 @@ class TestSparseFetch(unittest.TestCase):
                 )
 
 
+class TestIndexMode(unittest.TestCase):
+    """Which page index mode a life cycle gets, and why it is a per-life-cycle question.
+
+    Only scratch-slot substitution can make one layer's converted indices differ from
+    another's in the same life cycle. A life cycle with no sliding window yields an empty
+    scratch range whatever the watermarks, so no request can hold scratch slots there and
+    SHARED is always available -- even with scratch reuse enabled for the manager.
+    """
+
+    #: Layer 0 slides and so may hold scratch; layer 1 does not and so never can.
+    WINDOWED_LAYER = 0
+    PLAIN_LAYER = 1
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @staticmethod
+    def _manager(*, scratch_reuse: bool) -> KVCacheManager:
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(0),
+                        buffers=[BufferConfig(role=Role.KEY, size=1024)],
+                        sliding_window_size=32,
+                        num_sink_tokens=0,
+                    ),
+                    AttentionLayerConfig(
+                        layer_id=LayerId(1),
+                        buffers=[BufferConfig(role=Role.KEY, size=1024)],
+                        sliding_window_size=None,
+                    ),
+                ],
+                constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=32, history_length=0)])],
+                swa_scratch_reuse=(SwaScratchReuseConfig() if scratch_reuse else None),
+            )
+        )
+
+    def test_a_life_cycle_without_a_window_keeps_shared_under_scratch_reuse(self):
+        """The collapsing query cannot say this: it answers for the manager, not a group."""
+        manager = self._manager(scratch_reuse=True)
+        try:
+            windowed = manager.get_layer_group_id(self.WINDOWED_LAYER)
+            plain = manager.get_layer_group_id(self.PLAIN_LAYER)
+            self.assertNotEqual(windowed, plain)
+
+            # Collapsed: scratch reuse is on, so the answer is "it depends".
+            self.assertIsNone(manager.supports_index_mode(PageIndexMode.SHARED))
+            # Per life cycle: only the sliding one is in doubt.
+            self.assertIsNone(manager.supports_index_mode(PageIndexMode.SHARED, windowed))
+            self.assertTrue(manager.supports_index_mode(PageIndexMode.SHARED, plain))
+            # PER_LAYER never depends on anything.
+            self.assertTrue(manager.supports_index_mode(PageIndexMode.PER_LAYER, windowed))
+        finally:
+            manager.shutdown()
+
+    def test_without_scratch_reuse_every_life_cycle_is_shared(self):
+        manager = self._manager(scratch_reuse=False)
+        try:
+            for layer in (self.WINDOWED_LAYER, self.PLAIN_LAYER):
+                lg = manager.get_layer_group_id(layer)
+                self.assertTrue(manager.supports_index_mode(PageIndexMode.SHARED, lg))
+        finally:
+            manager.shutdown()
+
+    def test_a_batch_takes_the_smaller_table_wherever_it_can(self):
+        """Per life cycle, not per batch: the sliding group alone pays for PER_LAYER."""
+        manager = self._manager(scratch_reuse=True)
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            self.assertEqual(
+                batch.index_mode(manager.get_layer_group_id(self.WINDOWED_LAYER)),
+                PageIndexMode.PER_LAYER,
+            )
+            self.assertEqual(
+                batch.index_mode(manager.get_layer_group_id(self.PLAIN_LAYER)),
+                PageIndexMode.SHARED,
+            )
+        finally:
+            manager.shutdown()
+
+    def test_an_explicit_mode_overrides_every_life_cycle(self):
+        manager = self._manager(scratch_reuse=False)
+        try:
+            batch = Batch(
+                manager, max_batch_size=1, max_blocks_per_seq=4, mode=PageIndexMode.PER_LAYER
+            )
+            for layer in (self.WINDOWED_LAYER, self.PLAIN_LAYER):
+                lg = manager.get_layer_group_id(layer)
+                # SHARED was available and still not taken.
+                self.assertTrue(manager.supports_index_mode(PageIndexMode.SHARED, lg))
+                self.assertEqual(batch.index_mode(lg), PageIndexMode.PER_LAYER)
+        finally:
+            manager.shutdown()
+
+
 class TestBorrowedPageTable(unittest.TestCase):
     """Batch(page_table=...): page indices written into storage someone else owns.
 
