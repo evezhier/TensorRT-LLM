@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import FrozenSet, List, Optional, Tuple
+from typing import FrozenSet, List, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -109,6 +109,8 @@ class PhysicalPool:
     ``slot_stride_bytes == slot_bytes`` and
     ``layer_stride_bytes == num_slots * slot_stride_bytes``. V2 Mamba supplies
     both explicitly for its slot-major, role-interleaved pools.
+    ``memory_type`` describes the backing allocation, including the host hot
+    tier for sparse buffers, independently of the logical layer layout.
     """
 
     base_address: int  # uint64
@@ -116,8 +118,11 @@ class PhysicalPool:
     num_slots: int
     slot_stride_bytes: Optional[int] = None
     layer_stride_bytes: Optional[int] = None
+    memory_type: Literal["VRAM", "DRAM"] = "VRAM"
 
     def __post_init__(self) -> None:
+        if self.memory_type not in ("VRAM", "DRAM"):
+            raise ValueError(f"Unsupported KV pool memory type: {self.memory_type!r}")
         if self.slot_stride_bytes is None:
             self.slot_stride_bytes = self.slot_bytes
         if self.layer_stride_bytes is None:
@@ -134,6 +139,7 @@ class PhysicalPool:
             "num_slots": int(self.num_slots),
             "slot_stride_bytes": int(self.slot_stride_bytes),
             "layer_stride_bytes": int(self.layer_stride_bytes),
+            "memory_type": self.memory_type,
         }
 
     @staticmethod
@@ -152,6 +158,7 @@ class PhysicalPool:
                 if data.get("layer_stride_bytes") is not None
                 else None
             ),
+            memory_type=data.get("memory_type", "VRAM"),
         )
 
 
@@ -387,6 +394,11 @@ class KVCachePageTable:
     tokens_per_block: int
     layer_groups: List[LayerGroup]
     pool_groups: List[PhysicalPoolGroup]  # indexed by LayerGroup.pool_group_idx
+
+    @property
+    def has_host_pools(self) -> bool:
+        """Whether any transferable allocation is backed by host memory."""
+        return any(pool.memory_type == "DRAM" for group in self.pool_groups for pool in group.pools)
 
     def to_dict(self) -> dict:
         return {

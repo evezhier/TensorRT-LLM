@@ -1247,13 +1247,16 @@ class ModelConfig(Generic[TConfig]):
                             compress_ratios = list(compress_ratios) + [1] * (
                                 total_layers - len(compress_ratios))
 
-                    indexer_k_dtype = indexer_config.pop('indexer_k_dtype')
+                    resolved_sparse_config = (
+                        sparse_attention_config.model_dump()
+                        if sparse_attention_config is not None else {})
+                    resolved_sparse_config.update(
+                        compress_ratios=compress_ratios,
+                        window_size=window_size,
+                        **indexer_config)
                     kwargs[
                         'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
-                            compress_ratios=compress_ratios,
-                            window_size=window_size,
-                            indexer_k_dtype=indexer_k_dtype,
-                            **indexer_config)
+                            **resolved_sparse_config)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

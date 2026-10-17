@@ -390,18 +390,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self._sparse_batch_prepared = False
         sparse_kv_offload_config = sparse_attn_config.get_kv_cache_offload_config()
         if sparse_kv_offload_config is not None:
-            # Report configuration errors before refusing to run.
             self._check_sparse_kv_offload_config(
                 sparse_kv_offload_config,
                 kv_cache_config,
                 mapping,
                 spec_config=kwargs.get("spec_config"),
-            )
-            # Inference requires compressor/attention arena addressing and a
-            # prefill-to-decode handoff in addition to the decode fetch adapter.
-            raise NotImplementedError(
-                "DeepSeek-V4 KV cache offload requires the KVCM v2 sparse runtime "
-                "and validated arena read/write addressing, prefill handoff, and transfer ordering."
             )
 
         # DeepSeek-V4 specific attributes initialization

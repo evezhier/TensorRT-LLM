@@ -232,16 +232,12 @@ def test_sparse_offload_descriptors_use_runtime_ids(tokens_per_block):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "invalid",
-    # "mixed" is gone: a dense buffer beside a sparse one in the same layer is the
-    # supported shape, since only the sparse ones are fetched through the cache.
-    ["expansion", "ordinary_group", "not_sparse", "unconfigured", "width", "footer"],
+    ["expansion", "not_sparse", "unconfigured", "width", "footer"],
 )
 def test_sparse_offload_rejects_incompatible_layout(invalid):
     manager = _manager()
     if invalid == "expansion":
         manager.impl.expansions[41] = 1
-    elif invalid == "ordinary_group":
-        manager.impl.groups[42] = 13
     elif invalid == "not_sparse":
         manager.impl.sparse.remove(41)
     elif invalid == "footer":
@@ -249,7 +245,9 @@ def test_sparse_offload_rejects_incompatible_layout(invalid):
     else:
         config = manager.impl.layers[41]
         if invalid == "unconfigured":
-            config.sparse_cache = None
+            manager.impl.layers[41] = AttentionLayerConfig(
+                layer_id=config.layer_id, buffers=config.buffers
+            )
         elif invalid == "width":
             cache = config.sparse_cache
             cache.num_selected_blocks += 1
@@ -270,6 +268,22 @@ def test_sparse_offload_accepts_a_dense_buffer_in_a_sparse_layer():
     assert descriptors
     roles = {b.role for d in descriptors.values() for b in d.buffer_ids}
     assert "ordinary" not in roles
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_accepts_a_dense_layer_in_a_sparse_group():
+    manager = _manager()
+    manager.impl.groups[42] = 13
+    role = DeepseekV4AttentionType.INDEXER_COMPRESS.role
+    manager.impl.layers[42] = AttentionLayerConfig(
+        layer_id=42, buffers=[BufferConfig(role=role, size=1024)]
+    )
+    manager.impl.pool_indices[BufferId(42, role)] = 1
+
+    descriptors = manager.get_sparse_offload_descriptors()
+
+    assert set(descriptors) == {2, 4}
+    assert all(buffer.layer_id != 42 for d in descriptors.values() for buffer in d.buffer_ids)
 
 
 @pytest.mark.cpu_only
@@ -553,7 +567,9 @@ def test_sparse_warmup_cleanup_covers_arenas_and_leaves_host_history(
     manager.impl.get_mem_pool_base_address = Mock(
         side_effect=lambda layer, role, mode: storage[layer, role].data_ptr()
     )
-    manager.impl.get_page_index_upper_bound = Mock(return_value=host_rows)
+    manager.impl.get_page_index_upper_bound = Mock(
+        return_value=host_rows // manager.compressed_block_sizes[2]
+    )
     by_address = {buffer.data_ptr(): buffer for buffer in storage.values()}
     convert = deepseek_v4_cache.convert_to_torch_tensor
 
@@ -1467,28 +1483,49 @@ def test_sparse_offload_cache_config_requires_positive_topk(index_topk: int | No
         manager._build_cache_config(config)
 
 
-@pytest.mark.cpu_only
-def test_sparse_offload_rejects_inference_before_cache_allocation() -> None:
-    sparse_config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
-    with (
-        patch.object(deepseek_v4_cache, "get_sm_version") as get_sm_version,
-        patch.object(deepseek_v4_cache.KVCacheManagerV2, "__init__") as initialize_cache,
-        pytest.raises(NotImplementedError, match="KVCM v2 sparse runtime"),
-    ):
-        DeepseekV4CacheManager(
-            kv_cache_config=KvCacheConfig(enable_block_reuse=False, host_cache_size=1 << 20),
-            kv_cache_type=CacheTypeCpp.SELFKONLY,
-            num_layers=len(sparse_config.compress_ratios),
-            max_batch_size=1,
-            tokens_per_block=128,
-            max_seq_len=256,
-            vocab_size=128,
-            mapping=Mapping(),
-            sparse_attn_config=sparse_config,
-        )
-
-    get_sm_version.assert_not_called()
-    initialize_cache.assert_not_called()
+@skip_pre_blackwell
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+@pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
+def test_sparse_offload_initializes_host_history_and_gpu_arena(
+    tokens_per_block: int, dtype: DataType
+) -> None:
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        enable_kv_cache_offload=True,
+        compress_ratios=[4, 128],
+        index_topk=8,
+        kv_cache_offload_config={"host_history_size": 64 << 20},
+    )
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=1024, host_cache_size=0),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=len(sparse_config.compress_ratios),
+        head_dim=512,
+        max_batch_size=1,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=512,
+        max_num_tokens=512,
+        vocab_size=128,
+        mapping=Mapping(),
+        dtype=dtype,
+        sparse_attn_config=sparse_config,
+    )
+    try:
+        assert manager.get_host_backed_pool_groups()
+        page_table = build_page_table_from_manager(manager)
+        assert {pool.memory_type for group in page_table.pool_groups for pool in group.pools} == {
+            "DRAM",
+            "VRAM",
+        }
+        assert set(manager.get_sparse_offload_descriptors()) == {0}
+        assert set(manager._sparse_arena_buffers) == {0}
+        data, scales = manager._sparse_arena_buffers[0]
+        assert data.is_cuda
+        if dtype == DataType.NVFP4:
+            assert scales is not None and scales.is_cuda
+        else:
+            assert scales is None
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.parametrize(("avg_seq_len", "expected"), [(None, 1024), (256, 256)])
@@ -1572,6 +1609,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
             compress_ratios=[1, 4, 1, 128],
             indexer_k_dtype="fp8",
             window_size=128,
+            enable_kv_cache_offload=False,
         )
         pretrained_config = SimpleNamespace(
             kv_lora_rank=512,
@@ -1596,6 +1634,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
 
 def test_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(DeepseekV4CacheManager)
+    manager._enable_kv_cache_offload = False
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
     manager.dtype = DataType.BF16
@@ -1632,6 +1671,7 @@ def test_quota_from_max_tokens_models_context_swa_scratch():
 
 def test_needed_resource_uses_context_swa_scratch_slope():
     manager = object.__new__(DeepseekV4CacheManager)
+    manager._enable_kv_cache_offload = False
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
     manager.dtype = DataType.BF16
