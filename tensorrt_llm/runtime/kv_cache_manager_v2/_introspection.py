@@ -269,6 +269,17 @@ def batch_watermarks(batch: Any) -> tuple[list[int], list[int]]:
     return list(history), list(capacity)
 
 
+def batch_previous_watermarks(batch: Any) -> tuple[list[int], list[int]]:
+    """The same pair as of the publish before this one.
+
+    A write-back needs both ends of a watermark move: the units to write are those between
+    the two history watermarks, and only a unit below the previous capacity was in flight
+    and so has a cell holding its one copy. Synchronises.
+    """
+    history, capacity = _cpp().batch_previous_watermarks(batch)
+    return list(history), list(capacity)
+
+
 class SparseResolveResult(NamedTuple):
     """State and outputs of one sparse resolve launch."""
 

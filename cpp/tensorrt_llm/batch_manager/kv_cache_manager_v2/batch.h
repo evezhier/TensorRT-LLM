@@ -119,10 +119,17 @@ struct SparseFetchScratch
 //! are per-layer-group constants a kernel already has.
 //!
 //! A free row reads zero, so it describes a request with nothing eligible.
+//!
+//! The previous pair is what the same row carried at the publish before this one. A
+//! write-back needs both ends: the units it must move are those between the two history
+//! watermarks, and only a unit that was already in flight -- below the previous capacity --
+//! has a cell holding its one copy.
 struct WatermarkView
 {
     CUdeviceptr historyLength = 0;
     CUdeviceptr capacity = 0;
+    CUdeviceptr previousHistoryLength = 0;
+    CUdeviceptr previousCapacity = 0;
     int32_t numRows = 0;
 };
 
@@ -341,7 +348,14 @@ private:
     //! Element offset of the watermark regions within the staged block.
     [[nodiscard]] size_t _historyOffset() const noexcept;
     [[nodiscard]] size_t _capacityOffset() const noexcept;
+    [[nodiscard]] size_t _prevHistoryOffset() const noexcept;
+    [[nodiscard]] size_t _prevCapacityOffset() const noexcept;
     [[nodiscard]] size_t _totalElements() const noexcept;
+
+    //! Seed a row's staged watermarks so its next publish reports no movement. A row holds
+    //! whatever its last occupant left, and a delta taken against that would name units the
+    //! new member never wrote.
+    void _seedRowWatermarks(int row, int historyLength, int capacity);
 
     //! Refresh the staged watermarks and cache views from the members. Cheap, and it keeps
     //! KvCache ignorant of the staging: only its page indices are written through

@@ -173,6 +173,16 @@ std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batc
     return {std::move(history), std::move(capacity)};
 }
 
+std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batchPreviousWatermarks(Batch const& batch)
+{
+    auto const view = batch.watermarks();
+    std::vector<int32_t> history(static_cast<size_t>(view.numRows));
+    std::vector<int32_t> capacity(static_cast<size_t>(view.numRows));
+    cuCheck(cuMemcpyDtoH(history.data(), view.previousHistoryLength, sizeof(int32_t) * history.size()));
+    cuCheck(cuMemcpyDtoH(capacity.data(), view.previousCapacity, sizeof(int32_t) * capacity.size()));
+    return {std::move(history), std::move(capacity)};
+}
+
 std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};

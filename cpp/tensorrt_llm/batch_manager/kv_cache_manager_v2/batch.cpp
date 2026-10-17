@@ -610,9 +610,19 @@ size_t Batch::_capacityOffset() const noexcept
     return _historyOffset() + static_cast<size_t>(mMaxBatchSize);
 }
 
-size_t Batch::_totalElements() const noexcept
+size_t Batch::_prevHistoryOffset() const noexcept
 {
     return _capacityOffset() + static_cast<size_t>(mMaxBatchSize);
+}
+
+size_t Batch::_prevCapacityOffset() const noexcept
+{
+    return _prevHistoryOffset() + static_cast<size_t>(mMaxBatchSize);
+}
+
+size_t Batch::_totalElements() const noexcept
+{
+    return _prevCapacityOffset() + static_cast<size_t>(mMaxBatchSize);
 }
 
 size_t Batch::_viewsOffsetBytes() const noexcept
@@ -636,11 +646,18 @@ void Batch::_stageRowState()
     auto* base = reinterpret_cast<int32_t*>(bytes);
     auto* history = base + _historyOffset();
     auto* capacity = base + _capacityOffset();
+    auto* prevHistory = base + _prevHistoryOffset();
+    auto* prevCapacity = base + _prevCapacityOffset();
     auto* views = reinterpret_cast<SparseCacheView*>(bytes + _viewsOffsetBytes());
 
     for (size_t row = 0; row < mRows.size(); ++row)
     {
         auto const* kvCache = mRows[row];
+        // The staging holds the last published pair until it is overwritten just below, so
+        // carrying it across here is what makes the published block self-describing: a
+        // write-back reads both ends of the move from one transfer.
+        prevHistory[row] = history[row];
+        prevCapacity[row] = capacity[row];
         history[row] = kvCache == nullptr ? 0 : kvCache->historyLength();
         capacity[row] = kvCache == nullptr ? 0 : kvCache->capacity();
 
@@ -653,6 +670,16 @@ void Batch::_stageRowState()
                                                                             : kvCache->mSparseCache[lg].view();
         }
     }
+}
+
+void Batch::_seedRowWatermarks(int row, int historyLength, int capacity)
+{
+    auto* base = reinterpret_cast<int32_t*>(mStaging->address());
+    auto const index = static_cast<size_t>(row);
+    base[_historyOffset() + index] = historyLength;
+    base[_capacityOffset() + index] = capacity;
+    base[_prevHistoryOffset() + index] = historyLength;
+    base[_prevCapacityOffset() + index] = capacity;
 }
 
 int32_t* Batch::_stagingRow(LayerGroupId layerGroupId, int row) const
@@ -714,6 +741,8 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
         kvCache._bindBasePageIndexBuf(kDefaultBeamIndex, lg, _stagingRow(lg, row), mMaxBlocksPerSeq);
     }
 
+    _seedRowWatermarks(row, kvCache.historyLength(), kvCache.capacity());
+
     mRows[static_cast<size_t>(row)] = &kvCache;
     kvCache.mBatch = this;
     kvCache.mBatchRow = row;
@@ -735,6 +764,7 @@ void Batch::removeKvCache(KvCache& kvCache)
         auto* staged = _stagingRow(lg, row);
         std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
     }
+    _seedRowWatermarks(row, 0, 0);
     mRows[static_cast<size_t>(row)] = nullptr;
     kvCache.mBatch = nullptr;
     kvCache.mBatchRow = -1;
@@ -753,6 +783,7 @@ void Batch::_detach(KvCache& kvCache) noexcept
         auto* staged = _stagingRow(lg, row);
         std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
     }
+    _seedRowWatermarks(row, 0, 0);
     mRows[static_cast<size_t>(row)] = nullptr;
     kvCache.mBatch = nullptr;
     kvCache.mBatchRow = -1;
@@ -910,6 +941,8 @@ WatermarkView Batch::watermarks() const
     WatermarkView view;
     view.historyLength = base + sizeof(int32_t) * _historyOffset();
     view.capacity = base + sizeof(int32_t) * _capacityOffset();
+    view.previousHistoryLength = base + sizeof(int32_t) * _prevHistoryOffset();
+    view.previousCapacity = base + sizeof(int32_t) * _prevCapacityOffset();
     view.numRows = mMaxBatchSize;
     return view;
 }

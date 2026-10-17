@@ -2208,6 +2208,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("batch"));
     mIntrospection.def(
+        "batch_previous_watermarks",
+        [](kv::Batch const& batch)
+        {
+            auto r = kv::KvCacheIntrospection::batchPreviousWatermarks(batch);
+            return std::make_tuple(std::move(r.first), std::move(r.second));
+        },
+        nb::arg("batch"),
+        "The (history_length, capacity) pair each row carried at the publish before this one. A write-back "
+        "needs both ends of the move, and only a unit below the previous capacity has a cell holding it.");
+    mIntrospection.def(
         "sparse_resolve",
         [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
             int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,

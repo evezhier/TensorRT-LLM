@@ -3380,6 +3380,75 @@ class TestBatch(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_previous_watermarks_lag_the_current_pair_by_one_publish(self):
+        """A write-back reads both ends of a move, so both have to travel together."""
+        manager = self._manager()
+        cache = None
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                cache = manager.create_kv_cache()
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+
+                batch.resize([256], [128], handle)
+                self.assertEqual(_introspection.batch_watermarks(batch), ([128], [256]))
+                self.assertEqual(
+                    _introspection.batch_previous_watermarks(batch),
+                    ([0], [0]),
+                    "the first publish has nothing behind it",
+                )
+
+                batch.resize([384], [256], handle)
+                self.assertEqual(_introspection.batch_watermarks(batch), ([256], [384]))
+                self.assertEqual(
+                    _introspection.batch_previous_watermarks(batch),
+                    ([128], [256]),
+                    "the previous pair must be the one published before, not two steps back",
+                )
+
+                batch.resize([512], [384], handle)
+                self.assertEqual(_introspection.batch_previous_watermarks(batch), ([256], [384]))
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_a_joining_member_reports_no_watermark_movement(self):
+        """Its history was written before it had a row, so no cell here holds those units."""
+        manager = self._manager()
+        cache = None
+        batch = None
+        try:
+            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                cache = manager.create_kv_cache()
+                self.assertTrue(cache.resume(handle))
+                # Advanced while unbatched, which is what makes the row's own history stale.
+                self.assertTrue(cache.resize(256, 128))
+
+                batch.add_kv_cache(cache)
+                batch.publish(handle)
+                current = _introspection.batch_watermarks(batch)
+                self.assertEqual(current, ([128], [256]))
+                self.assertEqual(
+                    _introspection.batch_previous_watermarks(batch),
+                    current,
+                    "a delta taken against the row's old contents would name units this "
+                    "member never wrote",
+                )
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
     def test_batch_resize_needs_one_entry_per_row(self):
         manager = self._manager()
         try:

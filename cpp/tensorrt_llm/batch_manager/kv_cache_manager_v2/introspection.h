@@ -71,6 +71,9 @@ public:
     // Synchronises.
     static std::pair<std::vector<int32_t>, std::vector<int32_t>> batchWatermarks(Batch const& batch);
 
+    // White-box hook: the same pair as of the publish before this one.
+    static std::pair<std::vector<int32_t>, std::vector<int32_t>> batchPreviousWatermarks(Batch const& batch);
+
     // White-box hook: run the sparse resolve kernel over caller-supplied state, so the
     // probe index, victim choice and recency rebuild can be exercised without a request.
     // Synchronises. Inputs are [layer][entry] and [layer][selectionWidth] row-major.
