@@ -2569,9 +2569,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Resize every member, then publish once.\n\n"
             "The sanctioned way to advance a batched step: it waits on the previous publish "
             "before touching anyone, so the staging hazard is closed without the caller "
-            "remembering wait_published(). One result per row, in row order, False for a free "
+            "remembering wait_published(). One result per row, in row order, 0 for a free "
             "row; a member that fails rolls itself back, so a batch can partially fail and the "
-            "table published afterwards describes the post-rollback state.")
+            "table published afterwards describes the post-rollback state.\n\n"
+            "Rejects, before touching any member, a history length that falls or that outruns the "
+            "capacity its row already had - capacity this call grants makes room for tokens written "
+            "after it. A row whose growth fails still takes its history advance, which needs no "
+            "slots and lets the units below it be written back; its result is still 0, since the "
+            "row is not at the state that was asked for.")
         .def(
             "publish",
             [](kv::Batch& self)

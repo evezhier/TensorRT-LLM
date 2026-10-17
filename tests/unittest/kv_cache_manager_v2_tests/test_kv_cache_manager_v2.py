@@ -1359,10 +1359,13 @@ class TestSparseFetch(unittest.TestCase):
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(manager, handle, max_batch_size=rows, max_blocks_per_seq=blocks)
                 cache = manager.create_kv_cache()
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
                 # Two whole blocks of history, so ordinals 0 and 1 are eligible.
                 tokens = 2 * self.TOKENS_PER_BLOCK
+                # Seeded before joining: a Batch only accepts a history its row already had
+                # the capacity for, and this one is jumping straight past both.
+                self.assertTrue(cache.resize(tokens, tokens))
+                batch.add_kv_cache(cache)
                 # resize() publishes, so the batch is already current here.
                 self.assertEqual(batch.resize([tokens, None], [tokens, None]), [True, False])
                 yield torch, manager, batch, cache, handle
@@ -1756,9 +1759,12 @@ class TestIndexTables(unittest.TestCase):
                     index_tables=[request],
                 )
                 cache = manager.create_kv_cache()
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
                 tokens = 2 * 32
+                # Seeded before joining: the Batch only accepts a history its row already
+                # had the capacity for.
+                self.assertTrue(cache.resize(tokens, tokens))
+                batch.add_kv_cache(cache)
                 batch.resize([tokens], [tokens])
                 yield batch, cache
         finally:
@@ -2066,9 +2072,12 @@ class TestBorrowedPageTable(unittest.TestCase):
         """A resumed cache seated in `row`, with two whole blocks of history."""
         cache = manager.create_kv_cache()
         try:
-            batch.add_kv_cache(cache, row)
             self.assertTrue(cache.resume(handle))
             tokens = 2 * TestSparseFetch.TOKENS_PER_BLOCK
+            # Seeded before joining: the Batch only accepts a history its row already had
+            # the capacity for.
+            self.assertTrue(cache.resize(tokens, tokens))
+            batch.add_kv_cache(cache, row)
             sizes = [None] * self.ROWS
             sizes[row] = tokens
             batch.resize(list(sizes), list(sizes))
@@ -3339,11 +3348,14 @@ class TestBatch(unittest.TestCase):
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=8)
-                for _ in range(2):
+                # Seeded before joining: the Batch only accepts a history its row already
+                # had the capacity for, and these start at nothing.
+                for capacity, history in ((256, 128), (384, 256)):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
-                    batch.add_kv_cache(cache)
                     self.assertTrue(cache.resume(handle))
+                    self.assertTrue(cache.resize(capacity, history))
+                    batch.add_kv_cache(cache)
 
                 batch.resize([256, 384, None], [128, 256, None])
                 history, capacity = _introspection.batch_watermarks(batch)
@@ -3375,8 +3387,11 @@ class TestBatch(unittest.TestCase):
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=4)
                 cache = manager.create_kv_cache()
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
+                # Seeded before joining: the Batch only accepts a history its row already
+                # had the capacity for.
+                self.assertTrue(cache.resize(256, 128))
+                batch.add_kv_cache(cache)
                 batch.resize([256], [128])
                 self.assertEqual(_introspection.batch_watermarks(batch)[0], [128])
 
@@ -3400,15 +3415,18 @@ class TestBatch(unittest.TestCase):
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 cache = manager.create_kv_cache()
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
+                # Seeded before joining: the Batch only accepts a history its row already
+                # had the capacity for.
+                self.assertTrue(cache.resize(256, 128))
+                batch.add_kv_cache(cache)
 
                 batch.resize([256], [128])
                 self.assertEqual(_introspection.batch_watermarks(batch), ([128], [256]))
                 self.assertEqual(
                     _introspection.batch_previous_watermarks(batch),
-                    ([0], [0]),
-                    "the first publish has nothing behind it",
+                    ([128], [256]),
+                    "the row was seeded at join, so its first publish moved nothing",
                 )
 
                 batch.resize([384], [256])
@@ -3469,6 +3487,87 @@ class TestBatch(unittest.TestCase):
                 with self.assertRaisesRegex(Exception, "per row"):
                     batch.resize([128], [0])
         finally:
+            manager.shutdown()
+
+    def test_history_may_not_outrun_the_capacity_the_row_already_had(self):
+        """Capacity granted now makes room for tokens written later, not already written."""
+        manager = self._manager()
+        cache = None
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                cache = manager.create_kv_cache()
+                self.assertTrue(cache.resume(handle))
+                # Seeded before joining: the Batch only accepts a history its row already
+                # had the capacity for.
+                self.assertTrue(cache.resize(256, 128))
+                batch.add_kv_cache(cache)
+                batch.resize([256], [128])
+
+                # Capacity 256 now, so token 256 has no space yet and cannot be history,
+                # however much capacity this same call would add.
+                with self.assertRaisesRegex(Exception, "capacity the row already had"):
+                    batch.resize([512], [384])
+                # Refused before anything moved.
+                self.assertEqual(_introspection.batch_watermarks(batch), ([128], [256]))
+
+                with self.assertRaisesRegex(Exception, "cannot be decreased"):
+                    batch.resize([256], [64])
+                self.assertEqual(_introspection.batch_watermarks(batch), ([128], [256]))
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_a_row_whose_growth_fails_still_advances_its_history(self):
+        """The advance needs no slots, and is what frees the cells the growth wanted."""
+        tpb, page = 128, 4096
+        # The pool bottoms out at 512 blocks whatever the quota, so two rows of 256 fill
+        # it and a third-party grow to 512 has nowhere to come from. Measured, not derived
+        # from the quota: a small quota does not shrink the pool below that floor.
+        blocks, pool = 256, 512
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=tpb,
+                cache_tiers=[GpuCacheTierConfig(pool * page)],
+                layers=[AttentionLayerConfig(0, [BufferConfig("key", page)])],
+            )
+        )
+        caches = []
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=pool)
+                for _ in range(2):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    batch.add_kv_cache(cache)
+                    self.assertTrue(cache.resume(handle))
+
+                each = blocks * tpb
+                self.assertEqual(list(batch.resize([each, each], [0, 0])), [1, 1])
+
+                # The two rows now hold the whole pool, so row 1's grow has nowhere to come
+                # from and rolls back. Row 0 only advances history, which never allocates.
+                results = list(batch.resize([each, pool * tpb], [each, each]))
+                self.assertEqual(results[0], 1)
+                self.assertEqual(
+                    results[1], 0, "the grow must actually fail or this proves nothing"
+                )
+
+                history, capacity = _introspection.batch_watermarks(batch)
+                self.assertEqual(history, [each, each], "both advanced; neither needed a slot")
+                self.assertEqual(capacity, [each, each], "row 1's growth rolled itself back")
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
             manager.shutdown()
 
     def test_wait_published_is_a_noop_when_nothing_is_in_flight(self):

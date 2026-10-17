@@ -26,6 +26,7 @@
 
 #include <cuda.h>
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -238,7 +239,15 @@ public:
     //!
     //! `capacities` and `historyLengths` are indexed by row, so both must be maxBatchSize
     //! long. A nullopt leaves that dimension alone, matching KvCache::resize.
-    std::vector<bool> resize(
+    //! Rejects, before touching any member, a history length that falls or that outruns the
+    //! capacity its row already had: capacity granted by this call makes room for tokens
+    //! written after it, so history can only cover tokens whose space was already there.
+    //!
+    //! A row whose growth fails still takes its history advance, which is legal by that same
+    //! check and needs no slots -- both the stale range and the scratch range are monotone
+    //! in history, so raising it only releases. Its result is still 0: the row is not at the
+    //! state that was asked for.
+    std::vector<uint8_t> resize(
         std::vector<std::optional<int>> const& capacities, std::vector<std::optional<int>> const& historyLengths);
 
     //! Copy the staged rows to the device, enqueuing on the Batch's stream.

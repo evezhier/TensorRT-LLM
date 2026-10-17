@@ -796,17 +796,41 @@ void Batch::_detach(KvCache& kvCache) noexcept
     kvCache.mBatchRow = -1;
 }
 
-std::vector<bool> Batch::resize(
+std::vector<uint8_t> Batch::resize(
     std::vector<std::optional<int>> const& capacities, std::vector<std::optional<int>> const& historyLengths)
 {
     if (capacities.size() != mRows.size() || historyLengths.size() != mRows.size())
     {
         throw std::invalid_argument("Batch::resize: one capacity and history length per row");
     }
+
+    // Every row is checked before any is touched, so a bad request leaves the batch as it
+    // was rather than part-way through.
+    for (size_t row = 0; row < mRows.size(); ++row)
+    {
+        auto const* kvCache = mRows[row];
+        if (kvCache == nullptr || !historyLengths[row].has_value())
+        {
+            continue;
+        }
+        int const newHist = *historyLengths[row];
+        if (newHist < kvCache->historyLength())
+        {
+            throw std::invalid_argument("Batch::resize: history length cannot be decreased");
+        }
+        // Against the capacity that already existed, not the one being asked for. Capacity
+        // this call grants makes room for tokens written after it, so history can only
+        // cover tokens whose space was there while they were being written.
+        if (newHist > kvCache->capacity())
+        {
+            throw std::invalid_argument("Batch::resize: history length cannot exceed the capacity the row already had");
+        }
+    }
+
     // Before the first member is touched, since each resize writes its staging row.
     waitPublished();
 
-    std::vector<bool> results(mRows.size(), false);
+    std::vector<uint8_t> results(mRows.size(), 0);
     for (size_t row = 0; row < mRows.size(); ++row)
     {
         auto* kvCache = mRows[row];
@@ -814,7 +838,20 @@ std::vector<bool> Batch::resize(
         {
             continue;
         }
-        results[row] = kvCache->resize(capacities[row], historyLengths[row]);
+        if (kvCache->resize(capacities[row], historyLengths[row]))
+        {
+            results[row] = 1;
+            continue;
+        }
+        // The growth failed and rolled itself back, but the history advance is still both
+        // legal -- it was checked against the capacity this row kept -- and free: the stale
+        // range and the scratch range are each monotone in history, so raising it can only
+        // release slots. Taking it anyway is what lets the units below it be written back
+        // and their cells released, which is the pressure that made the growth fail.
+        if (capacities[row].has_value() && historyLengths[row].has_value())
+        {
+            kvCache->resize(std::nullopt, historyLengths[row]);
+        }
     }
     // Once, after every member has settled: a partial failure leaves the rolled-back state,
     // which is what the table should describe.
