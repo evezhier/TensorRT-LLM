@@ -167,15 +167,34 @@ and two raw buffers stop existing -- Batch's raw mirror and the runtime's
 
 ## What this does to the sparse path
 
-`SparseUnitCopyArgs.hostBase` becomes a per-buffer base and `pageBufferOffset` goes away:
-the per-buffer offset that the copy carries today is exactly what the base now absorbs. The
-GPU-side cache stops needing to know that a page coalesces several buffers, which is not its
-concern -- it caches a buffer, not a page.
+The copy reaches a cold page as `hostBase + converted * pageStride`, where `pageStride` is
+one buffer and `hostBase` is the base of the index table the buffer was declared in. The
+per-buffer offset the copy used to add is folded into the converted value, so
+`pageBufferOffset` is gone from `SparseCacheView`, the arena's shared metadata and the cache
+shape. The pool's slot size plays no part: what a converted index counts is whole buffers.
+The GPU-side cache stops needing to know that a page coalesces several buffers, which was
+never its concern -- it caches a buffer, not a page.
 
-This touches the resolve, copy and index-scatter paths, which are the least covered part of
-the suite. The quantised case -- data plus block scales as two sparse pools -- should be
-exercised alongside it, since that is where coalescing does the most work and where a
-mistake is least likely to be caught by existing tests.
+A run of buffers is copied in one launch from one base, so each buffer reads its own entry
+of the table: `entry = buffer - bufferBase`, with `pageTableEntryStride` spanning the whole
+table's rows. That is the same `numEntries` dimension a `{K, V}` request already produced.
+
+Both producers of page indices read that one table, at different extents. The fetch passes
+it from row zero across the batch. The write-back passes it positioned at its own row,
+entries still striding by the whole table's rows -- it used to stage a private slice of raw
+slot ids instead, which was a second addressing mode for the same kernel.
+
+Two constraints follow and are checked when the Batch is built, because a run that cannot be
+addressed produces wrong page addresses at step time rather than an error:
+
+- every sparse buffer must be named by some request -- a fetch with no converted indices
+  would read the wrong pages rather than fail;
+- a `(layer, pool)` run must sit at consecutive entries of **one** request. Split across
+  two, a single launch would need two base pointers.
+
+That shape is not a choice -- it follows from the pool layout -- so
+`KvCacheManager::sparseIndexTableRequests()` hands it out. A Batch still has to be given it:
+the declaration stays explicit, and only the re-derivation is saved.
 
 ## Not in scope
 

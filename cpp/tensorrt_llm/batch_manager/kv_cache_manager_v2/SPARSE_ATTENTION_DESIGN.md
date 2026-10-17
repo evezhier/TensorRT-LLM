@@ -107,29 +107,70 @@ sparse buffer locks there, the table is **uniform**: every entry is a level-0 sl
 for a dense buffer. Nothing resolves against the cache arena, and no caller has to know
 which rule applies to which ordinal.
 
-A block's data reaches its host page by a **flush**: a copy on the owning `KvCache`'s
-stream that does **not** evict the GPU entry, which stays cached and merely stops being
-pinned.
+A block's data reaches its host page by a **flush**: a copy on the Batch's stream that does
+**not** evict the GPU entry, which stays cached and merely stops being pinned.
 
 The governing rule is that **a block must be flushed before it can be selected**. Selectable
-means below the watermark, so `resize()` is the deadline and must flush everything the
-watermark has just passed.
+means below the watermark, so the watermark move is the deadline: everything it passes must
+already be in its host page.
 
-`resize()` rather than `setHistoryLength()` because it is the single chokepoint: the
-latter is `resize(nullopt, hist)`, `setCapacity()` is `resize(cap, nullopt)`, and a caller
-may advance capacity and history together in one call. Hooking the wrapper would miss
-that. Flushing inside `resize()` also composes with its rollback: a flush is a copy, so a
-block flushed before a failed resize stays correctly flushed — early is always safe, and
-only late is not.
+### Who flushes
 
-`resize()` is also the *only* flush site. `commit()` needs none of its own: the manager
-maintains `num_committed_tokens <= history_length <= capacity`, so a committed block is
-already at or below the watermark and was flushed by the `resize()` that took the watermark
-past it. Where `commit()` would advance the watermark it does so by calling `resize()`,
-which flushes on the way through.
+`Batch::flushSparseUnits(newHistoryLengths)`, given the per-row history the caller is about
+to set. The Batch records it; `resize()` then *checks* against that record rather than
+flushing anything itself.
+
+The flush used to live inside `resize()`, on the grounds that it was the single chokepoint
+through which `setHistoryLength` and `setCapacity` both pass. That reasoning held, but it
+bought the chokepoint at the price of hiding an ordering requirement: the write-back reads
+converted page indices, which only a publish produces, so a flush buried in `resize()` was
+silently depending on when the last publish happened. Naming the flush makes that a stated
+precondition of a call the caller issues.
+
+It is also what lets the write-back be **batch-wide**. Per request, it was one scan and one
+copy launch per pool *per row*, plus two synchronous host-to-device copies to tell the
+kernel which units moved. Driven from the Batch it is one scan over `(layers, rows)` and one
+copy launch per pool for the whole step, with a single small upload of per-row ranges.
+
+The check `resize()` performs is `newHistory <= recorded`, not equality: a step may resize a
+row more than once, and a row whose growth failed rolls back to a history below the one that
+was flushed for it. Flushing early is always safe — a flush is a copy, and a block flushed
+before a failed resize stays correctly flushed. Only flushing late is not.
+
+`commit()` needs no flush site of its own: the manager maintains
+`num_committed_tokens <= history_length <= capacity`, so a committed block is already at or
+below the watermark and was flushed before the watermark passed it.
 
 `history_length` therefore keeps two jobs: it defines selection eligibility, and it is the
 flush deadline.
+
+### Ordering
+
+`flushSparseUnits` stages its per-row ranges on a helper stream and launches the write-back
+on the Batch's stream:
+
+```
+helper: waitEvent(flushRead)          // the previous step finished reading the ranges
+        cuMemcpyBatchAsync(ranges -> device, CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL)
+        staged = record(helper)
+main:   waitEvent(staged)
+        scan the flush lists, then one write-back copy per pool
+        flushRead = record(main)
+```
+
+The helper stream is not a device-side overlap optimisation — the array is two ints per row.
+It is there because `DURING_API_CALL` consumes the host array *before the call returns*, so
+issuing the copy on the Batch's stream would hold the host until the previous step's graph
+replay reached it. On a helper stream the source is captured at once and only the device
+write queues behind the wait, so the call returns promptly. The wait itself is a stream
+wait, not a host sync: the hazard is the previous step's kernel still reading the same
+destination, which is ordinary stream ordering. (Do not set
+`CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE` on that copy — it breaks `DURING_API_CALL`
+semantics; driver bug 6718200, see `batchedPageCopy.cu`.)
+
+The write-back reads the index table as of the **last publish**. That is current enough
+because the move is clamped to the capacity the step started from, so the blocks it touches
+were allocated by an earlier resize and published then.
 
 ### Unflushed entries carry no state
 
@@ -590,6 +631,13 @@ Only a unit below the old capacity can have been in the cache at all. Without th
 range is the whole prompt, which no reservation could cover, and the resize fails on a
 write-back that had nothing to do.
 
+That jump has to happen **before the request joins a Batch**. `Batch::resize` refuses a
+history beyond the capacity its row already had, because capacity granted by a call makes
+room for tokens written after it — so history can only cover tokens whose space was already
+there. A resumed request sets capacity and history together from nothing, which is the one
+shape that rule excludes. Seeding it on the way in costs nothing: nothing was in flight, so
+there is nothing to write back and no converted table is needed yet.
+
 ### Capacity and eviction
 
 Capacity is guaranteed by reservation, not back-pressure: a fetch can always satisfy its
@@ -605,6 +653,20 @@ hint — but it is derived, not stored: see *Unflushed entries carry no state*.
 
 Selections must name only pure-history units; `num_blocks` carries each request's eligible
 count.
+
+A step's order is the caller's too, and it is now explicit rather than implied:
+
+1. `flushSparseUnits(newHistory)` — writes back what the watermark is about to pass. It
+   reads the index table as of the last publish, which covers the blocks in range.
+2. `resize(...)` per row, or `Batch::resize` — refused if it would take history past what
+   was flushed.
+3. `publish()` — converts this step's indices for the fetch to read.
+4. the fetch, inside the captured graph.
+
+Steps 1 and 3 both read or write Batch-owned device state, so neither may be skipped on a
+step whose watermark moves. A history advance with no flush before it is refused; a flush
+with no publish behind it would write through indices for blocks that did not exist yet,
+which the clamp to the starting capacity is what prevents.
 
 Naming an ineligible one is no longer a memory-safety problem. The table is uniform, so the
 ordinal resolves to a real host page of the same request — but an unflushed block's host
@@ -657,6 +719,17 @@ Every device array here is indexed by batch row, and every call must agree on wh
 request occupies. `Batch` owns that: membership, row order, the page table, `num_blocks`,
 and the staging mirror. It is global, not per layer group, and carries one page table per
 layer group.
+
+It also owns three things the sparse path depends on:
+
+- **the stream.** Taken at construction; joining binds the member to it, and moving a member
+  off it is refused. A member's own work and the Batch's transfers have to be ordered
+  against each other, and a stream per call left two sources of truth for which one that is.
+  It is also what makes the write-back's ordering free rather than checked, since a member
+  records its events on the stream the flush is launched on.
+- **the converted index tables** (`INDEX_CONVERSION_DESIGN.md`), which both the fetch and
+  the write-back read.
+- **the write-back**, as `flushSparseUnits()` — see "Locking and flush".
 
 **Dirty rows — planned, not built.** `publish()` restages every row. The intended refinement
 is that a `_KVCache` knows its `Batch` and row (it does, for detach), any lock-changing
@@ -804,8 +877,10 @@ layout of its own:
 
 Every per-pool quantity is a launch scalar — `deviceBase`, `bufferBytes`, `cellsPerLease`,
 `layout` — so the kernels keep their shape. What they gained is `bufferSlotInPool`, a
-per-buffer map alongside `bufferLayer` and `pageBufferOffset`, replacing the assumption that
-a buffer's position among *all* the life cycle's buffers is also its position in its pool.
+per-buffer map alongside `bufferLayer`, replacing the assumption that a buffer's position
+among *all* the life cycle's buffers is also its position in its pool. A per-buffer offset
+within the cold page sat here too, until the converted index absorbed it; see
+`INDEX_CONVERSION_DESIGN.md`.
 
 Buffers sharing a pool must still share a selection unit layout. A pool fixes a cell's size
 but not how its units are strided within it, and the copy walks a run with one set of
