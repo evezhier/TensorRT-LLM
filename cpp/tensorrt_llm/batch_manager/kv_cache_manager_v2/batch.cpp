@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include <algorithm>
+#include <numeric>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -256,12 +257,12 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
 
         auto const& first = request.buffers.front();
         auto const lifeCycle = mManager->bufferAttr(first.layerId, first.role).lifeCycleId;
-        // A scratch slot substitutes a different page for one layer, so its entries stop
-        // being the affine function of the slot id that the conversion applies. Refusing
-        // beats converting a table nothing would notice was wrong.
-        TLLM_CHECK_WITH_INFO(mManager->supportsIndexMode(PageIndexMode::SHARED, lifeCycle).has_value(),
-            "Index conversion does not implement scratch-slot substitution yet, so a life cycle that can hold "
-            "scratch slots cannot have converted index tables");
+        // Substitution replaces one layer's page, so every layer of the life cycle can no
+        // longer read one table. SHARED is exactly the claim that they can.
+        bool const mayHoldScratch = !mManager->supportsIndexMode(PageIndexMode::SHARED, lifeCycle).has_value();
+        TLLM_CHECK_WITH_INFO(!mayHoldScratch || mIndexModes[lifeCycle] == PageIndexMode::PER_LAYER,
+            "A life cycle that can hold scratch slots needs PER_LAYER index tables; its layers stop sharing one "
+            "set of converted indices as soon as a scratch slot is substituted");
         auto const scale = mManager->getPageIndexScale(first.layerId, first.role);
         auto const mode = mIndexModes[lifeCycle];
 
@@ -277,6 +278,13 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
         for (auto const& buffer : request.buffers)
         {
             auto const& attr = mManager->bufferAttr(buffer.layerId, buffer.role);
+            // The reference converter emits `expansion` entries per block. Nothing in the
+            // tree sets tokensPerBlockOverride, and every attention backend refuses an
+            // expansion of anything but one, so this follows them rather than building a
+            // path no caller can reach.
+            TLLM_CHECK_WITH_INFO(attr.expansion == 1,
+                "Index conversion does not implement page index expansion, so a buffer with a tokens-per-block "
+                "override cannot have converted index tables");
             TLLM_CHECK_WITH_INFO(attr.lifeCycleId == lifeCycle,
                 "An index table request spans life cycles; their slot ids differ, so no one table can serve it");
             TLLM_CHECK_WITH_INFO(mManager->getPageIndexScale(buffer.layerId, buffer.role) == scale,
@@ -326,6 +334,56 @@ void Batch::_allocateIndexTables()
         return;
     }
 
+    // Scratch-capable life cycles sort last so that one launch covers the plain tables and
+    // one the substituting ones, rather than a kernel branching per table.
+    auto const mayHoldScratch = [this](IndexTable const& table)
+    { return !mManager->supportsIndexMode(PageIndexMode::SHARED, table.lifeCycle).has_value(); };
+
+    std::vector<size_t> order(mIndexTables.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::stable_partition(
+        order.begin(), order.end(), [&](size_t index) { return !mayHoldScratch(mIndexTables[index]); });
+
+    std::vector<IndexTable> sorted;
+    std::vector<int> remap(mIndexTables.size());
+    sorted.reserve(mIndexTables.size());
+    for (size_t position = 0; position < order.size(); ++position)
+    {
+        remap[order[position]] = static_cast<int>(position);
+        sorted.push_back(std::move(mIndexTables[order[position]]));
+    }
+    mIndexTables = std::move(sorted);
+    for (auto& [key, slot] : mBufferSlots)
+    {
+        slot.table = IndexTableId{remap[static_cast<size_t>(slot.table.value())]};
+    }
+    mNumPlainTables = static_cast<int>(std::count_if(
+        mIndexTables.begin(), mIndexTables.end(), [&](IndexTable const& table) { return !mayHoldScratch(table); }));
+
+    // Mirrors the runtime's bound: the most slots a request could need for one life cycle.
+    for (size_t index = static_cast<size_t>(mNumPlainTables); index < mIndexTables.size(); ++index)
+    {
+        auto const& table = mIndexTables[index];
+        auto const& first = table.served.front().buffers.front();
+        auto const pages = mManager->getPageIndexConverter(first.layerId, first.role).scratchPagesPerBlock;
+        auto const slots = (static_cast<int64_t>(mMaxBlocksPerSeq) * pages + table.scale - 1) / table.scale;
+        mMaxScratchSlots = std::max<int>(mMaxScratchSlots, static_cast<int>(std::max<int64_t>(1, slots)));
+    }
+
+    if (mMaxScratchSlots > 0)
+    {
+        auto const elements = _scratchElements();
+        mScratchStaging = std::make_unique<HostMem>(sizeof(int32_t) * elements);
+        auto* host = reinterpret_cast<int32_t*>(mScratchStaging->address());
+        // An empty range leaves every block on the plain path, which is what a member
+        // holding no scratch should look like.
+        std::fill(host, host + elements, 0);
+        CUdeviceptr scratch = 0;
+        cuCheck(cuMemAlloc(&scratch, sizeof(int32_t) * elements));
+        mScratchDevice = CudaUniqPtr{reinterpret_cast<std::byte*>(scratch)};
+        cuCheck(cuMemcpyHtoD(scratch, host, sizeof(int32_t) * elements));
+    }
+
     auto const rowBlocks = static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
     size_t elements = 0;
     for (auto& table : mIndexTables)
@@ -372,6 +430,21 @@ void Batch::_allocateIndexTables()
         desc.offsets = reinterpret_cast<int32_t const*>(offsetsBase + sizeof(int32_t) * offsetHost.size());
         desc.numEntries = static_cast<int32_t>(table.concatOffsets.size());
         desc.scale = table.scale;
+        if (static_cast<int>(descHost.size()) >= mNumPlainTables)
+        {
+            auto const row = static_cast<size_t>(mMaxBatchSize);
+            auto const lc = static_cast<size_t>(table.lifeCycle.value());
+            auto const begs = reinterpret_cast<CUdeviceptr>(mScratchDevice.get());
+            auto const groups = static_cast<size_t>(mNumLayerGroups.value());
+            desc.scratchBegs = reinterpret_cast<int32_t const*>(begs + sizeof(int32_t) * lc * row);
+            desc.scratchEnds = reinterpret_cast<int32_t const*>(begs + sizeof(int32_t) * (groups * row + lc * row));
+            desc.scratchSlots = reinterpret_cast<int32_t const*>(
+                begs + sizeof(int32_t) * (2 * groups * row + lc * row * static_cast<size_t>(mMaxScratchSlots)));
+            desc.scratchSlotStride = mMaxScratchSlots;
+            auto const& firstBuffer = table.served.front().buffers.front();
+            desc.scratchPagesPerBlock
+                = mManager->getPageIndexConverter(firstBuffer.layerId, firstBuffer.role).scratchPagesPerBlock;
+        }
         descHost.push_back(desc);
         offsetHost.insert(offsetHost.end(), table.concatOffsets.begin(), table.concatOffsets.end());
     }
@@ -386,8 +459,11 @@ void Batch::_convertIndices(CUstream stream)
     {
         return;
     }
-    launchIndexConversion(reinterpret_cast<IndexTableDesc const*>(mIndexTableDescs.get()),
-        static_cast<int32_t>(mIndexTables.size()), mMaxTableEntries, mMaxBatchSize, mMaxBlocksPerSeq,
+    auto const* const descs = reinterpret_cast<IndexTableDesc const*>(mIndexTableDescs.get());
+    launchIndexConversion(descs, mNumPlainTables, mMaxTableEntries, mMaxBatchSize, mMaxBlocksPerSeq,
+        static_cast<int32_t>(mMaxBlocksPerSeq), stream);
+    launchIndexConversionWithScratch(descs + mNumPlainTables,
+        static_cast<int32_t>(mIndexTables.size()) - mNumPlainTables, mMaxTableEntries, mMaxBatchSize, mMaxBlocksPerSeq,
         static_cast<int32_t>(mMaxBlocksPerSeq), stream);
 }
 
@@ -399,6 +475,52 @@ CUdeviceptr Batch::indexTableAddress(IndexTableId tableId) const
     }
     return reinterpret_cast<CUdeviceptr>(mIndexTableMemory.get())
         + sizeof(int32_t) * mIndexTables[static_cast<size_t>(tableId.value())].elementOffset;
+}
+
+size_t Batch::_scratchElements() const noexcept
+{
+    auto const rows = static_cast<size_t>(mMaxBatchSize);
+    auto const groups = static_cast<size_t>(mNumLayerGroups.value());
+    // [begs][ends][slots], each indexed by life cycle then row.
+    return 2 * groups * rows + groups * rows * static_cast<size_t>(mMaxScratchSlots);
+}
+
+void Batch::_stageScratch()
+{
+    if (!mScratchStaging)
+    {
+        return;
+    }
+    auto const rows = static_cast<size_t>(mMaxBatchSize);
+    auto const groups = static_cast<size_t>(mNumLayerGroups.value());
+    auto* const begs = reinterpret_cast<int32_t*>(mScratchStaging->address());
+    auto* const ends = begs + groups * rows;
+    auto* const slots = ends + groups * rows;
+
+    for (size_t row = 0; row < mRows.size(); ++row)
+    {
+        auto const* kvCache = mRows[row];
+        for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+        {
+            auto const flat = static_cast<size_t>(lcId.value()) * rows + row;
+            auto* const rowSlots = slots + flat * static_cast<size_t>(mMaxScratchSlots);
+
+            // A free row, a suspended member, or one holding no scratch here all leave an
+            // empty range, which the kernel reads as "every block takes the plain path".
+            auto const desc = kvCache != nullptr && kvCache->isActive() ? kvCache->getScratchDesc(lcId) : std::nullopt;
+            if (!desc.has_value())
+            {
+                begs[flat] = 0;
+                ends[flat] = 0;
+                continue;
+            }
+            begs[flat] = desc->range.beg.value();
+            ends[flat] = desc->range.end.value();
+            TLLM_CHECK_WITH_INFO(desc->slotIds.size() <= static_cast<size_t>(mMaxScratchSlots),
+                "A request holds more scratch slots than the batch was sized for");
+            std::copy(desc->slotIds.begin(), desc->slotIds.end(), rowSlots);
+        }
+    }
 }
 
 IndexTableId Batch::numIndexTables() const noexcept
@@ -695,6 +817,7 @@ void Batch::publish(CUstream stream)
     // The members write their own page indices, but not their watermarks; collect those
     // now so the single transfer below carries a matched pair.
     _stageRowState();
+    _stageScratch();
 
     auto const staging = reinterpret_cast<CUdeviceptr>(mDeviceStaging.get());
     auto* const upload = mUploadStream.handle();
@@ -731,6 +854,11 @@ void Batch::publish(CUstream stream)
     }
     cuCheck(cuMemcpyHtoDAsync(
         staging + _deviceBias(), reinterpret_cast<void*>(mStaging->address()), _totalBytes(), upload));
+    if (mScratchStaging)
+    {
+        cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mScratchDevice.get()),
+            reinterpret_cast<void*>(mScratchStaging->address()), sizeof(int32_t) * _scratchElements(), upload));
+    }
     mPublished = mUploadStream.recordEvent();
 
     // The staging now holds this step's tables, so carrying them across is all that is

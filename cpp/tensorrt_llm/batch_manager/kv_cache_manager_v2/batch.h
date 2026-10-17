@@ -399,6 +399,24 @@ private:
     //! Allocate the tables and the device-side descriptors the conversion reads.
     void _allocateIndexTables();
 
+    //! Collect each member's scratch slots for the life cycles that can hold them.
+    //! Kept out of the staged block because that block's offsets are shared with the
+    //! watermarks, the views and the borrowed-table bias; a separate buffer leaves all of
+    //! those alone for one small extra transfer on the upload stream.
+    void _stageScratch();
+
+    //! Elements of the scratch staging: [begs][ends][slots].
+    [[nodiscard]] size_t _scratchElements() const noexcept;
+
+    //! Host and device sides of the scratch metadata, laid out [begs][ends][slots].
+    //! Empty when no table's life cycle can hold scratch.
+    std::unique_ptr<HostMem> mScratchStaging;
+    CudaUniqPtr mScratchDevice;
+    //! Slot ids a request may hold for one life cycle, which bounds the staging.
+    int mMaxScratchSlots = 0;
+    //! Tables whose life cycle can hold scratch sort last, so one launch covers each kind.
+    int mNumPlainTables = 0;
+
     //! Convert this step's raw slot ids into every table, on `stream`.
     void _convertIndices(CUstream stream);
 

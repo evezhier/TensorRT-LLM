@@ -40,6 +40,18 @@ struct IndexTableDesc
     int32_t numEntries = 0;
     //! Slot id to page index, i.e. how many buffers the pool coalesces.
     int32_t scale = 1;
+
+    //! Scratch metadata for this table's life cycle, null when it cannot hold scratch.
+    //!
+    //! A scratch block's slot does not come from the page table at all: it comes from the
+    //! request's own scratch slots, indexed by how far into the scratch range the block
+    //! sits. Null `scratchBegs` means the plain path applies to every block.
+    int32_t const* scratchBegs = nullptr;  //!< [numRows]
+    int32_t const* scratchEnds = nullptr;  //!< [numRows]
+    int32_t const* scratchSlots = nullptr; //!< [numRows][scratchSlotStride]
+    int32_t scratchSlotStride = 0;
+    //! Sub-pages a scratch block occupies, which is what advances the slot cursor.
+    int32_t scratchPagesPerBlock = 1;
 };
 
 //! Convert raw slot ids into kernel page indices for every table at once.
@@ -58,5 +70,16 @@ struct IndexTableDesc
 //! @param rawRowStride  elements between consecutive rows of a raw table
 void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32_t maxEntries, int32_t numRows,
     int32_t blocksPerRow, int32_t rawRowStride, CUstream stream);
+
+//! The same, for tables whose life cycle substitutes scratch slots.
+//!
+//! Separate rather than a branch in the kernel above: a scratch block takes its slot from
+//! the request instead of the page table, and wraps the layer's offset within the slot
+//! rather than adding it, so the two paths share only their shape.
+//!
+//! Scratch is a PER_LAYER-only concern. Under SHARED every layer of a life cycle reads one
+//! table, which substitution would break.
+void launchIndexConversionWithScratch(IndexTableDesc const* descs, int32_t numTables, int32_t maxEntries,
+    int32_t numRows, int32_t blocksPerRow, int32_t rawRowStride, CUstream stream);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

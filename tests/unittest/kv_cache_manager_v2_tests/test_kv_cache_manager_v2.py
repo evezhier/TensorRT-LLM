@@ -1695,7 +1695,9 @@ class TestIndexTables(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def _assert_converted_matches_reference(self, manager, batch, cache, roles, mode):
+    def _assert_converted_matches_reference(
+        self, manager, batch, cache, roles, mode, scratch=None, layer=0
+    ):
         """Rebuild the concat table from PageIndexConverter and compare entry for entry.
 
         The reference gives each buffer its own table and puts the per-role offset in that
@@ -1718,11 +1720,14 @@ class TestIndexTables(unittest.TestCase):
         self.assertEqual(len(converted), len(roles) * rows * blocks)
 
         for entry, role in enumerate(roles):
-            stride = manager.get_page_stride(0, role)
+            stride = manager.get_page_stride(layer, role)
             shift = (
-                manager.get_mem_pool_base_address(0, role, mode) - batch.index_table_base(0, role)
+                manager.get_mem_pool_base_address(layer, role, mode)
+                - batch.index_table_base(layer, role)
             ) // stride
-            reference = list(manager.get_page_index_converter(0, role)(raw[:blocks], mode))
+            reference = list(
+                manager.get_page_index_converter(layer, role)(raw[:blocks], mode, scratch)
+            )
             want = [x if x == BAD_PAGE_INDEX else x + shift for x in reference]
             got = converted[entry * rows * blocks : entry * rows * blocks + blocks]
             self.assertEqual(got, want, f"entry {entry} ({role})")
@@ -1777,6 +1782,88 @@ class TestIndexTables(unittest.TestCase):
                     manager, batch, cache, ("key", "value"), PageIndexMode.PER_LAYER
                 )
         finally:
+            manager.shutdown()
+
+    def test_scratch_blocks_match_the_reference_converter(self):
+        """The substituting path, against PageIndexConverter given the same ScratchDesc.
+
+        A scratch block's slot comes from the request rather than the page table, and the
+        layer's offset wraps inside the shared slot instead of being added to it. Both are
+        easy to transcribe wrongly, and neither shows up on a config without scratch, so
+        this drives a real scratch range and defers the arithmetic to the reference.
+        """
+        num_layers, window, tpb, prompt_len = 4, 128, 32, 1024
+        cfg = KVCacheManagerConfig(
+            tokens_per_block=tpb,
+            cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(i),
+                    buffers=[
+                        BufferConfig(role=DataRole("key"), size=8192),
+                        BufferConfig(role=DataRole("value"), size=8192),
+                    ],
+                    sliding_window_size=window,
+                    num_sink_tokens=0,
+                )
+                for i in range(num_layers)
+            ],
+            swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=0),
+        )
+        manager = KVCacheManager(cfg)
+        cache = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            # Scratch makes the layers stop sharing one table, so PER_LAYER is required.
+            self.assertIsNone(manager.supports_index_mode(PageIndexMode.SHARED, lg))
+
+            # The last layer, because its sub-page offsets are the largest: the wrap only
+            # bites when total % scale + offset reaches scale, which layer zero's offsets
+            # of {0, 1} never do.
+            layer = num_layers - 1
+            converter = manager.get_page_index_converter(layer, "value")
+            scale, spb = converter.scale, converter.scratch_pages_per_block
+            self.assertTrue(
+                any((block * spb) % scale + converter.layer_offset >= scale for block in range(32)),
+                "config never wraps the layer offset, so the scratch path is only half tested",
+            )
+
+            request = IndexTableRequest([BufferId(layer, "key"), BufferId(layer, "value")])
+            batch = Batch(
+                manager,
+                max_batch_size=1,
+                max_blocks_per_seq=div_up(prompt_len, tpb),
+                mode=PageIndexMode.PER_LAYER,
+                index_tables=[request],
+            )
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                cache = manager.create_kv_cache(None, [TokenId(i) for i in range(prompt_len)])
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+                self.assertTrue(cache.resize(prompt_len))
+                self.assertTrue(cache.has_scratch_slots, "config produced no scratch")
+
+                scratch = cache.get_scratch_desc(lg)
+                self.assertIsNotNone(scratch)
+                self.assertGreater(scratch.range.end - scratch.range.beg, 0)
+
+                batch.wait_published()
+                batch.publish(handle)
+                self._assert_converted_matches_reference(
+                    manager,
+                    batch,
+                    cache,
+                    ("key", "value"),
+                    PageIndexMode.PER_LAYER,
+                    scratch=scratch,
+                    layer=layer,
+                )
+        finally:
+            if cache is not None:
+                if batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
             manager.shutdown()
 
     def test_an_unrequested_buffer_has_no_slot(self):

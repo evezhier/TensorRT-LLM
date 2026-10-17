@@ -55,6 +55,44 @@ __global__ __launch_bounds__(kThreads) void indexConversionKernel(
     }
 }
 
+//! One CTA row per (table, entry, row), as above, but scratch blocks take their slot from
+//! the request rather than the page table.
+__global__ __launch_bounds__(kThreads) void indexConversionScratchKernel(
+    IndexTableDesc const* descs, int32_t numRows, int32_t blocksPerRow, int32_t rawRowStride)
+{
+    auto const& desc = descs[blockIdx.z];
+    int32_t const entry = static_cast<int32_t>(blockIdx.y);
+    if (entry >= desc.numEntries)
+    {
+        return;
+    }
+    int32_t const row = static_cast<int32_t>(blockIdx.x);
+
+    int32_t const* raw = desc.raw + static_cast<ptrdiff_t>(row) * rawRowStride;
+    int32_t* out = desc.converted + (static_cast<ptrdiff_t>(entry) * numRows + row) * blocksPerRow;
+    int32_t const offset = desc.offsets[entry];
+
+    int32_t const scratchBeg = desc.scratchBegs[row];
+    int32_t const scratchEnd = desc.scratchEnds[row];
+    int32_t const* scratchSlots = desc.scratchSlots + static_cast<ptrdiff_t>(row) * desc.scratchSlotStride;
+
+    for (int32_t block = static_cast<int32_t>(threadIdx.x); block < blocksPerRow; block += kThreads)
+    {
+        if (block >= scratchBeg && block < scratchEnd)
+        {
+            // The slot cursor advances by the sub-pages each scratch block occupies, and
+            // the layer's own offset wraps inside the slot rather than running past it --
+            // a scratch slot is shared, so those sub-page positions are already spoken for.
+            int32_t const total = (block - scratchBeg) * desc.scratchPagesPerBlock;
+            int32_t const slotId = scratchSlots[total / desc.scale];
+            out[block] = slotId * desc.scale + (total % desc.scale + offset) % desc.scale;
+            continue;
+        }
+        int32_t const slot = raw[block];
+        out[block] = slot == kBadPageIndex.value() ? kBadPageIndex.value() : slot * desc.scale + offset;
+    }
+}
+
 } // namespace
 
 void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32_t maxEntries, int32_t numRows,
@@ -69,6 +107,19 @@ void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32
     dim3 const grid(
         static_cast<unsigned>(numRows), static_cast<unsigned>(maxEntries), static_cast<unsigned>(numTables));
     indexConversionKernel<<<grid, kThreads, 0, stream>>>(descs, numRows, blocksPerRow, rawRowStride);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void launchIndexConversionWithScratch(IndexTableDesc const* descs, int32_t numTables, int32_t maxEntries,
+    int32_t numRows, int32_t blocksPerRow, int32_t rawRowStride, CUstream stream)
+{
+    if (numTables <= 0 || maxEntries <= 0 || numRows <= 0 || blocksPerRow <= 0)
+    {
+        return;
+    }
+    dim3 const grid(
+        static_cast<unsigned>(numRows), static_cast<unsigned>(maxEntries), static_cast<unsigned>(numTables));
+    indexConversionScratchKernel<<<grid, kThreads, 0, stream>>>(descs, numRows, blocksPerRow, rawRowStride);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
