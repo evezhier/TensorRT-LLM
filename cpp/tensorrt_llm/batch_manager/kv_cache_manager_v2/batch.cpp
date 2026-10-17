@@ -52,9 +52,11 @@ std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
 
 } // namespace
 
-Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std::optional<ExternalPageTable> pageTable,
-    std::optional<PageIndexMode> mode, std::vector<IndexTableRequest> indexTables)
+Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int maxBlocksPerSeq,
+    std::optional<ExternalPageTable> pageTable, std::optional<PageIndexMode> mode,
+    std::vector<IndexTableRequest> indexTables)
     : mManager(&manager)
+    , mCudaStream(stream)
     , mPageTable(pageTable)
 {
     auto const [derivedRows, derivedBlocks] = deriveBounds(manager.config());
@@ -743,6 +745,11 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
 
     _seedRowWatermarks(row, kvCache.historyLength(), kvCache.capacity());
 
+    // Joining is a stream change, so it carries the same cross-stream sync a direct move
+    // would: work the member already enqueued has to retire before the Batch's stream
+    // reaches anything that reads it.
+    kvCache._setCudaStream(mCudaStream);
+
     mRows[static_cast<size_t>(row)] = &kvCache;
     kvCache.mBatch = this;
     kvCache.mBatchRow = row;
@@ -789,8 +796,8 @@ void Batch::_detach(KvCache& kvCache) noexcept
     kvCache.mBatchRow = -1;
 }
 
-std::vector<bool> Batch::resize(std::vector<std::optional<int>> const& capacities,
-    std::vector<std::optional<int>> const& historyLengths, CUstream stream)
+std::vector<bool> Batch::resize(
+    std::vector<std::optional<int>> const& capacities, std::vector<std::optional<int>> const& historyLengths)
 {
     if (capacities.size() != mRows.size() || historyLengths.size() != mRows.size())
     {
@@ -811,11 +818,11 @@ std::vector<bool> Batch::resize(std::vector<std::optional<int>> const& capacitie
     }
     // Once, after every member has settled: a partial failure leaves the rolled-back state,
     // which is what the table should describe.
-    publish(stream);
+    publish();
     return results;
 }
 
-void Batch::publish(CUstream stream)
+void Batch::publish()
 {
     // Refusing rather than waiting, because by this point a wait would be too late to help.
     // Everything that writes the staged rows has to be separated from the copy reading them:
@@ -893,11 +900,11 @@ void Batch::publish(CUstream stream)
     mPublished = mUploadStream.recordEvent();
 
     // The staging now holds this step's tables, so carrying them across is all that is
-    // left on the caller's stream -- one copy, because the two layouts match.
-    mPublished.waitInStream(reinterpret_cast<CudaStream>(stream));
-    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _deviceBytes(), stream));
-    _convertIndices(stream);
-    mStagingRead = CachedCudaEvent{reinterpret_cast<CudaStream>(stream)};
+    // left on the Batch's stream -- one copy, because the two layouts match.
+    mPublished.waitInStream(reinterpret_cast<CudaStream>(mCudaStream));
+    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _deviceBytes(), mCudaStream));
+    _convertIndices(mCudaStream);
+    mStagingRead = CachedCudaEvent{reinterpret_cast<CudaStream>(mCudaStream)};
 }
 
 void Batch::waitPublished()

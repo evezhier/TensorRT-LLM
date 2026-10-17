@@ -2709,8 +2709,8 @@ def test_sparse_arena_retains_padding_with_full_live_batch(
     )
     core = KVCacheManager(config)
     caches = []
-    batch = Batch(core, max_batch_size=max_batch_size, max_blocks_per_seq=1)
     stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+    batch = Batch(core, stream, max_batch_size=max_batch_size, max_blocks_per_seq=1)
     try:
         # Retained padding caches stay outside the attention Batch but own leases.
         for index in range(reserved + max_batch_size):
@@ -2721,7 +2721,7 @@ def test_sparse_arena_retains_padding_with_full_live_batch(
             if index >= reserved:
                 batch.add_kv_cache(cache)
         assert batch.max_batch_size == max_batch_size
-        batch.publish(stream)
+        batch.publish()
         batch.wait_published()
 
         extra = core.create_kv_cache()

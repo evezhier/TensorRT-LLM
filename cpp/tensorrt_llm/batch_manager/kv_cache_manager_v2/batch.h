@@ -169,9 +169,18 @@ public:
     //! @param indexTables what consumers need addressable together. Requests whose
     //! converted indices coincide are merged onto one table, which is how a quantised
     //! layer's data and block scales come to share one.
-    explicit Batch(KvCacheManager& manager, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
+    //! @param stream the stream every member runs on. A Batch owns it rather than taking
+    //! one per call: a member's own work and the Batch's transfers have to be ordered
+    //! against each other, and two streams would leave that ordering to the caller.
+    explicit Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
         std::optional<ExternalPageTable> pageTable = std::nullopt, std::optional<PageIndexMode> mode = std::nullopt,
         std::vector<IndexTableRequest> indexTables = {});
+
+    //! The stream the Batch and every member run on, fixed at construction.
+    [[nodiscard]] CUstream cudaStream() const noexcept
+    {
+        return mCudaStream;
+    }
 
     //! Page index mode of one life cycle, as chosen at construction.
     [[nodiscard]] PageIndexMode indexMode(LayerGroupId layerGroupId) const;
@@ -229,10 +238,10 @@ public:
     //!
     //! `capacities` and `historyLengths` are indexed by row, so both must be maxBatchSize
     //! long. A nullopt leaves that dimension alone, matching KvCache::resize.
-    std::vector<bool> resize(std::vector<std::optional<int>> const& capacities,
-        std::vector<std::optional<int>> const& historyLengths, CUstream stream);
+    std::vector<bool> resize(
+        std::vector<std::optional<int>> const& capacities, std::vector<std::optional<int>> const& historyLengths);
 
-    //! Copy the staged rows to the device, enqueuing on `stream`.
+    //! Copy the staged rows to the device, enqueuing on the Batch's stream.
     //!
     //! The staging rows are written by the members themselves, so they are always current;
     //! what this adds is a stream-ordered snapshot. Without it the host would be mutating
@@ -243,16 +252,16 @@ public:
     //! Borrowing costs one strided transfer per layer group instead of one linear transfer
     //! for all of them, because the lender's rows are further apart than they are wide.
     //!
-    //! Two stages. The host-to-device fill runs on a stream of this Batch's own, so it can
-    //! overlap the previous step; `stream` then carries one linear device-to-device copy
-    //! into the tables the fetch reads. Everything expensive is in the first stage, and
-    //! only the second has to wait for anything.
+    //! Two stages. The host-to-device fill runs on an upload stream of this Batch's own, so
+    //! it can overlap the previous step; the Batch's stream then carries one linear
+    //! device-to-device copy into the tables the fetch reads. Everything expensive is in the
+    //! first stage, and only the second has to wait for anything.
     //!
     //! **The second stage must be ordered after the kernels that read the previous
     //! publish.** Those live in a captured graph, so the tables cannot be double-buffered
     //! out of the hazard -- the capture baked their addresses, which is why the staging
-    //! sits upstream of them instead. Issuing this on the stream the graph replays on is
-    //! what provides that ordering today. A torn publish is not a stale answer: the cache
+    //! sits upstream of them instead. The Batch's stream being the one the graph replays on
+    //! is what provides that ordering. A torn publish is not a stale answer: the cache
     //! views carry pointers, so it can pair one request's residency with another's lease.
     //!
     //! The copy is asynchronous and reads pinned memory, so it is still in flight when this
@@ -266,7 +275,7 @@ public:
     //! into the same hazard. It refuses rather than waiting because a wait here covers only
     //! its own write -- a member mutated before the call has already raced by then, and
     //! waiting would hide it.
-    void publish(CUstream stream);
+    void publish();
 
     //! Block until the last publish() has finished reading the staging rows.
     //!
@@ -369,6 +378,7 @@ private:
     [[nodiscard]] size_t _totalBytes() const noexcept;
 
     KvCacheManager* mManager = nullptr;
+    CUstream mCudaStream = nullptr;
     int mMaxBatchSize = 0;
     int mMaxBlocksPerSeq = 0;
     LifeCycleId mNumLayerGroups{0};

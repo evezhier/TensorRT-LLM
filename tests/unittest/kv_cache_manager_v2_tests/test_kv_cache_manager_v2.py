@@ -165,6 +165,11 @@ with temporary_sys_path(_TEST_DIR):
     from kernels import HostGate, enable_kernel_delay
 
 
+# A Batch that is only inspected, never published, still has to name a stream. The null
+# stream is the honest answer for those: nothing is ever enqueued on it.
+NULL_STREAM = cast(CudaStream, 0)
+
+
 def get_cached_cuda_event_type():
     try:
         from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
@@ -1350,18 +1355,16 @@ class TestSparseFetch(unittest.TestCase):
         cache = None
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=rows, max_blocks_per_seq=blocks)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=rows, max_blocks_per_seq=blocks)
                 cache = manager.create_kv_cache()
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
                 # Two whole blocks of history, so ordinals 0 and 1 are eligible.
                 tokens = 2 * self.TOKENS_PER_BLOCK
                 # resize() publishes, so the batch is already current here.
-                self.assertEqual(
-                    batch.resize([tokens, None], [tokens, None], handle), [True, False]
-                )
+                self.assertEqual(batch.resize([tokens, None], [tokens, None]), [True, False])
                 yield torch, manager, batch, cache, handle
         finally:
             if cache is not None:
@@ -1541,7 +1544,9 @@ class TestIndexTables(unittest.TestCase):
 
     @staticmethod
     def _batch(manager, requests):
-        return Batch(manager, max_batch_size=1, max_blocks_per_seq=4, index_tables=requests)
+        return Batch(
+            manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4, index_tables=requests
+        )
 
     def test_a_request_is_reachable_from_every_buffer_it_names(self):
         """Entry order follows the request's buffer order, which is what a kernel indexes."""
@@ -1581,6 +1586,7 @@ class TestIndexTables(unittest.TestCase):
             requests = [IndexTableRequest([BufferId(layer, "key")]) for layer in range(2)]
             batch = Batch(
                 manager,
+                NULL_STREAM,
                 max_batch_size=1,
                 max_blocks_per_seq=4,
                 mode=PageIndexMode.PER_LAYER,
@@ -1736,22 +1742,24 @@ class TestIndexTables(unittest.TestCase):
     def _published(self, manager, mode):
         """A one-member batch whose {key, value} request has been converted once."""
         request = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
-        batch = Batch(
-            manager,
-            max_batch_size=1,
-            max_blocks_per_seq=4,
-            mode=mode,
-            index_tables=[request],
-        )
         cache = None
+        batch = None
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    mode=mode,
+                    index_tables=[request],
+                )
                 cache = manager.create_kv_cache()
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
                 tokens = 2 * 32
-                batch.resize([tokens], [tokens], handle)
+                batch.resize([tokens], [tokens])
                 yield batch, cache
         finally:
             if cache is not None:
@@ -1812,6 +1820,7 @@ class TestIndexTables(unittest.TestCase):
         )
         manager = KVCacheManager(cfg)
         cache = None
+        batch = None
         try:
             lg = manager.get_layer_group_id(0)
             # Scratch makes the layers stop sharing one table, so PER_LAYER is required.
@@ -1829,15 +1838,16 @@ class TestIndexTables(unittest.TestCase):
             )
 
             request = IndexTableRequest([BufferId(layer, "key"), BufferId(layer, "value")])
-            batch = Batch(
-                manager,
-                max_batch_size=1,
-                max_blocks_per_seq=div_up(prompt_len, tpb),
-                mode=PageIndexMode.PER_LAYER,
-                index_tables=[request],
-            )
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=div_up(prompt_len, tpb),
+                    mode=PageIndexMode.PER_LAYER,
+                    index_tables=[request],
+                )
                 cache = manager.create_kv_cache(None, [TokenId(i) for i in range(prompt_len)])
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
@@ -1849,7 +1859,7 @@ class TestIndexTables(unittest.TestCase):
                 self.assertGreater(scratch.range.end - scratch.range.beg, 0)
 
                 batch.wait_published()
-                batch.publish(handle)
+                batch.publish()
                 self._assert_converted_matches_reference(
                     manager,
                     batch,
@@ -1955,7 +1965,7 @@ class TestIndexMode(unittest.TestCase):
         """Per life cycle, not per batch: the sliding group alone pays for PER_LAYER."""
         manager = self._manager(scratch_reuse=True)
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            batch = Batch(manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4)
             self.assertEqual(
                 batch.index_mode(manager.get_layer_group_id(self.WINDOWED_LAYER)),
                 PageIndexMode.PER_LAYER,
@@ -1971,7 +1981,11 @@ class TestIndexMode(unittest.TestCase):
         manager = self._manager(scratch_reuse=False)
         try:
             batch = Batch(
-                manager, max_batch_size=1, max_blocks_per_seq=4, mode=PageIndexMode.PER_LAYER
+                manager,
+                NULL_STREAM,
+                max_batch_size=1,
+                max_blocks_per_seq=4,
+                mode=PageIndexMode.PER_LAYER,
             )
             for layer in (self.WINDOWED_LAYER, self.PLAIN_LAYER):
                 lg = manager.get_layer_group_id(layer)
@@ -2028,13 +2042,18 @@ class TestBorrowedPageTable(unittest.TestCase):
                 if borrow
                 else None
             )
-            batch = Batch(
-                manager,
-                max_batch_size=self.ROWS,
-                max_blocks_per_seq=self.BLOCKS,
-                page_table=table,
-            )
-            yield torch, manager, batch, host
+            # The stream belongs to the fixture because the Batch takes it at construction:
+            # a member joins the stream it was built for, so one cannot outlive the other.
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=self.ROWS,
+                    max_blocks_per_seq=self.BLOCKS,
+                    page_table=table,
+                )
+                yield torch, manager, batch, host, handle
         finally:
             manager.shutdown()
 
@@ -2052,7 +2071,7 @@ class TestBorrowedPageTable(unittest.TestCase):
             tokens = 2 * TestSparseFetch.TOKENS_PER_BLOCK
             sizes = [None] * self.ROWS
             sizes[row] = tokens
-            batch.resize(list(sizes), list(sizes), handle)
+            batch.resize(list(sizes), list(sizes))
             yield cache
         finally:
             if batch.row_of(cache) >= 0:
@@ -2061,15 +2080,13 @@ class TestBorrowedPageTable(unittest.TestCase):
 
     def test_a_member_writes_its_indices_into_the_row_it_was_given(self):
         """The lender chose the row, so the indices must land in that one and no other."""
-        with self._fixture() as (torch, manager, batch, host):
+        with self._fixture() as (torch, manager, batch, host, handle):
             lg = manager.get_layer_group_id(0)
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                with self._member(manager, batch, 1, handle) as cache:
-                    expected = [int(x) for x in cache.get_base_page_indices(lg)][: self.BLOCKS]
-                    self.assertEqual(self._row(host, 1)[: self.BLOCKS], expected)
-                    # A page index, not the fill: the member really has pages here.
-                    self.assertNotEqual(expected[0], self.UNTOUCHED)
+            with self._member(manager, batch, 1, handle) as cache:
+                expected = [int(x) for x in cache.get_base_page_indices(lg)][: self.BLOCKS]
+                self.assertEqual(self._row(host, 1)[: self.BLOCKS], expected)
+                # A page index, not the fill: the member really has pages here.
+                self.assertNotEqual(expected[0], self.UNTOUCHED)
 
     def test_the_lender_keeps_every_element_the_batch_was_not_given(self):
         """Everything outside a member's own row stays as the lender left it.
@@ -2078,15 +2095,13 @@ class TestBorrowedPageTable(unittest.TestCase):
         max_blocks_per_seq are its key/value half. Writing either would corrupt a request
         this Batch has never heard of.
         """
-        with self._fixture() as (torch, manager, batch, host):
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                with self._member(manager, batch, 1, handle):
-                    self.assertEqual(self._row(host, 0), [self.UNTOUCHED] * self.ROW_STRIDE)
-                    self.assertEqual(
-                        self._row(host, 1)[self.BLOCKS :],
-                        [self.UNTOUCHED] * (self.ROW_STRIDE - self.BLOCKS),
-                    )
+        with self._fixture() as (torch, manager, batch, host, handle):
+            with self._member(manager, batch, 1, handle):
+                self.assertEqual(self._row(host, 0), [self.UNTOUCHED] * self.ROW_STRIDE)
+                self.assertEqual(
+                    self._row(host, 1)[self.BLOCKS :],
+                    [self.UNTOUCHED] * (self.ROW_STRIDE - self.BLOCKS),
+                )
 
     def test_publish_packs_the_borrowed_rows_into_the_device_table(self):
         """The device table is the Batch's own and packed, whatever the host rows look like.
@@ -2097,24 +2112,22 @@ class TestBorrowedPageTable(unittest.TestCase):
         blocks_per_seq-wide destination, so a publish that ignored the source pitch would
         put a member's indices in some other member's row.
         """
-        with self._fixture() as (torch, manager, batch, host):
+        with self._fixture() as (torch, manager, batch, host, handle):
             lg = manager.get_layer_group_id(0)
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                with self._member(manager, batch, 1, handle):
-                    # _member's resize() already published; republishing needs the wait.
-                    batch.wait_published()
-                    batch.publish(handle)
-                    torch.cuda.synchronize()
-                    table = _introspection.batch_page_table(batch, lg)
-                    self.assertEqual(len(table), self.ROWS * self.BLOCKS)
-                    expected = self._row(host, 1)[: self.BLOCKS]
-                    self.assertEqual(table[self.BLOCKS : 2 * self.BLOCKS], expected)
-                    self.assertNotEqual(expected[0], self.UNTOUCHED)
-                    # Every row travels, including ones the lender keeps for its own
-                    # requests: skipping them would cost a transfer each. Nothing reads
-                    # them, because a free row's cache view has no residency.
-                    self.assertEqual(table[: self.BLOCKS], [self.UNTOUCHED] * self.BLOCKS)
+            with self._member(manager, batch, 1, handle):
+                # _member's resize() already published; republishing needs the wait.
+                batch.wait_published()
+                batch.publish()
+                torch.cuda.synchronize()
+                table = _introspection.batch_page_table(batch, lg)
+                self.assertEqual(len(table), self.ROWS * self.BLOCKS)
+                expected = self._row(host, 1)[: self.BLOCKS]
+                self.assertEqual(table[self.BLOCKS : 2 * self.BLOCKS], expected)
+                self.assertNotEqual(expected[0], self.UNTOUCHED)
+                # Every row travels, including ones the lender keeps for its own
+                # requests: skipping them would cost a transfer each. Nothing reads
+                # them, because a free row's cache view has no residency.
+                self.assertEqual(table[: self.BLOCKS], [self.UNTOUCHED] * self.BLOCKS)
 
     def test_publishing_over_a_publish_in_flight_is_refused(self):
         """A wait here would be too late, so it is the caller's to make.
@@ -2124,21 +2137,19 @@ class TestBorrowedPageTable(unittest.TestCase):
         itself. Waiting inside publish() would cover only the second, and would do it while
         hiding that a member mutated before the call had already raced.
         """
-        with self._fixture(borrow=False) as (torch, manager, batch, _host):
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                with self._member(manager, batch, 0, handle):
-                    # _member's resize() published and nobody has waited on it.
-                    with self.assertRaises(Exception) as caught:
-                        batch.publish(handle)
-                    self.assertIn("still reading the staged rows", str(caught.exception))
+        with self._fixture(borrow=False) as (torch, manager, batch, _host, handle):
+            with self._member(manager, batch, 0, handle):
+                # _member's resize() published and nobody has waited on it.
+                with self.assertRaises(Exception) as caught:
+                    batch.publish()
+                self.assertIn("still reading the staged rows", str(caught.exception))
 
-                    batch.wait_published()
-                    batch.publish(handle)
+                batch.wait_published()
+                batch.publish()
 
     def test_a_borrowed_batch_refuses_to_choose_a_row(self):
         """Choosing one would address whichever request the lender seated there."""
-        with self._fixture() as (torch, manager, batch, _host):
+        with self._fixture() as (torch, manager, batch, _host, _handle):
             cache = manager.create_kv_cache()
             try:
                 with self.assertRaises(Exception) as caught:
@@ -2153,16 +2164,14 @@ class TestBorrowedPageTable(unittest.TestCase):
         That buffer would take the writes with it and strand the row at whatever it held
         when the cache joined -- silently, which is the one outcome worth a hard failure.
         """
-        with self._fixture(borrow=False) as (torch, manager, batch, _host):
+        with self._fixture(borrow=False) as (torch, manager, batch, _host, handle):
             lg = manager.get_layer_group_id(0)
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                with self._member(manager, batch, 0, handle) as cache:
-                    self.assertEqual(cache.batch_row, 0)
-                    spare = array.array("i", [BAD_PAGE_INDEX] * self.BLOCKS)
-                    with self.assertRaises(Exception) as caught:
-                        cache.set_base_page_index_buf(DEFAULT_BEAM_INDEX, lg, memoryview(spare))
-                    self.assertIn("Batch member", str(caught.exception))
+            with self._member(manager, batch, 0, handle) as cache:
+                self.assertEqual(cache.batch_row, 0)
+                spare = array.array("i", [BAD_PAGE_INDEX] * self.BLOCKS)
+                with self.assertRaises(Exception) as caught:
+                    cache.set_base_page_index_buf(DEFAULT_BEAM_INDEX, lg, memoryview(spare))
+                self.assertIn("Batch member", str(caught.exception))
 
     def test_suspending_a_member_leaves_its_row_bound(self):
         """A suspended member's row reads as absent, not as pages it has released.
@@ -2170,15 +2179,11 @@ class TestBorrowedPageTable(unittest.TestCase):
         Reverting to the cache's own storage would leave the row holding indices of pages
         it no longer owns; the unlocks write BAD_PAGE_INDEX through the binding instead.
         """
-        with self._fixture() as (torch, manager, batch, host):
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                with self._member(manager, batch, 1, handle) as cache:
-                    cache.suspend()
-                    self.assertEqual(cache.batch_row, 1)
-                    self.assertEqual(
-                        self._row(host, 1)[: self.BLOCKS], [BAD_PAGE_INDEX] * self.BLOCKS
-                    )
+        with self._fixture() as (torch, manager, batch, host, handle):
+            with self._member(manager, batch, 1, handle) as cache:
+                cache.suspend()
+                self.assertEqual(cache.batch_row, 1)
+                self.assertEqual(self._row(host, 1)[: self.BLOCKS], [BAD_PAGE_INDEX] * self.BLOCKS)
 
 
 class TestSparseDataPath(unittest.TestCase):
@@ -2253,9 +2258,9 @@ class TestSparseDataPath(unittest.TestCase):
             stride = manager.get_page_stride(LayerId(0), "key")
             arena = int(manager.get_sparse_cache_base_address(LayerId(0), "key"))
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(4 * self.TPB, 4 * self.TPB))
@@ -2267,7 +2272,7 @@ class TestSparseDataPath(unittest.TestCase):
                 pages = [int(x) for x in cache.get_base_page_indices(lg)]
                 ctypes.memmove(pool + pages[ordinal] * stride, pattern, self.BUF)
 
-                batch.publish(handle)
+                batch.publish()
                 selected = torch.tensor([[ordinal, -1]], dtype=torch.int32, device="cuda")
                 out = torch.full((1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
                 manager.fetch_sparse_pages(batch, [BufferId(0, "key")], selected, out, handle)
@@ -2301,15 +2306,15 @@ class TestSparseDataPath(unittest.TestCase):
             stride = manager.get_page_stride(LayerId(0), "key")
             arena = int(manager.get_sparse_cache_base_address(LayerId(0), "key"))
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 # Capacity one token past a watermark that has not reached unit 0, so unit 0
                 # is in flight and the resolve pins a cell for it.
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
-                batch.publish(handle)
+                batch.publish()
                 selected = torch.tensor([[-1, -1]], dtype=torch.int32, device="cuda")
                 out = torch.full((1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
                 manager.fetch_sparse_pages(batch, [BufferId(0, "key")], selected, out, handle)
@@ -2417,15 +2422,15 @@ class TestSparseWriteIndices(unittest.TestCase):
             stride = manager.get_page_stride(LayerId(0), "key")
             arena = int(manager.get_sparse_cache_base_address(LayerId(0), "key"))
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 # Capacity one token past a history that has not reached unit 0, so unit 0
                 # is the unit in flight.
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
-                batch.publish(handle)
+                batch.publish()
 
                 out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
                 manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
@@ -2464,13 +2469,13 @@ class TestSparseWriteIndices(unittest.TestCase):
         cache = None
         try:
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
-                batch.publish(handle)
+                batch.publish()
 
                 seen = []
                 for _ in range(3):
@@ -2493,13 +2498,13 @@ class TestSparseWriteIndices(unittest.TestCase):
         cache = None
         try:
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(self.TPB, self.TPB))
-                batch.publish(handle)
+                batch.publish()
 
                 out = torch.full((2, 1), 12345, dtype=torch.int32, device="cuda")
                 manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
@@ -2560,13 +2565,13 @@ class TestSparseWriteIndices(unittest.TestCase):
         cache = None
         try:
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
-                batch.publish(handle)
+                batch.publish()
 
                 out = torch.full((1, 2), 12345, dtype=torch.int32, device="cuda")
                 manager.prepare_sparse_write_indices(
@@ -2626,13 +2631,13 @@ class TestSparseWriteIndices(unittest.TestCase):
         cache = None
         try:
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
-                batch.publish(handle)
+                batch.publish()
 
                 indices = []
                 for layer in range(layers):
@@ -2683,16 +2688,16 @@ class TestSparseWriteIndices(unittest.TestCase):
             stride = manager.get_page_stride(LayerId(0), "key")
             arena = int(manager.get_sparse_cache_base_address(LayerId(0), "key"))
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 # resize() bounds capacity - history to one token, so a unit is in flight
                 # only as history reaches a unit boundary: two units of history behind the
                 # watermark, and unit 2 in flight.
                 self.assertTrue(cache.resize(3 * self.TPB, 3 * self.TPB - 1))
-                batch.publish(handle)
+                batch.publish()
 
                 out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
                 manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
@@ -2823,9 +2828,9 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
         try:
             lg = manager.get_layer_group_id(0)
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(4 * self.TPB, 4 * self.TPB))
@@ -2841,7 +2846,7 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                     stride = manager.get_page_stride(LayerId(0), role)
                     ctypes.memmove(pool + pages[ordinal] * stride, patterns[role], size)
 
-                batch.publish(handle)
+                batch.publish()
                 selected = torch.tensor([[ordinal, -1]], dtype=torch.int32, device="cuda")
                 out = torch.full((1, 2, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
                 manager.fetch_sparse_pages(
@@ -2883,15 +2888,15 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
         try:
             lg = manager.get_layer_group_id(0)
             cache = manager.create_kv_cache()
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 # Capacity one token past a watermark that has not reached unit 0, so unit 0
                 # is in flight and the resolve pins a cell for it in both pools.
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
-                batch.publish(handle)
+                batch.publish()
                 selected = torch.tensor([[-1, -1]], dtype=torch.int32, device="cuda")
                 out = torch.full((1, 2, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
                 manager.fetch_sparse_pages(
@@ -3072,7 +3077,7 @@ class TestBatch(unittest.TestCase):
 
         manager = self._manager()
         try:
-            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
+            batch = Batch(manager, NULL_STREAM, max_batch_size=2, max_blocks_per_seq=4)
             lg_id = manager.get_layer_group_id(0)
             table = torch.from_dlpack(batch.page_table(lg_id))
             history = torch.from_dlpack(batch.history_lengths())
@@ -3127,18 +3132,18 @@ class TestBatch(unittest.TestCase):
         cache = None
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
             lg_id = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
                 # Before anyone resumes, no reservation exists, so no view does either.
-                batch.publish(handle)
+                batch.publish()
                 self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
 
                 cache = manager.create_kv_cache()
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
-                batch.publish(handle)
+                batch.publish()
                 entries = _introspection.batch_sparse_view_entries(batch, lg_id)
                 self.assertEqual(entries[0], manager.get_sparse_cache_max_units(0))
                 self.assertEqual(entries[1], 0, "the free row stays absent")
@@ -3147,7 +3152,7 @@ class TestBatch(unittest.TestCase):
                 # than leaving the fetch a handle into freed memory.
                 batch.wait_published()
                 cache.suspend()
-                batch.publish(handle)
+                batch.publish()
                 self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
         finally:
             if cache is not None:
@@ -3159,7 +3164,7 @@ class TestBatch(unittest.TestCase):
     def test_rows_are_slots_so_a_hole_is_reused(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, max_batch_size=3, max_blocks_per_seq=4)
+            batch = Batch(manager, NULL_STREAM, max_batch_size=3, max_blocks_per_seq=4)
             first = manager.create_kv_cache()
             second = manager.create_kv_cache()
             third = manager.create_kv_cache()
@@ -3186,8 +3191,8 @@ class TestBatch(unittest.TestCase):
     def test_membership_is_exclusive(self):
         manager = self._manager()
         try:
-            one = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
-            two = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
+            one = Batch(manager, NULL_STREAM, max_batch_size=2, max_blocks_per_seq=4)
+            two = Batch(manager, NULL_STREAM, max_batch_size=2, max_blocks_per_seq=4)
             cache = manager.create_kv_cache()
             one.add_kv_cache(cache)
             with self.assertRaisesRegex(Exception, "at most one Batch"):
@@ -3213,7 +3218,7 @@ class TestBatch(unittest.TestCase):
         )
         cache = None
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            batch = Batch(manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4)
             cache = manager.create_kv_cache()
             cache.beam_width = 2
             with self.assertRaisesRegex(Exception, "beam"):
@@ -3227,7 +3232,7 @@ class TestBatch(unittest.TestCase):
     def test_a_full_batch_refuses_rather_than_growing(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            batch = Batch(manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4)
             first = manager.create_kv_cache()
             second = manager.create_kv_cache()
             batch.add_kv_cache(first)
@@ -3243,10 +3248,15 @@ class TestBatch(unittest.TestCase):
     def test_an_unoccupied_row_reads_as_absent(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=3)
             lg_id = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
-                batch.publish(cast(CudaStream, stream.handle))
+                batch = Batch(
+                    manager,
+                    cast(CudaStream, stream.handle),
+                    max_batch_size=2,
+                    max_blocks_per_seq=3,
+                )
+                batch.publish()
                 table = _introspection.batch_page_table(batch, lg_id)
             # Every cell is the sentinel, not slot zero: only the sentinel distinguishes
             # an absent block from a real page.
@@ -3259,15 +3269,15 @@ class TestBatch(unittest.TestCase):
         cache = None
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
             lg_id = manager.get_layer_group_id(0)
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
                 cache.resize(256, 0)  # 128-token blocks, so two of them
-                batch.publish(handle)
+                batch.publish()
                 table = _introspection.batch_page_table(batch, lg_id)
 
                 # The installed buffer is max_blocks_per_seq long, so the member reports
@@ -3291,17 +3301,17 @@ class TestBatch(unittest.TestCase):
         caches = []
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=3, max_blocks_per_seq=8)
             lg_id = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=8)
                 for _ in range(2):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
                     batch.add_kv_cache(cache)
                     self.assertTrue(cache.resume(handle))
 
-                results = batch.resize([256, 384, None], [0, 0, None], handle)
+                results = batch.resize([256, 384, None], [0, 0, None])
                 # Row 2 is free, so it reports False rather than raising.
                 self.assertEqual(results, [True, True, False])
                 self.assertEqual(caches[0].capacity, 256)
@@ -3325,17 +3335,17 @@ class TestBatch(unittest.TestCase):
         caches = []
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=3, max_blocks_per_seq=8)
             lg_id = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=8)
                 for _ in range(2):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
                     batch.add_kv_cache(cache)
                     self.assertTrue(cache.resume(handle))
 
-                batch.resize([256, 384, None], [128, 256, None], handle)
+                batch.resize([256, 384, None], [128, 256, None])
                 history, capacity = _introspection.batch_watermarks(batch)
                 self.assertEqual(history, [128, 256, 0])
                 self.assertEqual(capacity, [256, 384, 0], "a free row reads as nothing eligible")
@@ -3361,17 +3371,17 @@ class TestBatch(unittest.TestCase):
         cache = None
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=4)
                 cache = manager.create_kv_cache()
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
-                batch.resize([256], [128], handle)
+                batch.resize([256], [128])
                 self.assertEqual(_introspection.batch_watermarks(batch)[0], [128])
 
                 batch.remove_kv_cache(cache)
-                batch.publish(handle)
+                batch.publish()
                 # Otherwise the row would still claim blocks the departed request owned.
                 history, capacity = _introspection.batch_watermarks(batch)
                 self.assertEqual((history, capacity), ([0], [0]))
@@ -3386,14 +3396,14 @@ class TestBatch(unittest.TestCase):
         cache = None
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 cache = manager.create_kv_cache()
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
 
-                batch.resize([256], [128], handle)
+                batch.resize([256], [128])
                 self.assertEqual(_introspection.batch_watermarks(batch), ([128], [256]))
                 self.assertEqual(
                     _introspection.batch_previous_watermarks(batch),
@@ -3401,7 +3411,7 @@ class TestBatch(unittest.TestCase):
                     "the first publish has nothing behind it",
                 )
 
-                batch.resize([384], [256], handle)
+                batch.resize([384], [256])
                 self.assertEqual(_introspection.batch_watermarks(batch), ([256], [384]))
                 self.assertEqual(
                     _introspection.batch_previous_watermarks(batch),
@@ -3409,7 +3419,7 @@ class TestBatch(unittest.TestCase):
                     "the previous pair must be the one published before, not two steps back",
                 )
 
-                batch.resize([512], [384], handle)
+                batch.resize([512], [384])
                 self.assertEqual(_introspection.batch_previous_watermarks(batch), ([256], [384]))
         finally:
             if cache is not None:
@@ -3424,16 +3434,16 @@ class TestBatch(unittest.TestCase):
         cache = None
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
                 # Advanced while unbatched, which is what makes the row's own history stale.
                 self.assertTrue(cache.resize(256, 128))
 
                 batch.add_kv_cache(cache)
-                batch.publish(handle)
+                batch.publish()
                 current = _introspection.batch_watermarks(batch)
                 self.assertEqual(current, ([128], [256]))
                 self.assertEqual(
@@ -3452,19 +3462,19 @@ class TestBatch(unittest.TestCase):
     def test_batch_resize_needs_one_entry_per_row(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, max_batch_size=2, max_blocks_per_seq=4)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
                 # Indexed by row, so a short list would silently misalign members.
                 with self.assertRaisesRegex(Exception, "per row"):
-                    batch.resize([128], [0], handle)
+                    batch.resize([128], [0])
         finally:
             manager.shutdown()
 
     def test_wait_published_is_a_noop_when_nothing_is_in_flight(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
+            batch = Batch(manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4)
             # Safe to call at the top of a step whether or not a publish happened.
             batch.wait_published()
             batch.wait_published()
@@ -3481,15 +3491,15 @@ class TestBatch(unittest.TestCase):
         cache = None
         batch = None
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=8)
             lg_id = manager.get_layer_group_id(0)
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
                 cache.resize(256, 0)
-                batch.publish(handle)
+                batch.publish()
                 first = _introspection.batch_page_table(batch, lg_id)
                 self.assertEqual(sum(1 for i in first if i != self.BAD), 2)
 
@@ -3497,7 +3507,7 @@ class TestBatch(unittest.TestCase):
                 # copy above is still reading.
                 batch.wait_published()
                 cache.resize(512, 0)
-                batch.publish(handle)
+                batch.publish()
                 second = _introspection.batch_page_table(batch, lg_id)
                 self.assertEqual(sum(1 for i in second if i != self.BAD), 4, second)
         finally:
@@ -3510,16 +3520,16 @@ class TestBatch(unittest.TestCase):
     def test_a_removed_members_row_is_cleared(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, max_batch_size=1, max_blocks_per_seq=4)
             lg_id = manager.get_layer_group_id(0)
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=4)
                 batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
                 cache.resize(256, 0)
                 batch.remove_kv_cache(cache)
-                batch.publish(handle)
+                batch.publish()
                 # Otherwise the row would still name pages the departed request owns.
                 self.assertEqual(_introspection.batch_page_table(batch, lg_id), [self.BAD] * 4)
         finally:

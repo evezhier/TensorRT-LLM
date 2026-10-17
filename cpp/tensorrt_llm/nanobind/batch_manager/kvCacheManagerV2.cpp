@@ -2491,9 +2491,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("buffers", &kv::IndexTableRequest::buffers);
 
     nb::class_<kv::Batch>(m, "Batch")
-        .def(nb::init<kv::KvCacheManager&, int, int, std::optional<kv::ExternalPageTable>,
-                 std::optional<kv::PageIndexMode>, std::vector<kv::IndexTableRequest>>(),
-            nb::arg("manager"), nb::arg("max_batch_size") = 0, nb::arg("max_blocks_per_seq") = 0,
+        .def(
+            "__init__",
+            [](kv::Batch* self, kv::KvCacheManager& manager, intptr_t stream, int maxBatchSize, int maxBlocksPerSeq,
+                std::optional<kv::ExternalPageTable> pageTable, std::optional<kv::PageIndexMode> mode,
+                std::vector<kv::IndexTableRequest> indexTables)
+            {
+                new (self) kv::Batch(manager, reinterpret_cast<CUstream>(stream), maxBatchSize, maxBlocksPerSeq,
+                    std::move(pageTable), mode, std::move(indexTables));
+            },
+            nb::arg("manager"), nb::arg("stream"), nb::arg("max_batch_size") = 0, nb::arg("max_blocks_per_seq") = 0,
             nb::arg("page_table") = nb::none(), nb::arg("mode") = nb::none(),
             nb::arg("index_tables") = std::vector<kv::IndexTableRequest>{}, nb::keep_alive<1, 2>(),
             "The KV caches stepped together, and their device-side page tables.\n\n"
@@ -2553,14 +2560,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "resize",
             [](kv::Batch& self, std::vector<std::optional<int>> const& capacities,
-                std::vector<std::optional<int>> const& historyLengths, nb::object stream)
+                std::vector<std::optional<int>> const& historyLengths)
             {
-                auto const handle
-                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
                 nb::gil_scoped_release rel;
-                return self.resize(capacities, historyLengths, handle);
+                return self.resize(capacities, historyLengths);
             },
-            nb::arg("capacities"), nb::arg("history_lengths"), nb::arg("stream") = nb::none(),
+            nb::arg("capacities"), nb::arg("history_lengths"),
             "Resize every member, then publish once.\n\n"
             "The sanctioned way to advance a batched step: it waits on the previous publish "
             "before touching anyone, so the staging hazard is closed without the caller "
@@ -2569,15 +2574,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "table published afterwards describes the post-rollback state.")
         .def(
             "publish",
-            [](kv::Batch& self, nb::object stream)
+            [](kv::Batch& self)
             {
-                auto const handle
-                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
                 nb::gil_scoped_release rel;
-                self.publish(handle);
+                self.publish();
             },
-            nb::arg("stream") = nb::none(),
-            "Copy the staged page indices to the device, enqueuing on the stream. What this adds "
+            "Copy the staged page indices to the device, enqueuing on the Batch's stream. What this adds "
             "over the staging rows, which members keep current themselves, is a stream-ordered "
             "snapshot: without it the host would be mutating a table a previously enqueued fetch "
             "is still reading.\n\n"
@@ -2630,6 +2632,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "int32[max_batch] per-row capacity, in tokens. Published with history_lengths().")
 
         .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
+        .def_prop_ro(
+            "cuda_stream", [](kv::Batch const& self) { return reinterpret_cast<intptr_t>(self.cudaStream()); },
+            "The stream the Batch and every member run on, fixed at construction.")
         .def_prop_ro("max_batch_size", &kv::Batch::maxBatchSize)
         .def_prop_ro("max_blocks_per_seq", &kv::Batch::maxBlocksPerSeq);
 

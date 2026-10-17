@@ -412,9 +412,21 @@ public:
 
     CUstream cudaStream() const;
 
+    // A member runs on its Batch's stream. Letting it move would leave the Batch's
+    // transfers and the member's own work ordered against different streams, which is
+    // exactly what a Batch exists to prevent.
+    void setCudaStream(CUstream stream)
+    {
+        if (mBatch != nullptr)
+        {
+            throw LogicError("A KvCache in a Batch runs on the Batch's stream; remove it first to move it");
+        }
+        _setCudaStream(stream);
+    }
+
     // Mirrors Python's cuda_stream setter: if already on a stream AND active,
     // make the new stream wait for the old one before switching (cross-stream sync).
-    void setCudaStream(CUstream stream)
+    void _setCudaStream(CUstream stream)
     {
         if (mCudaStream.has_value())
         {

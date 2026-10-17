@@ -762,7 +762,8 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
 class _SchedulingBatch:
     """Model native Batch's exclusive page-index ownership and published snapshots."""
 
-    def __init__(self, manager, max_batch_size, max_blocks_per_seq):
+    def __init__(self, manager, cuda_stream, max_batch_size, max_blocks_per_seq):
+        self.cuda_stream = cuda_stream
         self.max_batch_size = max_batch_size
         self.max_blocks_per_seq = max_blocks_per_seq
         self.rows = [None] * max_batch_size
@@ -783,7 +784,7 @@ class _SchedulingBatch:
         self.rows[self.rows.index(cache)] = None
         cache.page_index_owner = "cache"
 
-    def publish(self, stream):
+    def publish(self):
         assert not self.upload_pending
         self.snapshots.append(
             [
@@ -852,7 +853,9 @@ def test_sparse_batch_publishes_schedule_and_reuses_allocation(sparse_scheduling
     manager.prepare_resources(case.scheduled)
     assert manager.get_sparse_batch([10, 20]) is batch
     assert [row[0] for row in batch.snapshots[-1]] == [10, 20, None, None]
-    case.create_batch.assert_called_once_with(manager.impl, max_batch_size=4, max_blocks_per_seq=6)
+    case.create_batch.assert_called_once_with(
+        manager.impl, manager._stream.cuda_stream, max_batch_size=4, max_blocks_per_seq=6
+    )
     assert case.restore_buffers.call_count == 2
 
 

@@ -1894,6 +1894,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if self._sparse_batch is None:
             self._sparse_batch = Batch(
                 self.impl,
+                CudaStream(self._stream.cuda_stream),
                 max_batch_size=self.max_batch_size,
                 max_blocks_per_seq=self.max_blocks_per_seq,
             )
@@ -1906,7 +1907,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # Reusing the device mirror follows the previous forward. Publish on
             # the cache stream so metadata preparation can also join it there.
             self._stream.wait_stream(stream)
-            batch.publish(CudaStream(self._stream.cuda_stream))
+            batch.publish()
             stream.wait_stream(self._stream)
             self._sparse_batch_prepared = True
         finally:

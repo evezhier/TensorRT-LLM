@@ -427,7 +427,14 @@ bool KvCache::resume(std::optional<CUstream> stream)
     // Set stream first (mirrors Python: self.cuda_stream = cuda_stream).
     if (stream.has_value())
     {
-        setCudaStream(*stream);
+        // A member may be resumed, but only onto the stream it already runs on. Naming it
+        // is how the ordinary call site reads; naming a different one would silently move
+        // the member off the stream its Batch orders everything against.
+        if (mBatch != nullptr && *stream != mBatch->cudaStream())
+        {
+            throw LogicError("A KvCache in a Batch can only be resumed on the Batch's stream");
+        }
+        _setCudaStream(*stream);
     }
     TLLM_CHECK_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
