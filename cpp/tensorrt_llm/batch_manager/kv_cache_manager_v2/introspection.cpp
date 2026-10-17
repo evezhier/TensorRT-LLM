@@ -137,6 +137,16 @@ std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, in
     return out;
 }
 
+std::vector<int32_t> KvCacheIntrospection::batchIndexTable(Batch const& batch, int tableId)
+{
+    IndexTableId const typed{tableId};
+    auto const entries = static_cast<size_t>(batch.indexTable(typed).front().buffers.size());
+    auto const perEntry = static_cast<size_t>(batch.maxBatchSize()) * static_cast<size_t>(batch.maxBlocksPerSeq());
+    std::vector<int32_t> out(entries * perEntry);
+    cuCheck(cuMemcpyDtoH(out.data(), batch.indexTableAddress(typed), sizeof(int32_t) * out.size()));
+    return out;
+}
+
 std::vector<int32_t> KvCacheIntrospection::batchSparseViewEntries(Batch const& batch, int layerGroupId)
 {
     auto const rows = static_cast<size_t>(batch.maxBatchSize());

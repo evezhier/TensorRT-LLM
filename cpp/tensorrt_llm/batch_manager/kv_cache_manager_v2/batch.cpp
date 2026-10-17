@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/batch.h"
 
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/indexConversionKernels.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
@@ -137,6 +138,7 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std
 
     // After the modes: a request's offsets depend on where its life cycle puts the base.
     _buildIndexTables(indexTables);
+    _allocateIndexTables();
 }
 
 void Batch::_allocateFetchScratch()
@@ -254,6 +256,12 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
 
         auto const& first = request.buffers.front();
         auto const lifeCycle = mManager->bufferAttr(first.layerId, first.role).lifeCycleId;
+        // A scratch slot substitutes a different page for one layer, so its entries stop
+        // being the affine function of the slot id that the conversion applies. Refusing
+        // beats converting a table nothing would notice was wrong.
+        TLLM_CHECK_WITH_INFO(mManager->supportsIndexMode(PageIndexMode::SHARED, lifeCycle).has_value(),
+            "Index conversion does not implement scratch-slot substitution yet, so a life cycle that can hold "
+            "scratch slots cannot have converted index tables");
         auto const scale = mManager->getPageIndexScale(first.layerId, first.role);
         auto const mode = mIndexModes[lifeCycle];
 
@@ -309,6 +317,88 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
                 "A buffer appears in two index table requests that resolved differently");
         }
     }
+}
+
+void Batch::_allocateIndexTables()
+{
+    if (mIndexTables.empty())
+    {
+        return;
+    }
+
+    auto const rowBlocks = static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
+    size_t elements = 0;
+    for (auto& table : mIndexTables)
+    {
+        table.elementOffset = elements;
+        elements += table.concatOffsets.size() * rowBlocks;
+        mMaxTableEntries = std::max(mMaxTableEntries, static_cast<int>(table.concatOffsets.size()));
+    }
+
+    CUdeviceptr memory = 0;
+    cuCheck(cuMemAlloc(&memory, sizeof(int32_t) * elements));
+    mIndexTableMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(memory)};
+    // A table a publish has not reached yet must read as absent rather than as slot zero.
+    cuCheck(cuMemsetD32(memory, static_cast<unsigned int>(kBadPageIndex.value()), elements));
+
+    // The descriptors and the offsets they point at share one allocation: the offsets are a
+    // handful of ints per table and would otherwise be an allocation each.
+    size_t offsetElements = 0;
+    for (auto const& table : mIndexTables)
+    {
+        offsetElements += table.concatOffsets.size();
+    }
+    size_t const descBytes = sizeof(IndexTableDesc) * mIndexTables.size();
+    size_t const offsetsBytes = sizeof(int32_t) * offsetElements;
+
+    CUdeviceptr descs = 0;
+    cuCheck(cuMemAlloc(&descs, descBytes + offsetsBytes));
+    mIndexTableDescs = CudaUniqPtr{reinterpret_cast<std::byte*>(descs)};
+
+    std::vector<int32_t> offsetHost;
+    offsetHost.reserve(offsetElements);
+    std::vector<IndexTableDesc> descHost;
+    descHost.reserve(mIndexTables.size());
+
+    auto const offsetsBase = descs + descBytes;
+    auto const rawBase = reinterpret_cast<CUdeviceptr>(mDeviceStaging.get());
+    for (auto const& table : mIndexTables)
+    {
+        IndexTableDesc desc;
+        // The raw slot ids of this table's life cycle, in the staging the upload filled.
+        desc.raw = reinterpret_cast<int32_t const*>(
+            rawBase + sizeof(int32_t) * _rowElements() * static_cast<size_t>(table.lifeCycle.value()));
+        desc.converted = reinterpret_cast<int32_t*>(memory + sizeof(int32_t) * table.elementOffset);
+        desc.offsets = reinterpret_cast<int32_t const*>(offsetsBase + sizeof(int32_t) * offsetHost.size());
+        desc.numEntries = static_cast<int32_t>(table.concatOffsets.size());
+        desc.scale = table.scale;
+        descHost.push_back(desc);
+        offsetHost.insert(offsetHost.end(), table.concatOffsets.begin(), table.concatOffsets.end());
+    }
+
+    cuCheck(cuMemcpyHtoD(descs, descHost.data(), descBytes));
+    cuCheck(cuMemcpyHtoD(offsetsBase, offsetHost.data(), offsetsBytes));
+}
+
+void Batch::_convertIndices(CUstream stream)
+{
+    if (mIndexTables.empty())
+    {
+        return;
+    }
+    launchIndexConversion(reinterpret_cast<IndexTableDesc const*>(mIndexTableDescs.get()),
+        static_cast<int32_t>(mIndexTables.size()), mMaxTableEntries, mMaxBatchSize, mMaxBlocksPerSeq,
+        static_cast<int32_t>(mMaxBlocksPerSeq), stream);
+}
+
+CUdeviceptr Batch::indexTableAddress(IndexTableId tableId) const
+{
+    if (tableId.value() < 0 || tableId >= numIndexTables())
+    {
+        throw std::out_of_range("Batch::indexTableAddress: unknown table");
+    }
+    return reinterpret_cast<CUdeviceptr>(mIndexTableMemory.get())
+        + sizeof(int32_t) * mIndexTables[static_cast<size_t>(tableId.value())].elementOffset;
 }
 
 IndexTableId Batch::numIndexTables() const noexcept
@@ -647,6 +737,7 @@ void Batch::publish(CUstream stream)
     // left on the caller's stream -- one copy, because the two layouts match.
     mPublished.waitInStream(reinterpret_cast<CudaStream>(stream));
     cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _deviceBytes(), stream));
+    _convertIndices(stream);
     mStagingRead = CachedCudaEvent{reinterpret_cast<CudaStream>(stream)};
 }
 

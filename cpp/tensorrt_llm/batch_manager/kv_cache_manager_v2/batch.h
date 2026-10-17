@@ -184,6 +184,10 @@ public:
     //! What a kernel adds to a converted index for this buffer. Every buffer of a request
     //! shares it, because the request's own offsets are already in the entries.
     [[nodiscard]] MemAddress indexTableBase(LayerId layerId, DataRole const& role) const;
+
+    //! Where one table's converted indices live: int32[entries][max_batch][blocks].
+    //! Stable for the Batch's lifetime, so a captured graph may bake it.
+    [[nodiscard]] CUdeviceptr indexTableAddress(IndexTableId tableId) const;
     ~Batch();
 
     Batch(Batch const&) = delete;
@@ -370,6 +374,8 @@ private:
         LifeCycleId lifeCycle{0};
         int scale = 1;
         std::vector<int> concatOffsets;
+        //! Element offset into mIndexTableMemory.
+        size_t elementOffset = 0;
     };
 
     std::vector<IndexTable> mIndexTables;
@@ -389,6 +395,18 @@ private:
     //! Validate the requests, merge those whose converted indices coincide, and record
     //! where each buffer landed.
     void _buildIndexTables(std::vector<IndexTableRequest> const& requests);
+
+    //! Allocate the tables and the device-side descriptors the conversion reads.
+    void _allocateIndexTables();
+
+    //! Convert this step's raw slot ids into every table, on `stream`.
+    void _convertIndices(CUstream stream);
+
+    //! All converted tables, carved by IndexTable::elementOffset.
+    CudaUniqPtr mIndexTableMemory;
+    //! One IndexTableDesc per table, and the offsets they point at.
+    CudaUniqPtr mIndexTableDescs;
+    int mMaxTableEntries = 0;
 
     //! Set when the page-index table is borrowed, in which case mStaging and mDevice hold
     //! only the watermarks and cache views.

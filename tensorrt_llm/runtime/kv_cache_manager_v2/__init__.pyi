@@ -944,6 +944,14 @@ class Batch:
         :meth:`index_table_base`. Iterating :meth:`index_table` is for introspection.
         """
 
+    def index_table_address(self, table_id: int) -> MemAddress:
+        """Where one table's converted indices live.
+
+        ``int32[entries][max_batch][blocks_per_seq]``, stable for the ``Batch``'s lifetime,
+        so a captured graph may bake it. Reads as ``BAD_PAGE_INDEX`` until the first
+        :meth:`publish` converts into it.
+        """
+
     def index_table_base(self, layer_id: LayerId, role: DataRole) -> MemAddress:
         """What a kernel adds to a converted index for this buffer.
 

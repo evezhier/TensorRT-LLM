@@ -242,6 +242,15 @@ def batch_page_table(batch: Any, layer_group_id: int) -> list[int]:
     return list(_cpp().batch_page_table(batch, layer_group_id))
 
 
+def batch_index_table(batch: Any, table_id: int) -> list[int]:
+    """A Batch's converted index table, row-major [entries][max_batch][blocks_per_seq].
+
+    Reads the device copy, so it shows what the last publish() converted rather than what
+    the raw staging holds. Synchronises.
+    """
+    return list(_cpp().batch_index_table(batch, table_id))
+
+
 def batch_sparse_view_entries(batch: Any, layer_group_id: int) -> list[int]:
     """Entries per buffer of each row's published sparse cache view.
 

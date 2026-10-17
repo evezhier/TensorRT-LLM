@@ -1695,6 +1695,90 @@ class TestIndexTables(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def _assert_converted_matches_reference(self, manager, batch, cache, roles, mode):
+        """Rebuild the concat table from PageIndexConverter and compare entry for entry.
+
+        The reference gives each buffer its own table and puts the per-role offset in that
+        table's base. A concat request shares one base across its buffers, so it must carry
+        the offset in the entry instead:
+
+            expected[i] = reference[i] + (role_base[i] - request_base) / stride
+
+        Under SHARED that difference is the K-to-V gap; under PER_LAYER both bases are the
+        pool group's, so it is zero and the reference's own layer_offset already separates
+        the roles. Either way the reference supplies the arithmetic, so this tests the
+        conversion rather than restating it.
+        """
+        lg = manager.get_layer_group_id(0)
+        raw = [int(x) for x in cache.get_base_page_indices(lg)]
+        self.assertTrue(any(x != BAD_PAGE_INDEX for x in raw), "no blocks to convert")
+
+        converted = _introspection.batch_index_table(batch, 0)
+        rows, blocks = batch.max_batch_size, batch.max_blocks_per_seq
+        self.assertEqual(len(converted), len(roles) * rows * blocks)
+
+        for entry, role in enumerate(roles):
+            stride = manager.get_page_stride(0, role)
+            shift = (
+                manager.get_mem_pool_base_address(0, role, mode) - batch.index_table_base(0, role)
+            ) // stride
+            reference = list(manager.get_page_index_converter(0, role)(raw[:blocks], mode))
+            want = [x if x == BAD_PAGE_INDEX else x + shift for x in reference]
+            got = converted[entry * rows * blocks : entry * rows * blocks + blocks]
+            self.assertEqual(got, want, f"entry {entry} ({role})")
+
+    @contextlib.contextmanager
+    def _published(self, manager, mode):
+        """A one-member batch whose {key, value} request has been converted once."""
+        request = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
+        batch = Batch(
+            manager,
+            max_batch_size=1,
+            max_blocks_per_seq=4,
+            mode=mode,
+            index_tables=[request],
+        )
+        cache = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                cache = manager.create_kv_cache()
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resume(handle))
+                tokens = 2 * 32
+                batch.resize([tokens], [tokens], handle)
+                yield batch, cache
+        finally:
+            if cache is not None:
+                if batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+
+    def test_shared_entries_match_the_reference_converter(self):
+        manager = self._manager(roles=("key", "value"), layers=1)
+        try:
+            with self._published(manager, PageIndexMode.SHARED) as (batch, cache):
+                self._assert_converted_matches_reference(
+                    manager, batch, cache, ("key", "value"), PageIndexMode.SHARED
+                )
+        finally:
+            manager.shutdown()
+
+    def test_per_layer_entries_match_the_reference_converter(self):
+        """A separate case because the base differs between the modes.
+
+        The pool group's base here, carrying no per-layer offset, against the request's
+        first buffer under SHARED, which carries one. Same formula, different entries.
+        """
+        manager = self._manager(roles=("key", "value"), layers=1)
+        try:
+            with self._published(manager, PageIndexMode.PER_LAYER) as (batch, cache):
+                self._assert_converted_matches_reference(
+                    manager, batch, cache, ("key", "value"), PageIndexMode.PER_LAYER
+                )
+        finally:
+            manager.shutdown()
+
     def test_an_unrequested_buffer_has_no_slot(self):
         manager = self._manager(roles=("key", "value"))
         try:

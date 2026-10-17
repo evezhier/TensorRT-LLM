@@ -59,6 +59,10 @@ public:
     // [max_batch][max_blocks_per_seq]. Synchronises.
     static std::vector<int32_t> batchPageTable(Batch const& batch, int layerGroupId);
 
+    //! One converted index table, row-major [entries][max_batch][blocks_per_seq].
+    //! Reads the device copy, so it shows what the last publish() converted. Synchronises.
+    static std::vector<int32_t> batchIndexTable(Batch const& batch, int tableId);
+
     // White-box hook: entriesPerLayer of each row's published sparse cache view, zero where
     // no view is staged. Non-zero exactly where a member holds a reservation. Synchronises.
     static std::vector<int32_t> batchSparseViewEntries(Batch const& batch, int layerGroupId);

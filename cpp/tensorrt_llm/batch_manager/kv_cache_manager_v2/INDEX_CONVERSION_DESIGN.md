@@ -64,9 +64,11 @@ Entries are the same formula in both. What differs is how many tables exist and 
 per-layer distinction lives -- in the base under SHARED, in the table's identity under
 PER_LAYER.
 
-The two modes may use separate kernels rather than one that branches. PER_LAYER carries the
-scratch substitution and a layer dimension SHARED does not have, so a shared kernel would be
-mostly mode-dependent anyway.
+Without scratch substitution one kernel covers both modes: PER_LAYER is SHARED writing to
+more destinations with a different offset per layer, and a descriptor per table expresses
+that uniformly. Scratch is the only thing that needs its own kernel, and only under
+PER_LAYER -- it substitutes a different page for one layer, so entries stop being the affine
+function of the slot id that the conversion applies.
 
 Which means: with entries identical across the layers of a life cycle, the only thing that
 can make layer *L* differ from *L+1* is **scratch-slot substitution**. That is why

@@ -2192,6 +2192,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("lc_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("batch_page_table", &kv::KvCacheIntrospection::batchPageTable, nb::arg("batch"),
         nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
+
+    mIntrospection.def("batch_index_table", &kv::KvCacheIntrospection::batchIndexTable, nb::arg("batch"),
+        nb::arg("table_id"),
+        "One converted index table, row-major [entries][max_batch][blocks_per_seq]. Reads the "
+        "device copy, so it shows what the last publish() converted. Synchronises.");
     mIntrospection.def("batch_sparse_view_entries", &kv::KvCacheIntrospection::batchSparseViewEntries, nb::arg("batch"),
         nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
@@ -2528,6 +2533,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_id"), nb::arg("role"),
             "What a kernel adds to a converted index for this buffer. Every buffer of a request "
             "shares it, because the request's own offsets are already in the entries.")
+        .def(
+            "index_table_address",
+            [](kv::Batch const& self, int tableId)
+            { return static_cast<std::uintptr_t>(self.indexTableAddress(kv::IndexTableId{tableId})); },
+            nb::arg("table_id"),
+            "Where one table's converted indices live: int32[entries][max_batch][blocks]. "
+            "Stable for the Batch's lifetime, so a captured graph may bake it.")
         .def(
             "resize",
             [](kv::Batch& self, std::vector<std::optional<int>> const& capacities,
