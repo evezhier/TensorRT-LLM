@@ -26,6 +26,7 @@
 
 #include <cuda.h>
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -71,6 +72,23 @@ struct ExternalPageTable
     //! Elements between consecutive layer groups, and between consecutive rows of one.
     int64_t layerGroupStride = 0;
     int64_t rowStride = 0;
+};
+
+//! Identifies one converted index table of a Batch.
+using IndexTableId = StrongIndex<int, struct IndexTableIdTag>;
+
+//! Buffers a consumer must address from one table, under one base pointer.
+//!
+//! This states a kernel's requirement, not a preference: some attention ops take a single
+//! block table covering K and V rather than one each. Order defines the table's buffer
+//! dimension, so a kernel reads buffer `i` of this request at entry `i`.
+//!
+//! Every buffer must share a life cycle and a page-index scale, since no one table can
+//! serve buffers whose converted indices differ. A request that spans either is refused
+//! when the Batch is constructed.
+struct IndexTableRequest
+{
+    std::vector<BufferId> buffers;
 };
 
 //! Device scratch one layer group's fetch resolves into, before the copy and the index
@@ -141,11 +159,31 @@ public:
     //!
     //! The mode is fixed here because a converted table's shape is baked into a captured
     //! graph. It cannot follow a member's scratch state, which varies per step.
+    //! @param indexTables what consumers need addressable together. Requests whose
+    //! converted indices coincide are merged onto one table, which is how a quantised
+    //! layer's data and block scales come to share one.
     explicit Batch(KvCacheManager& manager, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
-        std::optional<ExternalPageTable> pageTable = std::nullopt, std::optional<PageIndexMode> mode = std::nullopt);
+        std::optional<ExternalPageTable> pageTable = std::nullopt, std::optional<PageIndexMode> mode = std::nullopt,
+        std::vector<IndexTableRequest> indexTables = {});
 
     //! Page index mode of one life cycle, as chosen at construction.
     [[nodiscard]] PageIndexMode indexMode(LayerGroupId layerGroupId) const;
+
+    // ---- Converted index tables --------------------------------------------
+
+    [[nodiscard]] IndexTableId numIndexTables() const noexcept;
+
+    //! Every request one table satisfies. A request's buffer order is its own mapping into
+    //! the buffer dimension, so the first buffer of each sits at entry zero.
+    [[nodiscard]] std::vector<IndexTableRequest> const& indexTable(IndexTableId tableId) const;
+
+    //! Which table serves this buffer, and its entry in that table's buffer dimension.
+    //! This is the normal query: a kernel asks where its indices are and at what entry.
+    [[nodiscard]] std::pair<IndexTableId, int> indexTableSlot(LayerId layerId, DataRole const& role) const;
+
+    //! What a kernel adds to a converted index for this buffer. Every buffer of a request
+    //! shares it, because the request's own offsets are already in the entries.
+    [[nodiscard]] MemAddress indexTableBase(LayerId layerId, DataRole const& role) const;
     ~Batch();
 
     Batch(Batch const&) = delete;
@@ -323,6 +361,34 @@ private:
     //! layer's indices differ from another's in the same life cycle, so a life cycle that
     //! cannot hold scratch takes SHARED and the single smaller table that implies.
     TypedVec<LifeCycleId, PageIndexMode> mIndexModes;
+
+    //! One converted index table: the requests it serves, and what a consumer needs to read
+    //! it. `concatOffsets` is in page-index units, parallel to a request's buffers.
+    struct IndexTable
+    {
+        std::vector<IndexTableRequest> served;
+        LifeCycleId lifeCycle{0};
+        int scale = 1;
+        std::vector<int> concatOffsets;
+    };
+
+    std::vector<IndexTable> mIndexTables;
+
+    //! Where one buffer's indices are. The base belongs to the buffer's request, not to the
+    //! table: merged requests share entries precisely so they can be read through different
+    //! bases, which is what keeps a quantised layer's data and block scales apart.
+    struct BufferSlot
+    {
+        IndexTableId table{0};
+        int entry = 0;
+        MemAddress base = 0;
+    };
+
+    std::map<std::pair<LayerId, DataRole>, BufferSlot> mBufferSlots;
+
+    //! Validate the requests, merge those whose converted indices coincide, and record
+    //! where each buffer landed.
+    void _buildIndexTables(std::vector<IndexTableRequest> const& requests);
 
     //! Set when the page-index table is borrowed, in which case mStaging and mDevice hold
     //! only the watermarks and cache views.

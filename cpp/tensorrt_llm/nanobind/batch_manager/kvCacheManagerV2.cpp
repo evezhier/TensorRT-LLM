@@ -2461,11 +2461,26 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("layer_group_stride", &kv::ExternalPageTable::layerGroupStride)
         .def_rw("row_stride", &kv::ExternalPageTable::rowStride);
 
+    nb::class_<kv::IndexTableRequest>(m, "IndexTableRequest")
+        .def(nb::init<>())
+        .def(
+            "__init__",
+            [](kv::IndexTableRequest* self, std::vector<kv::BufferId> buffers)
+            { new (self) kv::IndexTableRequest{std::move(buffers)}; },
+            nb::arg("buffers"),
+            "Buffers a consumer must address from one table, under one base pointer.\n\n"
+            "States a kernel's requirement, not a preference: some attention ops take a single "
+            "block table covering K and V rather than one each. Order defines the buffer "
+            "dimension, so a kernel reads buffer i of this request at entry i. Every buffer must "
+            "share a life cycle and a page index scale, or the request is refused.")
+        .def_rw("buffers", &kv::IndexTableRequest::buffers);
+
     nb::class_<kv::Batch>(m, "Batch")
         .def(nb::init<kv::KvCacheManager&, int, int, std::optional<kv::ExternalPageTable>,
-                 std::optional<kv::PageIndexMode>>(),
+                 std::optional<kv::PageIndexMode>, std::vector<kv::IndexTableRequest>>(),
             nb::arg("manager"), nb::arg("max_batch_size") = 0, nb::arg("max_blocks_per_seq") = 0,
-            nb::arg("page_table") = nb::none(), nb::arg("mode") = nb::none(), nb::keep_alive<1, 2>(),
+            nb::arg("page_table") = nb::none(), nb::arg("mode") = nb::none(),
+            nb::arg("index_tables") = std::vector<kv::IndexTableRequest>{}, nb::keep_alive<1, 2>(),
             "The KV caches stepped together, and their device-side page tables.\n\n"
             "max_batch_size and max_blocks_per_seq bound device arrays whose shape must not change "
             "between steps, so neither can be grown later. Zero derives them from the manager's "
@@ -2489,6 +2504,30 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Page index mode of one life cycle, as chosen at construction.\n\n"
             "Unset at construction, each life cycle takes the smaller table: SHARED where the "
             "manager reports it always available, PER_LAYER otherwise.")
+        .def_prop_ro("num_index_tables", [](kv::Batch const& self) { return self.numIndexTables().value(); })
+        .def(
+            "index_table",
+            [](kv::Batch const& self, int tableId) { return self.indexTable(kv::IndexTableId{tableId}); },
+            nb::arg("table_id"),
+            "Every request this table satisfies. A request's buffer order is its own mapping "
+            "into the buffer dimension, so the first buffer of each sits at entry zero.")
+        .def(
+            "index_table_slot",
+            [](kv::Batch const& self, int layerId, kv::DataRole const& role)
+            {
+                auto const [tableId, slot] = self.indexTableSlot(kv::LayerId{layerId}, role);
+                return nb::make_tuple(tableId.value(), slot);
+            },
+            nb::arg("layer_id"), nb::arg("role"),
+            "(table, entry) serving this buffer. The normal query: a kernel asks where its "
+            "indices are and at what entry.")
+        .def(
+            "index_table_base",
+            [](kv::Batch const& self, int layerId, kv::DataRole const& role)
+            { return self.indexTableBase(kv::LayerId{layerId}, role); },
+            nb::arg("layer_id"), nb::arg("role"),
+            "What a kernel adds to a converted index for this buffer. Every buffer of a request "
+            "shares it, because the request's own offsets are already in the entries.")
         .def(
             "resize",
             [](kv::Batch& self, std::vector<std::optional<int>> const& capacities,

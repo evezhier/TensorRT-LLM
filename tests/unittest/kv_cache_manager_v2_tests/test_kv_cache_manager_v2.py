@@ -51,6 +51,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         ExternalPageTable,
         GpuCacheTierConfig,
         HostCacheTierConfig,
+        IndexTableRequest,
         KVCacheDesc,
         KVCacheManager,
         KVCacheManagerConfig,
@@ -105,6 +106,7 @@ else:
         ExternalPageTable,
         GpuCacheTierConfig,
         HostCacheTierConfig,
+        IndexTableRequest,
         KVCacheDesc,
         KVCacheManager,
         KVCacheManagerConfig,
@@ -1506,6 +1508,209 @@ class TestSparseFetch(unittest.TestCase):
                 manager.fetch_sparse_pages(
                     batch, self._buffers(roles), selected, self._out(torch, 2, 1), handle
                 )
+
+
+class TestIndexTables(unittest.TestCase):
+    """Which converted index tables a Batch builds, and which requests share one.
+
+    A request states what a kernel must address together. Two requests share a table when
+    their converted entries coincide, which needs the same life cycle, the same page index
+    scale, and the same offsets -- the condition a quantised layer's data and block scales
+    satisfy because their pool group mirrors their slots.
+    """
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @staticmethod
+    def _manager(*, roles: tuple[str, ...], layers: int = 2) -> KVCacheManager:
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=8 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(layer),
+                        buffers=[BufferConfig(role=role, size=1024) for role in roles],
+                    )
+                    for layer in range(layers)
+                ],
+                constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=32, history_length=0)])],
+            )
+        )
+
+    @staticmethod
+    def _batch(manager, requests):
+        return Batch(manager, max_batch_size=1, max_blocks_per_seq=4, index_tables=requests)
+
+    def test_a_request_is_reachable_from_every_buffer_it_names(self):
+        """Entry order follows the request's buffer order, which is what a kernel indexes."""
+        manager = self._manager(roles=("key", "value"))
+        try:
+            request = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
+            batch = self._batch(manager, [request])
+            self.assertEqual(batch.num_index_tables, 1)
+            self.assertEqual(batch.index_table_slot(0, "key"), (0, 0))
+            self.assertEqual(batch.index_table_slot(0, "value"), (0, 1))
+            # One base for the whole request: the offsets are already in the entries.
+            self.assertEqual(batch.index_table_base(0, "key"), batch.index_table_base(0, "value"))
+        finally:
+            manager.shutdown()
+
+    def test_layers_of_one_life_cycle_share_a_table_under_shared(self):
+        """SHARED is exactly this: entries that every layer of the group can read."""
+        manager = self._manager(roles=("key",), layers=2)
+        try:
+            lg = manager.get_layer_group_id(0)
+            requests = [IndexTableRequest([BufferId(layer, "key")]) for layer in range(2)]
+            batch = self._batch(manager, requests)
+            self.assertEqual(batch.index_mode(lg), PageIndexMode.SHARED)
+            self.assertEqual(batch.num_index_tables, 1)
+            self.assertEqual(
+                batch.index_table_slot(0, "key")[0], batch.index_table_slot(1, "key")[0]
+            )
+            # Two requests merged onto it, one per layer.
+            self.assertEqual(len(batch.index_table(0)), 2)
+        finally:
+            manager.shutdown()
+
+    def test_per_layer_keeps_the_layers_apart(self):
+        """However alike the entries look, a PER_LAYER table serves one layer."""
+        manager = self._manager(roles=("key",), layers=2)
+        try:
+            requests = [IndexTableRequest([BufferId(layer, "key")]) for layer in range(2)]
+            batch = Batch(
+                manager,
+                max_batch_size=1,
+                max_blocks_per_seq=4,
+                mode=PageIndexMode.PER_LAYER,
+                index_tables=requests,
+            )
+            self.assertEqual(batch.num_index_tables, 2)
+            self.assertNotEqual(
+                batch.index_table_slot(0, "key")[0], batch.index_table_slot(1, "key")[0]
+            )
+        finally:
+            manager.shutdown()
+
+    @staticmethod
+    def _quantised_manager(*, paired_scales: bool) -> KVCacheManager:
+        """One layer whose data and block-scale buffers land in separate pools.
+
+        Pools group buffers of equal size, and a pool's scale is how many buffers it
+        coalesces. So two same-size scale buffers give scale 2 like the data pair, while a
+        lone one gives scale 1.
+        """
+        scale_roles = ["k_scale", "v_scale"] if paired_scales else ["k_scale"]
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=8 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(0),
+                        buffers=[BufferConfig(role=role, size=1024) for role in ("key", "value")]
+                        + [BufferConfig(role=role, size=256) for role in scale_roles],
+                    )
+                ],
+                constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=32, history_length=0)])],
+            )
+        )
+
+    def test_data_and_block_scales_share_a_table_when_their_scales_match(self):
+        """The quantised case the merge rule exists for.
+
+        Both pools coalesce two buffers and the pool group mirrors their slots, so the
+        converted entries coincide and one table serves both -- through different bases.
+        """
+        manager = self._quantised_manager(paired_scales=True)
+        try:
+            self.assertEqual(
+                manager.get_page_index_scale(0, "key"), manager.get_page_index_scale(0, "k_scale")
+            )
+            data = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
+            scales = IndexTableRequest([BufferId(0, "k_scale"), BufferId(0, "v_scale")])
+            batch = self._batch(manager, [data, scales])
+
+            self.assertEqual(batch.num_index_tables, 1)
+            self.assertEqual(len(batch.index_table(0)), 2)
+            # Same entries, so the same table at the same slots...
+            self.assertEqual(batch.index_table_slot(0, "key"), batch.index_table_slot(0, "k_scale"))
+            self.assertEqual(
+                batch.index_table_slot(0, "value"), batch.index_table_slot(0, "v_scale")
+            )
+            # ...reached through different bases, which is what keeps them distinct.
+            self.assertNotEqual(
+                batch.index_table_base(0, "key"), batch.index_table_base(0, "k_scale")
+            )
+        finally:
+            manager.shutdown()
+
+    def test_a_request_spanning_scales_is_refused(self):
+        """A request whose buffers disagree on scale cannot be served by one table.
+
+        Scale sets the entry stride, so buffers with different scales have different
+        converted indices for the same slot.
+        """
+        manager = self._quantised_manager(paired_scales=False)
+        try:
+            data_scale = manager.get_page_index_scale(0, "key")
+            lone_scale = manager.get_page_index_scale(0, "k_scale")
+            self.assertNotEqual(data_scale, lone_scale, "config does not produce differing scales")
+            with self.assertRaises(Exception) as caught:
+                self._batch(
+                    manager, [IndexTableRequest([BufferId(0, "key"), BufferId(0, "k_scale")])]
+                )
+            self.assertIn("scales", str(caught.exception))
+        finally:
+            manager.shutdown()
+
+    def test_a_request_spanning_life_cycles_is_refused(self):
+        """Different life cycles number their slots separately, so the entries cannot agree."""
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=8 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(0),
+                        buffers=[BufferConfig(role="key", size=1024)],
+                        sliding_window_size=32,
+                        num_sink_tokens=0,
+                    ),
+                    AttentionLayerConfig(
+                        layer_id=LayerId(1),
+                        buffers=[BufferConfig(role="key", size=1024)],
+                        sliding_window_size=None,
+                    ),
+                ],
+                constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=32, history_length=0)])],
+            )
+        )
+        try:
+            self.assertNotEqual(manager.get_layer_group_id(0), manager.get_layer_group_id(1))
+            with self.assertRaises(Exception) as caught:
+                self._batch(manager, [IndexTableRequest([BufferId(0, "key"), BufferId(1, "key")])])
+            self.assertIn("life cycles", str(caught.exception))
+        finally:
+            manager.shutdown()
+
+    def test_an_unrequested_buffer_has_no_slot(self):
+        manager = self._manager(roles=("key", "value"))
+        try:
+            batch = self._batch(manager, [IndexTableRequest([BufferId(0, "key")])])
+            with self.assertRaises(Exception) as caught:
+                batch.index_table_slot(0, "value")
+            self.assertIn("no index table request", str(caught.exception))
+        finally:
+            manager.shutdown()
+
+    def test_no_requests_means_no_tables(self):
+        manager = self._manager(roles=("key",))
+        try:
+            self.assertEqual(self._batch(manager, []).num_index_tables, 0)
+        finally:
+            manager.shutdown()
 
 
 class TestIndexMode(unittest.TestCase):

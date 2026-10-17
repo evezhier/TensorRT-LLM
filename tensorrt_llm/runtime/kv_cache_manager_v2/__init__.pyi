@@ -850,6 +850,22 @@ class ExternalPageTable:
     @property
     def row_stride(self) -> int: ...
 
+class IndexTableRequest:
+    """Buffers a consumer must address from one table, under one base pointer.
+
+    States a kernel's requirement, not a preference: some attention ops take a single block
+    table covering K and V rather than one each. Order defines the table's buffer dimension,
+    so a kernel reads buffer ``i`` of this request at entry ``i``.
+
+    Every buffer must share a life cycle and a page-index scale, since no one table can
+    serve buffers whose converted indices differ. A request spanning either is refused when
+    the ``Batch`` is constructed.
+    """
+
+    def __init__(self, buffers: Sequence[BufferId]) -> None: ...
+    @property
+    def buffers(self) -> list[BufferId]: ...
+
 class Batch:
     """The ``_KVCache`` objects stepped together, and their device-side mirror.
 
@@ -876,6 +892,7 @@ class Batch:
         max_blocks_per_seq: int = 0,
         page_table: ExternalPageTable | None = None,
         mode: PageIndexMode | None = None,
+        index_tables: Sequence[IndexTableRequest] = (),
     ) -> None:
         """Bound the device arrays, whose shape must not change between steps.
 
@@ -908,6 +925,31 @@ class Batch:
 
     def remove_kv_cache(self, kv_cache: _KVCache) -> None:
         """Free the cache's row, leaving a hole for reuse."""
+
+    @property
+    def num_index_tables(self) -> int: ...
+    def index_table(self, table_id: int) -> list[IndexTableRequest]:
+        """Every request this table satisfies.
+
+        A request's buffer order is its own mapping into the buffer dimension, so the first
+        buffer of each sits at entry zero. Requests whose converted indices coincide are
+        merged onto one table, which is how a quantised layer's data and block scales come
+        to share one.
+        """
+
+    def index_table_slot(self, layer_id: LayerId, role: DataRole) -> tuple[int, int]:
+        """``(table, entry)`` serving this buffer.
+
+        The normal query: a kernel asks where its indices are and at what entry, then binds
+        :meth:`index_table_base`. Iterating :meth:`index_table` is for introspection.
+        """
+
+    def index_table_base(self, layer_id: LayerId, role: DataRole) -> MemAddress:
+        """What a kernel adds to a converted index for this buffer.
+
+        Every buffer of a request shares it, because the request's own offsets are already
+        in the entries.
+        """
 
     def index_mode(self, layer_group_id: LayerGroupId) -> PageIndexMode:
         """Page index mode of one life cycle, as chosen at construction.

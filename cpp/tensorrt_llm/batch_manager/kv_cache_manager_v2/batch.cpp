@@ -51,7 +51,7 @@ std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
 } // namespace
 
 Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std::optional<ExternalPageTable> pageTable,
-    std::optional<PageIndexMode> mode)
+    std::optional<PageIndexMode> mode, std::vector<IndexTableRequest> indexTables)
     : mManager(&manager)
     , mPageTable(pageTable)
 {
@@ -134,6 +134,9 @@ Batch::Batch(KvCacheManager& manager, int maxBatchSize, int maxBlocksPerSeq, std
     }
 
     _allocateFetchScratch();
+
+    // After the modes: a request's offsets depend on where its life cycle puts the base.
+    _buildIndexTables(indexTables);
 }
 
 void Batch::_allocateFetchScratch()
@@ -227,6 +230,119 @@ PageIndexMode Batch::indexMode(LayerGroupId layerGroupId) const
         throw std::out_of_range("Batch::indexMode: unknown layer group");
     }
     return mIndexModes[layerGroupId];
+}
+
+void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
+{
+    // The offset of a buffer relative to a chosen base, in page-index units. Mirrors the
+    // runtime's kv_offset: a base difference divided by the page stride, which must divide
+    // exactly or the two buffers do not sit a whole number of pages apart.
+    auto pageOffset = [this](BufferId const& buffer, MemAddress base)
+    {
+        auto const bufferBase = mManager->getMemPoolBaseAddress(buffer.layerId, buffer.role, PageIndexMode::SHARED);
+        auto const stride = static_cast<int64_t>(mManager->getPageStride(buffer.layerId, buffer.role));
+        TLLM_CHECK_WITH_INFO(stride > 0, "Page stride must be positive to offset a buffer within its slot");
+        auto const delta = static_cast<int64_t>(bufferBase) - static_cast<int64_t>(base);
+        TLLM_CHECK_WITH_INFO(delta % stride == 0,
+            "Buffers sharing an index table must sit a whole number of pages apart; they cannot share one");
+        return static_cast<int>(delta / stride);
+    };
+
+    for (auto const& request : requests)
+    {
+        TLLM_CHECK_WITH_INFO(!request.buffers.empty(), "An index table request names no buffers");
+
+        auto const& first = request.buffers.front();
+        auto const lifeCycle = mManager->bufferAttr(first.layerId, first.role).lifeCycleId;
+        auto const scale = mManager->getPageIndexScale(first.layerId, first.role);
+        auto const mode = mIndexModes[lifeCycle];
+
+        // Under SHARED the base carries the per-layer offset, so the request's own offsets
+        // are relative to its first buffer. Under PER_LAYER the base is the pool group's
+        // and carries none, so every offset is absolute within the slot.
+        auto const base = mode == PageIndexMode::SHARED
+            ? mManager->getMemPoolBaseAddress(first.layerId, first.role, PageIndexMode::SHARED)
+            : mManager->getMemPoolBaseAddress(first.layerId, first.role, PageIndexMode::PER_LAYER);
+
+        std::vector<int> offsets;
+        offsets.reserve(request.buffers.size());
+        for (auto const& buffer : request.buffers)
+        {
+            auto const& attr = mManager->bufferAttr(buffer.layerId, buffer.role);
+            TLLM_CHECK_WITH_INFO(attr.lifeCycleId == lifeCycle,
+                "An index table request spans life cycles; their slot ids differ, so no one table can serve it");
+            TLLM_CHECK_WITH_INFO(mManager->getPageIndexScale(buffer.layerId, buffer.role) == scale,
+                "An index table request spans page index scales; their converted indices differ, so no one table "
+                "can serve it");
+            offsets.push_back(pageOffset(buffer, base));
+        }
+
+        // Requests coincide when their entries do. Under PER_LAYER the table is per layer,
+        // so requests for different layers never merge however alike their entries look.
+        auto const sameTable = [&](IndexTable const& table)
+        {
+            if (table.lifeCycle != lifeCycle || table.scale != scale || table.concatOffsets != offsets)
+            {
+                return false;
+            }
+            return mode == PageIndexMode::SHARED || table.served.front().buffers.front().layerId == first.layerId;
+        };
+
+        auto found = std::find_if(mIndexTables.begin(), mIndexTables.end(), sameTable);
+        if (found == mIndexTables.end())
+        {
+            mIndexTables.push_back(IndexTable{{}, lifeCycle, scale, offsets});
+            found = std::prev(mIndexTables.end());
+        }
+        IndexTableId const tableId{static_cast<int>(std::distance(mIndexTables.begin(), found))};
+        found->served.push_back(request);
+
+        for (size_t slot = 0; slot < request.buffers.size(); ++slot)
+        {
+            auto const& buffer = request.buffers[slot];
+            auto const key = std::make_pair(buffer.layerId, buffer.role);
+            BufferSlot const resolved{tableId, static_cast<int>(slot), base};
+            auto const [it, inserted] = mBufferSlots.emplace(key, resolved);
+            TLLM_CHECK_WITH_INFO(inserted
+                    || (it->second.table == resolved.table && it->second.entry == resolved.entry
+                        && it->second.base == resolved.base),
+                "A buffer appears in two index table requests that resolved differently");
+        }
+    }
+}
+
+IndexTableId Batch::numIndexTables() const noexcept
+{
+    return IndexTableId{static_cast<int>(mIndexTables.size())};
+}
+
+std::vector<IndexTableRequest> const& Batch::indexTable(IndexTableId tableId) const
+{
+    if (tableId.value() < 0 || tableId >= numIndexTables())
+    {
+        throw std::out_of_range("Batch::indexTable: unknown table");
+    }
+    return mIndexTables[static_cast<size_t>(tableId.value())].served;
+}
+
+std::pair<IndexTableId, int> Batch::indexTableSlot(LayerId layerId, DataRole const& role) const
+{
+    auto const found = mBufferSlots.find(std::make_pair(layerId, role));
+    if (found == mBufferSlots.end())
+    {
+        throw std::out_of_range("Batch::indexTableSlot: no index table request named this buffer");
+    }
+    return {found->second.table, found->second.entry};
+}
+
+MemAddress Batch::indexTableBase(LayerId layerId, DataRole const& role) const
+{
+    auto const found = mBufferSlots.find(std::make_pair(layerId, role));
+    if (found == mBufferSlots.end())
+    {
+        throw std::out_of_range("Batch::indexTableBase: no index table request named this buffer");
+    }
+    return found->second.base;
 }
 
 int64_t Batch::_pageTableRowStride() const noexcept

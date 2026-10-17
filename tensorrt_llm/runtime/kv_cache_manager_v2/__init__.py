@@ -153,6 +153,7 @@ ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 ScratchDesc = _cpp.ScratchDesc
 Batch = _cpp.Batch
 ExternalPageTable = _cpp.ExternalPageTable
+IndexTableRequest = _cpp.IndexTableRequest
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
 SsmLayerConfig = _cpp.SsmLayerConfig
@@ -258,6 +259,7 @@ __all__ = [
     "ScratchDesc",
     "Batch",
     "ExternalPageTable",
+    "IndexTableRequest",
     "KVCacheIterationStatsDelta",
     "ReusedBlocksByLevel",
     "KVCacheStatsDelta",
