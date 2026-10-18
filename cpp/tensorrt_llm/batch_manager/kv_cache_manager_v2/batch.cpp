@@ -344,7 +344,7 @@ Batch::~Batch()
     KVCM2_POISON_ON_EXCEPT(
         [this]
         {
-            for (auto* kvCache : mRows)
+            for (auto const& kvCache : mRows)
             {
                 if (kvCache != nullptr)
                 {
@@ -532,7 +532,7 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
 
         for (size_t row = 0; row < mRows.size(); ++row)
         {
-            auto const* kvCache = mRows[row];
+            auto const& kvCache = mRows[row];
             int fromUnit = 0;
             int toUnit = 0;
             if (kvCache != nullptr)
@@ -833,7 +833,7 @@ void Batch::_stageScratch()
 
     for (size_t row = 0; row < mRows.size(); ++row)
     {
-        auto const* kvCache = mRows[row];
+        auto const& kvCache = mRows[row];
         for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
         {
             auto const flat = static_cast<size_t>(lcId.value()) * rows + row;
@@ -950,7 +950,7 @@ void Batch::_stageRowState()
 
     for (size_t row = 0; row < mRows.size(); ++row)
     {
-        auto const* kvCache = mRows[row];
+        auto const& kvCache = mRows[row];
         history[row] = kvCache == nullptr ? 0 : kvCache->historyLength();
         capacity[row] = kvCache == nullptr ? 0 : kvCache->capacity();
 
@@ -1057,13 +1057,25 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
         kvCache.mSparseCache[lc] = std::move(*lease);
     }
 
-    mRows[static_cast<size_t>(row)] = &kvCache;
+    // Owning from here: the member cannot be destroyed under the Batch, so a caller may
+    // keep only the Batch and get the reference back when it leaves.
+    mRows[static_cast<size_t>(row)] = kvCache.shared_from_this();
     kvCache.mBatch = this;
     kvCache.mBatchRow = row;
     return row;
 }
 
-void Batch::removeKvCache(KvCache& kvCache)
+std::shared_ptr<KvCache> Batch::removeKvCache(int row)
+{
+    if (row < 0 || row >= mMaxBatchSize)
+    {
+        throw std::out_of_range("Batch::removeKvCache: row is beyond max_batch_size");
+    }
+    auto seated = mRows[static_cast<size_t>(row)];
+    return seated ? removeKvCache(*seated) : nullptr;
+}
+
+std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
 {
     if (kvCache.mBatch != this)
     {
@@ -1071,6 +1083,9 @@ void Batch::removeKvCache(KvCache& kvCache)
     }
     waitPublished();
     int const row = kvCache.mBatchRow;
+    // Held until the end: clearing the row below drops the Batch's reference, and the rest
+    // of this runs against the member.
+    auto leaving = std::move(mRows[static_cast<size_t>(row)]);
     // Membership ends first, so the unbinding below goes through the same setter a caller
     // would use. Nothing binds a seated member's buffer, including the Batch.
     kvCache.mBatch = nullptr;
@@ -1091,6 +1106,7 @@ void Batch::removeKvCache(KvCache& kvCache)
     }
     _seedRowWatermarks(row, 0, 0);
     mRows[static_cast<size_t>(row)] = nullptr;
+    return leaving;
 }
 
 void Batch::_detach(KvCache& kvCache) noexcept
@@ -1099,17 +1115,11 @@ void Batch::_detach(KvCache& kvCache) noexcept
     {
         return;
     }
-    KVCM2_POISON_ON_EXCEPT([this] { waitPublished(); });
-    int const row = kvCache.mBatchRow;
-    for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
-    {
-        auto* staged = _stagingRow(lg, row);
-        std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
-    }
-    _seedRowWatermarks(row, 0, 0);
-    mRows[static_cast<size_t>(row)] = nullptr;
-    kvCache.mBatch = nullptr;
-    kvCache.mBatchRow = -1;
+    // A seated member holds a reference from mRows, so its destructor cannot run while it
+    // is one. Reaching here means a row was cleared without unbinding the member, leaving a
+    // row that publishes from an object about to stop existing.
+    KVCM2_CHECK_FATAL_WITH_INFO(
+        false, "A KvCache was destroyed while seated in a Batch, so its row outlived the cache it names");
 }
 
 std::vector<uint8_t> Batch::resize(
@@ -1124,7 +1134,7 @@ std::vector<uint8_t> Batch::resize(
     // was rather than part-way through.
     for (size_t row = 0; row < mRows.size(); ++row)
     {
-        auto const* kvCache = mRows[row];
+        auto const& kvCache = mRows[row];
         if (kvCache == nullptr || !historyLengths[row].has_value())
         {
             continue;
@@ -1149,7 +1159,7 @@ std::vector<uint8_t> Batch::resize(
     std::vector<uint8_t> results(mRows.size(), 0);
     for (size_t row = 0; row < mRows.size(); ++row)
     {
-        auto* kvCache = mRows[row];
+        auto const& kvCache = mRows[row];
         if (kvCache == nullptr)
         {
             continue;
@@ -1205,7 +1215,7 @@ void Batch::publish()
     // while no member substitutes scratch slots there. Prefill acquires those and decode
     // does not, so a batch that mixes them would have been given PER_LAYER; reaching here
     // means the phases were mixed after the mode was fixed.
-    for (auto const* kvCache : mRows)
+    for (auto const& kvCache : mRows)
     {
         if (kvCache == nullptr)
         {
@@ -1315,7 +1325,7 @@ WatermarkView Batch::watermarks() const
 int Batch::numKvCaches() const noexcept
 {
     return static_cast<int>(
-        std::count_if(mRows.begin(), mRows.end(), [](KvCache const* row) { return row != nullptr; }));
+        std::count_if(mRows.begin(), mRows.end(), [](std::shared_ptr<KvCache> const& row) { return row != nullptr; }));
 }
 
 bool Batch::isContiguous() const noexcept
@@ -1323,7 +1333,7 @@ bool Batch::isContiguous() const noexcept
     // Nothing occupied past the first free row is the same thing as a prefix, and says so
     // without counting first.
     auto const firstFree = std::find(mRows.begin(), mRows.end(), nullptr);
-    return std::none_of(firstFree, mRows.end(), [](KvCache const* row) { return row != nullptr; });
+    return std::none_of(firstFree, mRows.end(), [](std::shared_ptr<KvCache> const& row) { return row != nullptr; });
 }
 
 int Batch::rowOf(KvCache const& kvCache) const

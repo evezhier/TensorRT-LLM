@@ -2503,12 +2503,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "The Batch stages the host page indices itself; host_page_table() exposes them for a "
             "consumer that needs the same numbers, which leaves one buffer with one writer and a "
             "member's binding alive for the whole decode.")
-        .def("add_kv_cache", &kv::Batch::addKvCache, nb::arg("kv_cache"), nb::arg("row") = -1, nb::keep_alive<1, 2>(),
+        .def("add_kv_cache", &kv::Batch::addKvCache, nb::arg("kv_cache"), nb::arg("row") = -1,
             "Seat a cache in `row`, or in the lowest free row when it is negative, returning the "
             "row. Raises when the row is taken or out of range, the batch is full, or the cache "
-            "already belongs to a batch.")
-        .def("remove_kv_cache", &kv::Batch::removeKvCache, nb::arg("kv_cache"),
-            "Free the cache's row, leaving a hole for reuse.")
+            "already belongs to a batch.\n\n"
+            "The batch holds a reference while the cache is seated, so a caller may keep only the "
+            "batch; remove_kv_cache hands it back.")
+        .def(
+            "remove_kv_cache", [](kv::Batch& self, kv::KvCache& kvCache) { return self.removeKvCache(kvCache); },
+            nb::arg("kv_cache"),
+            "Free the cache's row, leaving a hole for reuse, and return the cache. Raises when it "
+            "is not a member.\n\n"
+            "Returns the arena lease, which discards whatever the GPU cache held: a lease comes "
+            "back with every entry free. Call flush_sparse_units() first for anything worth "
+            "keeping.")
+        .def(
+            "remove_row", [](kv::Batch& self, int row) { return self.removeKvCache(row); }, nb::arg("row"),
+            "The same, by the row add_kv_cache returned. None when nothing is seated there, so a "
+            "caller sweeping rows need not ask twice about each one.")
         .def(
             "index_mode",
             [](kv::Batch const& self, int layerGroupId) { return self.indexMode(kv::LayerGroupId{layerGroupId}); },

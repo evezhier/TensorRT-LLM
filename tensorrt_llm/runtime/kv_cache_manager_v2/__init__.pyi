@@ -919,14 +919,25 @@ class Batch:
 
         """
 
-    def remove_kv_cache(self, kv_cache: _KVCache) -> None:
-        """Free the cache's row, leaving a hole for reuse.
+    def remove_kv_cache(self, kv_cache: _KVCache) -> _KVCache:
+        """Free the cache's row, leaving a hole for reuse, and return the cache.
+
+        The batch held a reference while the cache was seated; this hands it back, so a
+        caller that kept only the batch still gets the cache. Raises when it is not a
+        member.
 
         Returns the arena lease, which **discards whatever the GPU cache held**: a lease
         comes back with every entry free, so a unit whose only copy was in a cell can no
         longer be addressed. Call :meth:`flush_sparse_units` first for anything worth
         keeping. A batch is meant to persist across steps -- churning membership per step
         cold-starts every request's cache.
+        """
+
+    def remove_row(self, row: int) -> _KVCache | None:
+        """The same, by the row :meth:`add_kv_cache` returned.
+
+        ``None`` when nothing is seated there, so a caller sweeping rows need not ask twice
+        about each one.
         """
 
     @property

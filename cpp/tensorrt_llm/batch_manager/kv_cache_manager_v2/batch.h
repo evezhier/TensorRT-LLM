@@ -252,8 +252,16 @@ public:
     //! wider request would have every beam read beam 0's pages.
     int addKvCache(KvCache& kvCache, int row = -1);
 
-    //! Free the cache's row, leaving a hole. Throws when it is not a member.
-    void removeKvCache(KvCache& kvCache);
+    //! Free the cache's row, leaving a hole, and hand back the reference the Batch held.
+    //! Throws when it is not a member.
+    //!
+    //! Returns the arena lease, which discards whatever the GPU cache held: a lease comes back
+    //! with every entry free. Call flushSparseUnits() first for anything worth keeping.
+    std::shared_ptr<KvCache> removeKvCache(KvCache& kvCache);
+
+    //! The same, by the row addKvCache returned. Null when nothing is seated there, since
+    //! a caller sweeping rows should not have to ask twice about each one.
+    std::shared_ptr<KvCache> removeKvCache(int row);
 
     //! Resize every member, then publish once.
     //!
@@ -397,7 +405,7 @@ public:
     }
 
     //! Members, by row; null where a row is free.
-    [[nodiscard]] std::vector<KvCache*> const& rows() const noexcept
+    [[nodiscard]] std::vector<std::shared_ptr<KvCache>> const& rows() const noexcept
     {
         return mRows;
     }
@@ -405,7 +413,8 @@ public:
 private:
     friend class KvCache;
 
-    //! Called by a member being destroyed, so its row does not dangle.
+    //! Called by a member being destroyed. Unreachable while seated -- the Batch holds a
+    //! reference, so the destructor cannot run -- and kept as the assertion of that.
     void _detach(KvCache& kvCache) noexcept;
 
     //! Host-side page-index row for one (layer group, row), inside the pinned staging block.
@@ -467,7 +476,10 @@ private:
     std::optional<int> mMaxTotalInputTokens;
     LifeCycleId mNumLayerGroups{0};
 
-    std::vector<KvCache*> mRows;
+    //! Owning: a seated member cannot be destroyed under the Batch, so a caller is free to
+    //! keep only the Batch. Leaving returns the reference. KvCache points back with a raw
+    //! `mBatch`, so there is no cycle.
+    std::vector<std::shared_ptr<KvCache>> mRows;
 
     //! Device storage behind every life cycle's per-BufferId copy descriptors.
     CudaUniqPtr<SparseCopyDesc> mCopyDesc;

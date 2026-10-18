@@ -3536,6 +3536,39 @@ class TestBatch(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_the_batch_keeps_a_seated_member_alive(self):
+        """A caller may keep only the Batch: seating is what holds the cache up.
+
+        Dropping the caller's reference and then getting the cache back from the Batch is
+        the whole contract -- if the row held a raw pointer the object would already be
+        gone, and what came back would name freed memory.
+        """
+        manager = self._manager()
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                cache = manager.create_kv_cache()
+                self.assertTrue(cache.resume(handle))
+                row = batch.add_kv_cache(cache)
+
+                # Drop the caller's only reference. Were the row raw, this would destroy the
+                # cache and poison on the way out, since a member must not outlive its row.
+                del cache
+                self.assertEqual(batch.num_kv_caches, 1)
+
+                # Leaving hands it back, still usable -- which a dangling row could not do.
+                returned = batch.remove_row(row)
+                self.assertIsNotNone(returned)
+                self.assertEqual(batch.num_kv_caches, 0)
+                self.assertEqual(batch.row_of(returned), -1)
+                returned.close()
+
+                # A row nobody occupies has nothing to hand back.
+                self.assertIsNone(batch.remove_row(0))
+        finally:
+            manager.shutdown()
+
     def test_membership_is_exclusive(self):
         manager = self._manager()
         try:
