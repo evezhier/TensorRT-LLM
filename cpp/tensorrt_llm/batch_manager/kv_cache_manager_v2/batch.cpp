@@ -895,6 +895,12 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
         // and have every beam read them. Refusing beats a wrong answer nothing would notice.
         throw LogicError("Batch does not support beam search yet; a member must have beam width 1");
     }
+    if (!kvCache.isActive())
+    {
+        // Membership means the member is being stepped, which is what lets its arena lease,
+        // its row and its active state be one thing rather than three that can disagree.
+        throw LogicError("A KvCache must be resumed before it joins a Batch");
+    }
     // Binding a row writes it, so the last publish must be done reading it.
     waitPublished();
     int row = requestedRow;
@@ -926,7 +932,7 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
     {
         // Beam 0 only; addKvCache rejects anything wider.
-        kvCache._bindBasePageIndexBuf(kDefaultBeamIndex, lg, _stagingRow(lg, row), mMaxBlocksPerSeq);
+        kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lg, _stagingRow(lg, row), mMaxBlocksPerSeq);
     }
 
     _seedRowWatermarks(row, kvCache.historyLength(), kvCache.capacity());
@@ -935,6 +941,24 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     // would: work the member already enqueued has to retire before the Batch's stream
     // reaches anything that reads it.
     kvCache._setCudaStream(mCudaStream);
+
+    // The arena lease goes with membership: a member is what gets stepped, so this is
+    // exactly when the GPU cache is needed. After the stream change, because acquiring one
+    // clears its residency on that stream. Sized from the same `constraints` the rows come
+    // from, so a free row always has a free lease and this cannot fail.
+    for (LifeCycleId lc{0}; lc < mNumLayerGroups; ++lc)
+    {
+        auto& arena = mManager->sparseArena(lc);
+        if (arena.empty() || !kvCache.mSparseCache[lc].empty())
+        {
+            continue;
+        }
+        auto lease = arena.acquire(mCudaStream);
+        TLLM_CHECK_WITH_INFO(lease.has_value(),
+            "Batch::addKvCache: the sparse cache arena is full, which cannot happen while it is sized from the "
+            "same `constraints` the Batch takes its rows from");
+        kvCache.mSparseCache[lc] = std::move(*lease);
+    }
 
     mRows[static_cast<size_t>(row)] = &kvCache;
     kvCache.mBatch = this;
@@ -950,17 +974,26 @@ void Batch::removeKvCache(KvCache& kvCache)
     }
     waitPublished();
     int const row = kvCache.mBatchRow;
+    // Membership ends first, so the unbinding below goes through the same setter a caller
+    // would use. Nothing binds a seated member's buffer, including the Batch.
+    kvCache.mBatch = nullptr;
+    kvCache.mBatchRow = -1;
     for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
     {
         // Hands the indices back to the cache's own storage before the row is reused.
-        kvCache._bindBasePageIndexBuf(kDefaultBeamIndex, lg, nullptr, 0);
+        kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lg, nullptr, 0);
         auto* staged = _stagingRow(lg, row);
         std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
     }
+    // Leaving returns the lease, which discards whatever the GPU cache held: a lease comes
+    // back with every entry free. Anything worth keeping is written back by
+    // flushSparseUnits() before this.
+    for (auto& lease : kvCache.mSparseCache)
+    {
+        lease.release();
+    }
     _seedRowWatermarks(row, 0, 0);
     mRows[static_cast<size_t>(row)] = nullptr;
-    kvCache.mBatch = nullptr;
-    kvCache.mBatchRow = -1;
 }
 
 void Batch::_detach(KvCache& kvCache) noexcept

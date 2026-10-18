@@ -193,9 +193,20 @@ public:
     // Resume: check utilization and lock active pages at their required storage levels.
     // Optionally sets a new CUDA stream; if nullopt, uses the existing one.
     // Returns false if utilization too high or out of memory.
+    //
+    // Refused while the cache belongs to a Batch: locking pages writes through the bound
+    // Span, which is the Batch's staged row, so a member is resumed before it joins.
     bool resume(std::optional<CUstream> stream = std::nullopt);
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
+    //
+    // Refused while the cache belongs to a Batch, for the same reason as resume(): the page
+    // unlocks write kBadPageIndex through the bound Span, which is the Batch's staged row.
+    //
+    // Returns the sparse cache arena lease, which **discards whatever the GPU cache held**.
+    // A lease comes back with every entry free, so a unit whose only copy was in a cell can
+    // no longer be addressed: call Batch::flushSparseUnits() first for anything worth
+    // keeping.
     void suspend();
 
     // Close: release all blocks back to KvCacheManager.
@@ -280,7 +291,8 @@ public:
     // Row this cache occupies in its Batch, or -1 when it belongs to none.
     //
     // Also the answer to who owns its page index buffers: a member's are the Batch's rows,
-    // so setBasePageIndexBuf refuses, and suspend() leaves them bound.
+    // so setBasePageIndexBuf refuses while it is seated -- including for the Batch, which
+    // ends the membership before handing the indices back.
     int batchRow() const noexcept
     {
         return mBatchRow;
@@ -513,9 +525,6 @@ public:
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
 
     int updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value);
-
-    // setBasePageIndexBuf without the membership check, for the Batch that owns the binding.
-    void _bindBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len);
 
     std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
 

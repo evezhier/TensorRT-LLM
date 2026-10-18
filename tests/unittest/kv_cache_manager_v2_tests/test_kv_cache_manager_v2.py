@@ -731,28 +731,48 @@ class TestSparseCacheReservation(unittest.TestCase):
 
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
-                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
+                self.assertTrue(cache.resume(handle))
+                # The lease comes with membership, so the cache state exists from the add.
+                batch.add_kv_cache(cache)
                 ordinals = _introspection.sparse_cache_resident_ordinals(cache, lc_id)
                 self.assertEqual(len(ordinals), buffers * entries)
                 self.assertTrue(all(o == BAD_PAGE_INDEX for o in ordinals), ordinals)
+                batch.remove_kv_cache(cache)
                 cache.close()
         finally:
             manager.shutdown()
 
-    def test_cache_state_is_dropped_with_the_pages(self):
+    def test_cache_state_is_dropped_when_the_member_leaves(self):
         manager = self._manager(max_cached_units=4)
         try:
             lc_id = manager.get_layer_group_id(0)
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
                 self.assertNotEqual(_introspection.sparse_cache_resident_ordinals(cache, lc_id), [])
-                cache.suspend()
-                # The metadata describes pages the request no longer holds, so it goes too.
+                batch.remove_kv_cache(cache)
+                # The metadata describes cells the request no longer leases, so it goes too.
                 self.assertEqual(_introspection.sparse_cache_resident_ordinals(cache, lc_id), [])
-                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
                 self.assertNotEqual(_introspection.sparse_cache_resident_ordinals(cache, lc_id), [])
+                batch.remove_kv_cache(cache)
                 cache.close()
         finally:
             manager.shutdown()
@@ -855,10 +875,18 @@ class TestSparseCacheReservation(unittest.TestCase):
             )
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=2,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
                 for _ in range(2):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
                     self.assertTrue(cache.resume(handle))
+                    batch.add_kv_cache(cache)
                 bases = [_introspection.sparse_cache_base_cell(c, lc_id) for c in caches]
                 self.assertTrue(all(b >= 0 for b in bases), bases)
                 self.assertEqual(len(set(bases)), len(bases), "leases must not overlap")
@@ -866,12 +894,14 @@ class TestSparseCacheReservation(unittest.TestCase):
                     self.assertEqual(
                         base % cells_per_lease, 0, "a lease starts on a block boundary"
                     )
+                for cache in caches:
+                    batch.remove_kv_cache(cache)
         finally:
             for cache in caches:
                 cache.close()
             manager.shutdown()
 
-    def test_a_lease_is_returned_with_the_reservation(self):
+    def test_a_lease_is_returned_when_the_member_leaves(self):
         manager = self._manager(max_cached_units=4)
         try:
             lc_id = manager.get_layer_group_id(0)
@@ -879,13 +909,25 @@ class TestSparseCacheReservation(unittest.TestCase):
             try:
                 with TemporaryCudaStream([]) as stream:
                     handle = cast(CudaStream, stream.handle)
+                    batch = Batch(
+                        manager,
+                        handle,
+                        max_batch_size=1,
+                        max_blocks_per_seq=4,
+                        index_tables=manager.sparse_index_table_requests(),
+                    )
                     self.assertTrue(cache.resume(handle))
+                    # Resuming alone takes none: a request that is not being stepped cannot
+                    # fetch, and a resumed one may still be receiving its history.
+                    self.assertEqual(_introspection.sparse_cache_base_cell(cache, lc_id), -1)
+                    batch.add_kv_cache(cache)
                     self.assertGreaterEqual(_introspection.sparse_cache_base_cell(cache, lc_id), 0)
-                    cache.suspend()
+                    batch.remove_kv_cache(cache)
                     self.assertEqual(_introspection.sparse_cache_base_cell(cache, lc_id), -1)
                     # Returned rather than leaked: the same cells are available again.
-                    self.assertTrue(cache.resume(handle))
+                    batch.add_kv_cache(cache)
                     self.assertGreaterEqual(_introspection.sparse_cache_base_cell(cache, lc_id), 0)
+                    batch.remove_kv_cache(cache)
             finally:
                 cache.close()
         finally:
@@ -1951,8 +1993,8 @@ class TestIndexTables(unittest.TestCase):
                     index_tables=[request],
                 )
                 cache = manager.create_kv_cache(None, [TokenId(i) for i in range(prompt_len)])
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resize(prompt_len))
                 self.assertTrue(cache.has_scratch_slots, "config produced no scratch")
 
@@ -2279,17 +2321,20 @@ class TestBorrowedPageTable(unittest.TestCase):
                     cache.set_base_page_index_buf(DEFAULT_BEAM_INDEX, lg, memoryview(spare))
                 self.assertIn("Batch member", str(caught.exception))
 
-    def test_suspending_a_member_leaves_its_row_bound(self):
-        """A suspended member's row reads as absent, not as pages it has released.
+    def test_a_seated_member_cannot_suspend(self):
+        """Unlocking pages writes through the binding, which is the Batch's row.
 
-        Reverting to the cache's own storage would leave the row holding indices of pages
-        it no longer owns; the unlocks write BAD_PAGE_INDEX through the binding instead.
+        Doing that while seated would write a row a publish may still be reading, so the
+        member leaves first and the row is cleared by the removal.
         """
         with self._fixture() as (torch, manager, batch, host, handle):
             with self._member(manager, batch, 1, handle) as cache:
-                cache.suspend()
-                self.assertEqual(cache.batch_row, 1)
+                with self.assertRaisesRegex(Exception, "remove it from the Batch first"):
+                    cache.suspend()
+                batch.remove_kv_cache(cache)
+                self.assertEqual(cache.batch_row, -1)
                 self.assertEqual(self._row(host, 1)[: self.BLOCKS], [BAD_PAGE_INDEX] * self.BLOCKS)
+                cache.suspend()
 
 
 class TestSparseDataPath(unittest.TestCase):
@@ -3322,16 +3367,19 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
 
                 cache = manager.create_kv_cache()
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
                 batch.publish()
                 entries = _introspection.batch_sparse_view_entries(batch, lg_id)
                 self.assertEqual(entries[0], manager.get_sparse_cache_max_units(0))
                 self.assertEqual(entries[1], 0, "the free row stays absent")
 
-                # suspend() releases the reservation, so the view must go with it rather
-                # than leaving the fetch a handle into freed memory.
+                # Leaving releases the reservation, so the view must go with it rather than
+                # leaving the fetch a handle into freed memory. A member is removed before
+                # it suspends -- suspending in place would write its row behind the Batch's
+                # back.
                 batch.wait_published()
+                batch.remove_kv_cache(cache)
                 cache.suspend()
                 batch.publish()
                 self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
@@ -3345,44 +3393,52 @@ class TestBatch(unittest.TestCase):
     def test_rows_are_slots_so_a_hole_is_reused(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, NULL_STREAM, max_batch_size=3, max_blocks_per_seq=4)
-            first = manager.create_kv_cache()
-            second = manager.create_kv_cache()
-            third = manager.create_kv_cache()
-            self.assertEqual(batch.add_kv_cache(first), 0)
-            self.assertEqual(batch.add_kv_cache(second), 1)
-            self.assertEqual(batch.add_kv_cache(third), 2)
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                first = manager.create_kv_cache()
+                second = manager.create_kv_cache()
+                third = manager.create_kv_cache()
+                for cache in (first, second, third):
+                    self.assertTrue(cache.resume(handle))
+                self.assertEqual(batch.add_kv_cache(first), 0)
+                self.assertEqual(batch.add_kv_cache(second), 1)
+                self.assertEqual(batch.add_kv_cache(third), 2)
 
-            # Removing the middle member must not shift the ones after it: addresses and
-            # row indices have to survive a graph capture.
-            batch.remove_kv_cache(second)
-            self.assertEqual(batch.row_of(third), 2)
-            self.assertEqual(batch.row_of(second), -1)
+                # Removing the middle member must not shift the ones after it: addresses and
+                # row indices have to survive a graph capture.
+                batch.remove_kv_cache(second)
+                self.assertEqual(batch.row_of(third), 2)
+                self.assertEqual(batch.row_of(second), -1)
 
-            fourth = manager.create_kv_cache()
-            self.assertEqual(batch.add_kv_cache(fourth), 1, "the hole is reused")
+                fourth = manager.create_kv_cache()
+                self.assertTrue(fourth.resume(handle))
+                self.assertEqual(batch.add_kv_cache(fourth), 1, "the hole is reused")
 
-            for cache in (first, third, fourth):
-                batch.remove_kv_cache(cache)
-            for cache in (first, second, third, fourth):
-                cache.close()
+                for cache in (first, third, fourth):
+                    batch.remove_kv_cache(cache)
+                for cache in (first, second, third, fourth):
+                    cache.close()
         finally:
             manager.shutdown()
 
     def test_membership_is_exclusive(self):
         manager = self._manager()
         try:
-            one = Batch(manager, NULL_STREAM, max_batch_size=2, max_blocks_per_seq=4)
-            two = Batch(manager, NULL_STREAM, max_batch_size=2, max_blocks_per_seq=4)
-            cache = manager.create_kv_cache()
-            one.add_kv_cache(cache)
-            with self.assertRaisesRegex(Exception, "at most one Batch"):
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                one = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                two = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                cache = manager.create_kv_cache()
+                self.assertTrue(cache.resume(handle))
+                one.add_kv_cache(cache)
+                with self.assertRaisesRegex(Exception, "at most one Batch"):
+                    two.add_kv_cache(cache)
+                one.remove_kv_cache(cache)
+                # Free to join another batch once released.
                 two.add_kv_cache(cache)
-            one.remove_kv_cache(cache)
-            # Free to join another batch once released.
-            two.add_kv_cache(cache)
-            two.remove_kv_cache(cache)
-            cache.close()
+                two.remove_kv_cache(cache)
+                cache.close()
         finally:
             manager.shutdown()
 
@@ -3413,16 +3469,20 @@ class TestBatch(unittest.TestCase):
     def test_a_full_batch_refuses_rather_than_growing(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4)
-            first = manager.create_kv_cache()
-            second = manager.create_kv_cache()
-            batch.add_kv_cache(first)
-            # Growing would move the device arrays, which a captured graph cannot tolerate.
-            with self.assertRaisesRegex(Exception, "full"):
-                batch.add_kv_cache(second)
-            batch.remove_kv_cache(first)
-            first.close()
-            second.close()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=4)
+                first = manager.create_kv_cache()
+                second = manager.create_kv_cache()
+                self.assertTrue(first.resume(handle))
+                self.assertTrue(second.resume(handle))
+                batch.add_kv_cache(first)
+                # Growing would move the device arrays, which a captured graph cannot tolerate.
+                with self.assertRaisesRegex(Exception, "full"):
+                    batch.add_kv_cache(second)
+                batch.remove_kv_cache(first)
+                first.close()
+                second.close()
         finally:
             manager.shutdown()
 
@@ -3455,8 +3515,8 @@ class TestBatch(unittest.TestCase):
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
                 cache.resize(256, 0)  # 128-token blocks, so two of them
                 batch.publish()
                 table = _introspection.batch_page_table(batch, lg_id)
@@ -3489,8 +3549,8 @@ class TestBatch(unittest.TestCase):
                 for _ in range(2):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
-                    batch.add_kv_cache(cache)
                     self.assertTrue(cache.resume(handle))
+                    batch.add_kv_cache(cache)
 
                 results = batch.resize([256, 384, None], [0, 0, None])
                 # Row 2 is free, so it reports False rather than raising.
@@ -3674,8 +3734,8 @@ class TestBatch(unittest.TestCase):
                 for _ in range(2):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
-                    batch.add_kv_cache(cache)
                     self.assertTrue(cache.resume(handle))
+                    batch.add_kv_cache(cache)
 
                 each = blocks * tpb
                 self.assertEqual(list(batch.resize([each, each], [0, 0])), [1, 1])
@@ -3723,8 +3783,8 @@ class TestBatch(unittest.TestCase):
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
                 cache.resize(256, 0)
                 batch.publish()
                 first = _introspection.batch_page_table(batch, lg_id)
@@ -3752,8 +3812,8 @@ class TestBatch(unittest.TestCase):
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=4)
-                batch.add_kv_cache(cache)
                 self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
                 cache.resize(256, 0)
                 batch.remove_kv_cache(cache)
                 batch.publish()

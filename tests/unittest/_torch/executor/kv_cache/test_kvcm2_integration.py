@@ -2718,24 +2718,34 @@ def test_sparse_arena_retains_padding_with_full_live_batch(
         index_tables=core.sparse_index_table_requests(),
     )
     try:
-        # Retained padding caches stay outside the attention Batch but own leases.
+        # A lease follows membership, so padding caches outside the Batch hold none and a
+        # resumed request receiving its history costs the arena nothing.
+        lc_id = core.get_layer_group_id(0)
         for index in range(reserved + max_batch_size):
             cache = core.create_kv_cache()
             caches.append(cache)
             assert cache.resume(stream)
             assert cache.resize(1)
+            assert _introspection.sparse_cache_base_cell(cache, lc_id) == -1
             if index >= reserved:
                 batch.add_kv_cache(cache)
+                assert _introspection.sparse_cache_base_cell(cache, lc_id) >= 0
         assert batch.max_batch_size == max_batch_size
         batch.publish()
         batch.wait_published()
 
+        # The rows bound membership, not the arena: a free row always has a free lease,
+        # so a full Batch refuses on its rows rather than running out of cells.
         extra = core.create_kv_cache()
         caches.append(extra)
-        assert not extra.resume(stream)
-        caches[0].suspend()
         assert extra.resume(stream)
         assert extra.resize(1)
+        with pytest.raises(Exception, match="full"):
+            batch.add_kv_cache(extra)
+        batch.remove_kv_cache(caches[-2])
+        assert _introspection.sparse_cache_base_cell(caches[-2], lc_id) == -1
+        batch.add_kv_cache(extra)
+        assert _introspection.sparse_cache_base_cell(extra, lc_id) >= 0
     finally:
         for cache in caches:
             if batch.row_of(cache) >= 0:

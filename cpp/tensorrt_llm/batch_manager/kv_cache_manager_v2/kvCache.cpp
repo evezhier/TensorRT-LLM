@@ -331,17 +331,17 @@ bool KvCache::resume(std::optional<CUstream> stream)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
+    // Locking pages writes page indices through the bound Span, which is the Batch's staged
+    // row. Doing that behind the Batch's back would race a publish still reading it, so a
+    // member is resumed before it joins rather than after.
+    if (mBatch != nullptr)
+    {
+        throw LogicError("A KvCache in a Batch cannot be resumed; remove it from the Batch first");
+    }
 
     // Set stream first (mirrors Python: self.cuda_stream = cuda_stream).
     if (stream.has_value())
     {
-        // A member may be resumed, but only onto the stream it already runs on. Naming it
-        // is how the ordinary call site reads; naming a different one would silently move
-        // the member off the stream its Batch orders everything against.
-        if (mBatch != nullptr && *stream != mBatch->cudaStream())
-        {
-            throw LogicError("A KvCache in a Batch can only be resumed on the Batch's stream");
-        }
         _setCudaStream(*stream);
     }
     TLLM_CHECK_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
@@ -393,31 +393,9 @@ bool KvCache::resume(std::optional<CUstream> stream)
     }
 
     // Cells backing this request's sparse cache, leased from the life cycle's arena.
-    // Returned at suspend() along with the rest of the reservation, so a later resume takes
-    // a lease afresh. Skipped for every life cycle whose fetch path is unconfigured, which
-    // keeps non-sparse deployments untouched.
-    //
-    // The arena is GPU memory whatever the life cycle's pages are made of: the cache is what
-    // makes host-resident sparse history reachable by the attention kernels.
-    TypedVec<LifeCycleId, SparseCacheLease> leases(numLc);
-    for (LifeCycleId lc{0}; lc < numLc; ++lc)
-    {
-        auto& arena = mManager->sparseArena(lc);
-        if (arena.empty() || !mSparseCache[lc].empty())
-        {
-            continue;
-        }
-        auto lease = arena.acquire(reinterpret_cast<CUstream>(cudaStream()));
-        if (!lease.has_value())
-        {
-            // The arena is full: more concurrent requests than `constraints` declared.
-            return false;
-        }
-        leases[lc] = std::move(*lease);
-    }
-
-    // Only allocate if any slots are needed. The leases above are already held; a failure
-    // below drops them, which returns their cells through the lease destructor.
+    // The arena lease is the Batch's to hand out, not this call's: a resumed request that
+    // is not being stepped cannot fetch, and a disaggregated one receives its whole history
+    // into host pages without touching the cache at all.
     bool const anyResident
         = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
     {
@@ -443,11 +421,6 @@ bool KvCache::resume(std::optional<CUstream> stream)
         std::vector<CUevent> scratchReadyEvents;
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
-            if (!leases[lc].empty())
-            {
-                mSparseCache[lc] = std::move(leases[lc]);
-            }
-
             if (!tmpSlots[lc].empty())
             {
                 // Mirrors Python: `if self._never_resumed and (... SsmLifeCycle or has_partial):`
@@ -673,24 +646,23 @@ bool KvCache::prefetch(CacheLevel target)
 void KvCache::suspend()
 {
     KVCM2_API_GUARD();
+    // Unlocking pages writes kBadPageIndex through the bound Span, which is the Batch's
+    // staged row. A member is removed from its Batch before it suspends, so neither this
+    // nor resume() can race a publish that is still reading those rows.
+    if (mBatch != nullptr)
+    {
+        throw LogicError("A KvCache in a Batch cannot be suspended; remove it from the Batch first");
+    }
     auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(_checkSanity());
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
-    //
-    // A Batch member keeps its binding instead: its row is the Batch's to hand out, and the
-    // page unlocks below write kBadPageIndex through the Span, which is what that row should
-    // read while the member holds nothing. Reverting would leave the row holding indices of
-    // pages this cache no longer owns.
-    if (mBatch == nullptr)
-    {
-        for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
-            for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
-                if (std::holds_alternative<Span<int>>(mBasePageIndices[bi][lcId]))
-                    _bindBasePageIndexBuf(bi, lcId, nullptr, 0);
-    }
+    for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
+        for (LifeCycleId lcId{0}; lcId < mBasePageIndices[bi].size(); ++lcId)
+            if (std::holds_alternative<Span<int>>(mBasePageIndices[bi][lcId]))
+                setBasePageIndexBuf(bi, lcId, nullptr, 0);
 
     // Record event scope — mirrors Python's `with self._record_event()`.
     // SharedPageLock destructors inside the scope use finishEvent() to synchronize.
@@ -2954,11 +2926,7 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
             "setBasePageIndexBuf: this KvCache is a Batch member, so its page index buffer is the Batch's row; "
             "remove it from the Batch first");
     }
-    _bindBasePageIndexBuf(beamIdx, lgId, buf, len);
-}
 
-void KvCache::_bindBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len)
-{
     auto& slot = mBasePageIndices[beamIdx][lgId];
     BlockOrdinal const numBlocks = mBlocks.size();
 
