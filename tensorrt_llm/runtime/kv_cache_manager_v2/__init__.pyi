@@ -892,7 +892,7 @@ class Batch:
         manager's ``constraints``, which fails when none were declared. A pool-sizing hint
         is a default, never a substitute for a batch bound.
 
-        The batch stages the host page indices itself; :meth:`host_page_table` exposes
+        The batch stages the host page indices itself; :meth:`coalesced_page_table` exposes
         them for a consumer that needs the same numbers. One buffer with one writer is what
         keeps a member's binding alive for the whole decode, and which side allocates it
         never mattered to that.
@@ -917,9 +917,6 @@ class Batch:
         from the same ``constraints`` the rows come from, so a free row always has a free
         lease and this cannot fail for want of one.
 
-        A batch borrowing a page table requires ``row``: its rows are indexed by whatever
-        slot the lender gave the request, and one chosen here would address a different
-        request's entries.
         """
 
     def remove_kv_cache(self, kv_cache: _KVCache) -> None:
@@ -950,12 +947,14 @@ class Batch:
         :meth:`index_table_base`. Iterating :meth:`index_table` is for introspection.
         """
 
-    def index_table_address(self, table_id: int) -> MemAddress:
-        """Where one table's converted indices live.
+    def converted_index_table(self, table_id: int) -> DeviceArray:
+        """``int32[entries, max_batch, max_blocks_per_seq]`` converted indices for one table.
 
-        ``int32[entries][max_batch][blocks_per_seq]``, stable for the ``Batch``'s lifetime,
-        so a captured graph may bake it. Reads as ``BAD_PAGE_INDEX`` until the first
-        :meth:`publish` converts into it.
+        A DLPack array over memory the ``Batch`` owns; it keeps the ``Batch`` alive for as
+        long as the array exists. A buffer reads the entry :meth:`index_table_slot` gives
+        it, having added :meth:`index_table_base`.
+
+        The address is stable for the ``Batch``'s lifetime, so a captured graph may bake it.
         """
 
     def index_table_base(self, layer_id: LayerId, role: DataRole) -> MemAddress:
@@ -1041,11 +1040,9 @@ class Batch:
         write-back read: there the buffer's own offset within its page is already in the
         value, so an entry counts whole buffers from its table's base.
 
-        A borrowed page table is copied too, not read in place: the snapshot is the whole
-        point, since the host has to be free to write the next step's rows long before the
-        kernels reading this step's have retired. Borrowing costs one strided transfer per
-        layer group instead of one linear transfer for all of them, because the lender's
-        rows are further apart than they are wide.
+        The page table is copied, not read in place: the snapshot is the whole point, since
+        the host has to be free to write the next step's rows long before the kernels
+        reading this step's have retired.
 
         Two stages. The host-to-device fill runs on an upload stream of the batch's own,
         so it overlaps the previous step -- the host enqueues this while that step's
@@ -1082,24 +1079,26 @@ class Batch:
         is idempotent and free once the copy has landed.
         """
 
-    def host_page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
-        """``int32[max_batch, max_blocks_per_seq]`` base page indices, on the host.
+    def coalesced_page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
+        """``int32[max_batch, max_blocks_per_seq]`` coalesced page indices, on the host.
 
         A DLPack array over the pinned staging the members write into, which a consumer
-        needing the same indices reads instead of keeping a buffer of its own. It keeps the
+        needing these numbers reads instead of keeping a buffer of its own. It keeps the
         ``Batch`` alive for as long as the array exists.
+
+        An entry names a coalesced slot, which may hold several buffers; a converted index
+        names one buffer inside one. See :meth:`converted_index_table`.
         """
 
-    def page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
-        """``int32[max_batch, max_blocks_per_seq]`` base page indices for one group.
+    def gpu_coalesced_page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
+        """``int32[max_batch, max_blocks_per_seq]`` coalesced page indices, on the device.
+
+        Internal. The device copy exists for the index conversion to read; a consumer's own
+        kernels read the converted tables instead, and a consumer wanting the indices
+        themselves reads :meth:`coalesced_page_table`. Exposed for tests and introspection.
 
         A DLPack array over memory the ``Batch`` owns; it keeps the ``Batch`` alive for as
-        long as the array exists. Always packed, whatever the host rows it was published
-        from look like.
-
-        An unoccupied row reads as ``BAD_PAGE_INDEX`` throughout until the first publish.
-        With a borrowed table it then holds whatever the lender had in that row, since the
-        transfer carries every row rather than paying for one per member.
+        long as the array exists. An unoccupied row reads as ``BAD_PAGE_INDEX`` throughout.
         """
 
     def history_lengths(self) -> DeviceArray:

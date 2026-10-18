@@ -664,7 +664,7 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     LayerGroupId const lgId{lcId.value()};
     auto const views = reinterpret_cast<SparseCacheView const*>(batch.sparseCacheViews(lgId));
     auto const watermarks = batch.watermarks();
-    auto const table = batch.pageTable(lgId);
+    auto const table = batch.gpuCoalescedPageTable(lgId);
     auto const numRows = batch.maxBatchSize();
 
     SparseResolveArgs resolve;

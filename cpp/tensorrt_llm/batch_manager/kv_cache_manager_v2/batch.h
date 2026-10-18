@@ -41,9 +41,22 @@ class KvCacheManager;
 
 //! One layer group's page table as the device sees it. Always packed: the Batch allocates
 //! it, so a row is exactly `blocksPerRow` entries.
-struct PageTableView
+struct GpuCoalescedPageTable
 {
     CUdeviceptr data = 0;
+    int32_t numRows = 0;
+    int32_t blocksPerRow = 0;
+};
+
+//! One index table's converted page indices as the device sees them, laid out
+//! [entries][numRows][blocksPerRow]. A buffer reads the entry `index_table_slot` gives it.
+//!
+//! Packed, like the tables either side of it: the Batch allocates it, so there is no stride
+//! a caller has to be told separately.
+struct ConvertedIndexTable
+{
+    CUdeviceptr data = 0;
+    int32_t entries = 0;
     int32_t numRows = 0;
     int32_t blocksPerRow = 0;
 };
@@ -54,7 +67,7 @@ struct PageTableView
 //! A consumer that needs these indices for its own purposes reads this rather than lending
 //! the Batch storage of its own. One buffer with one writer is what keeps a member's
 //! binding alive for the whole decode; which side allocates it never mattered to that.
-struct HostPageTableView
+struct CoalescedPageTable
 {
     int32_t* data = nullptr;
     int32_t numRows = 0;
@@ -205,6 +218,11 @@ public:
     //! Stable for the Batch's lifetime, so a captured graph may bake it.
     [[nodiscard]] CUdeviceptr indexTableAddress(IndexTableId tableId) const;
 
+    //! One index table's converted indices, shaped. The same memory indexTableAddress
+    //! returns, with the extents a reader would otherwise have to assemble from
+    //! numIndexTables(), index_table_slot() and the Batch's own bounds.
+    [[nodiscard]] ConvertedIndexTable convertedIndexTable(IndexTableId tableId) const;
+
     //! How a sparse copy addresses a run of buffers that begins at `first`.
     //!
     //! The run's buffers occupy consecutive entries of one request, which construction
@@ -228,10 +246,6 @@ public:
 
     //! Seat a cache in `row`, or in the lowest free row when it is negative.
     //!
-    //! A borrowed page table makes the row the owner's to choose: its rows are indexed by
-    //! whatever slot the owner assigned the request, and a row this Batch picked for itself
-    //! would address a different request's entries. So `row` is required in that case and
-    //! refused in neither -- passing one is always allowed.
     //!
     //! Throws when the row is taken or out of range, the batch is full, the cache already
     //! belongs to a batch, or its beam width exceeds one -- only beam 0 is mirrored, so a
@@ -270,12 +284,9 @@ public:
     //!
     //! The staging rows are written by the members themselves, so they are always current;
     //! what this adds is a stream-ordered snapshot. Without it the host would be mutating
-    //! the table a previously enqueued fetch is still reading. That snapshot is why a
-    //! borrowed table is still copied rather than read in place: the host has to be free to
-    //! write the next step's rows long before the kernels reading this step's have retired.
-    //!
-    //! Borrowing costs one strided transfer per layer group instead of one linear transfer
-    //! for all of them, because the lender's rows are further apart than they are wide.
+    //! the table a previously enqueued fetch is still reading. That snapshot is why the
+    //! table is copied rather than read in place: the host has to be free to write the next
+    //! step's rows long before the kernels reading this step's have retired.
     //!
     //! Two stages. The host-to-device fill runs on an upload stream of this Batch's own, so
     //! it can overlap the previous step; the Batch's stream then carries one linear
@@ -334,10 +345,10 @@ public:
     //! member directly is the one that has to.
     void waitPublished();
 
-    [[nodiscard]] PageTableView pageTable(LayerGroupId layerGroupId) const;
+    [[nodiscard]] GpuCoalescedPageTable gpuCoalescedPageTable(LayerGroupId layerGroupId) const;
 
     //! One layer group's page table on the host, as a publish will upload it.
-    [[nodiscard]] HostPageTableView hostPageTable(LayerGroupId layerGroupId) const;
+    [[nodiscard]] CoalescedPageTable coalescedPageTable(LayerGroupId layerGroupId) const;
 
     //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
     //!
@@ -507,8 +518,8 @@ private:
 
     //! Collect each member's scratch slots for the life cycles that can hold them.
     //! Kept out of the staged block because that block's offsets are shared with the
-    //! watermarks, the views and the borrowed-table bias; a separate buffer leaves all of
-    //! those alone for one small extra transfer on the upload stream.
+    //! watermarks and the views; a separate buffer leaves those alone for one small extra
+    //! transfer on the upload stream.
     void _stageScratch();
 
     //! Elements of the scratch staging: [begs][ends][slots].
@@ -531,9 +542,6 @@ private:
     //! One IndexTableDesc per table, and the offsets they point at.
     CudaUniqPtr<> mIndexTableDescs;
     int mMaxTableEntries = 0;
-
-    //! Set when the page-index table is borrowed, in which case mStaging and mDevice hold
-    //! only the watermarks and cache views.
 
     //! Pinned so the members' index writes land here with no extra copy, and so the
     //! publish is a single asynchronous transfer per layer group.

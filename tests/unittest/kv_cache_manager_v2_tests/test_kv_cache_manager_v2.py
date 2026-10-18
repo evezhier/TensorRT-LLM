@@ -1748,6 +1748,28 @@ class TestIndexTables(unittest.TestCase):
             manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4, index_tables=requests
         )
 
+    def test_the_view_is_shaped_for_the_entries_the_table_serves(self):
+        """One entry per buffer of the request, each a full batch-by-blocks plane."""
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to read the view")
+        manager = self._manager(roles=("key", "value"))
+        try:
+            request = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
+            batch = self._batch(manager, [request])
+            view = torch.from_dlpack(batch.converted_index_table(0))
+            # Two buffers in the request, so two entries; the rest is the Batch's bounds.
+            self.assertEqual(tuple(view.shape), (2, 1, 4))
+            self.assertEqual(view.dtype, torch.int32)
+            self.assertTrue(view.is_cuda)
+            # The entry a buffer reads is the one index_table_slot names.
+            self.assertEqual(batch.index_table_slot(0, "value")[1], 1)
+            with self.assertRaises(Exception):
+                batch.converted_index_table(batch.num_index_tables)
+        finally:
+            manager.shutdown()
+
     def test_a_request_is_reachable_from_every_buffer_it_names(self):
         """Entry order follows the request's buffer order, which is what a kernel indexes."""
         manager = self._manager(roles=("key", "value"))
@@ -2204,7 +2226,7 @@ class TestBatchPageTable(unittest.TestCase):
 
     A member writes its indices into the Batch's row and nowhere else, which is what keeps
     one buffer with one writer and a binding that survives the whole decode. A consumer
-    needing the same numbers reads host_page_table() rather than keeping a buffer of its
+    needing the same numbers reads coalesced_page_table() rather than keeping a buffer of its
     own.
     """
 
@@ -2245,7 +2267,7 @@ class TestBatchPageTable(unittest.TestCase):
 
     def _row(self, torch, batch, manager, row: int, group: int = 0):
         lg = manager.get_layer_group_id(group)
-        host = torch.from_dlpack(batch.host_page_table(lg))
+        host = torch.from_dlpack(batch.coalesced_page_table(lg))
         return host[row].tolist()
 
     @contextlib.contextmanager
@@ -3324,7 +3346,7 @@ class TestBatch(unittest.TestCase):
         try:
             batch = Batch(manager, NULL_STREAM, max_batch_size=2, max_blocks_per_seq=4)
             lg_id = manager.get_layer_group_id(0)
-            table = torch.from_dlpack(batch.page_table(lg_id))
+            table = torch.from_dlpack(batch.gpu_coalesced_page_table(lg_id))
             history = torch.from_dlpack(batch.history_lengths())
             capacity = torch.from_dlpack(batch.capacities())
 

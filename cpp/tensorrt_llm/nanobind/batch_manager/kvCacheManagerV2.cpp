@@ -371,6 +371,13 @@ static DeviceArray2D makeDeviceArray2D(CUdeviceptr data, int32_t rows, int32_t c
         {}, nb::dtype<int32_t>(), nb::device::cuda::value, currentCudaDevice()};
 }
 
+static DeviceArray3D makeDeviceArray3D(CUdeviceptr data, int32_t d0, int32_t d1, int32_t d2, nb::handle owner)
+{
+    return DeviceArray3D{reinterpret_cast<void*>(data),
+        {static_cast<size_t>(d0), static_cast<size_t>(d1), static_cast<size_t>(d2)}, owner, {}, nb::dtype<int32_t>(),
+        nb::device::cuda::value, currentCudaDevice()};
+}
+
 //! The host counterpart, for staging a consumer reads rather than copies.
 using HostArray2D = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
@@ -2534,12 +2541,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "What a kernel adds to a converted index for this buffer. Every buffer of a request "
             "shares it, because the request's own offsets are already in the entries.")
         .def(
-            "index_table_address",
-            [](kv::Batch const& self, int tableId)
-            { return static_cast<std::uintptr_t>(self.indexTableAddress(kv::IndexTableId{tableId})); },
+            "converted_index_table",
+            [](nb::object self, int tableId)
+            {
+                auto const& batch = nb::cast<kv::Batch const&>(self);
+                auto const view = batch.convertedIndexTable(kv::IndexTableId{tableId});
+                // The Batch owns the memory; self keeps it alive for the array's lifetime.
+                return makeDeviceArray3D(view.data, view.entries, view.numRows, view.blocksPerRow, self);
+            },
             nb::arg("table_id"),
-            "Where one table's converted indices live: int32[entries][max_batch][blocks]. "
-            "Stable for the Batch's lifetime, so a captured graph may bake it.")
+            "int32[entries, max_batch, max_blocks_per_seq] converted page indices for one "
+            "table, as a DLPack array on the device. A buffer reads the entry index_table_slot "
+            "gives it.\n\n"
+            "The address is stable for the Batch's lifetime, so a captured graph may bake it; "
+            "the array keeps the Batch alive meanwhile.")
         .def(
             "resize",
             [](kv::Batch& self, std::vector<std::optional<int>> const& capacities,
@@ -2601,30 +2616,35 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Block until the last publish() has finished reading the staging rows. Cheap once "
             "complete and a no-op when nothing is in flight, so it is safe at the top of a step.")
         .def(
-            "host_page_table",
+            "coalesced_page_table",
             [](nb::object self, int layerGroupId)
             {
                 auto const& batch = nb::cast<kv::Batch const&>(self);
-                auto const view = batch.hostPageTable(kv::LayerGroupId{layerGroupId});
+                auto const view = batch.coalescedPageTable(kv::LayerGroupId{layerGroupId});
                 // The Batch owns the memory; self keeps it alive for the array's lifetime.
                 return makeHostArray2D(view.data, view.numRows, view.blocksPerRow, self);
             },
             nb::arg("layer_group_id"),
-            "int32[max_batch, max_blocks_per_seq] base page indices for one layer group, as a "
-            "DLPack array on the host. Pinned, and written by the members themselves, so a "
-            "consumer reads these rather than keeping a copy of its own.")
+            "int32[max_batch, max_blocks_per_seq] coalesced page indices for one layer group, "
+            "as a DLPack array on the host. Pinned, and written by the members themselves, so a "
+            "consumer needing these numbers reads them here rather than keeping a buffer of its "
+            "own. An entry names a coalesced slot; the converted tables name one buffer inside "
+            "one.")
         .def(
-            "page_table",
+            "gpu_coalesced_page_table",
             [](nb::object self, int layerGroupId)
             {
                 auto const& batch = nb::cast<kv::Batch const&>(self);
-                auto const view = batch.pageTable(kv::LayerGroupId{layerGroupId});
+                auto const view = batch.gpuCoalescedPageTable(kv::LayerGroupId{layerGroupId});
                 // The Batch owns the memory; self keeps it alive for the array's lifetime.
                 return makeDeviceArray2D(view.data, view.numRows, view.blocksPerRow, self);
             },
             nb::arg("layer_group_id"),
-            "int32[max_batch, max_blocks_per_seq] base page indices for one layer group, as a "
-            "DLPack array on the device.")
+            "int32[max_batch, max_blocks_per_seq] coalesced page indices for one layer group, "
+            "as a DLPack array on the device.\n\n"
+            "Internal: the device copy exists for the index conversion to read, and the kernels "
+            "a consumer writes read the converted table instead. Exposed for tests and "
+            "introspection; read coalesced_page_table() for the indices themselves.")
         .def(
             "history_lengths",
             [](nb::object self)

@@ -785,6 +785,21 @@ CUdeviceptr Batch::indexTableAddress(IndexTableId tableId) const
         + sizeof(int32_t) * mIndexTables[static_cast<size_t>(tableId.value())].elementOffset;
 }
 
+ConvertedIndexTable Batch::convertedIndexTable(IndexTableId tableId) const
+{
+    if (tableId.value() < 0 || tableId >= numIndexTables())
+    {
+        throw std::out_of_range("Batch::convertedIndexTable: unknown table");
+    }
+    ConvertedIndexTable view;
+    view.data = indexTableAddress(tableId);
+    // A table's entries are its requests' buffers: the offsets it converts with, one each.
+    view.entries = static_cast<int32_t>(mIndexTables[static_cast<size_t>(tableId.value())].concatOffsets.size());
+    view.numRows = mMaxBatchSize;
+    view.blocksPerRow = mMaxBlocksPerSeq;
+    return view;
+}
+
 Batch::SparseIndexRun Batch::sparseIndexRun(LayerId layerId, DataRole const& role) const
 {
     auto const [tableId, entry] = indexTableSlot(layerId, role);
@@ -1250,26 +1265,26 @@ void Batch::waitPublished()
     mPublished.close();
 }
 
-HostPageTableView Batch::hostPageTable(LayerGroupId layerGroupId) const
+CoalescedPageTable Batch::coalescedPageTable(LayerGroupId layerGroupId) const
 {
     if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
     {
-        throw std::out_of_range("Batch::hostPageTable: unknown layer group");
+        throw std::out_of_range("Batch::coalescedPageTable: unknown layer group");
     }
-    HostPageTableView view;
+    CoalescedPageTable view;
     view.data = _stagingRow(layerGroupId, 0);
     view.numRows = mMaxBatchSize;
     view.blocksPerRow = mMaxBlocksPerSeq;
     return view;
 }
 
-PageTableView Batch::pageTable(LayerGroupId layerGroupId) const
+GpuCoalescedPageTable Batch::gpuCoalescedPageTable(LayerGroupId layerGroupId) const
 {
     if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
     {
-        throw std::out_of_range("Batch::pageTable: unknown layer group");
+        throw std::out_of_range("Batch::gpuCoalescedPageTable: unknown layer group");
     }
-    PageTableView view;
+    GpuCoalescedPageTable view;
     view.data = reinterpret_cast<CUdeviceptr>(mDevice.get())
         + sizeof(int32_t) * _rowElements() * static_cast<size_t>(layerGroupId.value());
     view.numRows = mMaxBatchSize;

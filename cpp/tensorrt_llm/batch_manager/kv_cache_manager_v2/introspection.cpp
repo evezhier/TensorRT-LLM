@@ -131,7 +131,7 @@ int KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId, 
 
 std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, int layerGroupId)
 {
-    auto const view = batch.pageTable(LayerGroupId{layerGroupId});
+    auto const view = batch.gpuCoalescedPageTable(LayerGroupId{layerGroupId});
     std::vector<int32_t> out(static_cast<size_t>(view.numRows) * view.blocksPerRow);
     cuCheck(cuMemcpyDtoH(out.data(), view.data, sizeof(int32_t) * out.size()));
     return out;
