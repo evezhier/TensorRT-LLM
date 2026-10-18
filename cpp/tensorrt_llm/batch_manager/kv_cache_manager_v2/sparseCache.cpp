@@ -105,9 +105,17 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     }
     for (auto const& [cellBytes, buffers] : shape.pools)
     {
-        if (cellBytes == 0 || buffers <= 0)
+        // {0, 0} is a pool index no sparse buffer of this life cycle uses: it holds its place
+        // so that a storage pool index indexes this arena directly, and carries no cells. Any
+        // other combination describes a pool that cannot be addressed.
+        if ((cellBytes == 0) != (buffers == 0))
         {
-            throw std::invalid_argument("SparseCellArena requires a positive cell size and buffer count per pool");
+            throw std::invalid_argument(
+                "SparseCellArena: a pool needs both a cell size and buffers drawing on it, or neither");
+        }
+        if (buffers < 0)
+        {
+            throw std::invalid_argument("SparseCellArena: a pool cannot have a negative buffer count");
         }
     }
 

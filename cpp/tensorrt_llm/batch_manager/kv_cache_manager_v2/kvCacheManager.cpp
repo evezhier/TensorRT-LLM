@@ -374,16 +374,10 @@ void KvCacheManager::_buildSparseArenas()
             cellBytes = entry.size;
             ++buffers;
         }
-        // A pool index the life cycle never uses still gets a region, because the arena is
-        // indexed by the storage pool index rather than by a dense numbering of its own.
-        for (auto& [cellBytes, buffers] : shape.pools)
-        {
-            if (buffers == 0)
-            {
-                cellBytes = 1;
-                buffers = 1;
-            }
-        }
+        // A pool index the life cycle's sparse buffers never use keeps its place in the list,
+        // because the arena is indexed by the storage pool index rather than by a dense
+        // numbering of its own. It stays {0, 0}: holding no cells, it takes no space, and its
+        // base is simply where the next pool's region starts.
         mSparseArenas[lcId] = SparseCellArena(shape, maxLeases);
     }
 }

@@ -2652,7 +2652,9 @@ def test_sparse_arena_also_reserves_guard_request() -> None:
     ) == (4, 4, 2)
 
 
-def _sparse_arena_config(max_batch_size: int, explicit_ratio: bool) -> KVCacheManagerConfig:
+def _sparse_arena_config(
+    max_batch_size: int, explicit_ratio: bool, dense_size: int = 4096
+) -> KVCacheManagerConfig:
     return KVCacheManagerConfig(
         tokens_per_block=16,
         cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
@@ -2664,7 +2666,7 @@ def _sparse_arena_config(max_batch_size: int, explicit_ratio: bool) -> KVCacheMa
                     # that sizes the pool group's slots.
                     BufferConfig(role=Role.KEY, size=4 * 4096, is_sparse=True),
                     BufferConfig(role=Role.KEY_BLOCK_SCALE, size=4 * 128, is_sparse=True),
-                    BufferConfig(role=Role.VALUE, size=4096),
+                    BufferConfig(role=Role.VALUE, size=dense_size),
                 ],
                 sparse_cache=SparseCacheConfig(
                     num_selected_blocks=2, max_cached_units=4, unit_tokens=4
@@ -2797,7 +2799,11 @@ def test_sparse_arena_shape_matches_native_layout() -> None:
         core.shutdown()
 
 
-def test_sparse_arena_bytes_match_the_native_allocation() -> None:
+# A dense buffer that sorts between the sparse ones leaves a pool index no sparse buffer
+# uses; one that sorts last leaves none. The two exercise different arena layouts, and
+# until both were checked a missing placeholder region and a phantom shared array cancelled.
+@pytest.mark.parametrize("dense_size", [4096, 256], ids=["dense-between", "dense-last"])
+def test_sparse_arena_bytes_match_the_native_allocation(dense_size: int) -> None:
     """Python predicts the arena's bytes; this is the only thing that checks the prediction.
 
     The reservation has to run before a manager exists, so the bytes are modelled in
@@ -2806,7 +2812,9 @@ def test_sparse_arena_bytes_match_the_native_allocation() -> None:
     """
     torch.cuda.synchronize()
     leases = 5
-    config = KVCacheManagerV2._reserve_sparse_arena_leases(_sparse_arena_config(2, False), leases)
+    config = KVCacheManagerV2._reserve_sparse_arena_leases(
+        _sparse_arena_config(2, False, dense_size), leases
+    )
     core = KVCacheManager(config)
     try:
         (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=config.tokens_per_block)

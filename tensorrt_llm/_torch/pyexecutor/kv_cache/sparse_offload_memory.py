@@ -162,7 +162,6 @@ class SparseArenaShape:
         )
         num_buffers = len(self.cell_bytes)
         shared_arrays = (
-            num_buffers,  # page offset of each buffer
             num_buffers,  # metadata row of each buffer
             num_buffers,  # slot of each buffer in its pool
             self.entries,  # recency order a lease starts from
