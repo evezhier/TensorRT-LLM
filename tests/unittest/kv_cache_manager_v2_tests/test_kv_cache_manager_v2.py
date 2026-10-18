@@ -3505,6 +3505,37 @@ class TestBatch(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_a_taken_row_is_refused_rather_than_overwritten(self):
+        """Seating over a member would rebind its row, which nothing downstream would notice."""
+        manager = self._manager()
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                first = manager.create_kv_cache()
+                second = manager.create_kv_cache()
+                for cache in (first, second):
+                    self.assertTrue(cache.resume(handle))
+                self.assertEqual(batch.add_kv_cache(first, 0), 0)
+
+                with self.assertRaisesRegex(Exception, "already occupied"):
+                    batch.add_kv_cache(second, 0)
+                with self.assertRaisesRegex(Exception, "beyond max_batch_size"):
+                    batch.add_kv_cache(second, 2)
+                # Neither attempt seated it, and neither disturbed the member already there.
+                self.assertEqual(batch.row_of(second), -1)
+                self.assertEqual(batch.row_of(first), 0)
+                self.assertEqual(batch.num_kv_caches, 1)
+
+                # The row it was refused is still free to whoever asks for it properly.
+                self.assertEqual(batch.add_kv_cache(second), 1)
+                batch.remove_kv_cache(first)
+                batch.remove_kv_cache(second)
+                first.close()
+                second.close()
+        finally:
+            manager.shutdown()
+
     def test_membership_is_exclusive(self):
         manager = self._manager()
         try:
