@@ -736,6 +736,16 @@ class PoolDesc:
     base_address: MemAddress
     slot_bytes: int
 
+    storage_medium: CacheTier
+    """What this pool's pages actually are.
+
+    The same as the owning group's tier, except for a sparse pool of the GPU tier: those
+    are host-backed, and the group still reports ``GPU_MEM`` because its other pools are
+    not. Ask per pool rather than per group wherever the medium of an address decides
+    something -- registering it for a disaggregated transfer, or choosing a copy
+    implementation -- since a group is not uniform in this.
+    """
+
 class BufferId(NamedTuple):
     layer_id: LayerId
     role: DataRole
@@ -993,7 +1003,21 @@ class Batch:
 
     @property
     def num_kv_caches(self) -> int:
-        """Members seated, which is the rows occupied."""
+        """Members seated, which is the rows occupied.
+
+        Also the leases held: seating takes one from every life cycle's arena and leaving
+        returns it, so the free leases are the arena's capacity less this.
+        """
+
+    @property
+    def sparse_arena_bytes(self) -> int:
+        """Device bytes every life cycle's sparse arena holds, ``0`` without sparse offload.
+
+        The arenas sit outside the cache tiers' quota, so a caller budgeting device memory
+        accounts for them separately and otherwise has to predict the layout to do so. This
+        reports what was actually allocated, which makes that prediction checkable rather
+        than something only a profiler disagrees with.
+        """
 
     @property
     def is_contiguous(self) -> bool:

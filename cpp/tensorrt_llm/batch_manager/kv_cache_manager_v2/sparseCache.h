@@ -228,6 +228,14 @@ public:
         return static_cast<int>(mFree.size());
     }
 
+    //! Device bytes this arena holds: every pool's cell region, the state its leases share,
+    //! and one metadata block per lease. The whole allocation, so a caller reserving the
+    //! arena's bytes against a budget can check its own figure against this one.
+    [[nodiscard]] size_t numBytes() const noexcept
+    {
+        return mNumBytes;
+    }
+
     //! Take a lease, enqueuing its metadata reset on `stream`. nullopt when the arena is
     //! full, which a resume reports as a failed reservation rather than throwing.
     //!
@@ -258,6 +266,7 @@ private:
     CudaUniqPtr<> mMemory;
     SparseCacheInit mShape;
     size_t mMetadataBytes = 0;
+    size_t mNumBytes = 0;
     TypedVec<PoolIndex, CUdeviceptr> mPoolBase;
     std::byte* mMetadataBase = nullptr;
 

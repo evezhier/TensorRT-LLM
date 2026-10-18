@@ -130,8 +130,10 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     size_t const identityBytes = alignedBytes(sizeof(int32_t) * entries);
     size_t const sharedBytes = layerBytes + slotBytes + identityBytes;
 
+    mNumBytes = cellBytes + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes;
+
     CUdeviceptr base = 0;
-    cuCheck(cuMemAlloc(&base, cellBytes + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes));
+    cuCheck(cuMemAlloc(&base, mNumBytes));
     mMemory = CudaUniqPtr<>{reinterpret_cast<std::byte*>(base)};
 
     for (auto offset : regionOffset)

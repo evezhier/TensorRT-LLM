@@ -1534,7 +1534,10 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
         pools.reserve(slotSizeList.size());
         for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
         {
-            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx)});
+            // A sparse pool's pages are host memory whatever its group's tier says.
+            auto const medium
+                = isSparsePool(kHotLevel, pgIdx, poolIdx) ? CacheTier::HOST_MEM : cacheTier(kHotLevel, pgIdx);
+            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx), medium});
         }
         result.push_back(PoolGroupDesc{pgIdx, numSlots(pgIdx, kHotLevel), descList.at(pgIdx), std::move(pools)});
     }

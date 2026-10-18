@@ -2797,6 +2797,32 @@ def test_sparse_arena_shape_matches_native_layout() -> None:
         core.shutdown()
 
 
+def test_sparse_arena_bytes_match_the_native_allocation() -> None:
+    """Python predicts the arena's bytes; this is the only thing that checks the prediction.
+
+    The reservation has to run before a manager exists, so the bytes are modelled in
+    Python and compared against a figure Python also computed -- which cannot catch the
+    model drifting from the allocation. Reading the allocation back closes that loop.
+    """
+    torch.cuda.synchronize()
+    leases = 5
+    config = KVCacheManagerV2._reserve_sparse_arena_leases(_sparse_arena_config(2, False), leases)
+    core = KVCacheManager(config)
+    try:
+        (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=config.tokens_per_block)
+        batch = Batch(
+            core,
+            CudaStream(torch.cuda.current_stream().cuda_stream),
+            max_batch_size=2,
+            max_blocks_per_seq=1,
+            index_tables=core.sparse_index_table_requests(),
+        )
+        assert batch.sparse_arena_bytes == shape.arena_bytes(leases)
+        assert batch.sparse_arena_bytes > 0
+    finally:
+        core.shutdown()
+
+
 def _native_config_with_sparse_arena(
     *,
     arena_bytes: int,

@@ -390,8 +390,17 @@ public:
     //! Row of a member, or -1.
     [[nodiscard]] int rowOf(KvCache const& kvCache) const;
 
-    //! Members seated, which is the rows occupied.
+    //! Members seated, which is the rows occupied. Also the leases held: seating takes one
+    //! from every life cycle's arena and leaving returns it.
     [[nodiscard]] int numKvCaches() const noexcept;
+
+    //! Device bytes every life cycle's sparse arena holds, zero without sparse offload.
+    //!
+    //! The arenas sit outside the cache tiers' quota, so a caller budgeting device memory
+    //! has to account for them separately and otherwise has to predict the layout to do it.
+    //! This reports what was allocated, which makes such a prediction checkable rather than
+    //! something only a profiler disagrees with.
+    [[nodiscard]] size_t sparseArenaBytes() const;
 
     //! Whether the occupied rows are exactly [0, numKvCaches()).
     //!

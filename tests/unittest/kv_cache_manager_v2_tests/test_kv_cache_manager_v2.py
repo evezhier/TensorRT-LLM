@@ -44,6 +44,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         BufferConfig,
         BufferId,
         CacheLevel,
+        CacheTier,
         CorruptedError,
         CudaStream,
         DataRole,
@@ -98,6 +99,7 @@ else:
         BufferConfig,
         BufferId,
         CacheLevel,
+        CacheTier,
         CorruptedError,
         CudaStream,
         DataRole,
@@ -541,6 +543,30 @@ class TestSparseTierFlexibility(unittest.TestCase):
                     self.assertGreater(manager.get_sparse_cache_max_units(0), 0)
                 finally:
                     manager.shutdown()
+
+    def test_a_sparse_pool_names_the_host_memory_it_actually_is(self):
+        """A GPU-tier group is not uniform, so the medium has to be read per pool.
+
+        The sparse pool's pages are host memory while the dense pool beside it is device
+        memory, and the group reports one tier for both. A consumer that has to name the
+        medium of an address -- registering it for a disaggregated transfer, say -- gets
+        it wrong for exactly one pool if it asks the group.
+        """
+        manager = self._manager([GpuCacheTierConfig(64 << 20)])
+        try:
+            media = [
+                pool.storage_medium for group in manager.pool_group_descs for pool in group.pools
+            ]
+            self.assertEqual(
+                media.count(CacheTier.HOST_MEM), 1, "the one sparse buffer is the host-backed pool"
+            )
+            self.assertEqual(
+                media.count(CacheTier.GPU_MEM),
+                len(media) - 1,
+                "every other pool of a GPU tier is device memory",
+            )
+        finally:
+            manager.shutdown()
 
 
 class TestSparseCacheReservation(unittest.TestCase):

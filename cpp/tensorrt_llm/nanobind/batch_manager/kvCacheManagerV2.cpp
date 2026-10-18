@@ -1579,7 +1579,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PoolDesc>(m, "PoolDesc")
         .def_prop_ro("pool_index", [](kv::PoolDesc const& self) { return self.poolIndex.value(); })
         .def_ro("base_address", &kv::PoolDesc::baseAddress)
-        .def_ro("slot_bytes", &kv::PoolDesc::slotBytes);
+        .def_ro("slot_bytes", &kv::PoolDesc::slotBytes)
+        .def_ro("storage_medium", &kv::PoolDesc::storageMedium,
+            "What this pool's pages actually are. The same as the group's tier except for a sparse "
+            "pool of the GPU tier, which is host-backed while the group still reports GPU_MEM. Ask "
+            "per pool, not per group, when the medium of an address matters -- registering it for "
+            "transfer, or picking a copy implementation.");
 
     nb::class_<kv::PoolGroupDesc>(m, "PoolGroupDesc")
         .def_prop_ro("pool_group_index", [](kv::PoolGroupDesc const& self) { return self.poolGroupIndex.value(); })
@@ -2688,6 +2693,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "int32[max_batch] per-row capacity, in tokens. Published with history_lengths().")
 
         .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
+        .def_prop_ro("sparse_arena_bytes", &kv::Batch::sparseArenaBytes,
+            "Device bytes every life cycle's sparse arena holds, 0 without sparse offload.\n\n"
+            "The arenas sit outside the cache tiers' quota, so a caller budgeting device memory "
+            "accounts for them separately and otherwise has to predict the layout to do it. This "
+            "is what was allocated, which makes that prediction checkable.")
         .def_prop_ro("num_kv_caches", &kv::Batch::numKvCaches, "Members seated, which is the rows occupied.")
         .def_prop_ro("is_contiguous", &kv::Batch::isContiguous,
             "Whether the occupied rows are exactly [0, num_kv_caches).\n\n"

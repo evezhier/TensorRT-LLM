@@ -1325,6 +1325,16 @@ WatermarkView Batch::watermarks() const
     return view;
 }
 
+size_t Batch::sparseArenaBytes() const
+{
+    size_t total = 0;
+    for (LifeCycleId lc{0}; lc < mNumLayerGroups; ++lc)
+    {
+        total += mManager->sparseArena(lc).numBytes();
+    }
+    return total;
+}
+
 int Batch::numKvCaches() const noexcept
 {
     return static_cast<int>(
