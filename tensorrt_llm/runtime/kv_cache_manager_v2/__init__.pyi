@@ -1009,6 +1009,22 @@ class Batch:
         returns it, so the free leases are the arena's capacity less this.
         """
 
+    def peek_hit_miss_counter(self) -> tuple[int, int]:
+        """Cumulative ``(hits, misses)`` in selection units, since build or the last reset.
+
+        A hit is a selected unit the GPU cache already held; a miss is one the fetch had to
+        copy from its host page. Padded selection entries and in-flight units are neither,
+        so they appear in neither figure -- which is why the pair comes from the resolve
+        rather than from a count the caller could keep itself.
+
+        Reads on a temporary stream and synchronises only that, so the pair may be a few
+        launches stale. That does not move a ratio; synchronise the device first if an exact
+        pair matters.
+        """
+
+    def reset_hit_miss_counter(self) -> None:
+        """Zero the cumulative pair, enqueued on the Batch's stream."""
+
     @property
     def sparse_arena_bytes(self) -> int:
         """Device bytes every life cycle's sparse arena holds, ``0`` without sparse offload.

@@ -230,6 +230,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     __shared__ typename BlockScan::TempStorage temp;
     __shared__ int32_t numMiss;
     __shared__ int32_t numCopy;
+    __shared__ int32_t numResolved;
 
     // The view's own arrays belong to this row's allocation, so only the layer indexes them.
     int32_t* residentOrdinal = view.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
@@ -246,6 +247,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     {
         numMiss = 0;
         numCopy = 0;
+        numResolved = 0;
     }
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < tableSize; i += kThreads)
     {
@@ -296,6 +298,12 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
 
     // Probe once per required unit. A hit resolves immediately; a miss is recorded against
     // its position in the virtual list and resolved once a victim is chosen.
+    //
+    // Selection entries naming real history are counted as they pass: they are the
+    // denominator of the fetch's hit rate, and only this pass knows which they are. A
+    // padded entry is neither hit nor miss, and an in-flight unit is not a fetch -- its
+    // host page is not written until the watermark passes it.
+    int32_t resolvedMine = 0;
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < required; i += kThreads)
     {
         int32_t const ord = i < inFlight ? historyUnits + i : selected[i - inFlight];
@@ -304,6 +312,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             outSlot[i - inFlight] = kNoSparseSlot;
             continue;
         }
+        resolvedMine += i < inFlight ? 0 : 1;
         uint32_t pos = slotOf(ord, mask);
         int32_t key = keys[pos];
         while (key != kEmptyKey && key != ord)
@@ -323,6 +332,10 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             missOrd[j] = ord;
             missIdx[j] = i;
         }
+    }
+    if (resolvedMine > 0)
+    {
+        atomicAdd(&numResolved, resolvedMine);
     }
     __syncthreads();
 
@@ -346,6 +359,14 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             // The list is sized for every row missing its whole selection, so a claim can
             // only run past it if the caller sized it from a different width.
             KVCM2_SPARSE_REQUIRE(copyBase + claimed <= args.work.capacity);
+            if (args.hitMiss != nullptr)
+            {
+                // This row's own contribution, not a total read back later: the step's
+                // counters are cleared per publish, not per fetch, so anything reading them
+                // afterwards would count a second fetch of the same layer twice.
+                atomicAdd(&args.hitMiss->resolved, static_cast<unsigned long long>(numResolved));
+                atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(claimed));
+            }
         }
     }
     __syncthreads();

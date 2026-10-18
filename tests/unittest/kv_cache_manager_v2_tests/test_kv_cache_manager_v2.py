@@ -1622,6 +1622,54 @@ class TestSparseFetch(unittest.TestCase):
             # Slot 1 was padded, so it reads as absent rather than as the fill we started from.
             self.assertTrue(bool((out[0, :, 1] == BAD_PAGE_INDEX).all()))
 
+    def test_the_hit_rate_counts_selected_units_and_nothing_else(self):
+        """Hits and misses are selection entries naming real history, and only those.
+
+        A padded entry is neither, which is why the pair cannot be derived on the host from
+        the selection's width -- the padding is the model's and lives on the device.
+        """
+        roles = ("key",)
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            self.assertEqual(batch.peek_hit_miss_counter(), (0, 0))
+            buffers = self._buffers(roles)
+            out = self._out(torch, 2, len(roles))
+
+            # Row 0 selects two real units; row 1 holds no reservation and resolves nothing.
+            both = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
+            manager.fetch_sparse_pages(batch, buffers, both, out, handle)
+            torch.cuda.synchronize()
+            self.assertEqual(batch.peek_hit_miss_counter(), (0, 2), "a cold cache misses both")
+
+            # The same units are resident now, so the second fetch copies nothing.
+            manager.fetch_sparse_pages(batch, buffers, both, out, handle)
+            torch.cuda.synchronize()
+            self.assertEqual(batch.peek_hit_miss_counter(), (2, 2))
+
+            # One real selection and one padded: the padding moves neither figure.
+            padded = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
+            manager.fetch_sparse_pages(batch, buffers, padded, out, handle)
+            torch.cuda.synchronize()
+            self.assertEqual(batch.peek_hit_miss_counter(), (3, 2))
+
+            batch.reset_hit_miss_counter()
+            torch.cuda.synchronize()
+            self.assertEqual(batch.peek_hit_miss_counter(), (0, 0))
+
+    def test_a_write_back_leaves_the_hit_rate_alone(self):
+        """The flush shares the copy kernel; its units moved are not cache misses."""
+        roles = ("key",)
+        with self._fixture(roles) as (torch, manager, batch, _cache, handle):
+            buffers = self._buffers(roles)
+            out = self._out(torch, 2, len(roles))
+            both = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
+            manager.fetch_sparse_pages(batch, buffers, both, out, handle)
+            torch.cuda.synchronize()
+            before = batch.peek_hit_miss_counter()
+
+            batch.flush_sparse_units([2 * self.TOKENS_PER_BLOCK, 0])
+            torch.cuda.synchronize()
+            self.assertEqual(batch.peek_hit_miss_counter(), before)
+
     def test_the_output_follows_the_selection_order(self):
         """Slot k of out and slot k of the selection describe the same unit.
 

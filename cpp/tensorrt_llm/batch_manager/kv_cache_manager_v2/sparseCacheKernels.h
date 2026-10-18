@@ -82,6 +82,36 @@ struct SparseWorkList
     int32_t numLists = 1;
 };
 
+//! Fetch statistics, as the device counter and as its host copy.
+//!
+//! The two figures the resolve produces, not the two a reader wants: `hits()` is their
+//! difference and is never stored. `misses` is the row's claimed run in the compacted miss
+//! list -- the selected units that were not resident and so had to be copied from their
+//! host pages.
+//!
+//! `unsigned long long` rather than `uint64_t` because the device side accumulates with
+//! `atomicAdd`, which has no overload for `unsigned long` on LP64.
+//!
+//! 64-bit because a step at B = 256 with a 2048-wide selection resolves millions of units
+//! per layer: a 32-bit pair would wrap within a few hundred steps, and a wrapped miss count
+//! makes the hit rate improve.
+struct SparseHitMiss
+{
+    //! Selection entries that named real history. Padding and in-flight units are neither
+    //! hit nor miss, so neither reaches this.
+    unsigned long long resolved = 0;
+    //! Of those, the ones the cache did not hold.
+    unsigned long long misses = 0;
+
+    //! Clamped, because a host copy races a running fetch and the two are separate atomics:
+    //! a resolve can land between them and show a miss its selection has not been counted
+    //! for yet. A diagnostic must not be able to report a negative.
+    [[nodiscard]] unsigned long long hits() const noexcept
+    {
+        return resolved >= misses ? resolved - misses : 0;
+    }
+};
+
 struct SparseResolveArgs
 {
     //! [numRows] cache state per row, as Batch::sparseCacheViews() publishes it. A row with
@@ -142,6 +172,17 @@ struct SparseResolveArgs
     //! [numRows] entries this row contributed. The copy does not read it -- it walks the
     //! compacted list -- but it is what makes a row's hit rate observable.
     int32_t* missCount = nullptr;
+
+    //! Cumulative fetch statistics, which every row adds its own share of. Null skips it.
+    //!
+    //! Counted in the resolve because only the resolve can count either half: a padded
+    //! selection entry is negative and an in-flight unit is not a fetch, neither of which
+    //! the host can see. Both halves come from one pass, so they agree on what they count.
+    //!
+    //! A row adds its own contribution rather than anything reading a total afterwards. The
+    //! step's counters are cleared once per publish, not per fetch, so a reader downstream
+    //! would count two fetches of one layer twice.
+    SparseHitMiss* hitMiss = nullptr;
 };
 
 //! Shared memory one CTA needs for `entriesPerLayer` entries and `selectionWidth` selections.

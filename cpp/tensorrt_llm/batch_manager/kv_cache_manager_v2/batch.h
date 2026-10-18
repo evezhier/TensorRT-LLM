@@ -107,6 +107,10 @@ struct SparseStepScratch
     int32_t* flushCount = nullptr; //!< [numRows][numLayers]
     int32_t numLayers = 0;
 
+    //! The Batch's cumulative fetch statistics, the same pointer for every life cycle.
+    //! Carried here so a fetch reaches it the way it reaches the rest of its arguments.
+    SparseHitMiss* hitMiss = nullptr;
+
     //! What differs between the pools of a copy, on the device for the kernel to index by
     //! `blockIdx.z`. Built and uploaded once with the Batch: every field comes from the
     //! buffer plan and the index tables, both fixed at construction, so a captured graph
@@ -394,6 +398,23 @@ public:
     //! from every life cycle's arena and leaving returns it.
     [[nodiscard]] int numKvCaches() const noexcept;
 
+    //! Cumulative fetch statistics, in selection units, since the Batch was built or the
+    //! counters were last reset.
+    //!
+    //! A hit is a selected unit the GPU cache already held; a miss is one the fetch had to
+    //! copy from its host page. Padded selection entries and in-flight units are neither,
+    //! so they reach neither figure -- which is why this comes from the resolve rather than
+    //! from a count the caller could keep.
+    //!
+    //! Reads back on a temporary stream and syncs only that, so the counters may be a few
+    //! launches stale. That does not move a ratio; a caller wanting the two to agree
+    //! exactly synchronises the device first and calls this after.
+    [[nodiscard]] SparseHitMiss peekHitMissCounter() const;
+
+    //! Zero the cumulative pair. Enqueued on the Batch's stream, so it orders against the
+    //! fetches around it rather than tearing one.
+    void resetHitMissCounter();
+
     //! Device bytes every life cycle's sparse arena holds, zero without sparse offload.
     //!
     //! The arenas sit outside the cache tiers' quota, so a caller budgeting device memory
@@ -496,6 +517,10 @@ private:
     //! keep only the Batch. Leaving returns the reference. KvCache points back with a raw
     //! `mBatch`, so there is no cycle.
     std::vector<std::shared_ptr<KvCache>> mRows;
+
+    //! Cumulative fetch statistics, across every life cycle and step. Outside mStepScratch
+    //! because the step's clear must not touch it.
+    CudaUniqPtr<SparseHitMiss> mHitMiss;
 
     //! Device storage behind every life cycle's per-BufferId copy descriptors.
     CudaUniqPtr<SparseCopyDesc> mCopyDesc;

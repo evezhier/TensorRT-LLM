@@ -687,6 +687,8 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     layerWork.total += layerInGroup;
     resolve.work = layerWork;
     resolve.missCount = scratch.missCount;
+    // Every row adds its own hits and misses as it resolves them.
+    resolve.hitMiss = scratch.hitMiss;
     launchSparseResolve(resolve, stream);
 
     // The misses this layer produced, applied to each of its buffers. One list row per

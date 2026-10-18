@@ -275,6 +275,9 @@ void Batch::_allocateStepScratch()
     }
 
     mStepScratch = allocateDeviceMemory<int32_t>(total + mCounterElements);
+    // Its own allocation: the step's clear covers mCounters, and these have to survive it.
+    mHitMiss = allocateDeviceMemory<SparseHitMiss>(1);
+    cuCheck(cuMemsetD32(reinterpret_cast<CUdeviceptr>(mHitMiss.get()), 0U, sizeof(SparseHitMiss) / sizeof(uint32_t)));
 
     // The counters lead the block so that one clear covers every life cycle's.
     auto* counter = mStepScratch.get();
@@ -318,6 +321,7 @@ void Batch::_allocateStepScratch()
         // its own by offsetting this; the write-back's counters match its lists one to one.
         scratch.fetchWork.total = carveCounters(layerCount);
         scratch.flushWork.total = carveCounters(layerCount);
+        scratch.hitMiss = mHitMiss.get();
 
         auto const layers = static_cast<size_t>(scratch.numLayers);
         scratch.flushCount = carve(rows * layers);
@@ -1323,6 +1327,30 @@ WatermarkView Batch::watermarks() const
     view.capacity = base + sizeof(int32_t) * _capacityOffset();
     view.numRows = mMaxBatchSize;
     return view;
+}
+
+SparseHitMiss Batch::peekHitMissCounter() const
+{
+    if (!mHitMiss)
+    {
+        return {};
+    }
+    // A temporary stream, synced alone: the Batch's own stream carries the step, and
+    // waiting on that would turn a statistics read into a pipeline stall.
+    SparseHitMiss host;
+    TemporaryCudaStream temp{{}};
+    cuCheck(cuMemcpyDtoHAsync(&host, reinterpret_cast<CUdeviceptr>(mHitMiss.get()), sizeof(host), temp.get()));
+    cuCheck(cuStreamSynchronize(temp.get()));
+    return host;
+}
+
+void Batch::resetHitMissCounter()
+{
+    if (mHitMiss)
+    {
+        TLLM_CUDA_CHECK(
+            cudaMemsetAsync(mHitMiss.get(), 0, sizeof(SparseHitMiss), reinterpret_cast<cudaStream_t>(mCudaStream)));
+    }
 }
 
 size_t Batch::sparseArenaBytes() const

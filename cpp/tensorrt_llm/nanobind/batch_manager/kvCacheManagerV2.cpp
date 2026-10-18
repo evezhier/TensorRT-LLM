@@ -2693,6 +2693,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "int32[max_batch] per-row capacity, in tokens. Published with history_lengths().")
 
         .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
+        .def(
+            "peek_hit_miss_counter",
+            [](kv::Batch const& self)
+            {
+                auto const stats = self.peekHitMissCounter();
+                return nb::make_tuple(stats.hits(), stats.misses);
+            },
+            "Cumulative (hits, misses) in selection units since the Batch was built or the "
+            "counters were reset.\n\n"
+            "A hit is a selected unit the GPU cache already held; a miss is one the fetch copied "
+            "from its host page. Padded selection entries and in-flight units are neither, so they "
+            "are in neither figure.\n\n"
+            "Reads on a temporary stream and syncs only that, so the pair may be a few launches "
+            "stale -- which does not move a ratio. Synchronise the device first for an exact one.")
+        .def("reset_hit_miss_counter", &kv::Batch::resetHitMissCounter,
+            "Zero the cumulative pair, on the Batch's stream.")
         .def_prop_ro("sparse_arena_bytes", &kv::Batch::sparseArenaBytes,
             "Device bytes every life cycle's sparse arena holds, 0 without sparse offload.\n\n"
             "The arenas sit outside the cache tiers' quota, so a caller budgeting device memory "

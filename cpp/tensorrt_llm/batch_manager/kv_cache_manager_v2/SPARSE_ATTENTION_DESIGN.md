@@ -712,6 +712,59 @@ page has no valid contents yet, so the result is stale data rather than unrelate
 A debug check against the flushed state can catch it; silence would be a wrong answer, not
 corruption.
 
+### Measuring the hit rate
+
+A hit is a selected unit the cache already held; a miss is one the fetch copied from its
+host page. The ratio is what a deployment tunes the cache size against, so it is collected
+rather than inferred.
+
+**Both figures come from the resolve, because only the resolve can produce either.** The
+obvious denominator — rows times selection width, which the host knows for free — counts
+things that are neither. A selection entry may be padded, and padding is negative and lives
+on the device, chosen by whatever selected the units. An in-flight unit is resolved in the
+same pass but is not a fetch: its host page is not written until the watermark passes it,
+so there is nothing to copy and nothing to miss. Counting either as a hit inflates the rate,
+and does so worst where histories are short — early decode, short prompts — which is
+exactly the regime someone reads the rate to understand.
+
+So the resolve counts the selection entries that named real history, in the pass that
+already classifies them. The miss half is `claimed`, the run the row takes in the compacted
+list, which it computes anyway. The two are produced together and agree by construction on
+what they count; hits are their difference and are never stored.
+
+**Each row adds its own contribution, rather than anything reading a total afterwards.**
+This is the part that is easy to get wrong. The step's counters — `work.total` and anything
+beside it — are cleared once per `publish()`, not once per fetch, which is what lets one
+clear cover every layer without a non-kernel node between each resolve and the work before
+it. A consumer downstream that read those counters and folded them into a cumulative pair
+would therefore be correct only if every layer were fetched exactly once per publish. That
+is what a step does, but the interface permits more, and a second fetch of a layer would
+silently re-add the first one's totals. Accumulating per CTA from the values the row holds
+in registers has no such precondition, costs two atomics per row, and needs no ordering
+against anything.
+
+It also keeps the whole mechanism inside one kernel: nothing in the copy, no programmatic
+dependency to reason about, and no need to exclude the write-back — which shares the copy
+kernel and whose moved units are due to be written rather than units the cache failed to
+hold. The in-flight resolve contributes nothing on its own, since it has no selection and
+its ordinals sit above the watermark.
+
+64-bit counters: a step at B = 256 with a 2048-wide selection resolves millions of units per
+layer, so a 32-bit pair would wrap within a few hundred steps — and a wrapped miss count
+makes the hit rate *improve*, which is the failure a reader would trust.
+
+**There is no enable switch.** The cost is two atomics per row per fetched layer. A switch
+would cost nothing to run either, but it would bake into a captured graph, so turning
+statistics on mid-run would keep reporting zeros until the graph was captured again — a
+disabled feature indistinguishable from a broken one.
+
+`peekHitMissCounter()` reads the pair on a temporary stream and synchronises only that, so
+it never stalls the step. The pair may be a few launches stale, which does not move a ratio;
+a caller wanting the two to agree exactly synchronises the device first. Because the read
+races a running fetch and the counters are separate atomics, a copy can land between them —
+the result is clamped rather than checked, since a diagnostic must not be able to fail the
+cache. Per-row detail is already available separately in `missCount`.
+
 ## One arena, one index space
 
 The cache arena holds nothing but cells — selected history and the unit being written alike.
