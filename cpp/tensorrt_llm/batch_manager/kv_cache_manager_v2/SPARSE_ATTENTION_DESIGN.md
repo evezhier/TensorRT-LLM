@@ -158,13 +158,17 @@ main:   waitEvent(staged)
         flushRead = record(main)
 ```
 
-The helper stream is not a device-side overlap optimisation — the array is two ints per row.
-It is there because `DURING_API_CALL` consumes the host array *before the call returns*, so
-issuing the copy on the Batch's stream would hold the host until the previous step's graph
-replay reached it. On a helper stream the source is captured at once and only the device
-write queues behind the wait, so the call returns promptly. The wait itself is a stream
-wait, not a host sync: the hazard is the previous step's kernel still reading the same
-destination, which is ordinary stream ordering. (Do not set
+The helper stream buys both things, dominated by the first. `DURING_API_CALL` consumes the
+host array *before the call returns*, so issuing the copy on the Batch's stream would hold
+the host until the previous step's graph replay reached it; on a helper stream the source is
+captured at once and the call returns promptly. The device write then overlaps that replay
+too, since the main stream reaches its wait on `staged` only after draining what it already
+had queued — though with two ints per row that part is worth a microsecond, where the
+host-side decoupling is worth whatever the replay has left.
+
+The kernel stays on the Batch's stream because the cells it reads are written there. The
+wait is a stream wait, not a host sync: the hazard is the previous step's kernel still
+reading the same destination, which is ordinary stream ordering. (Do not set
 `CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE` on that copy — it breaks `DURING_API_CALL`
 semantics; driver bug 6718200, see `batchedPageCopy.cu`.)
 
