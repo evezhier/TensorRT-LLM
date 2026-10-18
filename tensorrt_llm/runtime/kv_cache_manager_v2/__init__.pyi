@@ -598,6 +598,9 @@ class _KVCache:
         layer group to a row of the batch's table, and a second buffer would take the writes
         with it, leaving that row holding whatever it held when the cache joined. Remove it
         from the batch first, or give the batch the buffer worth writing to.
+
+        This holds for the batch too -- it ends the membership before handing the indices
+        back, so nothing binds a seated member's buffer.
         """
     @property
     def manager(self) -> "KVCacheManager": ...
@@ -686,8 +689,24 @@ class _KVCache:
     def reuse_scope(self) -> ReuseScope: ...
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
-    def suspend(self) -> None: ...
-    def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
+    def suspend(self) -> None:
+        """Unlock this cache's pages and detach from its stream.
+
+        Raises while it belongs to a :class:`Batch`: the unlocks write ``BAD_PAGE_INDEX``
+        through the bound buffer, which is the batch's row, so doing it while seated would
+        write a row a publish may still be reading. Remove it from the batch first.
+        """
+
+    def resume(self, cuda_stream: CudaStream | None = None) -> bool:
+        """Lock this cache's pages at their required levels.
+
+        Returns ``False`` when utilisation is too high or pages cannot be had. Raises while
+        it belongs to a :class:`Batch`, for the same reason as :meth:`suspend` -- locking
+        writes page indices through the batch's row. A member is resumed before it joins.
+
+        Takes no sparse cache arena lease: that follows membership, so a request receiving
+        its history costs the GPU cache nothing until it is seated.
+        """
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> ScratchDesc | None: ...
     @property
@@ -888,6 +907,7 @@ class Batch:
     def __init__(
         self,
         manager: KVCacheManager,
+        stream: CudaStream,
         max_batch_size: int = 0,
         max_blocks_per_seq: int = 0,
         page_table: ExternalPageTable | None = None,
@@ -895,6 +915,11 @@ class Batch:
         index_tables: Sequence[IndexTableRequest] = (),
     ) -> None:
         """Bound the device arrays, whose shape must not change between steps.
+
+        ``stream`` is the stream every member runs on. A batch owns it rather than taking
+        one per call: a member's own work and the batch's transfers have to be ordered
+        against each other, and two streams would leave that to the caller. Joining binds
+        the member to it, and a member cannot be moved off it.
 
         Neither can be grown later, so neither is inferred: zero derives it from the
         manager's ``constraints``, which fails when none were declared. A pool-sizing hint
@@ -915,8 +940,15 @@ class Batch:
         """Seat a cache in ``row``, or in the lowest free row when it is negative.
 
         Returns the row. Raises if the row is taken or out of range, if the batch is full,
-        if the cache already belongs to a batch, or if its beam width exceeds one -- only
-        beam 0 is mirrored, so a wider request would have every beam read beam 0's pages.
+        if the cache already belongs to a batch, if it has not been resumed, or if its beam
+        width exceeds one -- only beam 0 is mirrored, so a wider request would have every
+        beam read beam 0's pages.
+
+        Takes the sparse cache arena lease, because membership is what being stepped means:
+        a resumed request that is not seated cannot fetch, and a disaggregated one receives
+        its whole history into host pages without touching the cache. The arena is sized
+        from the same ``constraints`` the rows come from, so a free row always has a free
+        lease and this cannot fail for want of one.
 
         A batch borrowing a page table requires ``row``: its rows are indexed by whatever
         slot the lender gave the request, and one chosen here would address a different
@@ -924,7 +956,14 @@ class Batch:
         """
 
     def remove_kv_cache(self, kv_cache: _KVCache) -> None:
-        """Free the cache's row, leaving a hole for reuse."""
+        """Free the cache's row, leaving a hole for reuse.
+
+        Returns the arena lease, which **discards whatever the GPU cache held**: a lease
+        comes back with every entry free, so a unit whose only copy was in a cell can no
+        longer be addressed. Call :meth:`flush_sparse_units` first for anything worth
+        keeping. A batch is meant to persist across steps -- churning membership per step
+        cold-starts every request's cache.
+        """
 
     @property
     def num_index_tables(self) -> int: ...
@@ -979,23 +1018,57 @@ class Batch:
         self,
         capacities: Sequence[int | None],
         history_lengths: Sequence[int | None],
-        stream: CudaStream,
-    ) -> list[bool]:
+    ) -> list[int]:
         """Resize every member, then publish once.
 
-        One result per row, in row order: a member rolls back on its own, so a batch can
-        partially fail. A table published after a partial failure describes the
-        post-rollback state.
+        One result per row, in row order, ``0`` for a free row: a member rolls back on its
+        own, so a batch can partially fail. A table published after a partial failure
+        describes the post-rollback state.
+
+        Rejects, before touching any member, a history length that falls or that outruns
+        the capacity its row already had -- capacity granted by this call makes room for
+        tokens written *after* it, so history can only cover tokens whose space was already
+        there. A request arriving with a whole prompt as history is the one shape that
+        excludes, so seed it before it joins.
+
+        A row whose growth fails still takes its history advance, which needs no slots and
+        is what lets the units below it be written back; its result stays ``0``, since the
+        row is not at the state that was asked for.
         """
 
-    def publish(self, stream: CudaStream) -> None:
-        """Copy the staged rows to the device, enqueuing on ``stream``.
+    def flush_sparse_units(self, new_history_lengths: Sequence[int]) -> None:
+        """Write back the units each row's watermark is about to pass.
 
-        Page indices are published as stored -- level-relative, unscaled, and with
-        ``BAD_PAGE_INDEX`` preserved rather than folded to a safe slot. A sparse table
-        numbers pure-history and input-token entries in different levels' pools, so only
-        the sentinel separates an absent block from slot zero; the dense path's scaled
-        block offsets cannot serve here for that reason.
+        One entry per row, giving the history you are about to set; a row may repeat its
+        current history, which asks for nothing. **Call this before advancing history, not
+        after**: a block must be in its host page before it can be selected, and
+        :meth:`_KVCache.resize` refuses a history this has not covered.
+
+        Bounded by the capacity each row started from, not by how far history travels, so
+        a resumed request moving history across a whole prompt writes back nothing -- its
+        units reached their host pages directly rather than through a cell. A move wider
+        than the in-flight headroom is refused.
+
+        Reads the index table as of the last :meth:`publish`, which covers the blocks in
+        range because they were allocated by an earlier step.
+        """
+
+    def flushed_history(self, row: int) -> int:
+        """The history a row has been written back to.
+
+        A row that has never needed a flush reads its own history, so a caller may always
+        compare against it.
+        """
+
+    def publish(self) -> None:
+        """Copy the staged rows to the device, enqueuing on the batch's stream.
+
+        The staged page indices are slot ids as stored -- unscaled, with
+        ``BAD_PAGE_INDEX`` preserved rather than folded to a safe slot, since only the
+        sentinel separates an absent block from slot zero. Publishing also converts them
+        into the index tables declared at construction, which is what a sparse fetch and
+        write-back read: there the buffer's own offset within its page is already in the
+        value, so an entry counts whole buffers from its table's base.
 
         A borrowed page table is copied too, not read in place: the snapshot is the whole
         point, since the host has to be free to write the next step's rows long before the
@@ -1003,11 +1076,11 @@ class Batch:
         layer group instead of one linear transfer for all of them, because the lender's
         rows are further apart than they are wide.
 
-        Two stages. The host-to-device fill runs on a stream of the batch's own, so it
-        overlaps the previous step -- the host enqueues this while that step's forward is
-        still executing. ``stream`` then carries one linear device-to-device copy into the
-        tables the fetch reads. Everything expensive is in the first stage, and only the
-        second waits for anything.
+        Two stages. The host-to-device fill runs on an upload stream of the batch's own,
+        so it overlaps the previous step -- the host enqueues this while that step's
+        forward is still executing. The batch's stream then carries one linear
+        device-to-device copy into the tables the fetch reads, and the conversion. Everything
+        expensive is in the first stage, and only the second waits for anything.
 
         Raises if the previous publish has not been waited on. This call stages the
         watermarks and views itself, so it would be writing into the same hazard it is
@@ -1150,6 +1223,15 @@ class KVCacheManager:
         """
 
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def sparse_index_table_requests(self) -> list[IndexTableRequest]:
+        """The index table requests every sparse life cycle needs, one per (layer, pool) run.
+
+        A :class:`Batch` still has to be given these: it refuses a sparse buffer it was told
+        nothing about, because a fetch with no converted indices would read the wrong pages
+        rather than fail. Their shape is not a choice -- a copy walks one run per launch
+        from one base pointer, so the run is the request -- so this saves re-deriving the
+        pool layout to restate it.
+        """
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def prepare_sparse_write_indices(
         self,
