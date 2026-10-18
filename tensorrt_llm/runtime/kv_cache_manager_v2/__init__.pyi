@@ -537,8 +537,6 @@ class KVCacheEventManager:
         blocks: Sequence[KVCacheStoredBlockData],
         layer_group_id: int | None = None,
     ) -> None: ...
-    def add_stored_block_event_from_block(self, block: Any) -> None: ...
-    def add_stored_life_cycle_event_from_block(self, block: Any, life_cycle_id: int) -> None: ...
     def add_removed_event(self, block_hashes: BlockHashesLike) -> None: ...
     def add_removed_life_cycle_event(self, block_hash: bytes, life_cycle_id: int) -> None: ...
     def add_updated_event(
@@ -1009,6 +1007,10 @@ class Batch:
 
     def row_of(self, kv_cache: _KVCache) -> int:
         """Row of a member, or ``-1``."""
+
+    @property
+    def cuda_stream(self) -> CudaStream:
+        """The stream this batch and every member run on, fixed at construction."""
 
     @property
     def max_batch_size(self) -> int: ...
