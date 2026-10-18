@@ -246,6 +246,13 @@ public:
 
     //! Seat a cache in `row`, or in the lowest free row when it is negative.
     //!
+    //! Seat a request only once it is ready to be stepped. Seating takes the sparse arena
+    //! lease, so a request that holds pages without being stepped -- a disaggregated one
+    //! still receiving its KV, or one sitting out a step -- costs the arena nothing while it
+    //! stays out, and the arena is sized for the rows rather than for every request the
+    //! scheduler admits precisely because of that. Nothing here checks it: the Batch cannot
+    //! see what a request is waiting on, so an early seat is a caller's error that shows up
+    //! as arena pressure rather than as a throw.
     //!
     //! Throws when the row is taken or out of range, the batch is full, the cache already
     //! belongs to a batch, or its beam width exceeds one -- only beam 0 is mirrored, so a

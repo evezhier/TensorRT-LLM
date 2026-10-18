@@ -2881,10 +2881,11 @@ def _native_config_with_sparse_arena(
             is_disagg=True,
             sparse_kv_offload_config=sparse_kv_offload_config,
         )
-    # Every index the mapper can hand out holds a lease: 2 x 2 requests plus padding.
-    get_arena_bytes.assert_called_once_with(ANY, tokens_per_block=TOKENS_PER_BLOCK, max_leases=5)
+    # A lease follows Batch membership, so the arena is sized by the rows rather than by
+    # the 5 indices the mapper can hand out -- disagg doubling and padding included.
+    get_arena_bytes.assert_called_once_with(ANY, tokens_per_block=TOKENS_PER_BLOCK, max_leases=2)
     get_batch_buffer_bytes.assert_called_once_with(
-        ANY, tokens_per_block=TOKENS_PER_BLOCK, max_leases=5
+        ANY, tokens_per_block=TOKENS_PER_BLOCK, max_leases=2
     )
     return create_impl.call_args.args[0]
 

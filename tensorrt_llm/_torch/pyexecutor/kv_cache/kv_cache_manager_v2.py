@@ -1643,13 +1643,14 @@ class KVCacheManagerV2(BaseResourceManager):
         # With sparse KV cache offload, the sparse cache arenas and the buffers
         # sized for max_batch_size rows are allocated beside the pools, outside
         # the device tier's quota, so they come out of the device byte budget.
-        # Every concurrent request the index mapper admits holds a lease.
+        # A lease is held only while a cache is seated in the attention Batch, so
+        # the arena needs one per row rather than one per admitted sequence.
         reserved_arena_bytes = self._get_sparse_arena_bytes(
-            kv_cache_config, tokens_per_block=tokens_per_block, max_leases=index_mapper_capacity
+            kv_cache_config, tokens_per_block=tokens_per_block, max_leases=self.max_batch_size
         )
         self._sparse_batch_buffer_bytes, self._sparse_batch_staging_bytes = (
             self._get_sparse_batch_buffer_bytes(
-                kv_cache_config, tokens_per_block=tokens_per_block, max_leases=index_mapper_capacity
+                kv_cache_config, tokens_per_block=tokens_per_block, max_leases=self.max_batch_size
             )
         )
         reserved_bytes = reserved_arena_bytes + self._sparse_batch_buffer_bytes
@@ -1663,7 +1664,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if reserved_bytes > 0:
                 reserved = (
                     f"{reserved_arena_bytes / (1 << 30):.2f}GiB of sparse cache arena for "
-                    f"{index_mapper_capacity} leases and "
+                    f"{self.max_batch_size} leases and "
                     f"{self._sparse_batch_buffer_bytes / (1 << 30):.2f}GiB of offload buffers for "
                     f"max_batch_size={self.max_batch_size}"
                 )
@@ -1704,7 +1705,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         kv_cache_config,
                         quota,
                         tokens_per_block=tokens_per_block,
-                        max_leases=index_mapper_capacity,
+                        max_leases=self.max_batch_size,
                     )
                 except ValueError as error:
                     offload_error = error
@@ -1827,7 +1828,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache_config,
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
-            max_leases=index_mapper_capacity,
+            max_leases=self.max_batch_size,
         )
         arena_bytes = sparse_arena_bytes(config)
         if arena_bytes > reserved_arena_bytes:
@@ -3330,12 +3331,14 @@ class KVCacheManagerV2(BaseResourceManager):
     def _reserve_sparse_arena_leases(
         config: KVCacheManagerConfigPy, max_leases: int
     ) -> KVCacheManagerConfigPy:
-        """Reserve sparse leases for every resident request, including persistent dummies.
+        """Reserve sparse leases for every cache that can be seated at once.
 
-        Native arenas use the largest constraint's request count. Requests hold
-        their leases from resume to suspension, even when absent from the current
-        attention Batch. The index-slot bound includes padding and retiring requests;
-        zero-token descriptors express that bound without adding attention KV pages.
+        Native arenas use the largest constraint's request count, so a constraint is
+        what expresses the bound. A lease is taken when a cache joins the attention
+        Batch and returned when it leaves, so the bound is the Batch's rows; a request
+        holding pages without being seated -- one still receiving its disaggregated KV,
+        or waiting out a step -- holds no cells. Zero-token descriptors state the count
+        without adding attention KV pages.
         """
         if not any(
             getattr(layer, "sparse_cache", None) is not None

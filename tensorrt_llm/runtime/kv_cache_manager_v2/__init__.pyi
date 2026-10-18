@@ -917,6 +917,10 @@ class Batch:
         from the same ``constraints`` the rows come from, so a free row always has a free
         lease and this cannot fail for want of one.
 
+        So seat a request only once it is ready to be stepped: one still receiving its
+        disaggregated history, or sitting a step out, costs the arena nothing while it stays
+        out, which is why the arena is sized for the rows rather than for every request the
+        scheduler admits. Nothing checks it -- an early seat shows up as arena pressure.
         """
 
     def remove_kv_cache(self, kv_cache: _KVCache) -> _KVCache:

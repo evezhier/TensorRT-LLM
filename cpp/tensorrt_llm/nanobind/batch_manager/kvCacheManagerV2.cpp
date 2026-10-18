@@ -2508,7 +2508,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "row. Raises when the row is taken or out of range, the batch is full, or the cache "
             "already belongs to a batch.\n\n"
             "The batch holds a reference while the cache is seated, so a caller may keep only the "
-            "batch; remove_kv_cache hands it back.")
+            "batch; remove_kv_cache hands it back.\n\n"
+            "Seat a request only once it is ready to be stepped. Seating takes the sparse arena "
+            "lease, so a request that holds pages without being stepped -- a disaggregated one "
+            "still receiving its KV, or one sitting out a step -- costs the arena nothing while it "
+            "stays out, and the arena is sized for the rows rather than for every request the "
+            "scheduler admits because of that. Nothing checks it: an early seat shows up as arena "
+            "pressure, not as an error.")
         .def(
             "remove_kv_cache", [](kv::Batch& self, kv::KvCache& kvCache) { return self.removeKvCache(kvCache); },
             nb::arg("kv_cache"),
