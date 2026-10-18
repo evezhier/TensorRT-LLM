@@ -203,15 +203,6 @@ CudaUniqPtr<> deviceCopy(std::vector<int32_t> const& values)
     return owned;
 }
 
-CudaUniqPtr<> deviceCopyU32(std::vector<uint32_t> const& values)
-{
-    CUdeviceptr ptr = 0;
-    cuCheck(cuMemAlloc(&ptr, sizeof(uint32_t) * values.size()));
-    CudaUniqPtr<> owned{reinterpret_cast<std::byte*>(ptr)};
-    cuCheck(cuMemcpyHtoD(ptr, values.data(), sizeof(uint32_t) * values.size()));
-    return owned;
-}
-
 std::vector<int32_t> readBack(CudaUniqPtr<> const& buffer, size_t count)
 {
     std::vector<int32_t> out(count);
