@@ -201,3 +201,95 @@ No further production change was needed for overlap in this configuration.
 
 Run artifacts are stored locally in
 `../sparse-disagg-e2e-artifacts/sequential-20261017/` relative to this worktree.
+
+**32K sparse-offload capacity validation, October 17–18, 2026 (UTC).**
+The full 43-layer DeepSeek V4 Flash model sustained **1,134 simultaneous decode
+requests, 567 per attention-DP rank**, with exactly **32,768 input tokens and
+160 output tokens per request** on four B200 GPUs. This is the measured capacity
+with 32 GiB of CPU sparse-history memory per generation rank,
+`free_gpu_memory_fraction=0.9`, and generation `max_batch_size=1024` per rank.
+It is not an unrestricted hardware maximum or a throughput benchmark.
+
+The two offload trials at 1,134 both completed and produced identical output
+multisets. Offering 1,136, 1,140, or 1,182 requests still peaked at 1,134 active
+decodes; all offered requests eventually returned 160 tokens. The clean 1,136
+probe released its first batch after 1,134 receives. The exploratory 1,140 and
+1,182 probes required recorded manual barrier adjustments. Startup's aggregate
+estimate of 591 requests per rank (1,182 total) exceeded the observed usable
+capacity; the larger gated batches encountered attention-DP dummy-allocation
+pressure.
+[Capacity evidence](../sparse-disagg-e2e-artifacts/long-context-20261017T231142Z/offload-capacity-summary.json).
+
+The prompts are **synthetic and identical**: a repeated astronomy paragraph and
+a fixed question, with BOS included in the 32,768-token count. Context prefix
+reuse is enabled; generation reuse is disabled, so each decode request receives
+its own KV through disaggregation. Ratio-4 sparse layers have 8,192 compressed
+history rows at this input length. Their GPU fetch cache holds 1,056 rows with
+TopK 512, `gpu_cache_factor=2`, and 128-token pages. The complete history is
+therefore larger than the GPU fetch cache and uses the CPU hot tier. Dense pools
+and ratio-128 history remain on the GPU.
+
+The topology is context TP2/EP2 and generation TP2/EP2 with attention DP2. Both
+runs use NVFP4 KV, NIXL Python transfer, CUDA graphs, overlap scheduling, and
+2,048-token chunked prefill. Greedy sampling requests exactly 160 tokens and
+ignores EOS. The kernel-specific determinism flags listed above remain enabled,
+with global `FORCE_DETERMINISTIC=0` and autotuning disabled.
+
+Exact parity compares output-token **multisets**, allowing identical prompts to
+exchange attention-DP rank assignments. A test-only receive-publication barrier
+starts matching decode batches, and context `max_batch_size=1` fixes prefill
+shapes. The barrier leaves transfers, cache operations, model kernels, and
+sampling unchanged. Each passing trial must also sustain its full requested
+decode concurrency for all 159 decode iterations; the first output token comes
+from context execution.
+
+| Offered requests | Exact resident/offload matches | Active decode requests |
+| --- | --- | --- |
+| 1, cold prefix | 1/1 | 1 |
+| 1, reused prefix | 1/1 | 1 |
+| 512 | 512/512 | 512 |
+| 1,024 | 1,024/1,024 | 1,024 |
+| 1,134, first trial | 1,134/1,134 | 1,134 |
+| 1,134, repeat | 1,134/1,134 | 1,134 |
+
+All six comparisons pass: **3,806 matched request pairs and 608,960 exactly
+matched output tokens per mode**. Both maximum-size repeats sustain 567 decodes
+per rank for all 159 decode iterations with zero paused requests. The repeated
+output multisets also match within each mode.
+
+The GPU-resident reference needs different allocation settings to hold the same
+batch: `free_gpu_memory_fraction=0.99`, `max_util_for_resume=1.0`,
+`fp8_context_mla_kv_len_cap=33024`, and `avg_seq_len=32770`. These change memory
+allocation, while model computation, input/output lengths, graph sizes, and
+sampling remain matched. The last setting sizes windowed pools for decode
+crossing a page boundary. The default typical sequence ends exactly on a page
+boundary and models one window page where this workload can need two. Earlier
+resident attempts paused requests despite spare full-history blocks, changing
+the decode batch and failing the comparison. Those attempts are preserved.
+[Pool-sizing evidence](../sparse-disagg-e2e-artifacts/long-context-20261017T231142Z/resident-pool-sizing-diagnostic.json).
+
+**Ordinary asynchronous high-concurrency parity remains unresolved.** Initial
+runs without the barrier showed token differences as their batch schedules
+changed. The controlled results establish resident/offload parity for matching
+batches, not invariance to arbitrary request arrival or batching. Warm prefix
+reuse also makes this a capacity test with repeated prompts rather than a test
+of sustained throughput on distinct 32K documents.
+[Asynchronous comparison](../sparse-disagg-e2e-artifacts/long-context-20261017T231142Z/initial-comparison.json).
+
+The larger test exposed one additional **general disaggregation fix**. In
+generation-first serving, receive descriptors could expire after a fixed 120
+seconds while prefill remained queued, even with a 600-second transfer timeout.
+`Sender` now retains them for `max(120 seconds, configured transfer timeout)`.
+The regression checks the default lifetime, a shorter configured timeout, and
+retention plus eventual expiry for a longer timeout. Validation passed
+**90 tests, with one skipped**, across the unsubmitted-session and bounded-polling
+suites. This fix concerns transfer metadata lifetime and is not specific to
+sparse KV offload.
+[Implementation](tensorrt_llm/_torch/disaggregation/native/transfer.py),
+[regression tests](tests/unittest/disaggregated/test_unsubmitted_session.py),
+[validation evidence](../sparse-disagg-e2e-artifacts/long-context-20261017T231142Z/regression-validation.json).
+
+Complete results, configuration files, source hashes, failed attempts, and
+iteration metrics are linked from the
+[32K final report](../sparse-disagg-e2e-artifacts/long-context-20261017T231142Z/final-report.json)
+and [exact comparison](../sparse-disagg-e2e-artifacts/long-context-20261017T231142Z/verified-comparison.json).
