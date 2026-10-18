@@ -505,7 +505,12 @@ public:
     //! ordered (layer, pool), so a life cycle whose sparse buffers are alike yields a single
     //! run, and the quantised shape -- data and block scales in pools of their own -- yields
     //! one per layer and pool. A caller that wants only some buffers clips each run to them.
-    [[nodiscard]] std::vector<SparseUnitCopyArgs> sparseCopyTemplates(LifeCycleId lifeCycle) const;
+    [[nodiscard]] std::vector<SparseCopyRun> sparseCopyTemplates(LifeCycleId lifeCycle) const;
+
+    //! CTAs a copy over a list of `workCapacity` entries should launch.
+    [[nodiscard]] int32_t _sparseCopyGridCtas(int32_t workCapacity) const;
+    //! Multiprocessors of the device this manager runs on, read once on first use.
+    mutable int32_t mSmCount = 0;
 
     //! Base of the sparse cache arena region backing this buffer, for a consumer reading
     //! units the fetch resolved. Throws when the buffer has no sparse fetch path.

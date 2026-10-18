@@ -235,12 +235,27 @@ public:
     //! identity permutation.
     [[nodiscard]] std::optional<SparseCacheLease> acquire(CUstream stream);
 
+    //! [numBuffers] the layer each buffer belongs to, as every view of this life cycle sees
+    //! it. Reachable without a view because the copy has to pick a layer's work list before
+    //! it knows which row an entry names.
+    [[nodiscard]] int32_t const* bufferLayer() const noexcept
+    {
+        return mSharedLayer;
+    }
+
+    //! The shape this arena was built from, for a caller folding its per-buffer constants
+    //! into a descriptor rather than reading them through a view at every work item.
+    [[nodiscard]] SparseCacheInit const& shape() const noexcept
+    {
+        return mShape;
+    }
+
 private:
     friend class SparseCacheLease;
 
     void _release(int index) noexcept;
 
-    CudaUniqPtr mMemory;
+    CudaUniqPtr<> mMemory;
     SparseCacheInit mShape;
     size_t mMetadataBytes = 0;
     TypedVec<PoolIndex, CUdeviceptr> mPoolBase;

@@ -911,8 +911,16 @@ class Batch:
         page_table: ExternalPageTable | None = None,
         mode: PageIndexMode | None = None,
         index_tables: Sequence[IndexTableRequest] = (),
+        max_total_input_tokens: int | None = None,
     ) -> None:
         """Bound the device arrays, whose shape must not change between steps.
+
+        ``max_total_input_tokens`` is the tokens one step may ingest across every row. It
+        sizes the write-back's work list: a row advancing ``t`` tokens crosses at most
+        ``t / unit_tokens + 1`` units, so the batch crosses at most
+        ``max_total_input_tokens / unit_tokens + max_batch_size`` of them. Left unset it
+        assumes a decode step, where each row advances one token and so crosses at most
+        one unit boundary.
 
         ``stream`` is the stream every member runs on. A batch owns it rather than taking
         one per call: a member's own work and the batch's transfers have to be ordered

@@ -144,6 +144,30 @@ below the watermark and was flushed before the watermark passed it.
 `history_length` therefore keeps two jobs: it defines selection eligibility, and it is the
 flush deadline.
 
+### How much a step may cross
+
+The write-back's work list is sized by `maxTotalInputTokens`, the tokens one step may ingest
+across every row, which the runtime already bounds for its own batching. A row advancing `t`
+tokens crosses at most `t / unitTokens + 1` units -- the `+1` for the partial unit its
+watermark starts inside -- so one layer's list needs
+
+```
+maxTotalInputTokens / unitTokens + maxBatchSize
+```
+
+entries, and `flushSparseUnits` rejects a move whose units exceed that, summed over rows.
+
+The bound is an **aggregate** one, and it is usable only because the list is compacted. Were
+it indexed by row, each row's slice would have to allow for that row consuming the entire
+token budget, and the product over rows would be hundreds of times larger. The same property
+is what makes the guard right for in-flight batching: one prefilling row may cross the whole
+step's worth of units while every other row crosses none, which a per-row limit would refuse
+no matter how idle the rest of the batch was.
+
+Left unset, the bound falls back to `maxBatchSize * maxInFlightUnits`. That is today's decode
+behaviour -- a step advances capacity one token per row, so a row crosses at most one unit
+boundary -- and it is what the sparse path currently supports; see "Supported scope".
+
 ### Ordering
 
 `flushSparseUnits` stages its per-row ranges on a helper stream and launches the write-back
@@ -899,6 +923,81 @@ within the cold page sat here too, until the converted index absorbed it; see
 Buffers sharing a pool must still share a selection unit layout. A pool fixes a cell's size
 but not how its units are strided within it, and the copy walks a run with one set of
 strides; the check is per run rather than per life cycle.
+
+**The runs share one launch.** Nothing orders one pool's copy against another's — their
+cells are disjoint and the converted page table they share is read-only — while each is
+small and latency-bound, so issuing them back to back on one stream would expose each one's
+latency in turn. So one grid runs them all, and what differs between them lives in a
+**device-resident descriptor**.
+
+`gridDim.y` walks the buffers of every pool as **one flat range**, with a constant map from
+buffer to pool. The alternative — pools on one grid axis, buffers-per-pool on another —
+has to size the buffer axis for the widest pool, so every buffer a narrower pool lacks
+costs an idle block. Pools of one life cycle are often alike, and then the two are the same
+shape; they stop being alike as soon as a pool holds more buffers per layer than another,
+which a key-and-value pool beside a scale pool already does.
+
+The descriptors are built once, with the Batch. Every field comes from the buffer plan and
+the index tables, both fixed at construction, so nothing is written per step and a captured
+graph replays a copy with no host involvement at all. The fetch needs one row per layer — a
+layer has its own index-table entry and its own slice of each pool's buffers — while the
+write-back spans every layer at once and needs only the one.
+
+The vector width is part of the descriptor, chosen from the layout's **sizes alone**. The
+two base pointers are checked against it where the descriptor is built, because a pool whose
+base is misaligned is a configuration error worth naming rather than a case to carry into
+the kernel. A block switches on the width once and calls a device function templated on it;
+`blockIdx.z` is block-uniform, so the switch costs no divergence.
+
+One grid rather than several is also what lets **every** pool carry the launch dependency
+below. A per-pool fan-out across streams could not: a programmatic dependency follows a
+stream, not an event.
+
+### Launching before the producer finishes
+
+All three kernels are enrolled in programmatic dependent launch when the environment enables
+it, and in each the order of the prologue is the point: a block does everything that is not
+its predecessor's output *above* `cudaGridDependencySynchronize()`, so that by the time the
+predecessor drains the block is resident, addressed, and as far along as it can be.
+
+How far along differs by kernel, and the resolve gets the most out of it. Its probe index --
+an insert per resident entry, over the whole per-request cache -- reads only the layer's own
+residency table and writes only shared memory, and nothing running before a resolve touches
+that table: a previous layer's resolve owns a different slice of it, and the copy and index
+kernels between them write cells and indices. So the entire index build sits above the wait,
+and what the resolve actually waits for is the *selection*. The copy resolves its pool, its
+buffer and its work list from descriptors and block coordinates; the flush-list scan
+addresses its row from the staged view. Each then waits for the one thing that is genuinely
+produced upstream.
+
+**The work-list counters are cleared once a step, in `publish()`**, not once per producer.
+That is not a micro-optimisation: a clear is a memset, and a memset is not a kernel, so one
+standing between every resolve and whatever ran before it would sever the launch dependency
+at each of a model's layers -- for DeepSeek-V4, sixty-one times a step.
+
+What makes one clear enough is that the counters are per layer and per direction, so no two
+producers in a step share one. The fetch keeps a *single* list, reused from layer to layer,
+because a layer's copy has consumed it before the next layer's resolve overwrites it; only
+the counter has to read zero when a resolve starts. Per-layer lists would have cost the
+layer count times the list, which is megabytes, against a counter's four bytes.
+
+A step that somehow skipped `publish()` would have its second resolve add on top of the
+first's count, and the claim's bound check would fail rather than quietly overrun the list.
+
+Global **writes** stay below the wait in all three, even where the datum looks private. A
+block that has not yet waited may still be running beside a grid that could read what it
+would overwrite, and the cost of keeping the rule is a few stores.
+
+The producers release as early as they correctly can. The resolve's work list is final at
+the end of its eviction loop, and everything after that — the recency rebuild, three block
+scans over the resident set — is its own bookkeeping that nothing downstream reads; it calls
+`cudaTriggerProgrammaticLaunchCompletion()` there and hands the copy that whole tail as
+overlap. The flush-list scan has no such tail, since the list is the last thing it writes,
+so its release only brings the copy's launch forward.
+
+The copy releases immediately after its own wait. That looks wrong and is not: the kernel
+that follows it on the stream builds the attention index table from the resolve's slots and
+never reads a cell, so it must not be ordered behind a copy it does not depend on.
 
 ## Where sparse data lives
 

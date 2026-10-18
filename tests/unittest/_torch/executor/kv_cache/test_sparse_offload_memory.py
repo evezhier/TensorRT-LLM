@@ -60,7 +60,12 @@ V4_FLASH_ARENA = SparseArenaShape(
 # 256 rows of up to 1M tokens: a table of 8,196 pages for each of three life
 # cycles, and one fetch of 512 rows.
 V4_FLASH_BATCH = SparseBatchShape(
-    num_life_cycles=3, max_batch_size=256, max_blocks_per_seq=8196, selection_widths=(512,)
+    num_life_cycles=3,
+    max_batch_size=256,
+    max_blocks_per_seq=8196,
+    selection_widths=(512,),
+    layer_counts=(2,),
+    flush_capacities=(256,),
 )
 # The Batch and DeepSeek-V4's attention metadata offload state, of which the eager
 # and the CUDA graph metadata each hold one: 64 MiB of dequantized NVFP4 rows and
@@ -149,10 +154,12 @@ def test_units_per_page(unit_tokens: int | None, units_per_page: int) -> None:
     ("cells", "lease_bytes"),
     [
         # 21 layers x cells x (9216 B data + 1152 B scale), plus two int32 arrays
-        # per cached row and six 256-byte bookkeeping regions.
-        (17, 3_794_560),
-        (32, 7_140_864),
-        (33, 7_364_224),
+        # per cached row and the view. A lease holds the reservation and nothing of
+        # the step: the work lists belong to the Batch, sized by the batch rather
+        # than by whoever is seated.
+        (17, 3_793_280),
+        (32, 7_139_584),
+        (33, 7_362_944),
     ],
 )
 def test_lease_matches_native_layout(cells: int, lease_bytes: int) -> None:
@@ -180,7 +187,7 @@ def test_arena_follows_the_largest_constraint() -> None:
     (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=TOKENS_PER_BLOCK)
 
     assert shape == V4_FLASH_ARENA
-    assert shape.lease_bytes == 7_364_224
+    assert shape.lease_bytes == 7_362_944
     assert sparse_arena_leases(config) == 513
     assert sparse_arena_bytes(config) == shape.arena_bytes(513)
 
@@ -339,12 +346,40 @@ def test_batch_matches_native_layout() -> None:
     assert V4_FLASH_BATCH.mirror_bytes == 25_376_768
     # The staging copy is mapped in whole 4 KiB pages.
     assert V4_FLASH_BATCH.staging_bytes == 25_378_816
-    # Per row: a slot, a miss ordinal and a miss slot per selected row, a miss
-    # count and the row in flight.
-    assert V4_FLASH_BATCH.fetch_scratch_bytes == 4 * 256 * (3 * 512 + 2) == 1_574_912
+    # Per row: a slot per selected unit, a miss count and the unit in flight. Then the
+    # two compacted work lists -- a row, an ordinal and a slot per entry, plus a total
+    # per list -- one for the fetch, sized for every row missing its whole selection,
+    # and one per layer for the write-back, sized by the step's token budget.
+    assert V4_FLASH_BATCH.fetch_scratch_bytes == 4 * (
+        256 * (512 + 2) + (3 * 256 * 512 + 1) + 2 * (3 * 256 + 1) + 256 * 2
+    )
+    assert V4_FLASH_BATCH.fetch_scratch_bytes == 2_107_404
     # The device holds the mirror twice, the tables the fetch reads and the
     # staging copy a publish fills ahead of them, beside the work arrays.
-    assert V4_FLASH_BATCH.device_bytes == 2 * 25_376_768 + 1_574_912 == 52_328_448
+    assert V4_FLASH_BATCH.device_bytes == 2 * 25_376_768 + 2_107_404 == 52_860_940
+
+
+@pytest.mark.cpu_only
+def test_the_token_budget_sizes_the_write_back_list() -> None:
+    """A row advancing t tokens crosses at most t/unit_tokens + 1 units."""
+    layers = _v4_flash_like_layers()
+    shape = sparse_batch_shape(
+        layers,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_batch_size=256,
+        max_blocks_per_seq=8196,
+        max_total_input_tokens=8192,
+    )
+
+    # Four tokens to a unit, and one partial unit per row at the start of its move.
+    assert shape.flush_capacities == (8192 // 4 + 256,)
+    # The bound is an aggregate: it does not multiply by rows, which is what makes it
+    # affordable. Per row it would have to allow for one row taking the whole budget.
+    assert shape.flush_capacities[0] * 2 < 256 * (8192 // 4 + 1)
+    assert shape.fetch_scratch_bytes > V4_FLASH_BATCH.fetch_scratch_bytes
+
+    # Left unset it assumes a decode step: one token per row, so one unit boundary.
+    assert V4_FLASH_BATCH.flush_capacities == (256,)
 
 
 @pytest.mark.cpu_only
@@ -680,7 +715,7 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert capacity.by_limit == {"max_batch_size": 256, "host": 4, "gpu": 794}
     assert capacity.limited_by == "host"
     assert capacity.fits == 4
-    assert capacity.lease_bytes == 7_364_224
+    assert capacity.lease_bytes == 7_362_944
     assert capacity.arena_bytes == V4_FLASH_ARENA.arena_bytes(513)
     # The 50 GiB host budget holds 240 requests of 128K tokens; the GPU budget
     # would hold more even with two leases per request.
@@ -689,7 +724,7 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert "4 by host" in report
     assert "limited by host" in report
     assert "513 leases" in report
-    assert "offload buffers 180.9MiB for 256 rows" in report
+    assert "offload buffers 181.4MiB for 256 rows" in report
     assert "A max_batch_size of 240 fits" in report
 
 

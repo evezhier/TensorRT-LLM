@@ -23,8 +23,11 @@
 #include "kv_cache_manager_v2/indexConversionKernels.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
+
+#include "tensorrt_llm/common/cudaUtils.h"
 
 #include <algorithm>
 #include <numeric>
@@ -56,11 +59,16 @@ std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
 
 Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int maxBlocksPerSeq,
     std::optional<ExternalPageTable> pageTable, std::optional<PageIndexMode> mode,
-    std::vector<IndexTableRequest> indexTables)
+    std::vector<IndexTableRequest> indexTables, std::optional<int> maxTotalInputTokens)
     : mManager(&manager)
     , mCudaStream(stream)
+    , mMaxTotalInputTokens(maxTotalInputTokens)
     , mPageTable(pageTable)
 {
+    if (maxTotalInputTokens.has_value() && *maxTotalInputTokens <= 0)
+    {
+        throw std::invalid_argument("Batch: maxTotalInputTokens must be positive when given");
+    }
     auto const [derivedRows, derivedBlocks] = deriveBounds(manager.config());
     mMaxBatchSize = maxBatchSize > 0 ? maxBatchSize : derivedRows;
     mMaxBlocksPerSeq = maxBlocksPerSeq > 0 ? maxBlocksPerSeq : derivedBlocks;
@@ -119,12 +127,10 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
     // It also doubles what a Batch costs in device memory, which is the price of letting
     // the host-to-device crossing overlap the previous step; a caller that already holds a
     // buffer of this shape could lend it instead.
-    CUdeviceptr device = 0;
-    cuCheck(cuMemAlloc(&device, _deviceBytes()));
-    mDevice = CudaUniqPtr{reinterpret_cast<std::byte*>(device)};
-    CUdeviceptr deviceStaging = 0;
-    cuCheck(cuMemAlloc(&deviceStaging, _deviceBytes()));
-    mDeviceStaging = CudaUniqPtr{reinterpret_cast<std::byte*>(deviceStaging)};
+    mDevice = allocateDeviceMemory(_deviceBytes());
+    mDeviceStaging = allocateDeviceMemory(_deviceBytes());
+    auto const device = reinterpret_cast<CUdeviceptr>(mDevice.get());
+    auto const deviceStaging = reinterpret_cast<CUdeviceptr>(mDeviceStaging.get());
 
     for (auto const base : {device, deviceStaging})
     {
@@ -146,6 +152,105 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
     _buildIndexTables(indexTables);
     _checkSparseRunsAreAddressable();
     _allocateIndexTables();
+
+    // Last: a descriptor names where in the index tables a buffer's converted indices sit.
+    _allocateCopyDesc();
+}
+
+void Batch::_allocateCopyDesc()
+{
+    // One descriptor per buffer, serving both directions, for every life cycle. Small
+    // enough to share an allocation and a lifetime.
+    std::vector<SparseCopyDesc> host;
+    std::vector<size_t> offset(static_cast<size_t>(mNumLayerGroups.value()), 0);
+
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        auto& scratch = mScratch[lcId];
+        if (scratch.selectionWidth == 0)
+        {
+            continue;
+        }
+        auto const runs = mManager->sparseCopyTemplates(lcId);
+        auto const plan = mManager->sparseBufferPlan(lcId);
+        scratch.numBuffers = static_cast<int32_t>(plan.size());
+        offset[static_cast<size_t>(lcId.value())] = host.size();
+
+        for (auto const& run : runs)
+        {
+            // A run is consecutive buffers of one pool and, since buffers are ordered
+            // (layer, pool), of one layer. Its first buffer names the index table every
+            // buffer of the run is relative to -- the converted index carries each one's
+            // own offset within the coalesced page.
+            auto const& first = plan[static_cast<size_t>(run.bufferBase)].id;
+            auto const table = sparseIndexRun(first.layerId, first.role);
+
+            for (int32_t i = 0; i < run.numBuffers; ++i)
+            {
+                auto const buffer = run.bufferBase + i;
+                SparseCopyDesc desc;
+                desc.hostBase = static_cast<CUdeviceptr>(table.base);
+                desc.hostPageStride = run.hostPageStride;
+                // Pre-offset to this buffer's entry, so the kernel indexes the row alone.
+                desc.pageTable
+                    = reinterpret_cast<int32_t const*>(table.table) + static_cast<ptrdiff_t>(i) * table.entryStride;
+                desc.pageTableStride = static_cast<uint32_t>(table.rowStride);
+                desc.numBlocks = static_cast<uint32_t>(table.rowStride);
+                // The buffer's own slot in the pool, folded in so the kernel need not read
+                // it through a view it loads per work item.
+                desc.deviceBase = run.deviceBase
+                    + static_cast<uint64_t>(
+                          mManager->sparseArena(lcId).shape().bufferSlotInPool[static_cast<size_t>(buffer)])
+                        * run.cellsPerBuffer * run.bufferBytes;
+                desc.leaseStride = static_cast<uint32_t>(run.cellsPerLease) * run.bufferBytes;
+                desc.cellBytes = run.bufferBytes;
+                desc.layout = run.layout;
+                desc.width = run.width;
+
+                auto const width = static_cast<uint64_t>(sparseCopyWidthBytes(desc.width));
+                TLLM_CHECK_WITH_INFO(desc.hostBase % width == 0 && desc.deviceBase % width == 0,
+                    "A sparse buffer's bases must be aligned to the %llu bytes its layout copies at a time; host "
+                    "base %llu, device base %llu",
+                    static_cast<unsigned long long>(width), static_cast<unsigned long long>(desc.hostBase),
+                    static_cast<unsigned long long>(desc.deviceBase));
+                host.push_back(desc);
+            }
+        }
+    }
+
+    if (host.empty())
+    {
+        return;
+    }
+    mCopyDesc = allocateDeviceMemory<SparseCopyDesc>(host.size());
+    auto const* device = mCopyDesc.get();
+    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(device), host.data(), sizeof(SparseCopyDesc) * host.size()));
+    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    {
+        auto& scratch = mScratch[lcId];
+        if (scratch.selectionWidth != 0)
+        {
+            scratch.copyDesc = device + offset[static_cast<size_t>(lcId.value())];
+        }
+    }
+}
+
+int32_t Batch::_flushCapacity(LifeCycleId lifeCycle) const
+{
+    // A row advancing `t` tokens crosses at most `t / unitTokens + 1` units -- the `+1` for
+    // the partial unit its watermark starts inside -- so the batch crosses at most
+    // `maxTotalInputTokens / unitTokens + maxBatchSize`. The bound is an aggregate one, and
+    // usable only because the list is compacted: indexed by row, every row's slice would
+    // have to allow for that row taking the whole budget.
+    int const perPage = mManager->sparseCacheUnitsPerPage(lifeCycle);
+    int const unitTokens = perPage > 0 ? mManager->config().tokensPerBlock / perPage : 0;
+    if (mMaxTotalInputTokens.has_value() && unitTokens > 0)
+    {
+        return *mMaxTotalInputTokens / unitTokens + mMaxBatchSize;
+    }
+    // Without a budget, a step is assumed to advance capacity by the in-flight headroom in
+    // every row at once, which is what a decode step does.
+    return mMaxBatchSize * std::max(1, mManager->sparseCacheMaxInFlightUnits(lifeCycle));
 }
 
 void Batch::_allocateStepScratch()
@@ -166,28 +271,48 @@ void Batch::_allocateStepScratch()
         auto& scratch = mScratch[lcId];
         scratch.selectionWidth = width;
         scratch.maxInFlightUnits = mManager->sparseCacheMaxInFlightUnits(lcId);
-        // A move cannot carry more units out of flight than the reservation pinned, which
-        // is what bounds a row's flush list.
-        scratch.maxFlushUnits = scratch.maxInFlightUnits;
         scratch.numLayers = mManager->sparseCacheLayerCount(lcId);
         auto const layers = static_cast<size_t>(scratch.numLayers);
-        total += rows * (3 * static_cast<size_t>(width) + 1 + static_cast<size_t>(scratch.maxInFlightUnits));
-        total += rows * layers * (2 * static_cast<size_t>(scratch.maxFlushUnits) + 1);
+        // One list for the fetch, holding the worst case of every row missing its whole
+        // selection; one per layer for the write-back, each holding the units the step's
+        // token budget can carry across a watermark.
+        scratch.fetchWork.capacity = static_cast<int32_t>(rows) * width;
+        scratch.fetchWork.numLists = 1;
+        scratch.flushWork.capacity = _flushCapacity(lcId);
+        scratch.flushWork.numLists = scratch.numLayers;
+        // A counter per layer even though the fetch's list is one: the list is reused from
+        // layer to layer, because a layer's copy has consumed it before the next layer's
+        // resolve overwrites it, but the counter has to read zero when that resolve starts.
+        // Giving each layer its own lets the whole step's counters be cleared in one go,
+        // rather than one clear per layer standing between every resolve and whatever ran
+        // before it. Per-layer *lists* would cost the layer count times the list.
+        mCounterElements += 2 * layers;
+        auto const fetchEntries = 3 * static_cast<size_t>(scratch.fetchWork.capacity);
+        auto const flushEntries = layers * 3 * static_cast<size_t>(scratch.flushWork.capacity);
+        total += rows * (static_cast<size_t>(width) + 1 + static_cast<size_t>(scratch.maxInFlightUnits));
+        total += fetchEntries + flushEntries + rows * layers;
     }
     if (total == 0)
     {
         return;
     }
 
-    CUdeviceptr base = 0;
-    cuCheck(cuMemAlloc(&base, sizeof(int32_t) * total));
-    mStepScratch = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
+    mStepScratch = allocateDeviceMemory<int32_t>(total + mCounterElements);
 
-    auto* cursor = reinterpret_cast<int32_t*>(base);
+    // The counters lead the block so that one clear covers every life cycle's.
+    auto* counter = mStepScratch.get();
+    mCounters = counter;
+    auto* cursor = counter + mCounterElements;
     auto carve = [&cursor](size_t count)
     {
         auto* ptr = cursor;
         cursor += count;
+        return ptr;
+    };
+    auto const carveCounters = [&counter](size_t count)
+    {
+        auto* ptr = counter;
+        counter += count;
         return ptr;
     };
     for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
@@ -199,15 +324,25 @@ void Batch::_allocateStepScratch()
         }
         auto const width = static_cast<size_t>(scratch.selectionWidth);
         scratch.outSlot = carve(rows * width);
-        scratch.missOrdinal = carve(rows * width);
-        scratch.missSlot = carve(rows * width);
         scratch.missCount = carve(rows);
         scratch.inFlightSlot = carve(rows * static_cast<size_t>(scratch.maxInFlightUnits));
 
+        auto const carveList = [&carve](SparseWorkList& work)
+        {
+            auto const entries = static_cast<size_t>(work.capacity) * static_cast<size_t>(work.numLists);
+            work.row = carve(entries);
+            work.ordinal = carve(entries);
+            work.slot = carve(entries);
+        };
+        carveList(scratch.fetchWork);
+        carveList(scratch.flushWork);
+        auto const layerCount = static_cast<size_t>(scratch.numLayers);
+        // The fetch takes one counter per layer against its single list, so a layer names
+        // its own by offsetting this; the write-back's counters match its lists one to one.
+        scratch.fetchWork.total = carveCounters(layerCount);
+        scratch.flushWork.total = carveCounters(layerCount);
+
         auto const layers = static_cast<size_t>(scratch.numLayers);
-        auto const flush = static_cast<size_t>(scratch.maxFlushUnits);
-        scratch.flushOrdinal = carve(rows * layers * flush);
-        scratch.flushSlot = carve(rows * layers * flush);
         scratch.flushCount = carve(rows * layers);
         // -1 so that "no write-back has run" stays distinguishable from "one ran and found
         // nothing to move", which is what lets a test tell the two apart.
@@ -363,11 +498,9 @@ void Batch::_allocateFlushRanges()
     }
 
     auto const elements = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mNumLayerGroups.value());
-    CUdeviceptr base = 0;
-    cuCheck(cuMemAlloc(&base, sizeof(int32_t) * elements));
-    mFlushRanges = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
+    mFlushRanges = allocateDeviceMemory<int32_t>(elements);
     // An empty range asks for nothing, which is what a row that never flushes should read.
-    cuCheck(cuMemsetD32(base, 0, elements));
+    cuCheck(cuMemsetD32(reinterpret_cast<CUdeviceptr>(mFlushRanges.get()), 0, elements));
     mFlushRangeStaging.assign(elements, 0);
 }
 
@@ -415,6 +548,11 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
         int const unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
         auto const base = static_cast<size_t>(2 * mMaxBatchSize * lcId.value());
 
+        // Bounded in aggregate rather than per row, which is what the compacted list allows
+        // and what in-flight batching needs: one prefilling row may cross the whole step's
+        // worth of units while the rest cross none.
+        int64_t crossed = 0;
+
         for (size_t row = 0; row < mRows.size(); ++row)
         {
             auto const* kvCache = mRows[row];
@@ -432,17 +570,18 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
                 toUnit = std::min(newHistoryLengths[row], kvCache->capacity()) / unitTokens;
                 toUnit = std::max(toUnit, fromUnit);
 
-                int const headroom = mManager->sparseCacheMaxInFlightUnits(lcId);
-                if (toUnit - fromUnit > headroom)
-                {
-                    throw std::invalid_argument(
-                        "Batch::flushSparseUnits: a watermark move crossed more units than the reservation can "
-                        "hold in flight, so the row's flush list could not name them all");
-                }
+                crossed += toUnit - fromUnit;
                 anyWork = anyWork || toUnit > fromUnit;
             }
             mFlushRangeStaging[base + row] = fromUnit;
             mFlushRangeStaging[base + static_cast<size_t>(mMaxBatchSize) + row] = toUnit;
+        }
+
+        if (crossed > mScratch[lcId].flushWork.capacity)
+        {
+            throw std::invalid_argument(
+                "Batch::flushSparseUnits: the batch crossed more units than the step's token budget allows, so "
+                "the write-back list could not name them all; construct the Batch with maxTotalInputTokens");
         }
     }
 
@@ -574,10 +713,8 @@ void Batch::_allocateIndexTables()
         // An empty range leaves every block on the plain path, which is what a member
         // holding no scratch should look like.
         std::fill(host, host + elements, 0);
-        CUdeviceptr scratch = 0;
-        cuCheck(cuMemAlloc(&scratch, sizeof(int32_t) * elements));
-        mScratchDevice = CudaUniqPtr{reinterpret_cast<std::byte*>(scratch)};
-        cuCheck(cuMemcpyHtoD(scratch, host, sizeof(int32_t) * elements));
+        mScratchDevice = allocateDeviceMemory<int32_t>(elements);
+        cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mScratchDevice.get()), host, sizeof(int32_t) * elements));
     }
 
     auto const rowBlocks = static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
@@ -589,9 +726,8 @@ void Batch::_allocateIndexTables()
         mMaxTableEntries = std::max(mMaxTableEntries, static_cast<int>(table.concatOffsets.size()));
     }
 
-    CUdeviceptr memory = 0;
-    cuCheck(cuMemAlloc(&memory, sizeof(int32_t) * elements));
-    mIndexTableMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(memory)};
+    mIndexTableMemory = allocateDeviceMemory<int32_t>(elements);
+    auto const memory = reinterpret_cast<CUdeviceptr>(mIndexTableMemory.get());
     // A table a publish has not reached yet must read as absent rather than as slot zero.
     cuCheck(cuMemsetD32(memory, static_cast<unsigned int>(kBadPageIndex.value()), elements));
 
@@ -605,9 +741,8 @@ void Batch::_allocateIndexTables()
     size_t const descBytes = sizeof(IndexTableDesc) * mIndexTables.size();
     size_t const offsetsBytes = sizeof(int32_t) * offsetElements;
 
-    CUdeviceptr descs = 0;
-    cuCheck(cuMemAlloc(&descs, descBytes + offsetsBytes));
-    mIndexTableDescs = CudaUniqPtr{reinterpret_cast<std::byte*>(descs)};
+    mIndexTableDescs = allocateDeviceMemory(descBytes + offsetsBytes);
+    auto const descs = reinterpret_cast<CUdeviceptr>(mIndexTableDescs.get());
 
     std::vector<int32_t> offsetHost;
     offsetHost.reserve(offsetElements);
@@ -1080,6 +1215,21 @@ std::vector<uint8_t> Batch::resize(
 
 void Batch::publish()
 {
+    // A step's work-list counters start here, all of them at once. Per layer and per
+    // direction they are independent, so one clear at the head of a step is enough -- and
+    // clearing them here rather than before each producer keeps a non-kernel node from
+    // standing between every resolve and whatever ran before it, which is what a launch
+    // dependency cannot reach across.
+    //
+    // On the Batch's stream, like the staging below it. A fetch issued on another stream
+    // therefore has to be ordered after this call -- but it already did, because it reads
+    // the page tables and watermarks this same call stages.
+    if (mCounterElements > 0)
+    {
+        TLLM_CUDA_CHECK(cudaMemsetAsync(
+            mCounters, 0, sizeof(int32_t) * mCounterElements, reinterpret_cast<cudaStream_t>(mCudaStream)));
+    }
+
     // Refusing rather than waiting, because by this point a wait would be too late to help.
     // Everything that writes the staged rows has to be separated from the copy reading them:
     // the members' own mutations, which happened before this call, and the watermarks and

@@ -278,8 +278,12 @@ class SparseResolveResult(NamedTuple):
     resident_ordinal: list[int]
     lru_order: list[int]
     out_slot: list[int]
+    #: The compacted work list, one run per layer, of which the first ``miss_total[layer]``
+    #: are valid. Entry order is whatever the CTAs raced to, so compare as a set.
+    miss_row: list[int]
     miss_ordinal: list[int]
     miss_slot: list[int]
+    miss_total: list[int]
     miss_count: list[int]
     in_flight_slot: list[int]
 
@@ -304,6 +308,7 @@ def sparse_unit_copy(
     selection_width: int,
     buffer_layer: list[int],
     write_back: bool = False,
+    grid_ctas: int = 1,
 ) -> list[int]:
     """Move units between a caller-supplied cold pool and cache entries.
 
@@ -315,7 +320,10 @@ def sparse_unit_copy(
     within its page is already in the value and ``host_page_stride`` is one buffer.
 
     ``buffer_layer`` maps each buffer to the work-list row it reads, so buffers of one
-    layer share a list; its length is the number of buffers copied. Synchronises.
+    layer share a list; its length is the number of buffers copied.
+
+    ``grid_ctas`` is how many CTAs walk the compacted list. Only throughput depends on it,
+    so a result must not. Synchronises.
     """
     return list(
         _cpp().sparse_unit_copy(
@@ -338,6 +346,7 @@ def sparse_unit_copy(
             selection_width,
             buffer_layer,
             write_back,
+            grid_ctas,
         )
     )
 
@@ -345,8 +354,12 @@ def sparse_unit_copy(
 class SparseFlushList(NamedTuple):
     """Entries holding units a watermark move has just passed."""
 
+    #: The compacted list, one run per layer, of which the first ``total[layer]`` are
+    #: valid. Entry order is whatever the CTAs raced to, so compare as a set.
+    row: list[int]
     ordinal: list[int]
     slot: list[int]
+    total: list[int]
     count: list[int]
 
 
@@ -363,7 +376,7 @@ def sparse_flush_list(
     These are the units the watermark has just made selectable, so they must reach their
     host pages before any later fetch can read them. Synchronises.
     """
-    ordinal, slot, count = _cpp().sparse_flush_list(
+    row, ordinal, slot, total, count = _cpp().sparse_flush_list(
         resident_ordinal,
         num_layers,
         entries_per_layer,
@@ -371,7 +384,7 @@ def sparse_flush_list(
         to_units,
         max_flush_units,
     )
-    return SparseFlushList(list(ordinal), list(slot), list(count))
+    return SparseFlushList(list(row), list(ordinal), list(slot), list(total), list(count))
 
 
 def sparse_resolve(
@@ -410,8 +423,10 @@ def sparse_resolve(
         resident,
         lru,
         out,
+        miss_row,
         miss_ord,
         miss_slot,
+        miss_total,
         miss_count,
         in_flight,
     ) = _cpp().sparse_resolve(
@@ -430,8 +445,10 @@ def sparse_resolve(
         list(resident),
         list(lru),
         list(out),
+        list(miss_row),
         list(miss_ord),
         list(miss_slot),
+        list(miss_total),
         list(miss_count),
         list(in_flight),
     )

@@ -50,6 +50,38 @@ inline constexpr int32_t kNoSparseSlot = -1;
 //! One result serves every sparse buffer of the layer, since they select the same units
 //! and share one metadata row. Layouts are therefore [row][...], with no buffer dimension.
 //! Every array is device memory.
+//! A list of units for the copy to move, compacted across rows.
+//!
+//! Each producer CTA claims a contiguous run with one `atomicAdd` on its list's counter and
+//! writes its entries there, so the consumer walks a dense array: its grid follows the
+//! machine rather than the worst case, and no warp is tied to a row that had no work. The
+//! cost is that position no longer says which row an entry belongs to, so the entry says it.
+//!
+//! A fetch resolves one layer per launch and uses a single list, which is what `layerStride`
+//! of zero means -- the layer drops out of the index. A write-back spans every layer of the
+//! life cycle at once, so it takes one list per layer, chosen by the copied buffer's layer.
+//!
+//! Entry order is whatever the producer's CTAs raced to, which nothing depends on: the
+//! entries name disjoint cells, so they may be applied in any order.
+struct SparseWorkList
+{
+    //! [numLists][capacity] the row, the unit and the entry holding it.
+    int32_t* row = nullptr;
+    int32_t* ordinal = nullptr;
+    int32_t* slot = nullptr;
+    //! [numLists] entries written so far. Zeroed before the producer runs; the consumer
+    //! bounds its loop by it, which is why the count never crosses to the host.
+    int32_t* total = nullptr;
+
+    //! Entries one list holds, and the distance between consecutive lists. Zero for a single
+    //! list.
+    int32_t capacity = 0;
+    //! Layer the first list describes. The consumer subtracts it from a buffer's own layer.
+    int32_t layerBase = 0;
+    //! Lists behind `total`, so a producer can bound the layer it indexes.
+    int32_t numLists = 1;
+};
+
 struct SparseResolveArgs
 {
     //! [numRows] cache state per row, as Batch::sparseCacheViews() publishes it. A row with
@@ -101,13 +133,14 @@ struct SparseResolveArgs
     //! so the shape stays static while the live count varies.
     int32_t maxInFlightUnits = 0;
 
-    //! [numRows][selectionWidth] the history units that were not resident, and the entries
-    //! given to them. The copy stage reads these for every buffer of the layer; only the
-    //! first missCount[row] are valid. An in-flight unit that misses is allocated an entry but never appears
-    //! here: its host page holds nothing to fetch.
-    int32_t* missOrdinal = nullptr;
-    int32_t* missSlot = nullptr;
-    //! [numRows] number of misses.
+    //! The history units that were not resident, and the entries given to them. One list,
+    //! since a call resolves one layer; every buffer of that layer copies from it.
+    //!
+    //! An in-flight unit that misses is allocated an entry but never appears here: its host
+    //! page is not written until the watermark passes it, so there is nothing to fetch.
+    SparseWorkList work;
+    //! [numRows] entries this row contributed. The copy does not read it -- it walks the
+    //! compacted list -- but it is what makes a row's hit rate observable.
     int32_t* missCount = nullptr;
 };
 
@@ -119,6 +152,17 @@ struct SparseResolveArgs
 
 //! Largest entriesPerLayer this kernel can serve on `device`, given its shared memory limit.
 [[nodiscard]] int32_t sparseResolveMaxEntries(int32_t selectionWidth, int32_t maxInFlightUnits, CUdevice device);
+
+//! Multiprocessors `device` has, which is the one part of the grid sizing below that costs
+//! a driver call and so the one part worth holding on to.
+[[nodiscard]] int32_t sparseCopyMultiprocessors(CUdevice device);
+
+//! CTAs to give a copy: enough to fill a machine of `smCount` multiprocessors, capped by
+//! the most work items the list could ever hold, since beyond that the extra CTAs would
+//! only exit.
+//!
+//! Fixed before a graph captures the copy, so it follows the machine rather than the step.
+[[nodiscard]] int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept;
 
 //! Byte layout of one selection unit inside a buffer, mirroring config.h's
 //! SelectionUnitLayout. Repeated here so this header stays free of the config types.
@@ -149,87 +193,151 @@ enum class SparseCopyDirection : uint8_t
 //! Both directions use the same addressing: the cold side is reached through the page
 //! table by unit ordinal, the hot side through the cache page list by entry index. Only
 //! which of the two is the source changes.
+//! Vector type one pool's copy moves at a time, chosen from the layout's sizes alone.
+//!
+//! Sizes rather than addresses, so the width is a property of the layout and can live in a
+//! descriptor built once. The two base pointers are checked against it on the host, where a
+//! misaligned pool is a configuration error worth naming rather than a case to handle.
+enum class SparseCopyWidth : int32_t
+{
+    kByte = 0,
+    kWord = 1,
+    kWord2 = 2,
+    kWord4 = 3,
+};
+
+//! A maximal set of consecutive buffers sharing a pool, as the buffer plan groups them.
+//!
+//! Host-side only: it is what the manager knows about a pool, before the Batch folds each
+//! buffer's own slot and index-table entry into the per-buffer descriptors below. Buffers
+//! are ordered (layer, pool), so a run never spans layers.
+struct SparseCopyRun
+{
+    int32_t bufferBase = 0;
+    int32_t numBuffers = 0;
+    //! Base of this pool's region in the cell arena, before a buffer's slot is added.
+    CUdeviceptr deviceBase = 0;
+    uint32_t bufferBytes = 0;
+    int32_t cellsPerBuffer = 0;
+    int32_t cellsPerLease = 0;
+    uint32_t hostPageStride = 0;
+    SparseUnitLayout layout;
+    SparseCopyWidth width = SparseCopyWidth::kByte;
+};
+
+//! One buffer's share of a copy: everything a block needs that does not vary per work item.
+//!
+//! Device-resident and constant for the Batch's lifetime. Every field derives from the
+//! buffer plan and the index tables, both fixed at construction, so these are built and
+//! uploaded once -- which is what lets a captured graph replay a copy without any host
+//! write, and what lets every buffer of every pool share one launch.
+//!
+//! Per buffer rather than per pool so a block resolves itself in a single load, and so the
+//! two indirections a pool-level descriptor needs -- the buffer's slot within its pool and
+//! its entry within the page table -- can be folded in here instead of being paid per work
+//! item. `deviceBase` therefore already names this buffer's sub-region of the pool (the
+//! value half of a key-and-value pool starts midway through it) and `pageTable` already
+//! points at this buffer's entry.
+//!
+//! Sixteen-byte aligned and exactly four of them wide, so the load vectorises; the strides
+//! are 32-bit because a page, a lease and a cell are all far smaller than that, and only
+//! their products with a page or lease index need the wider type.
+struct alignas(16) SparseCopyDesc
+{
+    //! Base this buffer's converted page indices are relative to. Shared by the buffers of
+    //! one run: the converted index already carries each buffer's own offset within the
+    //! coalesced page, which is why the pool's slot size plays no part and the stride below
+    //! is one buffer.
+    CUdeviceptr hostBase = 0;
+    //! Converted page indices, already at this buffer's entry, so a row's run of blocks is
+    //! `pageTable[row * pageTableStride ...]`. Buffers that merged onto one index table
+    //! share an entry and so share this pointer; buffers of one request do not.
+    int32_t const* pageTable = nullptr;
+    //! This buffer's sub-region of its pool in the cell arena, which is the pool's base
+    //! plus its slot there. A lease's cells follow at `leaseIndex * leaseStride`.
+    CUdeviceptr deviceBase = 0;
+
+    uint32_t hostPageStride = 0;
+    uint32_t pageTableStride = 0;
+    //! Blocks a row's page table describes; an ordinal past them is outside this call.
+    uint32_t numBlocks = 0;
+    //! Bytes one lease takes in this pool's region, which is its cells there times the
+    //! cell size. Multiplied by a lease index, so widened at the multiply.
+    uint32_t leaseStride = 0;
+    //! Bytes of one cell, which is one buffer's worth of pages.
+    uint32_t cellBytes = 0;
+
+    SparseUnitLayout layout;
+
+    SparseCopyWidth width = SparseCopyWidth::kByte;
+};
+
+static_assert(sizeof(SparseCopyDesc) == 64, "A copy descriptor is meant to be four vector loads");
+
 struct SparseUnitCopyArgs
 {
-    //! [numRows] per-row cache state: the lease, the per-buffer page offsets and the
-    //! buffer-to-layer map all live here, because a batched fetch spans rows whose
-    //! metadata belongs to different requests and so is not contiguous. A row with a null
-    //! residentOrdinal holds no reservation and is skipped. A single-request write-back
-    //! passes one row rather than taking a second addressing mode.
+    //! [numRows] per-row cache state: the lease and the per-buffer pool slots live here,
+    //! because a batched copy spans rows whose metadata belongs to different requests and
+    //! so is not contiguous. A row with a null residentOrdinal holds no reservation.
     SparseCacheView const* views = nullptr;
     int32_t numRows = 0;
 
-    //! Base of this call's buffers, as an index table's entries are relative to. Every
-    //! buffer of the run shares it: the converted index already carries the buffer's own
-    //! offset within the coalesced page, which is why the pool's slot size plays no part
-    //! here and the stride below is one buffer.
-    CUdeviceptr hostBase = 0;
-    uint64_t hostPageStride = 0;
-    //! Converted page indices, [entries][rows][pageTableStride], positioned at the entry
-    //! and row this call starts from. Buffer `b` of the run reads entry `b - bufferBase`.
-    //!
-    //! A fetch spans the batch and starts at row zero; a write-back serves one request and
-    //! starts at its own row. Both read the same table, because a converted index means the
-    //! same thing to either.
-    int32_t const* pageTable = nullptr;
-    int32_t pageTableStride = 0;
-    //! Elements between consecutive entries, which is the whole table's rows times its
-    //! blocks -- not this call's rows, since a write-back passes only one of them.
-    int32_t pageTableEntryStride = 0;
-    int32_t numBlocks = 0;
-    int32_t pageTableBase = 0;
+    //! One descriptor per BufferId of the life cycle, indexed by `blockIdx.y` directly.
+    //! One launch for every pool: a pool's cells are disjoint from every other pool's and
+    //! the converted table they share is read-only, so nothing orders them against each
+    //! other, and one grid both runs them concurrently and gives every one of them the
+    //! launch dependency.
+    SparseCopyDesc const* copyDesc = nullptr;
 
-    //! Base of this call's pool region in the cell arena. One arena for every row: the lease
-    //! differs per request, the arena it comes from does not. One call serves one pool,
-    //! because a pool fixes the cell size.
-    CUdeviceptr deviceBase = 0;
-
-    //! A lease holds one contiguous run of buffer-sized cells in each pool's region, so an
-    //! entry is addressed by arithmetic alone:
-    //!
-    //!     cell = views[row].leaseIndex * cellsPerLease
-    //!          + views[row].bufferSlotInPool[buffer] * cellsPerBuffer
-    //!          + entry / unitsPerPage
-    //!
-    //! No page table and no slot indirection. Coalescing would earn nothing here because
-    //! different layers select different units, so a slot's cells would never fill together.
-    int32_t cellsPerBuffer = 0;
-    //! Cells one lease takes in this pool's region: its buffers there times cellsPerBuffer.
-    int32_t cellsPerLease = 0;
-    uint64_t bufferBytes = 0;
+    //! The buffers this call covers: `numBuffers` of them from `bufferBase`, which for a
+    //! fetch is one layer's and for a write-back is the life cycle's. Consecutive, because
+    //! buffers are grouped by layer and, within a layer, by pool.
+    int32_t bufferBase = 0;
+    int32_t numBuffers = 0;
 
     SparseCopyDirection direction = SparseCopyDirection::kFetch;
 
-    SparseUnitLayout layout;
-    //! Selection units one page of this buffer holds.
+    //! Selection units one page holds. A life cycle's property, so every pool shares it.
     int32_t unitsPerPage = 1;
 
-    //! The work list: the resolve's misses when fetching, the flush list when writing back.
-    //! [numRows][workRowStride][workWidth], of which the first workCount[...] are valid.
-    //!
-    //! Its inner rows are layers, while the copy itself walks buffers, because a layer's
-    //! buffers select the same units and so share one list. Buffer b of row r reads
-    //! `(r * workRowStride + views[r].bufferLayer[bufferBase + b] - workRowBase)`.
-    //!
-    //! That one expression covers both callers. A fetch resolves a single layer across the
-    //! batch, so it passes one list row per batch row and sets workRowBase to the layer it
-    //! resolved, making the inner index zero. A write-back crosses the watermark for every
-    //! layer of one request at once, so it passes one batch row and every layer.
-    int32_t const* workOrdinal = nullptr;
-    int32_t const* workSlot = nullptr;
-    int32_t const* workCount = nullptr;
-    int32_t workWidth = 0;
-    int32_t workRowStride = 1;
-    int32_t workRowBase = 0;
+    //! [numBuffers] the layer each buffer belongs to, shared by every row of the life
+    //! cycle. Read without a view because the list has to be chosen before an entry -- and
+    //! so a row -- is known.
+    int32_t const* bufferLayer = nullptr;
 
-    //! The buffers this call copies: `numBuffers` of them starting at `bufferBase`. They are
-    //! consecutive because buffers are grouped by layer and, within a layer, by pool.
-    int32_t bufferBase = 0;
-    int32_t numBuffers = 0;
+    //! The work list: the resolve's misses when fetching, the flush list when writing back.
+    //! Compacted, so a warp takes the next entry rather than the next slot of a row that may
+    //! hold nothing. The pools of one layer share it, because they hold the same units.
+    SparseWorkList work;
+
+    //! CTAs along the work dimension. A work item is one warp's worth -- a selection unit is
+    //! 288 bytes of NVFP4 data or 36 of scales, which is 18 or 36 lanes, so a block per item
+    //! would leave most of it idle -- and the warps walk the list with a grid-stride loop.
+    //!
+    //! Sized from the machine, not the work: the fetch is captured in a graph, so the grid
+    //! is fixed before anyone knows how many units a step will miss. The device-side total
+    //! is what the loop actually follows.
+    int32_t gridCtas = 1;
 };
 
-//! Launch the copies. One CTA per (buffer, potential work item); CTAs past the buffer's
-//! layer's count exit.
+//! Widest vector a pool's layout admits, from its sizes alone. A layout admitting none
+//! falls to bytes, so there is never a tail to handle in the kernel.
+[[nodiscard]] SparseCopyWidth sparseCopyWidth(
+    SparseUnitLayout const& layout, uint64_t hostPageStride, uint64_t bufferBytes);
+
+//! Bytes one `width` moves, for the caller that has to check its bases against it.
+[[nodiscard]] size_t sparseCopyWidthBytes(SparseCopyWidth width) noexcept;
+
+//! Launch the copies for every pool at once: the grid is `(gridCtas, numBuffers)`, where the
+//! buffers of every pool form one flat range.
+//!
+//! One launch rather than one per pool, because nothing orders the pools against each other
+//! -- their cells are disjoint and the converted table they share is read-only -- and a
+//! single grid both runs them concurrently and lets every one of them carry the programmatic
+//! dependency on the kernel that produced the work list.
+//!
+//! Enrolled in PDL when the environment enables it. The kernel resolves its pool, buffer and
+//! list before waiting, so a block is resident and addressed by the time its producer drains.
 void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream);
 
 //! Turn a resolve's entry indices into the index list an attention kernel can read.
@@ -312,15 +420,14 @@ struct SparseFlushListArgs
     int32_t const* fromUnits = nullptr;
     int32_t const* toUnits = nullptr;
 
-    //! [numRows][numLayers][maxFlushUnits] units to write back and the entries holding
-    //! them, and [numRows][numLayers] how many. Batch-owned, so one launch covering every
-    //! row hands the copy one pointer -- the reservation in a row's lease is its own, but
-    //! this is the step's.
-    int32_t* outOrdinal = nullptr;
-    int32_t* outSlot = nullptr;
+    //! Units to write back and the entries holding them: one list per layer, because the
+    //! copy that consumes it walks buffers and a buffer belongs to one layer. Batch-owned,
+    //! so one launch covering every row hands the copy one pointer -- the reservation in a
+    //! row's lease is its own, but this is the step's.
+    SparseWorkList work;
+    //! [numRows][numLayers] entries this (row, layer) contributed, for the same reason the
+    //! resolve keeps its miss count: the copy does not need it, an observer does.
     int32_t* outCount = nullptr;
-    //! Bound on one watermark move, which cannot exceed the in-flight headroom.
-    int32_t maxFlushUnits = 0;
 };
 
 //! Launch the flush-list scan. One CTA per (layer, row).

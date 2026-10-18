@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/sparseCache.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
@@ -92,21 +93,33 @@ using IndexTableId = StrongIndex<int, struct IndexTableIdTag>;
 struct SparseStepScratch
 {
     int32_t* outSlot = nullptr;      //!< [numRows][selectionWidth]
-    int32_t* missOrdinal = nullptr;  //!< [numRows][selectionWidth]
-    int32_t* missSlot = nullptr;     //!< [numRows][selectionWidth]
     int32_t* missCount = nullptr;    //!< [numRows]
     int32_t* inFlightSlot = nullptr; //!< [numRows][maxInFlightUnits]
     int32_t selectionWidth = 0;
     int32_t maxInFlightUnits = 0;
 
-    //! The write-back's counterpart of the miss lists. A fetch resolves one layer across
-    //! the batch; a write-back crosses every layer of a row at once, so these carry the
-    //! layer dimension the miss lists fold away.
-    int32_t* flushOrdinal = nullptr; //!< [numRows][numLayers][maxFlushUnits]
-    int32_t* flushSlot = nullptr;    //!< [numRows][numLayers][maxFlushUnits]
-    int32_t* flushCount = nullptr;   //!< [numRows][numLayers]
-    int32_t maxFlushUnits = 0;
+    //! The misses of one layer, compacted across rows. A fetch resolves one layer at a
+    //! time, so a single list serves the whole batch.
+    SparseWorkList fetchWork;
+
+    //! The write-back's counterpart. A write-back crosses every layer of a row at once and
+    //! the copy that consumes it walks buffers, so it takes one list per layer rather than
+    //! the one the fetch folds away.
+    SparseWorkList flushWork;
+    int32_t* flushCount = nullptr; //!< [numRows][numLayers]
     int32_t numLayers = 0;
+
+    //! What differs between the pools of a copy, on the device for the kernel to index by
+    //! `blockIdx.z`. Built and uploaded once with the Batch: every field comes from the
+    //! buffer plan and the index tables, both fixed at construction, so a captured graph
+    //! replays a copy with no host write at all.
+    //!
+    //! [numBuffers] one copy descriptor per BufferId, serving both directions. BufferIds
+    //! are ordered (layer, pool), so one already names its own layer's index-table entry
+    //! and needs no layer dimension; the fetch and the write-back then want the same
+    //! descriptors and differ only in which of them they launch over.
+    SparseCopyDesc const* copyDesc = nullptr;
+    int32_t numBuffers = 0;
 };
 
 //! Per-row watermarks, in tokens. Everything a step needs about how far a request has got
@@ -166,9 +179,23 @@ public:
     //! @param stream the stream every member runs on. A Batch owns it rather than taking
     //! one per call: a member's own work and the Batch's transfers have to be ordered
     //! against each other, and two streams would leave that ordering to the caller.
+    //!
+    //! @param maxTotalInputTokens tokens one step may ingest across every row, as the
+    //! runtime's own batching bound gives it. It sizes the write-back's work list: a row
+    //! advancing `t` tokens crosses at most `t / unitTokens + 1` units, so the batch
+    //! crosses at most `maxTotalInputTokens / unitTokens + maxBatchSize` of them.
+    //!
+    //! Only an aggregate bound works here, and only because the list is compacted across
+    //! rows. Were it indexed by row, each row's slice would have to allow for that row
+    //! taking the whole budget, and the product would be hundreds of times larger.
+    //!
+    //! Left unset it falls back to `maxBatchSize * maxInFlightUnits`, which today is
+    //! `maxBatchSize` -- a decode step advances capacity one token per row, so one row
+    //! crosses at most one unit boundary. Pass it once a step can ingest more than that,
+    //! which is what chunked prefill under in-flight batching does.
     explicit Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
         std::optional<ExternalPageTable> pageTable = std::nullopt, std::optional<PageIndexMode> mode = std::nullopt,
-        std::vector<IndexTableRequest> indexTables = {});
+        std::vector<IndexTableRequest> indexTables = {}, std::optional<int> maxTotalInputTokens = std::nullopt);
 
     //! The stream the Batch and every member run on, fixed at construction.
     [[nodiscard]] CUstream cudaStream() const noexcept
@@ -414,13 +441,20 @@ private:
 
     void _allocateStepScratch();
 
+    //! Entries one layer's write-back list must hold, from the step's token budget.
+    [[nodiscard]] int32_t _flushCapacity(LifeCycleId lifeCycle) const;
+
+    //! Fill the per-buffer copy descriptors and upload them. Runs once, after the index
+    //! tables exist, because a descriptor names where in them a buffer's indices sit.
+    void _allocateCopyDesc();
+
     //! Device room for the per-row unit ranges a write-back reads:
     //! [life cycle][2][maxBatchSize], as [from][to]. Allocated with the fetch scratch
     //! because it has the same lifetime and the same reason to exist -- a step that
     //! allocates nothing is a step a graph can capture.
     void _allocateFlushRanges();
 
-    CudaUniqPtr mFlushRanges;
+    CudaUniqPtr<int32_t> mFlushRanges;
     //! Staged host-side, then handed to a copy that consumes it before returning.
     std::vector<int32_t> mFlushRangeStaging;
     //! Per row, the history its units have been written back to.
@@ -436,9 +470,21 @@ private:
     CUstream mCudaStream = nullptr;
     int mMaxBatchSize = 0;
     int mMaxBlocksPerSeq = 0;
+    std::optional<int> mMaxTotalInputTokens;
     LifeCycleId mNumLayerGroups{0};
 
     std::vector<KvCache*> mRows;
+
+    //! Device storage behind every life cycle's per-BufferId copy descriptors.
+    CudaUniqPtr<SparseCopyDesc> mCopyDesc;
+
+    //! Every life cycle's work-list counters. A step clears them once, in publish(); a
+    //! producer then raises its own and the copy that consumes the list reads it.
+    //!
+    //! Not owning: they lead `mStepScratch`, which is what makes one clear reach all of
+    //! them, so that allocation frees them.
+    int32_t* mCounters = nullptr;
+    size_t mCounterElements = 0;
 
     //! Per life cycle, fixed at construction. Only scratch-slot substitution can make one
     //! layer's indices differ from another's in the same life cycle, so a life cycle that
@@ -499,7 +545,7 @@ private:
     //! Host and device sides of the scratch metadata, laid out [begs][ends][slots].
     //! Empty when no table's life cycle can hold scratch.
     std::unique_ptr<HostMem> mScratchStaging;
-    CudaUniqPtr mScratchDevice;
+    CudaUniqPtr<int32_t> mScratchDevice;
     //! Slot ids a request may hold for one life cycle, which bounds the staging.
     int mMaxScratchSlots = 0;
     //! Tables whose life cycle can hold scratch sort last, so one launch covers each kind.
@@ -509,9 +555,9 @@ private:
     void _convertIndices(CUstream stream);
 
     //! All converted tables, carved by IndexTable::elementOffset.
-    CudaUniqPtr mIndexTableMemory;
+    CudaUniqPtr<int32_t> mIndexTableMemory;
     //! One IndexTableDesc per table, and the offsets they point at.
-    CudaUniqPtr mIndexTableDescs;
+    CudaUniqPtr<> mIndexTableDescs;
     int mMaxTableEntries = 0;
 
     //! Set when the page-index table is borrowed, in which case mStaging and mDevice hold
@@ -524,7 +570,7 @@ private:
 
     //! What the fetch reads. Its address is baked into a captured graph, so it is written
     //! only on the caller's stream, after the replay that read the previous publish.
-    CudaUniqPtr mDevice;
+    CudaUniqPtr<> mDevice;
 
     //! A device-side copy of the same layout, filled from the host ahead of time.
     //!
@@ -534,13 +580,13 @@ private:
     //! reading the table are inside it and the table's address is fixed by capture.
     //! Double-buffering the table itself cannot work for that same reason, so the second
     //! buffer goes upstream of the fixed address instead.
-    CudaUniqPtr mDeviceStaging;
+    CudaUniqPtr<> mDeviceStaging;
 
     //! Carries the host-to-device fill, off the caller's stream so it can run early.
     CachedCudaStream mUploadStream;
 
     //! One allocation holding every layer group's fetch scratch, carved per group.
-    CudaUniqPtr mStepScratch;
+    CudaUniqPtr<int32_t> mStepScratch;
     TypedVec<LifeCycleId, SparseStepScratch> mScratch;
 
     //! Recorded after the host-to-device fill, so the host can tell when the staged rows

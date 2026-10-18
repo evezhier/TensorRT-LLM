@@ -2219,7 +2219,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             // No gil_scoped_release call guard: the tuple below is built from the lambda body,
             // which the guard would have left running without the GIL.
             return std::make_tuple(std::move(r.residentOrdinal), std::move(r.lruOrder), std::move(r.outSlot),
-                std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missCount), std::move(r.inFlightSlot));
+                std::move(r.missRow), std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missTotal),
+                std::move(r.missCount), std::move(r.inFlightSlot));
         },
         nb::arg("resident_ordinal"), nb::arg("lru_order"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
@@ -2229,7 +2230,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("num_blocks"), nb::arg("cells_per_buffer"), nb::arg("buffer_bytes"), nb::arg("num_chunks"),
         nb::arg("chunk_bytes"), nb::arg("chunk_stride"), nb::arg("unit_stride"), nb::arg("expansion"),
         nb::arg("miss_ordinal"), nb::arg("miss_slot"), nb::arg("miss_count"), nb::arg("selection_width"),
-        nb::arg("buffer_layer"), nb::arg("write_back") = false, nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("buffer_layer"), nb::arg("write_back") = false, nb::arg("grid_ctas") = 1,
+        nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "sparse_flush_list",
         [](std::vector<int32_t> const& residentOrdinal, int numLayers, int entriesPerLayer, int fromUnits, int toUnits,
@@ -2237,7 +2239,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         {
             auto r = kv::KvCacheIntrospection::sparseFlushList(
                 residentOrdinal, numLayers, entriesPerLayer, fromUnits, toUnits, maxFlushUnits);
-            return std::make_tuple(std::move(r.ordinal), std::move(r.slot), std::move(r.count));
+            return std::make_tuple(
+                std::move(r.row), std::move(r.ordinal), std::move(r.slot), std::move(r.total), std::move(r.count));
         },
         nb::arg("resident_ordinal"), nb::arg("num_layers"), nb::arg("entries_per_layer"), nb::arg("from_units"),
         nb::arg("to_units"), nb::arg("max_flush_units"));
@@ -2485,18 +2488,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::Batch* self, kv::KvCacheManager& manager, intptr_t stream, int maxBatchSize, int maxBlocksPerSeq,
                 std::optional<kv::ExternalPageTable> pageTable, std::optional<kv::PageIndexMode> mode,
-                std::vector<kv::IndexTableRequest> indexTables)
+                std::vector<kv::IndexTableRequest> indexTables, std::optional<int> maxTotalInputTokens)
             {
                 new (self) kv::Batch(manager, reinterpret_cast<CUstream>(stream), maxBatchSize, maxBlocksPerSeq,
-                    std::move(pageTable), mode, std::move(indexTables));
+                    std::move(pageTable), mode, std::move(indexTables), maxTotalInputTokens);
             },
             nb::arg("manager"), nb::arg("stream"), nb::arg("max_batch_size") = 0, nb::arg("max_blocks_per_seq") = 0,
             nb::arg("page_table") = nb::none(), nb::arg("mode") = nb::none(),
-            nb::arg("index_tables") = std::vector<kv::IndexTableRequest>{}, nb::keep_alive<1, 2>(),
+            nb::arg("index_tables") = std::vector<kv::IndexTableRequest>{},
+            nb::arg("max_total_input_tokens") = nb::none(), nb::keep_alive<1, 2>(),
             "The KV caches stepped together, and their device-side page tables.\n\n"
             "max_batch_size and max_blocks_per_seq bound device arrays whose shape must not change "
             "between steps, so neither can be grown later. Zero derives them from the manager's "
             "constraints, which fails when none were declared.\n\n"
+            "max_total_input_tokens is the tokens one step may ingest across every row. It sizes the "
+            "write-back's work list; left unset it assumes a decode step, where each row advances by "
+            "one token and so crosses at most one unit boundary.\n\n"
             "`page_table` borrows the host page-index storage rather than staging its own, which "
             "leaves one buffer with one writer so a member's binding survives the whole decode. "
             "Its rows then belong to the lender, so add_kv_cache must be told which one a member "

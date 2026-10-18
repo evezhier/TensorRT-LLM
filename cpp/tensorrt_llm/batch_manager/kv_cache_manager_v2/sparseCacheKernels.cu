@@ -20,6 +20,7 @@
 #include "exceptions.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <cassert>
 
@@ -52,6 +53,10 @@ namespace
     } while (0)
 
 constexpr int kThreads = 256;
+constexpr uint32_t kWarpSize = 32;
+//! Warps in one copy CTA. The CTA size is chosen for occupancy; how many warps serve one
+//! row is a separate number, so the two are decoupled by remapping a global warp id.
+constexpr int32_t kWarpsPerCopyCta = kThreads / static_cast<int>(kWarpSize);
 constexpr int32_t kEmptyKey = -1;
 //! kBadPageIndex as a plain int32, since device code cannot use the strong typedef.
 constexpr int32_t kBadPageIndexValue = kBadPageIndex.value();
@@ -119,6 +124,27 @@ __host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entr
         result <<= 1;
     }
     return result;
+}
+
+//! Programmatic dependent launch, where the hardware has it.
+//!
+//! Both calls are hints, not contracts: a wait with no launch dependency returns at once,
+//! and a release with no dependent kernel does nothing. So a kernel carrying them is correct
+//! whether or not its launch enrolled in PDL, and compiling them out below Hopper only falls
+//! back to ordinary stream ordering.
+__device__ inline void gridDependencyWait()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
+}
+
+//! Let a dependent grid start. Only sound once everything it reads from this one is written.
+__device__ inline void gridDependencyRelease()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 //! Fibonacci hashing. Unit ordinals are small and dense, and identity hashing turns a dense
@@ -214,8 +240,6 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     auto const inFlightBase = static_cast<ptrdiff_t>(row) * args.maxInFlightUnits;
     int32_t const* selected = args.selected + selectionBase;
     int32_t* outSlot = args.outSlot + selectionBase;
-    int32_t* missOrdinal = args.missOrdinal + selectionBase;
-    int32_t* missSlot = args.missSlot + selectionBase;
     int32_t* inFlightSlot = args.inFlightSlot + inFlightBase;
 
     if (threadIdx.x == 0)
@@ -231,16 +255,16 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     {
         cls[i] = kClassUntouched;
     }
-    // Slots past the in-flight span say "no unit in flight", so a consumer can read this
-    // array without also being told how many units there are.
-    for (int32_t i = static_cast<int32_t>(threadIdx.x) + inFlight; i < args.maxInFlightUnits; i += kThreads)
-    {
-        inFlightSlot[i] = kNoSparseSlot;
-    }
     __syncthreads();
 
     // Build the probe index over the resident set. Ordinals are unique within a layer, so
     // threads contend only on table-position collisions.
+    //
+    // Above the dependency wait deliberately: this reads the layer's own residency table and
+    // writes only shared memory, and nothing that runs before a resolve touches that table --
+    // a previous layer's resolve owns a different slice of it, and the copy and index kernels
+    // between them write cells and indices. So the whole index build is work a block can
+    // finish while the kernel it waits on is still draining.
     for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
     {
         int32_t const ord = residentOrdinal[s];
@@ -254,6 +278,19 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             pos = (pos + 1U) & mask;
         }
         vals[pos] = s;
+    }
+
+    // The selection is the caller's, produced by whatever chose the units this step wants,
+    // so this is as far as a block gets without it. Every global write stays below the wait
+    // too: a block that has not yet waited may still be running beside a grid that could
+    // read what it would overwrite.
+    gridDependencyWait();
+
+    // Slots past the in-flight span say "no unit in flight", so a consumer can read this
+    // array without also being told how many units there are.
+    for (int32_t i = static_cast<int32_t>(threadIdx.x) + inFlight; i < args.maxInFlightUnits; i += kThreads)
+    {
+        inFlightSlot[i] = kNoSparseSlot;
     }
     __syncthreads();
 
@@ -285,6 +322,30 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             int32_t const j = atomicAdd(&numMiss, 1);
             missOrd[j] = ord;
             missIdx[j] = i;
+        }
+    }
+    __syncthreads();
+
+    // Claim this row's run in the compacted list now that the miss set is final, so the
+    // eviction loop below can write straight into it. Only a miss below the watermark is
+    // copied, which is the same test the loop applies, so counting it here costs one pass
+    // over a list already in shared memory and saves staging the entries anywhere.
+    __shared__ int32_t copyBase;
+    {
+        int32_t mine = 0;
+        for (int32_t j = static_cast<int32_t>(threadIdx.x); j < numMiss; j += kThreads)
+        {
+            mine += missOrd[j] < historyUnits ? 1 : 0;
+        }
+        int32_t scanned = 0;
+        int32_t claimed = 0;
+        BlockScan(temp).ExclusiveSum(mine, scanned, claimed);
+        if (threadIdx.x == 0)
+        {
+            copyBase = claimed > 0 ? atomicAdd(args.work.total, claimed) : 0;
+            // The list is sized for every row missing its whole selection, so a claim can
+            // only run past it if the caller sized it from a different width.
+            KVCM2_SPARSE_REQUIRE(copyBase + claimed <= args.work.capacity);
         }
     }
     __syncthreads();
@@ -335,13 +396,19 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             // bytes over the data the model is about to write.
             if (ordinal < historyUnits)
             {
-                int32_t const c = atomicAdd(&numCopy, 1);
-                missOrdinal[c] = ordinal;
-                missSlot[c] = slot;
+                auto const c = copyBase + atomicAdd(&numCopy, 1);
+                args.work.row[c] = row;
+                args.work.ordinal[c] = ordinal;
+                args.work.slot[c] = slot;
             }
         }
     }
     __syncthreads();
+
+    // The work list and the slots are final here; the recency rebuild below is this
+    // kernel's own bookkeeping, which nothing downstream reads. Releasing now hands the
+    // copy the whole rebuild as overlap.
+    gridDependencyRelease();
 
     // Rebuild recency: hits, then units fetched this step, then everything untouched, each
     // group keeping its previous relative order.
@@ -388,92 +455,129 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     }
 }
 
-//! Copy `bytes` from `src` to `dst`, 16 bytes at a time when every operand allows it.
-//! Cold reads cross PCIe, so the wide path is what makes the copy worth doing on the SM.
-__device__ inline void copyChunk(char* dst, char const* src, uint32_t bytes)
+//! Copy `bytes` from `src` to `dst` with one warp, `sizeof(Vec)` at a time.
+//!
+//! The width is the launcher's choice, made from the layout and the addresses it produces,
+//! so there is no alignment test here and no tail: `bytes` divides by `sizeof(Vec)` and both
+//! pointers are aligned to it. Cold reads cross PCIe, which is what makes the wide types
+//! worth choosing when a layout admits them.
+template <typename Vec>
+__device__ inline void copyChunkWarp(char* dst, char const* src, uint32_t bytes, uint32_t lane)
 {
-    bool const wide = (reinterpret_cast<uintptr_t>(dst) % 16U == 0U) && (reinterpret_cast<uintptr_t>(src) % 16U == 0U)
-        && (bytes % 16U == 0U);
-    if (wide)
+    auto* out = reinterpret_cast<Vec*>(dst);
+    auto const* in = reinterpret_cast<Vec const*>(src);
+    uint32_t const count = bytes / static_cast<uint32_t>(sizeof(Vec));
+    for (uint32_t i = lane; i < count; i += kWarpSize)
     {
-        auto* dst16 = reinterpret_cast<uint4*>(dst);
-        auto const* src16 = reinterpret_cast<uint4 const*>(src);
-        uint32_t const count = bytes / 16U;
-        for (uint32_t i = threadIdx.x; i < count; i += kThreads)
-        {
-            dst16[i] = src16[i];
-        }
+        out[i] = in[i];
     }
-    else
+}
+
+//! One pool's work, with a vector width fixed at compile time.
+//!
+//! Split from the kernel so the width can be switched on once per block rather than
+//! templated into four kernels: with the pools merged into one launch they no longer each
+//! have a launch to be templated by.
+template <typename Vec>
+__device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t first)
+{
+    uint32_t const lane = threadIdx.x % kWarpSize;
+    int32_t const stride = static_cast<int32_t>(gridDim.x) * kWarpsPerCopyCta;
+    auto const listBase = static_cast<ptrdiff_t>(list) * args.work.capacity;
+    int32_t const count = args.work.total[list];
+
+    for (int32_t j = first; j < count; j += stride)
     {
-        for (uint32_t i = threadIdx.x; i < bytes; i += kThreads)
+        auto const index = listBase + j;
+        int32_t const row = args.work.row[index];
+        int32_t const ordinal = args.work.ordinal[index];
+        int32_t const slot = args.work.slot[index];
+
+        // Read per item rather than per warp: the list is dense across rows, so consecutive
+        // entries need not share one. A producer's CTA claims a contiguous run, so in
+        // practice a warp's items mostly do.
+        SparseCacheView const view = args.views[row];
+
+        // A unit ordinal names a unit within a block; a cache entry names a unit within a
+        // sub-slot. Both divide by the same units-per-page.
+        int32_t const block = ordinal / args.unitsPerPage;
+        int32_t const srcUnit = ordinal % args.unitsPerPage;
+        int32_t const dstUnit = slot % args.unitsPerPage;
+        if (block >= static_cast<int32_t>(desc.numBlocks))
         {
-            dst[i] = src[i];
+            // Outside the extent this call was given; the warp's other items may not be.
+            continue;
+        }
+
+        // The descriptor's pointer already stands at this buffer's entry, so the table
+        // index is the row's run of blocks and nothing else.
+        auto const hostPage
+            = static_cast<uint64_t>(desc.pageTable[static_cast<ptrdiff_t>(row) * desc.pageTableStride + block]);
+
+        // The cold side is reached by ordinal through the page table, the hot side by
+        // arithmetic from the lease: the arena hands out a contiguous run, so there is no
+        // page to look up, and the buffer's own slot in the pool is already in deviceBase.
+        // Direction only chooses which of the two is read.
+        auto* cold = reinterpret_cast<char*>(
+            desc.hostBase + hostPage * desc.hostPageStride + static_cast<uint64_t>(srcUnit) * desc.layout.unitStride);
+        auto* hot = reinterpret_cast<char*>(desc.deviceBase + static_cast<uint64_t>(view.leaseIndex) * desc.leaseStride
+            + static_cast<uint64_t>(slot / args.unitsPerPage) * desc.cellBytes
+            + static_cast<uint64_t>(dstUnit) * desc.layout.unitStride);
+        bool const fetching = args.direction == SparseCopyDirection::kFetch;
+        char const* src = fetching ? cold : hot;
+        char* dst = fetching ? hot : cold;
+
+        for (uint32_t c = 0; c < desc.layout.numChunks; ++c)
+        {
+            auto const offset = static_cast<uint64_t>(c) * desc.layout.chunkStride;
+            copyChunkWarp<Vec>(dst + offset, src + offset, desc.layout.chunkBytes, lane);
         }
     }
 }
 
-//! One CTA per (row, buffer, work item).
+//! One warp per work item, walking the compacted list with a grid-stride loop. `blockIdx.z`
+//! is the pool, `blockIdx.y` its buffer, `blockIdx.x` the work.
 __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyArgs args)
 {
-    int32_t const row = static_cast<int32_t>(blockIdx.z);
-    SparseCacheView const view = args.views[row];
-    if (view.residentOrdinal == nullptr)
-    {
-        // A free row, or a member that has suspended: no reservation to copy into.
-        return;
-    }
+    // Broadcast from lane zero before anything can diverge: threadIdx.x varies within the
+    // warp, so the compiler cannot otherwise see that this quotient does not, and every lane
+    // must still be present for the shuffle.
+    uint32_t warpInCta = threadIdx.x / kWarpSize;
+    warpInCta = __shfl_sync(0xffffffffU, warpInCta, 0);
+    int32_t const globalWarp = static_cast<int32_t>(blockIdx.x) * kWarpsPerCopyCta + static_cast<int32_t>(warpInCta);
 
-    // The grid walks this call's buffers; the work list is indexed by their layer, which is
-    // shared whenever a layer has more than one buffer.
+    // Everything down to the dependency wait is the producer's business only in that it
+    // names where to put the result: the descriptors are built once with the Batch, and the
+    // buffer and list follow from the block's own coordinates. Resolving it here is what the
+    // launch dependency is for -- the block is resident and addressed before the kernel it
+    // waits on has finished.
+    //
+    // One flat buffer range rather than pools by buffers-per-pool, so a pool narrower than
+    // its neighbours costs no idle blocks, and one descriptor load rather than a map into a
+    // per-pool table: everything that would have been looked up is folded in at build time.
     int32_t const buffer = args.bufferBase + static_cast<int32_t>(blockIdx.y);
-    auto const workRow
-        = static_cast<ptrdiff_t>(row) * args.workRowStride + (view.bufferLayer[buffer] - args.workRowBase);
-    int32_t const j = static_cast<int32_t>(blockIdx.x);
-    if (j >= args.workCount[workRow])
+    SparseCopyDesc const desc = args.copyDesc[buffer];
+    // The buffer is this block's, so its layer -- and therefore its list -- is uniform and
+    // known before any entry is read. The list index is zero whenever the caller passed one
+    // list, which is what a fetch does: it resolves a single layer.
+    int32_t const list = args.work.numLists > 1 ? args.bufferLayer[buffer] - args.work.layerBase : 0;
+
+    // The work list and its total are the producer's, so this is as far as the block gets
+    // before the kernel that fills them has run.
+    gridDependencyWait();
+
+    // Nothing launched after this reads a cell, so a successor need not wait for the copy
+    // itself -- only for the block to have got this far. Releasing here is what keeps the
+    // index kernel that follows on the stream from being ordered behind a copy it does not
+    // depend on.
+    gridDependencyRelease();
+
+    switch (desc.width)
     {
-        return;
-    }
-
-    auto const index = workRow * args.workWidth + j;
-    int32_t const ordinal = args.workOrdinal[index];
-    int32_t const slot = args.workSlot[index];
-
-    // A unit ordinal names a unit within a block; a cache entry names a unit within a
-    // sub-slot. Both divide by the same units-per-page.
-    int32_t const block = ordinal / args.unitsPerPage - args.pageTableBase;
-    int32_t const srcUnit = ordinal % args.unitsPerPage;
-    int32_t const dstUnit = slot % args.unitsPerPage;
-    if (block < 0 || block >= args.numBlocks)
-    {
-        return;
-    }
-
-    // A cell is reached by arithmetic from the lease's base: the arena hands out a
-    // contiguous run, so there is no page to look up.
-    auto const cell = static_cast<uint64_t>(view.leaseIndex * args.cellsPerLease
-        + view.bufferSlotInPool[buffer] * args.cellsPerBuffer + slot / args.unitsPerPage);
-
-    // Each buffer of the run has its own entry, differing only by the offset the conversion
-    // baked in -- which is what replaces adding the buffer's offset within the page here.
-    auto const entry = static_cast<ptrdiff_t>(buffer - args.bufferBase);
-    auto const hostPage = static_cast<uint64_t>(
-        args.pageTable[entry * args.pageTableEntryStride + static_cast<ptrdiff_t>(row) * args.pageTableStride + block]);
-
-    // The cold side is reached by ordinal through the page table, the hot side by entry
-    // index through the cache page list. Direction only chooses which one is read.
-    auto* cold = reinterpret_cast<char*>(
-        args.hostBase + hostPage * args.hostPageStride + static_cast<uint64_t>(srcUnit) * args.layout.unitStride);
-    auto* hot = reinterpret_cast<char*>(
-        args.deviceBase + cell * args.bufferBytes + static_cast<uint64_t>(dstUnit) * args.layout.unitStride);
-    bool const fetching = args.direction == SparseCopyDirection::kFetch;
-    char const* src = fetching ? cold : hot;
-    char* dst = fetching ? hot : cold;
-
-    for (uint32_t c = 0; c < args.layout.numChunks; ++c)
-    {
-        auto const offset = static_cast<uint64_t>(c) * args.layout.chunkStride;
-        copyChunk(dst + offset, src + offset, args.layout.chunkBytes);
+    case SparseCopyWidth::kWord4: copySparseUnits<uint4>(args, desc, list, globalWarp); break;
+    case SparseCopyWidth::kWord2: copySparseUnits<uint2>(args, desc, list, globalWarp); break;
+    case SparseCopyWidth::kWord: copySparseUnits<uint32_t>(args, desc, list, globalWarp); break;
+    case SparseCopyWidth::kByte: copySparseUnits<char>(args, desc, list, globalWarp); break;
     }
 }
 
@@ -525,6 +629,12 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
     }
     int32_t const layer = static_cast<int32_t>(blockIdx.x);
     int32_t const entries = view.entriesPerLayer;
+
+    // The row's view is staged with the watermarks and is nobody's output here, so a block
+    // can address itself before waiting. The range itself is uploaded by the call that asked
+    // for this write-back, so reading it is where the block has to stop.
+    gridDependencyWait();
+
     int32_t const from = args.fromUnits[row];
     int32_t const to = args.toUnits[row];
     if (from >= to)
@@ -538,45 +648,82 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
         return;
     }
 
+    __shared__ typename BlockScan::TempStorage temp;
+    int32_t const* residentOrdinal = view.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
+    auto const crossed = [&](int32_t slot)
+    {
+        int32_t const ord = residentOrdinal[slot];
+        return ord >= from && ord < to;
+    };
+
+    // Two passes over the resident set, because the run cannot be claimed until its length
+    // is known and the entries are too many to stage in shared memory: a prefilling row
+    // crosses as many units as its prompt holds. The set is the per-request cache, which is
+    // small enough that scanning it twice costs less than staging it once.
     __shared__ int32_t count;
+    __shared__ int32_t base;
     if (threadIdx.x == 0)
     {
         count = 0;
     }
     __syncthreads();
 
-    int32_t const* residentOrdinal = view.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
-    auto const listBase
-        = (static_cast<ptrdiff_t>(row) * args.numLayers + layer) * static_cast<ptrdiff_t>(args.maxFlushUnits);
-    int32_t* outOrdinal = args.outOrdinal + listBase;
-    int32_t* outSlot = args.outSlot + listBase;
-
-    for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
     {
-        int32_t const ord = residentOrdinal[s];
-        if (ord < from || ord >= to)
+        int32_t mine = 0;
+        for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
         {
-            continue;
+            mine += crossed(s) ? 1 : 0;
         }
-        int32_t const j = atomicAdd(&count, 1);
-        if (j < args.maxFlushUnits)
+        int32_t scanned = 0;
+        int32_t claimed = 0;
+        BlockScan(temp).ExclusiveSum(mine, scanned, claimed);
+        if (threadIdx.x == 0)
         {
-            outOrdinal[j] = ord;
-            outSlot[j] = s;
+            base = claimed > 0 ? atomicAdd(args.work.total + layer, claimed) : 0;
+            // Sized from the step's token budget, which bounds how far every row's watermark
+            // can move together. Running past it means the budget the Batch was given is not
+            // the one the caller honoured.
+            KVCM2_SPARSE_REQUIRE(base + claimed <= args.work.capacity);
+            args.outCount[static_cast<ptrdiff_t>(row) * args.numLayers + layer] = claimed;
         }
     }
     __syncthreads();
 
-    if (threadIdx.x == 0)
+    auto const listBase = static_cast<ptrdiff_t>(layer) * args.work.capacity + base;
+    for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
     {
-        // A resident unit the watermark crossed must have been in flight before the move,
-        // so the crossed set is bounded by the in-flight headroom this was sized from.
-        KVCM2_SPARSE_REQUIRE(count <= args.maxFlushUnits);
-        args.outCount[static_cast<ptrdiff_t>(row) * args.numLayers + layer] = count;
+        if (!crossed(s))
+        {
+            continue;
+        }
+        auto const j = listBase + atomicAdd(&count, 1);
+        args.work.row[j] = row;
+        args.work.ordinal[j] = residentOrdinal[s];
+        args.work.slot[j] = s;
     }
+
+    // Unlike the resolve, the list is the last thing this kernel writes, so there is no tail
+    // to overlap -- only the copy's launch to bring forward.
+    __syncthreads();
+    gridDependencyRelease();
 }
 
 } // namespace
+
+//! Throw unless the work list is fully described. Shared because all three launchers take
+//! the same descriptor, and a half-set one is the easiest mistake to make when adding a
+//! caller.
+void checkWorkList(SparseWorkList const& work, char const* api)
+{
+    if (work.row == nullptr || work.ordinal == nullptr || work.slot == nullptr || work.total == nullptr)
+    {
+        throw std::invalid_argument(std::string(api) + ": the work list's device arrays must be provided");
+    }
+    if (work.capacity <= 0 || work.numLists <= 0 || work.layerBase < 0)
+    {
+        throw std::invalid_argument(std::string(api) + ": the work list's capacity and list count must be positive");
+    }
+}
 
 void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
 {
@@ -612,52 +759,98 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseFlushList: rows and layers must be positive");
     }
-    if (args.views == nullptr || args.fromUnits == nullptr || args.toUnits == nullptr || args.outOrdinal == nullptr
-        || args.outSlot == nullptr || args.outCount == nullptr)
+    if (args.views == nullptr || args.fromUnits == nullptr || args.toUnits == nullptr || args.outCount == nullptr)
     {
         throw std::invalid_argument("launchSparseFlushList: every device array must be provided");
     }
-    if (args.maxFlushUnits <= 0)
+    checkWorkList(args.work, "launchSparseFlushList");
+    if (args.work.numLists != args.numLayers)
     {
-        throw std::invalid_argument("launchSparseFlushList: the flush bound must be positive");
+        throw std::invalid_argument("launchSparseFlushList: a write-back needs one work list per layer");
     }
     dim3 const grid(static_cast<unsigned>(args.numLayers), static_cast<unsigned>(args.numRows));
-    sparseFlushListKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
-    TLLM_CUDA_CHECK(cudaGetLastError());
+    tensorrt_llm::common::launchWithPdlWhenEnabled(
+        "sparseFlushList", sparseFlushListKernel, grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream), args);
+}
+
+SparseCopyWidth sparseCopyWidth(SparseUnitLayout const& layout, uint64_t hostPageStride, uint64_t bufferBytes)
+{
+    // Sizes only. Every offset a lane adds to a base is a sum of these, so a width dividing
+    // all of them leaves every access aligned relative to the base -- and the bases
+    // themselves are checked once, on the host, where a misaligned pool is a configuration
+    // error rather than a case to carry into the kernel.
+    auto const fits = [&](uint64_t width)
+    {
+        auto const divides = [width](uint64_t v) { return v % width == 0; };
+        return divides(hostPageStride) && divides(bufferBytes) && divides(layout.unitStride)
+            && divides(layout.chunkStride) && divides(layout.chunkBytes);
+    };
+    if (fits(sizeof(uint4)))
+    {
+        return SparseCopyWidth::kWord4;
+    }
+    if (fits(sizeof(uint2)))
+    {
+        return SparseCopyWidth::kWord2;
+    }
+    if (fits(sizeof(uint32_t)))
+    {
+        return SparseCopyWidth::kWord;
+    }
+    return SparseCopyWidth::kByte;
+}
+
+size_t sparseCopyWidthBytes(SparseCopyWidth width) noexcept
+{
+    switch (width)
+    {
+    case SparseCopyWidth::kWord4: return sizeof(uint4);
+    case SparseCopyWidth::kWord2: return sizeof(uint2);
+    case SparseCopyWidth::kWord: return sizeof(uint32_t);
+    case SparseCopyWidth::kByte: break;
+    }
+    return 1;
 }
 
 void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
 {
-    if (args.numBuffers <= 0 || args.workWidth <= 0 || args.unitsPerPage <= 0 || args.numRows <= 0
-        || args.workRowStride <= 0)
+    if (args.unitsPerPage <= 0 || args.numRows <= 0 || args.gridCtas <= 0 || args.numBuffers <= 0
+        || args.bufferBase < 0)
     {
         throw std::invalid_argument(
-            "launchSparseUnitCopy: rows, buffers, work width, work row stride and units-per-page must be "
-            "positive");
+            "launchSparseUnitCopy: rows, buffers, grid CTAs and units-per-page must be positive");
     }
-    if (args.bufferBase < 0 || args.workRowBase < 0 || args.pageTableStride < args.numBlocks)
-    {
-        throw std::invalid_argument(
-            "launchSparseUnitCopy: the bases must be non-negative and the page table stride must cover its blocks");
-    }
-    if (args.layout.numChunks == 0 || args.layout.chunkBytes == 0)
-    {
-        throw std::invalid_argument("launchSparseUnitCopy: the unit layout must describe a non-empty unit");
-    }
-    if (args.pageTable == nullptr || args.views == nullptr || args.workOrdinal == nullptr || args.workSlot == nullptr
-        || args.workCount == nullptr)
+    if (args.copyDesc == nullptr || args.views == nullptr)
     {
         throw std::invalid_argument("launchSparseUnitCopy: every device array must be provided");
     }
-    if (args.cellsPerBuffer <= 0 || args.cellsPerLease <= 0 || args.bufferBytes == 0)
+    checkWorkList(args.work, "launchSparseUnitCopy");
+    if (args.work.numLists > 1 && args.bufferLayer == nullptr)
     {
-        throw std::invalid_argument("launchSparseUnitCopy: the cell geometry must be positive");
+        throw std::invalid_argument("launchSparseUnitCopy: a per-layer work list needs the buffer-to-layer map");
     }
 
-    dim3 const grid(static_cast<unsigned>(args.workWidth), static_cast<unsigned>(args.numBuffers),
-        static_cast<unsigned>(args.numRows));
-    sparseUnitCopyKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
-    TLLM_CUDA_CHECK(cudaGetLastError());
+    dim3 const grid(static_cast<unsigned>(args.gridCtas), static_cast<unsigned>(args.numBuffers));
+    tensorrt_llm::common::launchWithPdlWhenEnabled(
+        "sparseUnitCopy", sparseUnitCopyKernel, grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream), args);
+}
+
+int32_t sparseCopyMultiprocessors(CUdevice device)
+{
+    int smCount = 0;
+    cuCheck(cuDeviceGetAttribute(&smCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+    return std::max(smCount, 1);
+}
+
+int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept
+{
+    //! Resident CTAs per SM this heuristic aims for.
+    constexpr int32_t kCtasPerSm = 4;
+
+    // Capped by the work itself: a CTA past the list's capacity could never find an item.
+    int32_t const full = std::max(smCount, 1) * kCtasPerSm;
+    int32_t const needed = (workCapacity + kWarpsPerCopyCta - 1) / kWarpsPerCopyCta;
+    return std::max(1, std::min(full, needed));
 }
 
 size_t sparseResolveSharedBytes(int32_t entriesPerLayer, int32_t selectionWidth, int32_t maxInFlightUnits)
@@ -697,9 +890,7 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseResolve: layerInGroup must name a layer of the group");
     }
-    bool const selectionArrays = args.selectionWidth == 0
-        || (args.selected != nullptr && args.outSlot != nullptr && args.missOrdinal != nullptr
-            && args.missSlot != nullptr);
+    bool const selectionArrays = args.selectionWidth == 0 || (args.selected != nullptr && args.outSlot != nullptr);
     if (args.views == nullptr || !selectionArrays || args.missCount == nullptr || args.historyTokens == nullptr
         || args.capacityTokens == nullptr || (args.maxInFlightUnits > 0 && args.inFlightSlot == nullptr))
     {
@@ -708,6 +899,14 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     if (args.maxInFlightUnits < 0)
     {
         throw std::invalid_argument("launchSparseResolve: maxInFlightUnits must not be negative");
+    }
+    if (args.selectionWidth > 0)
+    {
+        checkWorkList(args.work, "launchSparseResolve");
+        if (args.work.numLists != 1)
+        {
+            throw std::invalid_argument("launchSparseResolve: a fetch resolves one layer, so it fills one work list");
+        }
     }
     if (args.unitTokens <= 0)
     {
@@ -734,8 +933,9 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
         TLLM_CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<void const*>(&sparseResolveKernel),
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)));
     }
-    sparseResolveKernel<<<args.numRows, kThreads, shared, reinterpret_cast<cudaStream_t>(stream)>>>(args, tableSize);
-    TLLM_CUDA_CHECK(cudaGetLastError());
+    tensorrt_llm::common::launchWithPdlWhenEnabled("sparseResolve", sparseResolveKernel,
+        dim3(static_cast<unsigned>(args.numRows)), dim3(kThreads), shared, reinterpret_cast<cudaStream_t>(stream), args,
+        tableSize);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

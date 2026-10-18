@@ -132,7 +132,7 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
 
     CUdeviceptr base = 0;
     cuCheck(cuMemAlloc(&base, cellBytes + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes));
-    mMemory = CudaUniqPtr{reinterpret_cast<std::byte*>(base)};
+    mMemory = CudaUniqPtr<>{reinterpret_cast<std::byte*>(base)};
 
     for (auto offset : regionOffset)
     {

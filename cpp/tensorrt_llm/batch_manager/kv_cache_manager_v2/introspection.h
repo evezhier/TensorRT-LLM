@@ -79,10 +79,14 @@ public:
         std::vector<int32_t> residentOrdinal; //!< [layer][entry] after the resolve
         std::vector<int32_t> lruOrder;        //!< [layer][entry] after the resolve
         std::vector<int32_t> outSlot;         //!< [layer][width] entry per selection
-        std::vector<int32_t> missOrdinal;     //!< [layer][width], first missCount valid
-        std::vector<int32_t> missSlot;        //!< [layer][width], first missCount valid
-        std::vector<int32_t> missCount;       //!< [layer]
-        std::vector<int32_t> inFlightSlot;    //!< [layer][maxInFlightUnits]
+        //! The compacted work list, one per layer: [layer][rows * width], of which the
+        //! first missTotal[layer] are valid, in whatever order the CTAs raced to.
+        std::vector<int32_t> missRow;
+        std::vector<int32_t> missOrdinal;
+        std::vector<int32_t> missSlot;
+        std::vector<int32_t> missTotal;    //!< [layer] entries the list holds
+        std::vector<int32_t> missCount;    //!< [layer][row] entries that row contributed
+        std::vector<int32_t> inFlightSlot; //!< [layer][maxInFlightUnits]
     };
 
     static SparseResolveProbe sparseResolve(std::vector<int32_t> const& residentOrdinal,
@@ -98,15 +102,19 @@ public:
         int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
         uint32_t unitStride, int unitsPerPage, std::vector<int32_t> const& missOrdinal,
         std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
-        std::vector<int32_t> const& bufferLayer, bool writeBack);
+        std::vector<int32_t> const& bufferLayer, bool writeBack, int gridCtas);
 
     // White-box hook: the entries holding units a watermark move has just passed.
     // Synchronises.
     struct SparseFlushList
     {
-        std::vector<int32_t> ordinal; //!< [layer][maxFlushUnits]
-        std::vector<int32_t> slot;    //!< [layer][maxFlushUnits]
-        std::vector<int32_t> count;   //!< [layer]
+        //! The compacted list, one per layer: [layer][capacity], of which the first
+        //! total[layer] are valid, in whatever order the CTAs raced to.
+        std::vector<int32_t> row;
+        std::vector<int32_t> ordinal;
+        std::vector<int32_t> slot;
+        std::vector<int32_t> total; //!< [layer]
+        std::vector<int32_t> count; //!< [layer] entries this row contributed
     };
 
     static SparseFlushList sparseFlushList(std::vector<int32_t> const& residentOrdinal, int numLayers,

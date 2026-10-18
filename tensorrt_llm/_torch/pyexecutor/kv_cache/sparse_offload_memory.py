@@ -130,17 +130,14 @@ class SparseArenaShape:
 
     @property
     def lease_metadata_bytes(self) -> int:
-        """Bytes of one lease's recency, residency and write-back state."""
-        flush_entries = self.num_layers * _SPARSE_MAX_FLUSH_UNITS
-        max_flush_blocks = ceil_div(_SPARSE_MAX_FLUSH_UNITS, self.units_per_cell) + 1
+        """Bytes of one lease's residency and recency state.
+
+        The reservation only. A step's work lists belong to the Batch, not to a lease:
+        they are sized by the batch and reused by whichever requests are seated.
+        """
         arrays = (
             self.entries,  # residentOrdinal
             self.entries,  # lruOrder
-            flush_entries,  # flushOrdinal
-            flush_entries,  # flushSlot
-            self.num_layers,  # flushCount
-            2,  # flushRange
-            max_flush_blocks,  # flushPageSlice
         )
         return sum(_index_array_bytes(n) for n in arrays) + _SPARSE_CACHE_VIEW_BYTES
 
@@ -391,6 +388,8 @@ class SparseBatchShape:
     max_batch_size: int
     max_blocks_per_seq: int
     selection_widths: tuple[int, ...]
+    layer_counts: tuple[int, ...] = ()
+    flush_capacities: tuple[int, ...] = ()
 
     @property
     def mirror_bytes(self) -> int:
@@ -414,15 +413,26 @@ class SparseBatchShape:
 
     @property
     def fetch_scratch_bytes(self) -> int:
-        """Device bytes of the fetch's work arrays.
+        """Device bytes of a step's work arrays, for the fetch and the write-back both.
 
-        Per row and life cycle: three entries per selected unit, a miss count and
-        the unit in flight.
+        Per life cycle and row: one entry per selected unit, a miss count and the unit
+        in flight. Then the two compacted work lists, which carry a row, an ordinal and
+        a slot per entry plus one total per list: one list for the fetch, sized for every
+        row missing its whole selection, and one per layer for the write-back, sized by
+        the step's token budget.
         """
-        return sum(
-            _INDEX_BYTES * self.max_batch_size * (3 * width + 1 + _SPARSE_MAX_FLUSH_UNITS)
-            for width in self.selection_widths
-        )
+        rows = self.max_batch_size
+        layers = self.layer_counts or (0,) * len(self.selection_widths)
+        flush = self.flush_capacities or (rows,) * len(self.selection_widths)
+        total = 0
+        for width, num_layers, flush_capacity in zip(
+            self.selection_widths, layers, flush, strict=True
+        ):
+            total += rows * (width + 1 + _SPARSE_MAX_FLUSH_UNITS)
+            total += 3 * rows * width + 1
+            total += num_layers * (3 * flush_capacity + 1)
+            total += rows * num_layers
+        return _INDEX_BYTES * total
 
 
 def sparse_batch_shape(
@@ -431,6 +441,7 @@ def sparse_batch_shape(
     tokens_per_block: int,
     max_batch_size: int,
     max_blocks_per_seq: int,
+    max_total_input_tokens: int | None = None,
 ) -> SparseBatchShape:
     """Return the Batch a manager with ``layers`` steps its requests in.
 
@@ -439,15 +450,28 @@ def sparse_batch_shape(
         tokens_per_block: Tokens per page.
         max_batch_size: Rows of the Batch.
         max_blocks_per_seq: Pages the longest request can hold.
+        max_total_input_tokens: Tokens one step may ingest across every row. It sizes
+            the write-back's work lists: a row advancing ``t`` tokens crosses at most
+            ``t / unit_tokens + 1`` units. Left unset, a decode step is assumed, where
+            each row advances one token and so crosses at most one unit boundary.
     """
+    fetch_groups = list(_fetch_path_life_cycles(layers, tokens_per_block))
+
+    def flush_capacity(grouped_layers: Sequence[LayerConfig]) -> int:
+        if max_total_input_tokens is None:
+            return max_batch_size * _SPARSE_MAX_FLUSH_UNITS
+        unit_tokens = grouped_layers[0].sparse_cache.unit_tokens or tokens_per_block
+        return max_total_input_tokens // unit_tokens + max_batch_size
+
     return SparseBatchShape(
         num_life_cycles=len(life_cycle_pages(layers, tokens_per_block)),
         max_batch_size=max_batch_size,
         max_blocks_per_seq=max_blocks_per_seq,
         selection_widths=tuple(
-            grouped_layers[0].sparse_cache.num_selected_blocks
-            for grouped_layers in _fetch_path_life_cycles(layers, tokens_per_block)
+            grouped_layers[0].sparse_cache.num_selected_blocks for grouped_layers in fetch_groups
         ),
+        layer_counts=tuple(len(grouped_layers) for grouped_layers in fetch_groups),
+        flush_capacities=tuple(flush_capacity(grouped_layers) for grouped_layers in fetch_groups),
     )
 
 

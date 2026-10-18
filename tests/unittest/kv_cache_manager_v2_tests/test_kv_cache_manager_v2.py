@@ -1238,6 +1238,35 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.resident_ordinal[:2], [7, BAD_PAGE_INDEX])
         self.assertEqual(result.resident_ordinal[2 + result.out_slot[1]], 7)
 
+    def test_misses_compact_across_rows(self):
+        """Every row's misses land in one dense list, each entry naming its own row."""
+        # Three rows of two entries each; rows 0 and 2 miss, row 1 hits what it selects.
+        resident = (
+            [BAD_PAGE_INDEX, BAD_PAGE_INDEX]
+            + [4, BAD_PAGE_INDEX]
+            + [BAD_PAGE_INDEX, BAD_PAGE_INDEX]
+        )
+        result = self._resolve(resident, [3, 4, 5], num_rows=3, history_units=8)
+        self.assertEqual(result.miss_count, [1, 0, 1], "row 1 hits its selection")
+        self.assertEqual(
+            result.miss_total, [2], "the list holds exactly the misses, not a slot per row"
+        )
+
+        # Position says nothing about which row an entry came from, and the CTAs race, so
+        # the list is only defined as a set.
+        entries = {
+            (result.miss_row[i], result.miss_ordinal[i]) for i in range(result.miss_total[0])
+        }
+        self.assertEqual(entries, {(0, 3), (2, 5)})
+        for i in range(result.miss_total[0]):
+            row = result.miss_row[i]
+            slot = result.miss_slot[i]
+            self.assertEqual(
+                result.resident_ordinal[row * 2 + slot],
+                result.miss_ordinal[i],
+                "the entry names the cell the unit was given",
+            )
+
     def test_a_row_holding_no_reservation_is_skipped(self):
         """A free row, or one that has suspended, stages a default view the kernel skips."""
         resident = [BAD_PAGE_INDEX] * 4
@@ -1421,6 +1450,38 @@ class TestSparseUnitCopy(unittest.TestCase):
             buffer_layer=list(range(1)),
         )
         self.assertEqual(result[unit:], host[unit:])
+
+    def test_the_work_splits_across_the_grid(self):
+        """Giving the copy more CTAs only divides the work list, never changes the result."""
+        unit, units_per_page, misses = 16, 8, 5
+        page_stride = unit * units_per_page
+        host = self._pattern(page_stride)
+        # More warps than work on the last pass: the surplus must find nothing to do.
+        for grid_ctas in (1, 2, 4, 8):
+            with self.subTest(grid_ctas=grid_ctas):
+                result = _introspection.sparse_unit_copy(
+                    host_pool=host,
+                    host_page_stride=page_stride,
+                    page_table=[0],
+                    device_arena=[0] * page_stride,
+                    base_cell=0,
+                    num_blocks=1,
+                    cells_per_buffer=1,
+                    buffer_bytes=page_stride,
+                    num_chunks=1,
+                    chunk_bytes=unit,
+                    chunk_stride=0,
+                    unit_stride=unit,
+                    expansion=units_per_page,
+                    miss_ordinal=list(range(misses)),
+                    miss_slot=list(range(misses)),
+                    miss_count=[misses],
+                    selection_width=misses,
+                    buffer_layer=list(range(1)),
+                    grid_ctas=grid_ctas,
+                )
+                self.assertEqual(result[: unit * misses], host[: unit * misses])
+                self.assertEqual(result[unit * misses :], [0] * (page_stride - unit * misses))
 
 
 class TestSparseFetch(unittest.TestCase):
@@ -3182,8 +3243,14 @@ class TestSparseFlush(unittest.TestCase):
             max_flush_units=4,
         )
         self.assertEqual(result.count, [1], "only unit 7 is in [5, 11)")
+        self.assertEqual(
+            result.total, [1], "the list is compacted, so its total says how far it is filled"
+        )
         self.assertEqual(result.ordinal[0], 7)
         self.assertEqual(result.slot[0], 1)
+        self.assertEqual(
+            result.row[0], 0, "the entry carries its row, since position no longer does"
+        )
 
     def test_a_watermark_that_moved_nothing_lists_nothing(self):
         resident = [3, 7, 11, BAD_PAGE_INDEX]
@@ -3199,6 +3266,8 @@ class TestSparseFlush(unittest.TestCase):
             resident, num_layers=2, entries_per_layer=2, from_units=0, to_units=5, max_flush_units=2
         )
         self.assertEqual(result.count, [1, 0])
+        # One list per layer, each with its own counter, so layer 1's stays empty.
+        self.assertEqual(result.total, [1, 0])
         self.assertEqual(result.ordinal[0], 4)
 
     def test_write_back_inverts_the_fetch(self):

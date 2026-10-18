@@ -22,14 +22,17 @@
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 
@@ -385,13 +388,27 @@ void KvCacheManager::_buildSparseArenas()
     }
 }
 
-std::vector<SparseUnitCopyArgs> KvCacheManager::sparseCopyTemplates(LifeCycleId lifeCycle) const
+int32_t KvCacheManager::_sparseCopyGridCtas(int32_t workCapacity) const
+{
+    // Only the multiprocessor count is worth keeping: it is a device property behind a
+    // driver call, where the grid it feeds is two arithmetic steps a fetch can redo for
+    // every layer it resolves.
+    if (mSmCount == 0)
+    {
+        CUdevice device{};
+        cuCheck(cuCtxGetDevice(&device));
+        mSmCount = sparseCopyMultiprocessors(device);
+    }
+    return sparseCopyGridCtas(workCapacity, mSmCount);
+}
+
+std::vector<SparseCopyRun> KvCacheManager::sparseCopyTemplates(LifeCycleId lifeCycle) const
 {
     auto const plan = sparseBufferPlan(lifeCycle);
     TLLM_CHECK(!plan.empty());
     auto const& arena = mSparseArenas[lifeCycle];
 
-    std::vector<SparseUnitCopyArgs> templates;
+    std::vector<SparseCopyRun> templates;
     for (size_t begin = 0; begin < plan.size();)
     {
         auto const pool = plan[begin].poolIndex;
@@ -414,7 +431,7 @@ std::vector<SparseUnitCopyArgs> KvCacheManager::sparseCopyTemplates(LifeCycleId 
             }
         }
 
-        SparseUnitCopyArgs args;
+        SparseCopyRun args;
         // The page side is the life cycle's own hot pool. It is host memory, registered
         // device-mapped, so the kernel addresses it directly; but its layout is KVCM2's
         // rather than a codec's, which is what keeps the fetch independent of whatever a
@@ -424,20 +441,20 @@ std::vector<SparseUnitCopyArgs> KvCacheManager::sparseCopyTemplates(LifeCycleId 
         // buffer and the pool's slot size never enters. The base belongs to the index table
         // the run was declared in, which only the caller's Batch knows, so it is left unset
         // here.
-        args.hostPageStride = plan[begin].size;
+        args.hostPageStride = static_cast<uint32_t>(plan[begin].size);
         // The hot side is the cache arena, not a storage pool: a cell is the only GPU-resident
         // copy a kernel can read, and the arena is where cells live.
         args.deviceBase = arena.base(pool);
-        args.bufferBytes = arena.bufferBytes(pool);
+        args.bufferBytes = static_cast<uint32_t>(arena.bufferBytes(pool));
         args.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lifeCycle);
         args.cellsPerLease = arena.cellsPerLease(pool);
-        args.unitsPerPage = sparseCacheUnitsPerPage(lifeCycle);
         args.layout.numChunks = layout.numChunks;
         args.layout.chunkBytes = layout.chunkBytes;
         args.layout.chunkStride = layout.chunkStride;
         args.layout.unitStride = layout.unitStride;
         args.bufferBase = static_cast<int32_t>(begin);
         args.numBuffers = static_cast<int32_t>(end - begin);
+        args.width = sparseCopyWidth(args.layout, args.hostPageStride, args.bufferBytes);
         templates.push_back(args);
         begin = end;
     }
@@ -597,38 +614,26 @@ void KvCacheManager::writeBackSparseUnits(Batch& batch, LifeCycleId lifeCycle, C
     listArgs.numLayers = scratch.numLayers;
     listArgs.fromUnits = batch.flushRangeRow(lifeCycle);
     listArgs.toUnits = listArgs.fromUnits + numRows;
-    listArgs.outOrdinal = scratch.flushOrdinal;
-    listArgs.outSlot = scratch.flushSlot;
+    listArgs.work = scratch.flushWork;
     listArgs.outCount = scratch.flushCount;
-    listArgs.maxFlushUnits = scratch.maxFlushUnits;
     launchSparseFlushList(listArgs, stream);
 
-    // One pass per pool, each covering every layer of every row: a flush list is per layer,
-    // and a template's buffer run already spans as many layers as share its pool.
-    auto const plan = sparseBufferPlan(lifeCycle);
-    for (auto copy : sparseCopyTemplates(lifeCycle))
-    {
-        auto const& first = plan[static_cast<size_t>(copy.bufferBase)].id;
-        auto const run = batch.sparseIndexRun(first.layerId, first.role);
-        copy.hostBase = static_cast<CUdeviceptr>(run.base);
-        copy.pageTable = reinterpret_cast<int32_t const*>(run.table);
-        copy.pageTableStride = run.rowStride;
-        copy.pageTableEntryStride = run.entryStride;
-        copy.numBlocks = run.rowStride;
-        copy.pageTableBase = 0;
-        copy.views = views;
-        copy.numRows = numRows;
-        copy.direction = SparseCopyDirection::kWriteBack;
-        // The work list is every layer of this row, which is what a write-back crosses at
-        // once -- unlike a fetch, which resolves one layer across the batch.
-        copy.workOrdinal = scratch.flushOrdinal;
-        copy.workSlot = scratch.flushSlot;
-        copy.workCount = scratch.flushCount;
-        copy.workWidth = scratch.maxFlushUnits;
-        copy.workRowStride = scratch.numLayers;
-        copy.workRowBase = 0;
-        launchSparseUnitCopy(copy, stream);
-    }
+    // One launch for every pool and every layer: the descriptors the Batch built already
+    // say where each pool's buffers and index tables are, and a flush list is per layer.
+    SparseUnitCopyArgs copy;
+    copy.views = views;
+    copy.numRows = numRows;
+    copy.copyDesc = scratch.copyDesc;
+    copy.bufferBase = 0;
+    copy.numBuffers = scratch.numBuffers;
+    copy.direction = SparseCopyDirection::kWriteBack;
+    copy.unitsPerPage = sparseCacheUnitsPerPage(lifeCycle);
+    // The work list is every layer of this row, which is what a write-back crosses at
+    // once -- unlike a fetch, which resolves one layer across the batch.
+    copy.work = scratch.flushWork;
+    copy.bufferLayer = mSparseArenas[lifeCycle].bufferLayer();
+    copy.gridCtas = _sparseCopyGridCtas(scratch.flushWork.capacity);
+    launchSparseUnitCopy(copy, stream);
 }
 
 void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
@@ -676,48 +681,48 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
     resolve.outSlot = scratch.outSlot;
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
-    resolve.missOrdinal = scratch.missOrdinal;
-    resolve.missSlot = scratch.missSlot;
+    // The list is one, reused from layer to layer; the counter is this layer's own, so a
+    // step can clear every layer's at once instead of one clear before each resolve.
+    auto layerWork = scratch.fetchWork;
+    layerWork.total += layerInGroup;
+    resolve.work = layerWork;
     resolve.missCount = scratch.missCount;
     launchSparseResolve(resolve, stream);
 
     // The misses this layer produced, applied to each of its buffers. One list row per
     // batch row, so the inner index is zero once workRowBase names the layer resolved.
     //
-    // One pass per pool: a pool fixes the cell size and the slot stride, so each is its own
-    // launch. The templates span the life cycle, so each is clipped to this layer's buffers.
+    // One launch for every pool of this layer. The descriptors the Batch built already
+    // clip each pool to the layer's buffers and name its index table, so nothing here
+    // depends on which layer is being resolved beyond choosing the row.
+    SparseUnitCopyArgs copy;
+    copy.views = views;
+    copy.numRows = numRows;
+    // The same descriptors as the write-back: a run never spans layers, so it already
+    // names this layer's index table. Only the buffer range below differs.
+    copy.copyDesc = scratch.copyDesc;
+    copy.bufferBase = bufferBase;
+    copy.numBuffers = numBuffers;
+    copy.direction = SparseCopyDirection::kFetch;
+    copy.unitsPerPage = unitsPerPage;
+    copy.work = layerWork;
+    copy.bufferLayer = mSparseArenas[lcId].bufferLayer();
+    copy.gridCtas = _sparseCopyGridCtas(scratch.fetchWork.capacity);
+    launchSparseUnitCopy(copy, stream);
+
+    // The index table the attention kernel reads is derived from the resolve's slots alone:
+    // it neither reads a cell nor waits for one to be filled. The copy releases its launch
+    // dependency as soon as it is addressed, so this follows it on the stream without
+    // waiting for it to finish.
     auto const plan = sparseBufferPlan(lcId);
-    for (auto copy : sparseCopyTemplates(lcId))
+    for (auto const& pool : sparseCopyTemplates(lcId))
     {
-        auto const runBase = std::max(copy.bufferBase, bufferBase);
-        auto const runEnd = std::min(copy.bufferBase + copy.numBuffers, bufferBase + numBuffers);
+        auto const runBase = std::max(pool.bufferBase, bufferBase);
+        auto const runEnd = std::min(pool.bufferBase + pool.numBuffers, bufferBase + numBuffers);
         if (runBase >= runEnd)
         {
             continue;
         }
-        copy.bufferBase = runBase;
-        copy.numBuffers = runEnd - runBase;
-        copy.views = views;
-        copy.numRows = numRows;
-        // The run's buffers sit at consecutive entries of one request, so naming its first
-        // buffer positions the table for all of them.
-        auto const& first = plan[static_cast<size_t>(runBase)].id;
-        auto const run = batch.sparseIndexRun(first.layerId, first.role);
-        copy.hostBase = static_cast<CUdeviceptr>(run.base);
-        copy.pageTable = reinterpret_cast<int32_t const*>(run.table);
-        copy.pageTableStride = run.rowStride;
-        copy.pageTableEntryStride = run.entryStride;
-        copy.numBlocks = table.blocksPerRow;
-        copy.pageTableBase = 0;
-        copy.direction = SparseCopyDirection::kFetch;
-        copy.workOrdinal = scratch.missOrdinal;
-        copy.workSlot = scratch.missSlot;
-        copy.workCount = scratch.missCount;
-        copy.workWidth = selectionWidth;
-        copy.workRowStride = 1;
-        copy.workRowBase = layerInGroup;
-        launchSparseUnitCopy(copy, stream);
-
         SparseOutIndexArgs indices;
         indices.views = views;
         indices.numRows = numRows;
@@ -727,10 +732,10 @@ void KvCacheManager::fetchSparsePages(Batch& batch, std::vector<BufferId> const&
         indices.out = out;
         indices.outBuffers = numBuffers;
         indices.outBase = runBase - bufferBase;
-        indices.bufferBase = copy.bufferBase;
-        indices.numBuffers = copy.numBuffers;
-        indices.cellsPerBuffer = copy.cellsPerBuffer;
-        indices.cellsPerLease = copy.cellsPerLease;
+        indices.bufferBase = runBase;
+        indices.numBuffers = runEnd - runBase;
+        indices.cellsPerBuffer = pool.cellsPerBuffer;
+        indices.cellsPerLease = pool.cellsPerLease;
         indices.unitsPerPage = unitsPerPage;
         launchSparseOutIndices(indices, stream);
     }
