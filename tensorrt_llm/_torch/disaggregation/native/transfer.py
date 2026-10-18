@@ -961,7 +961,7 @@ class _SessionQuiescence:
 
 
 class Sender(SenderBase):
-    # Time-to-live for orphaned RecvReqInfo entries (seconds).
+    # Minimum time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
@@ -974,6 +974,7 @@ class Sender(SenderBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        request_info_timeout_s: Optional[float] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
@@ -981,6 +982,9 @@ class Sender(SenderBase):
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
         self._retirement_watchdog = retirement_watchdog
+        # Generation-first metadata can arrive while prefill is still queued.
+        # Keep it for at least the configured transfer timeout.
+        self._request_info_ttl_s = max(self._STALE_REQ_INFO_TTL_S, request_info_timeout_s or 0.0)
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -1074,7 +1078,7 @@ class Sender(SenderBase):
             stale_rids = [
                 rid
                 for rid, ts in self._peer_requests_timestamps.items()
-                if now - ts > self._STALE_REQ_INFO_TTL_S
+                if now - ts > self._request_info_ttl_s
             ]
         if not stale_rids:
             return
@@ -4757,6 +4761,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                request_info_timeout_s=self._config.tx_overall_timeout_s,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
