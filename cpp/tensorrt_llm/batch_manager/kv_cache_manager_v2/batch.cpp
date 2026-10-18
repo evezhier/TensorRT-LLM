@@ -1246,8 +1246,11 @@ void Batch::publish()
         mStagingRead.close();
     }
 
-    // Whole-table for now. Refreshing only the rows whose locks moved is an optimisation
-    // the design allows for: it degrades into a slower step, never a wrong answer.
+    // One transfer for the whole table, rather than one per row whose locks moved. The
+    // table is large but the copy is a single driver call on the upload stream, overlapping
+    // compute; per-row transfers would trade that for a launch apiece, and the driver cost
+    // of those dominates the bytes they save. Correctness does not depend on the choice --
+    // a narrower refresh would be slower to decide, never wrong.
     cuCheck(cuMemcpyHtoDAsync(staging, reinterpret_cast<void*>(mStaging->address()), _totalBytes(), upload));
     if (mScratchStaging)
     {
