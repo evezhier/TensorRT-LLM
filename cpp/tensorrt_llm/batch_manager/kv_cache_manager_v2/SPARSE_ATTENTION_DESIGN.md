@@ -611,6 +611,16 @@ of up to N times the selection width, so the reservation could no longer cover a
 unit evicted to make room for a later query token would invalidate an index already returned
 for an earlier one. Taking one row per token would make that reachable, not fix it.
 
+**What else is sized by this, and would need revisiting.** The restriction reaches further
+than the fetch. `maxInputLength()` returns one token, which makes
+`sparseCacheMaxInFlightUnits` one, which in turn sizes the write-back's per-row flush list
+and bounds how far one watermark move may travel. Those adapt on their own if the constant
+rises -- `flushSparseUnits()` refuses a span wider than the headroom, and the scan asserts
+the list cannot overrun. What does *not* adapt is throughput: the write-back is tuned on the
+assumption that a row has at most one unit to move, so it is given a single warp per
+request. Correct for any count, but once a flush list is long that warp is the long pole and
+wants the same treatment as the fetch.
+
 This is a difference in kind from the sparse implementations in this repository, not a gap in
 degree. Their sparse prefill is real — the context path reuses the generation kernel with
 per-token indices — but their indices point straight at a GPU-resident KV pool, and the
