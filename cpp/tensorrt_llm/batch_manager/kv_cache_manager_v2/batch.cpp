@@ -58,12 +58,11 @@ std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
 } // namespace
 
 Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int maxBlocksPerSeq,
-    std::optional<ExternalPageTable> pageTable, std::optional<PageIndexMode> mode,
-    std::vector<IndexTableRequest> indexTables, std::optional<int> maxTotalInputTokens)
+    std::optional<PageIndexMode> mode, std::vector<IndexTableRequest> indexTables,
+    std::optional<int> maxTotalInputTokens)
     : mManager(&manager)
     , mCudaStream(stream)
     , mMaxTotalInputTokens(maxTotalInputTokens)
-    , mPageTable(pageTable)
 {
     if (maxTotalInputTokens.has_value() && *maxTotalInputTokens <= 0)
     {
@@ -92,23 +91,9 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
                     : PageIndexMode::PER_LAYER);
     }
 
-    if (mPageTable)
-    {
-        if (mPageTable->host == nullptr)
-        {
-            throw std::invalid_argument("Batch: a borrowed page table needs a host address");
-        }
-        if (mPageTable->rowStride < mMaxBlocksPerSeq
-            || mPageTable->layerGroupStride < mPageTable->rowStride * mMaxBatchSize)
-        {
-            throw std::invalid_argument("Batch: borrowed page table strides are too small for its rows");
-        }
-    }
-
     // Page tables and watermarks are published together, so a kernel cannot read one step's
     // table beside another step's lengths -- an out-of-range read rather than a stale
-    // answer. When the page table is borrowed they travel as separate transfers on one
-    // stream, which orders them just as well.
+    // answer.
     auto const elements = _totalElements();
     mStaging = std::make_unique<HostMem>(_totalBytes());
     auto* staging = reinterpret_cast<int32_t*>(mStaging->address());
@@ -134,15 +119,7 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
 
     for (auto const base : {device, deviceStaging})
     {
-        if (_deviceBias() > 0)
-        {
-            // The borrowed rows are the lender's until a member takes one, so there is
-            // nothing to copy in yet; the table still has to read as absent until the
-            // first publish.
-            cuCheck(cuMemsetD32(base, static_cast<unsigned int>(kBadPageIndex.value()),
-                _rowElements() * static_cast<size_t>(mNumLayerGroups.value())));
-        }
-        cuCheck(cuMemcpyHtoD(base + _deviceBias(), staging, _totalBytes()));
+        cuCheck(cuMemcpyHtoD(base, staging, _totalBytes()));
     }
 
     _allocateStepScratch();
@@ -899,32 +876,9 @@ MemAddress Batch::indexTableBase(LayerId layerId, DataRole const& role) const
     return found->second.base;
 }
 
-int64_t Batch::_pageTableRowStride() const noexcept
-{
-    return mPageTable ? mPageTable->rowStride : static_cast<int64_t>(mMaxBlocksPerSeq);
-}
-
-int64_t Batch::_pageTableGroupStride() const noexcept
-{
-    return mPageTable ? mPageTable->layerGroupStride : static_cast<int64_t>(_rowElements());
-}
-
-size_t Batch::_deviceBias() const noexcept
-{
-    if (!mPageTable)
-    {
-        return 0;
-    }
-    // Aligned for the views, so adding this to a staging offset lands on the same field of
-    // the device block rather than one short of it.
-    auto const bytes = sizeof(int32_t) * _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
-    auto const align = alignof(SparseCacheView);
-    return (bytes + align - 1) / align * align;
-}
-
 size_t Batch::_deviceBytes() const noexcept
 {
-    return _deviceBias() + _totalBytes();
+    return _totalBytes();
 }
 
 void Batch::_drain() noexcept
@@ -943,8 +897,7 @@ void Batch::_drain() noexcept
 
 size_t Batch::_historyOffset() const noexcept
 {
-    // A borrowed table occupies none of the staged block, so the watermarks start it.
-    return mPageTable ? 0 : _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
+    return _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
 }
 
 size_t Batch::_capacityOffset() const noexcept
@@ -1007,10 +960,9 @@ void Batch::_seedRowWatermarks(int row, int historyLength, int capacity)
 
 int32_t* Batch::_stagingRow(LayerGroupId layerGroupId, int row) const
 {
-    auto* base = mPageTable ? mPageTable->host : reinterpret_cast<int32_t*>(mStaging->address());
-    auto const offset
-        = _pageTableGroupStride() * layerGroupId.value() + _pageTableRowStride() * static_cast<int64_t>(row);
-    return base + offset;
+    auto* base = reinterpret_cast<int32_t*>(mStaging->address());
+    return base + static_cast<int64_t>(_rowElements()) * layerGroupId.value()
+        + static_cast<int64_t>(mMaxBlocksPerSeq) * row;
 }
 
 int Batch::addKvCache(KvCache& kvCache, int requestedRow)
@@ -1018,11 +970,6 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     if (kvCache.mBatch != nullptr)
     {
         throw LogicError("A KvCache belongs to at most one Batch");
-    }
-    if (mPageTable && requestedRow < 0)
-    {
-        // Choosing one would address whichever request the lender seated there.
-        throw LogicError("A Batch borrowing a page table must be told which row a member occupies");
     }
     if (kvCache.beamWidth() != BeamIndex{1})
     {
@@ -1276,28 +1223,7 @@ void Batch::publish()
 
     // Whole-table for now. Refreshing only the rows whose locks moved is an optimisation
     // the design allows for: it degrades into a slower step, never a wrong answer.
-    if (mPageTable)
-    {
-        // One transfer per layer group rather than one for all of them: the lender's rows
-        // are further apart than they are wide, and its groups further apart still, so no
-        // single stride describes the source. Rows no member occupies are carried along
-        // because skipping them would cost a transfer each.
-        for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
-        {
-            CUDA_MEMCPY2D copy{};
-            copy.srcMemoryType = CU_MEMORYTYPE_HOST;
-            copy.srcHost = _stagingRow(lg, 0);
-            copy.srcPitch = sizeof(int32_t) * static_cast<size_t>(_pageTableRowStride());
-            copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-            copy.dstDevice = staging + sizeof(int32_t) * _rowElements() * static_cast<size_t>(lg.value());
-            copy.dstPitch = sizeof(int32_t) * static_cast<size_t>(mMaxBlocksPerSeq);
-            copy.WidthInBytes = sizeof(int32_t) * static_cast<size_t>(mMaxBlocksPerSeq);
-            copy.Height = static_cast<size_t>(mMaxBatchSize);
-            cuCheck(cuMemcpy2DAsync(&copy, upload));
-        }
-    }
-    cuCheck(cuMemcpyHtoDAsync(
-        staging + _deviceBias(), reinterpret_cast<void*>(mStaging->address()), _totalBytes(), upload));
+    cuCheck(cuMemcpyHtoDAsync(staging, reinterpret_cast<void*>(mStaging->address()), _totalBytes(), upload));
     if (mScratchStaging)
     {
         cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mScratchDevice.get()),
@@ -1324,6 +1250,19 @@ void Batch::waitPublished()
     mPublished.close();
 }
 
+HostPageTableView Batch::hostPageTable(LayerGroupId layerGroupId) const
+{
+    if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
+    {
+        throw std::out_of_range("Batch::hostPageTable: unknown layer group");
+    }
+    HostPageTableView view;
+    view.data = _stagingRow(layerGroupId, 0);
+    view.numRows = mMaxBatchSize;
+    view.blocksPerRow = mMaxBlocksPerSeq;
+    return view;
+}
+
 PageTableView Batch::pageTable(LayerGroupId layerGroupId) const
 {
     if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
@@ -1344,13 +1283,13 @@ CUdeviceptr Batch::sparseCacheViews(LayerGroupId layerGroupId) const
     {
         throw std::out_of_range("Batch::sparseCacheViews: unknown layer group");
     }
-    return reinterpret_cast<CUdeviceptr>(mDevice.get()) + _deviceBias() + _viewsOffsetBytes()
+    return reinterpret_cast<CUdeviceptr>(mDevice.get()) + _viewsOffsetBytes()
         + sizeof(SparseCacheView) * static_cast<size_t>(layerGroupId.value()) * static_cast<size_t>(mMaxBatchSize);
 }
 
 WatermarkView Batch::watermarks() const
 {
-    auto const base = reinterpret_cast<CUdeviceptr>(mDevice.get()) + _deviceBias();
+    auto const base = reinterpret_cast<CUdeviceptr>(mDevice.get());
     WatermarkView view;
     view.historyLength = base + sizeof(int32_t) * _historyOffset();
     view.capacity = base + sizeof(int32_t) * _capacityOffset();

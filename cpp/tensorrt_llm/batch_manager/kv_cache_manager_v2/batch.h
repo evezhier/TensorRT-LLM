@@ -48,32 +48,17 @@ struct PageTableView
     int32_t blocksPerRow = 0;
 };
 
-//! Host page-index storage owned by someone else, which a Batch's members write into
-//! instead of into staging of its own.
+//! One layer group's page table as the host writes it, in the Batch's pinned staging.
+//! Packed like the device one, and for the same reason: the Batch allocates it.
 //!
-//! The runtime already holds one of these -- the host offsets tensor the dense attention
-//! path fills -- and its rows carry exactly the numbers a member would otherwise write
-//! somewhere else as well. Since a KvCache can write to only one buffer at a time, having
-//! two means handing the binding back and forth every step. Pointing the member at the
-//! runtime's row instead leaves one buffer with one writer, and the binding then survives
-//! the whole decode.
-//!
-//! Only the host side is borrowed. The device table stays the Batch's own, because
-//! publish() must produce a snapshot: without one the host could not write a row until
-//! every kernel that reads it had finished, which for a captured graph means the end of the
-//! forward. The lender's own device mirror is no substitute -- it is read by no captured
-//! kernel today, which is what lets its upload overlap the previous step, and sharing it
-//! would give that up.
-//!
-//! Rows are laid out `[layer_group][row][block]` with the strides below. A row is usually
-//! longer than the Batch's `blocksPerRow`, since the lender's tensor carries a key/value
-//! dimension this table does not use.
-struct ExternalPageTable
+//! A consumer that needs these indices for its own purposes reads this rather than lending
+//! the Batch storage of its own. One buffer with one writer is what keeps a member's
+//! binding alive for the whole decode; which side allocates it never mattered to that.
+struct HostPageTableView
 {
-    int32_t* host = nullptr;
-    //! Elements between consecutive layer groups, and between consecutive rows of one.
-    int64_t layerGroupStride = 0;
-    int64_t rowStride = 0;
+    int32_t* data = nullptr;
+    int32_t numRows = 0;
+    int32_t blocksPerRow = 0;
 };
 
 //! Identifies one converted index table of a Batch.
@@ -161,12 +146,6 @@ public:
     //! none were declared -- a pool-sizing hint is not a batch bound, so it is only a
     //! default, never an inference.
     //!
-    //! @param pageTable borrowed host page-index storage. When absent the Batch stages its
-    //! own, which is what a caller with no runtime tensor to share wants. When present its
-    //! rows must be addressable for every (layer group, row) this Batch can reach, and the
-    //! rows become the lender's -- so addKvCache needs to be told which one a member
-    //! occupies rather than choosing. The device table is the Batch's either way.
-    //!
     //! @param mode page index mode, applied to every life cycle. Left unset, each life
     //! cycle takes the smaller table -- SHARED where the manager says it is always
     //! available, PER_LAYER otherwise.
@@ -194,8 +173,8 @@ public:
     //! crosses at most one unit boundary. Pass it once a step can ingest more than that,
     //! which is what chunked prefill under in-flight batching does.
     explicit Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
-        std::optional<ExternalPageTable> pageTable = std::nullopt, std::optional<PageIndexMode> mode = std::nullopt,
-        std::vector<IndexTableRequest> indexTables = {}, std::optional<int> maxTotalInputTokens = std::nullopt);
+        std::optional<PageIndexMode> mode = std::nullopt, std::vector<IndexTableRequest> indexTables = {},
+        std::optional<int> maxTotalInputTokens = std::nullopt);
 
     //! The stream the Batch and every member run on, fixed at construction.
     [[nodiscard]] CUstream cudaStream() const noexcept
@@ -357,6 +336,9 @@ public:
 
     [[nodiscard]] PageTableView pageTable(LayerGroupId layerGroupId) const;
 
+    //! One layer group's page table on the host, as a publish will upload it.
+    [[nodiscard]] HostPageTableView hostPageTable(LayerGroupId layerGroupId) const;
+
     //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
     //!
     //! A device array of SparseCacheView, indexed by row. A free row, or a member whose
@@ -404,18 +386,8 @@ private:
     //! Called by a member being destroyed, so its row does not dangle.
     void _detach(KvCache& kvCache) noexcept;
 
-    //! Host-side page-index row for one (layer group, row): inside the pinned staging block
-    //! when the table is this Batch's, inside the lender's when it is borrowed.
+    //! Host-side page-index row for one (layer group, row), inside the pinned staging block.
     [[nodiscard]] int32_t* _stagingRow(LayerGroupId layerGroupId, int row) const;
-
-    //! Element strides of the host page-index rows, whoever owns them.
-    [[nodiscard]] int64_t _pageTableRowStride() const noexcept;
-    [[nodiscard]] int64_t _pageTableGroupStride() const noexcept;
-
-    //! Bytes the device page table occupies ahead of the row state, when the staged block
-    //! does not carry one. Zero otherwise, so every staging offset reaches its device
-    //! counterpart by adding this and nothing else.
-    [[nodiscard]] size_t _deviceBias() const noexcept;
 
     //! Bytes of a device block: the page table, the row state and the views.
     [[nodiscard]] size_t _deviceBytes() const noexcept;
@@ -562,7 +534,6 @@ private:
 
     //! Set when the page-index table is borrowed, in which case mStaging and mDevice hold
     //! only the watermarks and cache views.
-    std::optional<ExternalPageTable> mPageTable;
 
     //! Pinned so the members' index writes land here with no extra copy, and so the
     //! publish is a single asynchronous transfer per layer group.

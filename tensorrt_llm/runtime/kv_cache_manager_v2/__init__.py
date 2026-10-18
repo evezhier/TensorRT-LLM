@@ -152,7 +152,6 @@ ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 ScratchDesc = _cpp.ScratchDesc
 Batch = _cpp.Batch
-ExternalPageTable = _cpp.ExternalPageTable
 IndexTableRequest = _cpp.IndexTableRequest
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
@@ -258,7 +257,6 @@ __all__ = [
     "ReuseScope",
     "ScratchDesc",
     "Batch",
-    "ExternalPageTable",
     "IndexTableRequest",
     "KVCacheIterationStatsDelta",
     "ReusedBlocksByLevel",

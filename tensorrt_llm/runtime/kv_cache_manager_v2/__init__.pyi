@@ -829,44 +829,6 @@ def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
     consumes an explicitly supplied codec, including an attempt that fails.
     """
 
-class ExternalPageTable:
-    """Host page-index storage a :class:`Batch`'s members write into.
-
-    The runtime already holds one of these -- the host block-offsets tensor the dense
-    attention path fills -- and its rows carry exactly the numbers a member would otherwise
-    write somewhere else as well. A ``_KVCache`` can write to only one buffer at a time, so
-    two of them means handing the binding back and forth every step. Pointing the member at
-    the runtime's row instead leaves one buffer with one writer, and the binding survives
-    the whole decode.
-
-    ``host`` addresses an ``int32`` array laid out as ``[layer_group][row][block]`` with the
-    given element strides. A row is longer than ``max_blocks_per_seq`` when the table is a
-    plane of a wider array, which is the usual case: the runtime's tensor carries a
-    key/value dimension the ``Batch`` does not use.
-
-    Only the host side is lent. The device table stays the ``Batch``'s own, because
-    :meth:`Batch.publish` has to produce a snapshot: without one the host could not write a
-    row until every kernel reading it had retired, which for a captured graph means the end
-    of the forward. The lender's own device mirror is no substitute either -- no captured
-    kernel reads it today, which is what lets its upload overlap the previous step, and
-    sharing it would give that up.
-
-    The lender owns the rows. A row no member occupies is left as the lender had it,
-    because it is serving one of the lender's other requests; and a member must be removed
-    from the ``Batch`` before the lender reassigns the row it sits in.
-    """
-
-    def __init__(
-        self,
-        host: int,
-        layer_group_stride: int,
-        row_stride: int,
-    ) -> None: ...
-    @property
-    def layer_group_stride(self) -> int: ...
-    @property
-    def row_stride(self) -> int: ...
-
 class IndexTableRequest:
     """Buffers a consumer must address from one table, under one base pointer.
 
@@ -908,7 +870,6 @@ class Batch:
         stream: CudaStream,
         max_batch_size: int = 0,
         max_blocks_per_seq: int = 0,
-        page_table: ExternalPageTable | None = None,
         mode: PageIndexMode | None = None,
         index_tables: Sequence[IndexTableRequest] = (),
         max_total_input_tokens: int | None = None,
@@ -931,10 +892,10 @@ class Batch:
         manager's ``constraints``, which fails when none were declared. A pool-sizing hint
         is a default, never a substitute for a batch bound.
 
-        ``page_table`` borrows the page-index storage instead of allocating it, which
-        leaves one buffer with one writer and takes the page indices out of
-        :meth:`publish`. Its rows then belong to the lender, so :meth:`add_kv_cache` has to
-        be told which one a member occupies.
+        The batch stages the host page indices itself; :meth:`host_page_table` exposes
+        them for a consumer that needs the same numbers. One buffer with one writer is what
+        keeps a member's binding alive for the whole decode, and which side allocates it
+        never mattered to that.
 
         ``mode`` applies to every life cycle. Left unset, each takes the smaller table:
         ``SHARED`` where the manager reports it always available, ``PER_LAYER`` otherwise.
@@ -1119,6 +1080,14 @@ class Batch:
         rather than through the members is the sanctioned path. For the operations with no
         ``Batch`` equivalent the simple rule is to call this once at the top of a step: it
         is idempotent and free once the copy has landed.
+        """
+
+    def host_page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
+        """``int32[max_batch, max_blocks_per_seq]`` base page indices, on the host.
+
+        A DLPack array over the pinned staging the members write into, which a consumer
+        needing the same indices reads instead of keeping a buffer of its own. It keeps the
+        ``Batch`` alive for as long as the array exists.
         """
 
     def page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:

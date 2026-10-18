@@ -48,7 +48,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
-        ExternalPageTable,
         GpuCacheTierConfig,
         HostCacheTierConfig,
         IndexTableRequest,
@@ -103,7 +102,6 @@ else:
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
-        ExternalPageTable,
         GpuCacheTierConfig,
         HostCacheTierConfig,
         IndexTableRequest,
@@ -2201,24 +2199,18 @@ class TestIndexMode(unittest.TestCase):
             manager.shutdown()
 
 
-class TestBorrowedPageTable(unittest.TestCase):
-    """Batch(page_table=...): page indices written into storage someone else owns.
+class TestBatchPageTable(unittest.TestCase):
+    """The Batch's own host page-index staging: who writes it, and what publish does with it.
 
-    The runtime already holds a table of these numbers and uploads it every step, so a
-    Batch that keeps its own stages and publishes the same values twice -- and leaves a
-    member's indices with two places to live, which is what forces the binding to be
-    handed back and forth within a step. Borrowing collapses both.
+    A member writes its indices into the Batch's row and nowhere else, which is what keeps
+    one buffer with one writer and a binding that survives the whole decode. A consumer
+    needing the same numbers reads host_page_table() rather than keeping a buffer of its
+    own.
     """
 
     ROWS = 2
     BLOCKS = 4
     GROUPS = 1
-    # Wider than the part the Batch describes, as a plane of the runtime's tensor is: its
-    # rows carry a key/value dimension this table does not use.
-    ROW_STRIDE = 2 * BLOCKS
-    GROUP_STRIDE = ROWS * ROW_STRIDE
-    #: Neither a page index nor BAD_PAGE_INDEX, so "the lender still owns this" is visible.
-    UNTOUCHED = 12345
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -2227,26 +2219,15 @@ class TestBorrowedPageTable(unittest.TestCase):
         try:
             import torch
         except ImportError:  # pragma: no cover - fast mode without torch
-            raise unittest.SkipTest("torch is needed to lend device memory")
+            raise unittest.SkipTest("torch is needed to read the staging as an array")
         return torch
 
     @contextlib.contextmanager
-    def _fixture(self, *, borrow: bool = True):
-        """A manager and a Batch, lending it a table unless asked not to."""
+    def _fixture(self):
+        """A manager and a Batch staging its own page indices."""
         torch = self._torch()
         manager = TestSparseFetch._manager(("key",))
         try:
-            elements = self.GROUPS * self.GROUP_STRIDE
-            host = torch.full((elements,), self.UNTOUCHED, dtype=torch.int32).pin_memory()
-            table = (
-                ExternalPageTable(
-                    host=host.data_ptr(),
-                    layer_group_stride=self.GROUP_STRIDE,
-                    row_stride=self.ROW_STRIDE,
-                )
-                if borrow
-                else None
-            )
             # The stream belongs to the fixture because the Batch takes it at construction:
             # a member joins the stream it was built for, so one cannot outlive the other.
             with TemporaryCudaStream([]) as stream:
@@ -2257,15 +2238,15 @@ class TestBorrowedPageTable(unittest.TestCase):
                     max_batch_size=self.ROWS,
                     max_blocks_per_seq=self.BLOCKS,
                     index_tables=manager.sparse_index_table_requests(),
-                    page_table=table,
                 )
-                yield torch, manager, batch, host, handle
+                yield torch, manager, batch, handle
         finally:
             manager.shutdown()
 
-    def _row(self, host, row: int, group: int = 0):
-        beg = group * self.GROUP_STRIDE + row * self.ROW_STRIDE
-        return host[beg : beg + self.ROW_STRIDE].tolist()
+    def _row(self, torch, batch, manager, row: int, group: int = 0):
+        lg = manager.get_layer_group_id(group)
+        host = torch.from_dlpack(batch.host_page_table(lg))
+        return host[row].tolist()
 
     @contextlib.contextmanager
     def _member(self, manager, batch, row: int, handle):
@@ -2287,41 +2268,28 @@ class TestBorrowedPageTable(unittest.TestCase):
                 batch.remove_kv_cache(cache)
             cache.close()
 
-    def test_a_member_writes_its_indices_into_the_row_it_was_given(self):
-        """The lender chose the row, so the indices must land in that one and no other."""
-        with self._fixture() as (torch, manager, batch, host, handle):
+    def test_a_member_writes_its_indices_into_its_own_row(self):
+        """The row it was seated in, and no other."""
+        with self._fixture() as (torch, manager, batch, handle):
             lg = manager.get_layer_group_id(0)
             with self._member(manager, batch, 1, handle) as cache:
                 expected = [int(x) for x in cache.get_base_page_indices(lg)][: self.BLOCKS]
-                self.assertEqual(self._row(host, 1)[: self.BLOCKS], expected)
+                self.assertEqual(self._row(torch, batch, manager, 1), expected)
                 # A page index, not the fill: the member really has pages here.
-                self.assertNotEqual(expected[0], self.UNTOUCHED)
-
-    def test_the_lender_keeps_every_element_the_batch_was_not_given(self):
-        """Everything outside a member's own row stays as the lender left it.
-
-        Row 0 serves one of the lender's own requests, and the columns past
-        max_blocks_per_seq are its key/value half. Writing either would corrupt a request
-        this Batch has never heard of.
-        """
-        with self._fixture() as (torch, manager, batch, host, handle):
-            with self._member(manager, batch, 1, handle):
-                self.assertEqual(self._row(host, 0), [self.UNTOUCHED] * self.ROW_STRIDE)
+                self.assertNotEqual(expected[0], BAD_PAGE_INDEX)
+                # The row nobody occupies still reads as absent.
                 self.assertEqual(
-                    self._row(host, 1)[self.BLOCKS :],
-                    [self.UNTOUCHED] * (self.ROW_STRIDE - self.BLOCKS),
+                    self._row(torch, batch, manager, 0), [BAD_PAGE_INDEX] * self.BLOCKS
                 )
 
-    def test_publish_packs_the_borrowed_rows_into_the_device_table(self):
-        """The device table is the Batch's own and packed, whatever the host rows look like.
+    def test_the_host_view_is_what_publish_uploads(self):
+        """The device table is a snapshot of the host rows, row for row.
 
         It is copied rather than read in place because publish() is a snapshot: the host
         has to be free to write the next step's rows long before the kernels reading this
-        step's have retired. Row 1 of a row_stride-wide source must land at row 1 of a
-        blocks_per_seq-wide destination, so a publish that ignored the source pitch would
-        put a member's indices in some other member's row.
+        step's have retired.
         """
-        with self._fixture() as (torch, manager, batch, host, handle):
+        with self._fixture() as (torch, manager, batch, handle):
             lg = manager.get_layer_group_id(0)
             with self._member(manager, batch, 1, handle):
                 # _member's resize() already published; republishing needs the wait.
@@ -2330,13 +2298,10 @@ class TestBorrowedPageTable(unittest.TestCase):
                 torch.cuda.synchronize()
                 table = _introspection.batch_page_table(batch, lg)
                 self.assertEqual(len(table), self.ROWS * self.BLOCKS)
-                expected = self._row(host, 1)[: self.BLOCKS]
+                expected = self._row(torch, batch, manager, 1)
                 self.assertEqual(table[self.BLOCKS : 2 * self.BLOCKS], expected)
-                self.assertNotEqual(expected[0], self.UNTOUCHED)
-                # Every row travels, including ones the lender keeps for its own
-                # requests: skipping them would cost a transfer each. Nothing reads
-                # them, because a free row's cache view has no residency.
-                self.assertEqual(table[: self.BLOCKS], [self.UNTOUCHED] * self.BLOCKS)
+                self.assertNotEqual(expected[0], BAD_PAGE_INDEX)
+                self.assertEqual(table[: self.BLOCKS], [BAD_PAGE_INDEX] * self.BLOCKS)
 
     def test_publishing_over_a_publish_in_flight_is_refused(self):
         """A wait here would be too late, so it is the caller's to make.
@@ -2346,7 +2311,7 @@ class TestBorrowedPageTable(unittest.TestCase):
         itself. Waiting inside publish() would cover only the second, and would do it while
         hiding that a member mutated before the call had already raced.
         """
-        with self._fixture(borrow=False) as (torch, manager, batch, _host, handle):
+        with self._fixture() as (torch, manager, batch, handle):
             with self._member(manager, batch, 0, handle):
                 # _member's resize() published and nobody has waited on it.
                 with self.assertRaises(Exception) as caught:
@@ -2356,24 +2321,13 @@ class TestBorrowedPageTable(unittest.TestCase):
                 batch.wait_published()
                 batch.publish()
 
-    def test_a_borrowed_batch_refuses_to_choose_a_row(self):
-        """Choosing one would address whichever request the lender seated there."""
-        with self._fixture() as (torch, manager, batch, _host, _handle):
-            cache = manager.create_kv_cache()
-            try:
-                with self.assertRaises(Exception) as caught:
-                    batch.add_kv_cache(cache)
-                self.assertIn("must be told which row", str(caught.exception))
-            finally:
-                cache.close()
-
     def test_a_member_refuses_a_second_page_index_buffer(self):
         """Its indices live in the Batch's row, so a second buffer is refused.
 
         That buffer would take the writes with it and strand the row at whatever it held
         when the cache joined -- silently, which is the one outcome worth a hard failure.
         """
-        with self._fixture(borrow=False) as (torch, manager, batch, _host, handle):
+        with self._fixture() as (torch, manager, batch, handle):
             lg = manager.get_layer_group_id(0)
             with self._member(manager, batch, 0, handle) as cache:
                 self.assertEqual(cache.batch_row, 0)
@@ -2388,13 +2342,15 @@ class TestBorrowedPageTable(unittest.TestCase):
         Doing that while seated would write a row a publish may still be reading, so the
         member leaves first and the row is cleared by the removal.
         """
-        with self._fixture() as (torch, manager, batch, host, handle):
+        with self._fixture() as (torch, manager, batch, handle):
             with self._member(manager, batch, 1, handle) as cache:
                 with self.assertRaisesRegex(Exception, "remove it from the Batch first"):
                     cache.suspend()
                 batch.remove_kv_cache(cache)
                 self.assertEqual(cache.batch_row, -1)
-                self.assertEqual(self._row(host, 1)[: self.BLOCKS], [BAD_PAGE_INDEX] * self.BLOCKS)
+                self.assertEqual(
+                    self._row(torch, batch, manager, 1), [BAD_PAGE_INDEX] * self.BLOCKS
+                )
                 cache.suspend()
 
 
