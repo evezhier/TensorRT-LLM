@@ -2670,6 +2670,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "int32[max_batch] per-row capacity, in tokens. Published with history_lengths().")
 
         .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
+        .def_prop_ro("num_kv_caches", &kv::Batch::numKvCaches, "Members seated, which is the rows occupied.")
+        .def_prop_ro("is_contiguous", &kv::Batch::isContiguous,
+            "Whether the occupied rows are exactly [0, num_kv_caches).\n\n"
+            "A Batch does not require it: removing a member leaves its row free and the next join "
+            "takes the lowest free one, so a hole is legal and transient. An engine that maps rows "
+            "onto its own request slots usually does require it, and asking here beats keeping a "
+            "mirror of the membership to check against.")
         .def_prop_ro(
             "cuda_stream", [](kv::Batch const& self) { return reinterpret_cast<intptr_t>(self.cudaStream()); },
             "The stream the Batch and every member run on, fixed at construction.")

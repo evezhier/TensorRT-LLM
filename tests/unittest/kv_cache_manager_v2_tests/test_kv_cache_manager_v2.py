@@ -3437,6 +3437,42 @@ class TestBatch(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_membership_is_countable_and_a_hole_is_visible(self):
+        """An engine mapping rows onto request slots asks the Batch, not a mirror of it."""
+        manager = self._manager()
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                self.assertEqual(batch.num_kv_caches, 0)
+                self.assertTrue(batch.is_contiguous, "an empty batch has no hole")
+
+                caches = [manager.create_kv_cache() for _ in range(3)]
+                for cache in caches:
+                    self.assertTrue(cache.resume(handle))
+                    batch.add_kv_cache(cache)
+                self.assertEqual(batch.num_kv_caches, 3)
+                self.assertTrue(batch.is_contiguous)
+
+                # A hole is legal, and is exactly what an engine wants to be told about.
+                batch.remove_kv_cache(caches[1])
+                self.assertEqual(batch.num_kv_caches, 2)
+                self.assertFalse(batch.is_contiguous)
+
+                # Refilling it closes the hole; dropping the tail never opens one.
+                batch.add_kv_cache(caches[1])
+                self.assertTrue(batch.is_contiguous)
+                batch.remove_kv_cache(caches[2])
+                self.assertEqual(batch.num_kv_caches, 2)
+                self.assertTrue(batch.is_contiguous)
+
+                for cache in caches:
+                    if batch.row_of(cache) >= 0:
+                        batch.remove_kv_cache(cache)
+                    cache.close()
+        finally:
+            manager.shutdown()
+
     def test_rows_are_slots_so_a_hole_is_reused(self):
         manager = self._manager()
         try:

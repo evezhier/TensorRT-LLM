@@ -375,6 +375,17 @@ public:
     //! Row of a member, or -1.
     [[nodiscard]] int rowOf(KvCache const& kvCache) const;
 
+    //! Members seated, which is the rows occupied.
+    [[nodiscard]] int numKvCaches() const noexcept;
+
+    //! Whether the occupied rows are exactly [0, numKvCaches()).
+    //!
+    //! A Batch does not require it. Removing a member leaves its row free and the next join
+    //! takes the lowest free one, so a hole is legal and transient. An engine that maps rows
+    //! onto its own request slots usually does require it, and asking here beats keeping a
+    //! mirror of the membership to check against -- a mirror can disagree, this cannot.
+    [[nodiscard]] bool isContiguous() const noexcept;
+
     [[nodiscard]] int maxBatchSize() const noexcept
     {
         return mMaxBatchSize;

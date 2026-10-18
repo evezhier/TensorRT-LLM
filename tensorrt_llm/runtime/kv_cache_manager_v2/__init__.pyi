@@ -977,6 +977,20 @@ class Batch:
         """Row of a member, or ``-1``."""
 
     @property
+    def num_kv_caches(self) -> int:
+        """Members seated, which is the rows occupied."""
+
+    @property
+    def is_contiguous(self) -> bool:
+        """Whether the occupied rows are exactly ``[0, num_kv_caches)``.
+
+        A batch does not require it: removing a member leaves its row free and the next
+        join takes the lowest free one, so a hole is legal and transient. An engine that
+        maps rows onto its own request slots usually does require it, and asking here beats
+        keeping a mirror of the membership to check against.
+        """
+
+    @property
     def cuda_stream(self) -> CudaStream:
         """The stream this batch and every member run on, fixed at construction."""
 

@@ -1312,6 +1312,20 @@ WatermarkView Batch::watermarks() const
     return view;
 }
 
+int Batch::numKvCaches() const noexcept
+{
+    return static_cast<int>(
+        std::count_if(mRows.begin(), mRows.end(), [](KvCache const* row) { return row != nullptr; }));
+}
+
+bool Batch::isContiguous() const noexcept
+{
+    // Nothing occupied past the first free row is the same thing as a prefix, and says so
+    // without counting first.
+    auto const firstFree = std::find(mRows.begin(), mRows.end(), nullptr);
+    return std::none_of(firstFree, mRows.end(), [](KvCache const* row) { return row != nullptr; });
+}
+
 int Batch::rowOf(KvCache const& kvCache) const
 {
     return kvCache.mBatch == this ? kvCache.mBatchRow : -1;
