@@ -7,7 +7,9 @@ reservation and device state; the write-back at `resize()`; `fetch_sparse_pages`
 `prepare_sparse_write_indices`; sparse buffers across more than one pool; sparsity as a pool
 attribute, so one layer may hold both sparse and dense buffers.
 
-**Pending**: compression is reachable but not turned on.
+**Pending**: nothing. Compression is a separate feature, configured through
+`KvCacheCompressionConfig` rather than through anything here, and needs nothing
+sparse-specific -- see *Compression*.
 
 Out of scope, by decision rather than by omission: prefill, which a separate instance serves,
 and speculative decoding — see *Supported scope*; and per-KV-head selection, which no
@@ -529,11 +531,25 @@ pool group really is `HOST_MEM` so that it cannot pass by accidentally describin
 one. Nothing in the fetch path is involved, which is the point -- it reads hot pages, which
 are never the compressed form.
 
-No compressing codec ships here, and none is needed to make the claim: compression lives
-behind `IKvCacheColdPageCodec`, so "can sparse history be compressed" reduces to "does a
-sparse page reach the codec", and it now does. What remains is the question the codec has
-always posed and this design does not answer: whether a lossy codec is acceptable for KV
-history, and under what accuracy budget.
+**The two are decoupled deliberately.** Compression is configured by
+`KvCacheCompressionConfig`, not by `SparseAttentionConfig`, on the stated grounds that
+compression changes *which KV is stored* while sparsity changes *which KV is read*. A
+storage-bound method provides a native cold-page codec that KVCM2 retains and invokes
+(`_util.py`, `cold_page_codec_provider`); an iteration-driven one runs on the
+resource-manager cycle instead. Neither knows anything about this package.
+
+Two algorithms ship: `quantization_for_cold_page`, which stores host and disk pages as
+NVFP4 while leaving the active GPU cache alone, and `triattention`, which evicts tokens
+periodically during decode.
+
+So "can sparse history be compressed" reduces to "does a sparse page reach the codec", and
+it does. Worth stating precisely which pages, because two true sentences sound like one:
+sparse history is *hot* -- host-backed, but hot -- and a cold-page codec compresses pages
+on their way to a **cold** tier. Sparse history is therefore compressed once demoted, at
+which point the codec applies with nothing sparse-specific, and not before.
+
+What remains is the question the codec has always posed and this design does not answer:
+whether a lossy codec is acceptable for KV history, and under what accuracy budget.
 
 ## Fetch
 
