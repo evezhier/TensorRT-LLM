@@ -3932,8 +3932,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache.batch_row >= 0:
             # A member's page indices belong to its Batch row; binding a second buffer
             # would take the writes with it and strand that row at whatever it held when
-            # the cache joined. When the Batch borrows this tensor the row is the one this
-            # method would have bound, so nothing is lost by leaving it alone.
+            # the cache joined. Adapters that need separate host tables must snapshot
+            # the Batch's rows before those tables are consumed.
             return
         index = self.index_mapper.get_index(request_id)
         for beam_idx in range(int(kv_cache.beam_width)):

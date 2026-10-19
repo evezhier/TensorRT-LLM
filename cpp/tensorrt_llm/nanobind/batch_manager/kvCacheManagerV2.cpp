@@ -2532,6 +2532,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "remove_row", [](kv::Batch& self, int row) { return self.removeKvCache(row); }, nb::arg("row"),
             "The same, by the row add_kv_cache returned. None when nothing is seated there, so a "
             "caller sweeping rows need not ask twice about each one.")
+        .def("reorder", &kv::Batch::reorder, nb::arg("kv_caches"), nb::call_guard<nb::gil_scoped_release>(),
+            "Pack every current member into the supplied order without releasing its sparse cache lease. "
+            "Requires every member exactly once. Waits for the previous staging upload; publish() "
+            "makes the new row order visible on the device.")
         .def(
             "index_mode",
             [](kv::Batch const& self, int layerGroupId) { return self.indexMode(kv::LayerGroupId{layerGroupId}); },

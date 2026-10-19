@@ -1808,7 +1808,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        self._release_sparse_batch()
+        self._sparse_batch_prepared = False
+        if self._sparse_batch is not None:
+            self._sparse_batch.wait_published()
         if self._enable_kv_cache_offload and any(
             not (request.is_first_context_chunk and request.is_last_context_chunk)
             for request in scheduled_batch.context_requests
@@ -1848,10 +1850,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _prepare_sparse_batch(self, request_ids: list[int]) -> None:
         """Publish scheduled caches in model input order before a forward.
 
-        The allocation persists across steps and CUDA graph profiles. Membership lasts
-        until the post-forward resource update: Batch temporarily owns every member's
-        host page-index buffers, including the dense SWA and indexer groups. Returning
-        those buffers before scheduler mutations keeps the legacy tables up to date.
+        Continuing requests keep their Batch membership and sparse GPU residency across
+        steps. Members write their page indices into Batch staging; the legacy SWA and
+        indexer tables receive a snapshot after scheduling and row reordering.
         """
         if not self._enable_kv_cache_offload or not any(
             self._compress_ratios[layer] == DEEPSEEK_V4_SPARSE_RATIO for layer in self.pp_layers
@@ -1896,9 +1897,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             )
         batch = self._sparse_batch
         try:
+            batch.wait_published()
+            self._release_sparse_batch(
+                request_id for request_id in self._sparse_batch_members if request_id not in caches
+            )
             for request_id, cache in caches.items():
-                batch.add_kv_cache(cache)
-                self._sparse_batch_members[request_id] = cache
+                if request_id not in self._sparse_batch_members:
+                    batch.add_kv_cache(cache)
+                    self._sparse_batch_members[request_id] = cache
+            batch.reorder(list(caches.values()))
+            self._sparse_batch_members = caches
+            self._refresh_sparse_page_index_bufs()
             stream = torch.cuda.current_stream(self._stream.device)
             # Reusing the device mirror follows the previous forward. Publish on
             # the cache stream so metadata preparation can also join it there.
@@ -1929,13 +1938,36 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             raise ValueError("Attention request order does not match the published sparse Batch")
         return self._sparse_batch
 
-    def _release_sparse_batch(self) -> None:
-        """Return host page-index ownership before updating or releasing request caches."""
-        self._sparse_batch_prepared = False
+    def _refresh_sparse_page_index_bufs(self) -> None:
+        """Snapshot Batch-owned indices for the legacy SWA and indexer consumers."""
+        if not self._sparse_batch_members:
+            return
+        assert self._sparse_batch is not None
+        indices = torch.tensor(
+            [
+                self.index_mapper.get_index(request_id) * self.max_beam_width
+                for request_id in self._sparse_batch_members
+            ],
+            dtype=torch.long,
+            device="cpu",
+        )
+        for pool_id in range(self.num_pools):
+            table = torch.from_dlpack(self._sparse_batch.coalesced_page_table(pool_id))
+            self.host_kv_cache_block_offsets[pool_id, :, 0, :].index_copy_(
+                0, indices, table[: len(self._sparse_batch_members)]
+            )
+
+    def _release_sparse_batch(self, request_ids: Iterable[int] | None = None) -> None:
+        """Detach departing requests while retaining other members' GPU cache leases."""
         if self._sparse_batch is None:
             return
         self._sparse_batch.wait_published()
-        for request_id, cache in list(self._sparse_batch_members.items()):
+        request_ids = list(self._sparse_batch_members if request_ids is None else request_ids)
+        for request_id in request_ids:
+            cache = self._sparse_batch_members.get(request_id)
+            if cache is None:
+                continue
+            self._sparse_batch_prepared = False
             self._sparse_batch.remove_kv_cache(cache)
             del self._sparse_batch_members[request_id]
             # Removal restores the cache's internal indices. Rebind the runtime's
@@ -1943,17 +1975,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._set_page_index_bufs(request_id, cache)
 
     def suspend_request(self, req: llm_request.LlmRequest) -> None:
-        self._release_sparse_batch()
+        self._release_sparse_batch([req.py_request_id])
         self._order_sparse_history_update([req])
         super().suspend_request(req)
 
     def free_resources(self, request: llm_request.LlmRequest, pin_on_release: bool = False) -> None:
-        self._release_sparse_batch()
+        self._release_sparse_batch([request.py_request_id])
         self._order_sparse_history_update([request])
         super().free_resources(request, pin_on_release)
 
     def release_index_slot(self, request_id: int) -> None:
-        self._release_sparse_batch()
+        self._release_sparse_batch([request_id])
         super().release_index_slot(request_id)
 
     def shutdown(self) -> None:
@@ -1977,8 +2009,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """Order writeback after all model producers and attention readers.
 
         The executor orders its calling stream after model forward.
-        Join it onto the cache stream before resize writes back completed units
-        or recycles pages. prepare_sparse_batch() supplies the reverse dependency
+        Join it onto the cache stream before flushing completed units or resizing
+        request caches. prepare_sparse_batch() supplies the reverse dependency
         for the next forward.
         """
         if not self._enable_kv_cache_offload:
@@ -1997,7 +2029,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._stream.wait_stream(torch.cuda.current_stream(self._stream.device))
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        self._release_sparse_batch()
+        self._release_sparse_batch(
+            request.py_request_id for request in scheduled_batch.context_requests
+        )
         self._order_sparse_history_update(scheduled_batch.context_requests)
         super().update_context_resources(scheduled_batch)
 
@@ -2012,10 +2046,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         nothing.
         """
         if self._enable_kv_cache_offload:
+            if self._sparse_batch is not None:
+                self._sparse_batch.wait_published()
             cache = self.kv_cache_map.get(req.py_request_id)
             if cache is not None and cache.is_active and cache.capacity > cache.history_length:
                 return True
         return super().try_allocate_generation(req)
+
+    def revert_allocate_generation(self, req: llm_request.LlmRequest) -> None:
+        if self._sparse_batch is not None:
+            self._sparse_batch.wait_published()
+        super().revert_allocate_generation(req)
 
     def update_forward_resources(
         self, scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
@@ -2030,12 +2071,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if not self._enable_kv_cache_offload or not scheduled_batch.generation_requests:
             return
         wait_for_input_copy()
-        # Before the batch is released and before any history moves: the write-back reads
+        self._order_sparse_history_update(scheduled_batch.generation_requests)
+        # Before any history moves: the write-back reads
         # the converted indices the Batch published, so it has to run while the members are
         # still seated. A row that is not advancing repeats its own history, which asks for
         # nothing.
         batch = self._sparse_batch
         if batch is not None:
+            batch.wait_published()
             histories = [0] * batch.max_batch_size
             for cache in self._sparse_batch_members.values():
                 row = batch.row_of(cache)
@@ -2050,8 +2093,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     histories[row] = cache.history_length + 1
             batch.flush_sparse_units(histories)
 
-        self._release_sparse_batch()
-        self._order_sparse_history_update(scheduled_batch.generation_requests)
+        # The flush watermark belongs to the attached Batch row. Keep membership
+        # until resize has checked it and advanced the request's history.
         for request in scheduled_batch.generation_requests:
             request_id = request.py_request_id
             cache = self.kv_cache_map.get(request_id)
@@ -2066,6 +2109,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     f"to {history_length} tokens after model forward"
                 )
             self._allocated_draft_lens.pop(request_id, None)
+        self._sparse_batch_prepared = False
 
     def update_resources(
         self,
