@@ -118,6 +118,25 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
     return mask
 
 
+@dataclass(frozen=True, kw_only=True)
+class MlaLatentWriteTarget:
+    """Where ``mla_rope_generation`` stores each token's new latent row.
+
+    By default the row goes to the token's position in the paged cache. A
+    target instead stores it in one row of a flat row array, such as a sparse
+    cache arena: pool 0 of ``pool_pointers`` starts at the array, the layer's
+    ``pool_mapping`` row selects pool 0, and each request owns a one-token page
+    whose block offset in ``block_offsets`` [1, requests, 2, 1] is its row.
+    ``write_slots`` [tokens] is 0 for a token to store and -1 for a token to
+    skip, such as CUDA graph padding.
+    """
+
+    block_offsets: torch.Tensor
+    pool_pointers: torch.Tensor
+    pool_mapping: torch.Tensor
+    write_slots: torch.Tensor
+
+
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
@@ -2604,6 +2623,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
         fuse_fp4_q_quant: bool = False,
+        latent_write_target: Optional[MlaLatentWriteTarget] = None,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2625,6 +2645,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_done_elsewhere (bool): Run the Q half only; the KV half already ran, hoisted onto an aux stream. Mutually exclusive with kv_only. With both halves done, do not call this at all.
             quant_scale_qkv (torch.Tensor): Non-None means q_nope in quant_q_buffer is already FP8, so the kernel drops the q_nope quantize rows from its grid.
             fuse_fp4_q_quant (bool): Quantize Q in the fused FP4 RoPE/cache update.
+            latent_write_target (MlaLatentWriteTarget): Store the new latent rows there instead of in the paged cache.
         """
 
         assert self.is_mla_enable and self.mla_params is not None
@@ -2635,6 +2656,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self._ensure_rope_table_size(metadata.max_seq_len)
 
         if self.uses_fp4_mla_attention:
+            if latent_write_target is not None:
+                raise NotImplementedError(
+                    "FP4 MLA generation cannot store its latent outside the paged cache"
+                )
             self._fp4_mla_rope_generation(
                 fused_q,
                 q_pe,
@@ -2647,7 +2672,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
-        if metadata._helix_spec_tokens_valid:
+        block_offsets = metadata.kv_cache_block_offsets
+        pool_pointers = metadata.kv_cache_manager.kv_cache_pool_pointers
+        pool_mapping = metadata.kv_cache_manager.kv_cache_pool_mapping
+        layer_idx = self.get_local_layer_idx(metadata)
+        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+        if latent_write_target is not None:
+            if metadata._helix_spec_tokens_valid or kv_norm_weight is not None:
+                raise NotImplementedError(
+                    "A latent write target needs the per-token write slots, which Helix "
+                    "speculative verify groups and the fused KV norm do not leave free"
+                )
+            # Each request's one-token page is the target row; the per-token slot
+            # 0 addresses it, and -1 skips the token.
+            helix_tensor_params.append(latent_write_target.write_slots)
+            block_offsets = latent_write_target.block_offsets
+            pool_pointers = latent_write_target.pool_pointers
+            pool_mapping = latent_write_target.pool_mapping
+            layer_idx = 0
+            tokens_per_block = 1
+        elif metadata._helix_spec_tokens_valid:
             # Speculative verify groups: per-token KV write slots (-1 = this
             # rank does not own the token's position). The append kernel then
             # gates and addresses per token instead of per sequence.
@@ -2668,9 +2712,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_lens_runtime,  # host_past_key_value_lengths
             metadata.prompt_lens_cpu_runtime,  # host_context_lengths,
             metadata.num_contexts,
-            metadata.kv_cache_block_offsets,
-            metadata.kv_cache_manager.kv_cache_pool_pointers,
-            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            block_offsets,
+            pool_pointers,
+            pool_mapping,
             None,  # kv_scale_orig_quant
             None,  # kv_scale_quant_orig
             getattr(self, "_nvfp4_mla_kv_scale_orig_quant", None),
@@ -2678,12 +2722,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.block_ids_per_seq,
             helix_tensor_params,
             self.predicted_tokens_per_seq,
-            self.get_local_layer_idx(metadata),
+            layer_idx,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             getattr(metadata.kv_cache_manager, "mla_kv_cache_residual_dim", 0),
-            metadata.kv_cache_manager.tokens_per_block,
+            tokens_per_block,
             metadata.max_seq_len,  # attention_window_size
             metadata.beam_width,
             self.quant_mode,

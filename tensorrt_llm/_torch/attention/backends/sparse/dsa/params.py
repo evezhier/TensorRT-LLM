@@ -43,6 +43,7 @@ class DSAMetadataParams(SparseMetadataParams):
     mtp_index_share: bool = False
     use_self_sampling_topk: bool = True
     use_gvr_emission: bool = False
+    enable_kv_cache_offload: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class DSAParams(SparseParams):
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True
     mtp_index_share: bool = False
+    enable_kv_cache_offload: bool = False
 
     @property
     def indices_block_size(self) -> int:

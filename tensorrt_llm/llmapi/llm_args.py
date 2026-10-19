@@ -1386,6 +1386,41 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         description=
         "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
         "it each step. Defaults to the model's HF config value.")
+    enable_kv_cache_offload: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Offload the sparse attention KV history to host memory with KV cache "
+        "manager v2. Each decode step fetches the units the indexer selects "
+        "into a per-request GPU cache; the indexer cache remains on GPU. Only "
+        "a decode-only worker, such as the generation worker of a "
+        "disaggregated deployment, can offload.")
+    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
+        default_factory=SparseKvCacheOffloadConfig,
+        status="prototype",
+        description="Memory sizing for KV cache offload. Applies only with "
+        "enable_kv_cache_offload.")
+
+    @model_validator(mode="after")
+    def _validate_kv_cache_offload(self):
+        """Reject offload sizing without offload and a non-positive top-k.
+
+        ``index_topk`` may still be None here; the checkpoint fills it later.
+        """
+        if self.enable_kv_cache_offload:
+            if self.index_topk is not None and self.index_topk <= 0:
+                raise ValueError(
+                    "KV cache offload requires a positive index_topk.")
+        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
+            raise ValueError("kv_cache_offload_config requires "
+                             "enable_kv_cache_offload=True.")
+        return self
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        if not self.enable_kv_cache_offload:
+            return None
+        return self.kv_cache_offload_config
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -1518,6 +1553,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
                 pretrained_config, kwargs.get("layer_idx")),
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
                                         False)),
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1553,6 +1589,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             has_shared_indexer_layers=has_shared_indexer_layers,
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
                                         False)),
+            enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
 
 
@@ -1590,13 +1627,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         description=
         "Offload ratio-4 compressed attention KV history to host memory with "
         "KV cache manager v2. The indexer and sliding-window caches remain on "
-        "GPU. This feature is under development and currently cannot be "
-        "enabled for inference.")
-    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
-        default_factory=SparseKvCacheOffloadConfig,
-        status="prototype",
-        description="Memory sizing for KV cache offload. Applies only with "
-        "enable_kv_cache_offload.")
+        "GPU. Only a decode-only worker, such as the generation worker of a "
+        "disaggregated deployment, can offload.")
 
     @field_validator("index_head_dim")
     @classmethod
@@ -1616,7 +1648,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return [1 if ratio == 0 else ratio for ratio in compress_ratios]
 
     @model_validator(mode="after")
-    def validate_kv_cache_offload(self) -> "DeepSeekV4SparseAttentionConfig":
+    def _validate_deepseek_v4_kv_cache_offload(
+            self) -> "DeepSeekV4SparseAttentionConfig":
         if self.enable_kv_cache_offload:
             if 4 not in self.compress_ratios:
                 raise ValueError(
@@ -1626,16 +1659,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
                 raise ValueError(
                     "DeepSeek-V4 KV cache offload requires a positive index_topk."
                 )
-        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
-            raise ValueError("kv_cache_offload_config requires "
-                             "enable_kv_cache_offload=True.")
         return self
-
-    def get_kv_cache_offload_config(
-            self) -> Optional[SparseKvCacheOffloadConfig]:
-        if not self.enable_kv_cache_offload:
-            return None
-        return self.kv_cache_offload_config
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"

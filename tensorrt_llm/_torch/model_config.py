@@ -1128,6 +1128,12 @@ class ModelConfig(Generic[TConfig]):
                         use_gvr_emission = sparse_attention_config.use_gvr_emission
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
+                        offload_kwargs = {
+                            'enable_kv_cache_offload':
+                            sparse_attention_config.enable_kv_cache_offload,
+                            'kv_cache_offload_config':
+                            sparse_attention_config.kv_cache_offload_config,
+                        }
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -1142,6 +1148,7 @@ class ModelConfig(Generic[TConfig]):
                         use_gvr_emission = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
+                        offload_kwargs = {}
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -1160,7 +1167,8 @@ class ModelConfig(Generic[TConfig]):
                             use_gvr_emission=use_gvr_emission,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
-                            index_share_for_mtp_iteration)
+                            index_share_for_mtp_iteration,
+                            **offload_kwargs)
                 elif pretrained_config.architectures[
                         0] == "DeepseekV4ForCausalLM":
                     if cls._is_deepseek_v4_base_checkpoint(checkpoint_dir):

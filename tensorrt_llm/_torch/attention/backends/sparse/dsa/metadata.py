@@ -20,6 +20,7 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
+from ..offload import SparseOffloadState, allocate_sparse_offload_state
 from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -234,8 +235,89 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+        self._init_dsa_sparse_offload_state()
+
+    def _init_dsa_sparse_offload_state(self) -> None:
+        """Validate the fixed offload configuration and allocate its persistent state.
+
+        Besides the shared offload state, the MLA latent writer gets a one-token
+        page table [1, B, 2, 1] and per-token write slots [B]: the writer stores
+        each request's new latent row at its arena write row through them.
+        """
+        self.sparse_offload_state: Optional[SparseOffloadState] = None
+        self.sparse_latent_block_offsets: Optional[torch.Tensor] = None
+        self.sparse_latent_write_slots: Optional[torch.Tensor] = None
+        self.sparse_offload_attn_indices: Optional[torch.Tensor] = None
+        manager = self.kv_cache_manager
+        if not (
+            self.sparse_metadata_params.enable_kv_cache_offload and is_dsa_cache_manager(manager)
+        ):
+            return
+        if (
+            self.beam_width != 1
+            or manager.max_beam_width != 1
+            or self.max_draft_tokens
+            or manager.max_draft_len
+            or manager.max_total_draft_tokens
+            or self.draft_kv_cache_manager is not None
+        ):
+            raise NotImplementedError(
+                "Sparse offload requires single-beam, non-speculative execution"
+            )
+        # History policies are bound after manager construction, before metadata
+        # initialization. Validate them once here, not on each batch.
+        manager._validate_sparse_history_policy()
+        layers = manager.get_sparse_offload_descriptors()
+        if self.sparse_mla_topk <= 0 or self.sparse_mla_topk != manager._sparse_offload_topk:
+            raise ValueError("Sparse offload metadata must match the configured positive top-k")
+        batch = manager.max_batch_size
+
+        def allocate(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            return self.get_empty(
+                self.cuda_graph_buffers,
+                shape,
+                dtype=dtype,
+                cache_name=f"dsa_sparse_offload_{name}",
+                capture_graph=self.is_cuda_graph,
+            )
+
+        # Native fetch always processes every Batch row, including for smaller
+        # graph profiles. Its selection width is fixed by the layer's sparse_cache.
+        self.sparse_offload_state = allocate_sparse_offload_state(
+            allocate, layers, max_batch_size=batch, topk=self.sparse_mla_topk
+        )
+        self.sparse_latent_block_offsets = allocate(
+            "latent_block_offsets", (1, batch, 2, 1), torch.int32
+        )
+        self.sparse_latent_block_offsets.fill_(-1)
+        self.sparse_latent_write_slots = allocate("latent_write_slots", (batch,), torch.int32)
+        self.sparse_latent_write_slots.fill_(-1)
+        self.sparse_offload_attn_indices = allocate(
+            "attn_indices", (batch, self.sparse_mla_topk), torch.int32
+        )
+
+    def _validate_dsa_sparse_offload_batch(self) -> None:
+        """Reject batches offload cannot run, on the host before any model writes.
+
+        An offloading worker only decodes, one query token per request.
+        """
+        state = self.sparse_offload_state
+        state.prepared = False
+        state.is_prefill = False
+        if self.num_contexts:
+            raise NotImplementedError(
+                "DSA KV cache offload runs decode batches only; context requests reach "
+                "an offloading worker through disaggregated KV transfer"
+            )
+        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
+            raise ValueError("Sparse offload batch validation requires host sequence lengths")
+        if not torch.equal(self.seq_lens, self.seq_lens_kv) or not torch.all(self.seq_lens == 1):
+            raise NotImplementedError("Sparse offload decode requires one query per request")
 
     def prepare(self):
+        if self.sparse_offload_state is not None:
+            self._validate_dsa_sparse_offload_batch()
+            self.kv_cache_manager.prepare_sparse_batch(self.request_ids)
         super().prepare()
         self._invalidate_pool_view_cache()
 
@@ -273,6 +355,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
+
+        if self.sparse_offload_state is not None:
+            self.kv_cache_manager.prepare_sparse_offload(
+                self.sparse_offload_state, self.request_ids, beam_width=self.beam_width
+            )
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""

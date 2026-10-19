@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ..offload_kernels import check_sparse_offload_tensor
+
 ########################################################
 # Index gather kernel
 ########################################################
@@ -302,7 +304,7 @@ def deepseek_v4_local_to_global_indices(
     num_tokens = req_id.shape[0]
     num_swa_indices = swa_local_indices.shape[1]
     if active_request_count is not None:
-        _check_sparse_offload_tensor(active_request_count, "active_request_count", 1, req_id.device)
+        check_sparse_offload_tensor(active_request_count, "active_request_count", 1, req_id.device)
         if active_request_count.shape != (1,):
             raise ValueError("active_request_count must be [1]")
 
@@ -336,7 +338,7 @@ def deepseek_v4_local_to_global_indices(
                 "Sparse indices require a compressed layer, all mappings and an active count"
             )
         for tensor, name, ndim in sparse_tensors:
-            _check_sparse_offload_tensor(tensor, name, ndim, req_id.device)
+            check_sparse_offload_tensor(tensor, name, ndim, req_id.device)
         sparse_batch_size, width = compressed_fetched_indices.shape
         sparse_num_lengths = compressed_lengths.numel()
         if (
@@ -350,7 +352,7 @@ def deepseek_v4_local_to_global_indices(
             )
         if compressed_local_indices is None:
             raise ValueError("Sparse index preparation requires the original top-k selection")
-        _check_sparse_offload_tensor(
+        check_sparse_offload_tensor(
             compressed_local_indices, "compressed_local_indices", 2, req_id.device
         )
         if compressed_local_indices.shape != (num_tokens, num_compressed_indices):
@@ -517,128 +519,3 @@ def deepseek_v4_local_to_global_indices(
     if split_extra:
         return out, out_extra
     return out
-
-
-def _check_sparse_offload_tensor(
-    tensor: torch.Tensor, name: str, ndim: int, device: torch.device
-) -> None:
-    if tensor.dtype != torch.int32 or tensor.ndim != ndim:
-        raise ValueError(f"{name} must be a {ndim}D int32 tensor")
-    if not tensor.is_cuda or tensor.device != device:
-        raise ValueError(f"{name} must be on CUDA device {device}")
-
-
-@triton.jit(do_not_specialize=["num_lengths"])
-def _select_sparse_history_units_kernel(
-    topk_ptr,
-    request_rows_ptr,
-    active_request_count_ptr,
-    compressed_lengths_ptr,
-    history_lengths_ptr,
-    out_ptr,
-    topk_stride0,
-    topk_stride1,
-    request_rows_stride,
-    compressed_lengths_stride,
-    history_lengths_stride,
-    out_stride0,
-    out_stride1,
-    NUM_REQUESTS: tl.constexpr,
-    num_lengths,
-    TOPK: tl.constexpr,
-    UNIT_TOKENS: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    query = tl.program_id(0)
-    active_count = tl.load(active_request_count_ptr)
-    request = tl.load(request_rows_ptr + query * request_rows_stride)
-    active = (query < active_count) & (request >= 0) & (request < active_count)
-    active = active & (request < NUM_REQUESTS) & (request < num_lengths)
-    length = tl.load(compressed_lengths_ptr + request * compressed_lengths_stride, active, other=0)
-    history = tl.load(history_lengths_ptr + request * history_lengths_stride, active, other=0)
-    k = tl.arange(0, BLOCK_K)
-    unit = tl.load(topk_ptr + query * topk_stride0 + k * topk_stride1, k < TOPK, other=-1)
-    valid = (unit >= 0) & (unit < length) & (unit < history // UNIT_TOKENS)
-    # Each live query owns a distinct Batch row. Keep top-k positions, including
-    # holes left by in-flight units, so fetch output has the same slot meaning.
-    tl.store(
-        out_ptr + request * out_stride0 + k * out_stride1,
-        tl.where(valid, unit, -1),
-        mask=active & (k < TOPK),
-    )
-
-
-def select_sparse_history_units(
-    topk_indices: torch.Tensor,
-    request_rows: torch.Tensor,
-    active_request_count: torch.Tensor,
-    compressed_lengths: torch.Tensor,
-    history_lengths: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    unit_tokens: int,
-) -> None:
-    """Mask non-history selections and put query rows into native Batch order.
-
-    All tensors are CUDA int32 on one device. ``topk_indices`` is [Q, K] in
-    compressed-row units, with distinct nonnegative selections per live row.
-    ``request_rows`` [Q] maps live queries to a permutation of the active Batch
-    prefix, one query per request. ``active_request_count`` [1] excludes graph
-    padding. ``compressed_lengths`` [R] is in request order and may cover fewer
-    rows than the native Batch capacity B. ``history_lengths`` [B] is the
-    Batch-owned, published history watermark in original tokens.
-
-    ``out`` is caller-owned [B, K], disjoint from the inputs. Only ordinals below
-    both the compressed length and history_lengths // unit_tokens are fetched.
-    Top-k order and padding positions are preserved; in-flight units and invalid
-    selections become -1. Unused Batch rows are overwritten with -1 on every
-    call, including when a graph's Q is smaller than B. No tensor allocation,
-    host read, or synchronization is performed.
-    """
-    device = out.device
-    for tensor, name, ndim in (
-        (topk_indices, "topk_indices", 2),
-        (request_rows, "request_rows", 1),
-        (active_request_count, "active_request_count", 1),
-        (compressed_lengths, "compressed_lengths", 1),
-        (history_lengths, "history_lengths", 1),
-        (out, "out", 2),
-    ):
-        _check_sparse_offload_tensor(tensor, name, ndim, device)
-    num_requests, width = out.shape
-    num_queries, topk = topk_indices.shape
-    if unit_tokens <= 0:
-        raise ValueError("unit_tokens must be positive")
-    if topk != width:
-        raise ValueError("top-k width must match the configured sparse selection width")
-    if request_rows.shape != (num_queries,) or active_request_count.shape != (1,):
-        raise ValueError("request_rows must be [Q] and active_request_count must be [1]")
-    if history_lengths.shape != (num_requests,):
-        raise ValueError("history_lengths must cover the native Batch capacity")
-    if not num_queries <= compressed_lengths.numel() <= num_requests:
-        raise ValueError("Query and compressed-length rows must fit the native Batch capacity")
-
-    with torch.cuda.device(device):
-        # Clear separately: padded queries can carry stale or invalid request IDs,
-        # and a smaller graph may leave native Batch rows without any query.
-        out.fill_(-1)
-        if num_queries == 0 or topk == 0:
-            return
-        _select_sparse_history_units_kernel[(num_queries,)](
-            topk_indices,
-            request_rows,
-            active_request_count,
-            compressed_lengths,
-            history_lengths,
-            out,
-            *topk_indices.stride(),
-            request_rows.stride(0),
-            compressed_lengths.stride(0),
-            history_lengths.stride(0),
-            *out.stride(),
-            NUM_REQUESTS=num_requests,
-            num_lengths=compressed_lengths.numel(),
-            TOPK=topk,
-            UNIT_TOKENS=unit_tokens,
-            BLOCK_K=triton.next_power_of_2(topk),
-        )

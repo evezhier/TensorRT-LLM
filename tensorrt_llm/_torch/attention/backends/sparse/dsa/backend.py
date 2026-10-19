@@ -18,9 +18,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
     MLAParams,
     PositionalEmbeddingParams,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import MlaLatentWriteTarget, TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..offload_kernels import merge_sparse_arena_indices
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -182,6 +183,14 @@ class DSATrtllmAttention(TrtllmAttention):
                     : topk_indices.shape[1],
                 ].copy_(topk_indices)
 
+        if self.sparse_params.enable_kv_cache_offload:
+            if not is_generation:
+                raise NotImplementedError(
+                    "DSA KV cache offload runs decode batches only; context requests reach "
+                    "an offloading worker through disaggregated KV transfer"
+                )
+            return self._sparse_offload_arena_indices(topk_indices, metadata, forward_args), None
+
         local_layer_idx = self.get_local_layer_idx(metadata)
         kv_cache_dtype = getattr(metadata.kv_cache_manager, "dtype", None)
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4 and not is_generation:
@@ -265,6 +274,83 @@ class DSATrtllmAttention(TrtllmAttention):
             return compact_indices, None
 
         return topk_indices_global, None
+
+    def _sparse_offload_arena_indices(
+        self,
+        topk_indices: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> torch.Tensor:
+        """Fetch this layer's selected history and return its latent arena rows.
+
+        The selection holds token ordinals in query order, one query per request.
+        History tokens come from the fetch, the token written this step from its
+        write row, and attention reads both through the layer's arena base.
+        """
+        state = metadata.sparse_offload_state
+        if state is None or state.write_layer != self.layer_idx:
+            raise RuntimeError("Write this layer's latent row before sparse attention")
+        if metadata.num_contexts:
+            raise NotImplementedError("DSA KV cache offload runs decode batches only")
+        num_tokens = topk_indices.shape[0]
+        topk = metadata.sparse_mla_topk
+        topk_indices = topk_indices[:, :topk]
+        request_rows = metadata.req_idx_per_token[:num_tokens]
+        kv_lengths = metadata.kv_lens_cuda[: metadata.num_seqs]
+        fetched = metadata.kv_cache_manager.fetch_sparse_indices(
+            state, self.layer_idx, topk_indices, request_rows, kv_lengths
+        )
+        descriptor = state.layers[self.layer_idx]
+        data_index = descriptor.data_buffer_index
+        indices = merge_sparse_arena_indices(
+            topk_indices,
+            request_rows,
+            state.active_request_count,
+            kv_lengths,
+            state.history_lengths,
+            fetched[:, data_index, :],
+            state.write_indices[len(descriptor.buffer_ids)][:, data_index],
+            metadata.sparse_offload_attn_indices[:num_tokens],
+            unit_tokens=descriptor.unit_tokens,
+        )
+        forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = descriptor.arena_base_addresses[
+            data_index
+        ]
+        return indices
+
+    def mla_rope_generation(
+        self,
+        fused_q: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
+        latent_cache: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        *args,
+        **kwargs,
+    ) -> None:
+        """Store the new latent row in the layer's arena when the latent is offloaded."""
+        state = getattr(metadata, "sparse_offload_state", None)
+        if not self.sparse_params.enable_kv_cache_offload or state is None:
+            return super().mla_rope_generation(
+                fused_q, q_pe, latent_cache, metadata, *args, **kwargs
+            )
+        manager = metadata.kv_cache_manager
+        write_indices = manager.prepare_sparse_write_indices(state, self.layer_idx)
+        data_index = state.layers[self.layer_idx].data_buffer_index
+        write_rows = write_indices[:, data_index]
+        # One token per request, in Batch row order: each request's one-token page
+        # is its write row. A row without a unit in flight writes nothing.
+        metadata.sparse_latent_block_offsets[0, :, 0, 0].copy_(write_rows)
+        num_tokens = latent_cache.shape[0]
+        write_slots = metadata.sparse_latent_write_slots[:num_tokens]
+        write_slots.copy_((write_rows[:num_tokens] >= 0).to(torch.int32) - 1)
+        pool_pointers, pool_mapping = manager.get_sparse_latent_write_pool(self.layer_idx)
+        kwargs["latent_write_target"] = MlaLatentWriteTarget(
+            block_offsets=metadata.sparse_latent_block_offsets,
+            pool_pointers=pool_pointers,
+            pool_mapping=pool_mapping,
+            write_slots=write_slots,
+        )
+        return super().mla_rope_generation(fused_q, q_pe, latent_cache, metadata, *args, **kwargs)
 
     def _remap_topk_to_global(
         self,

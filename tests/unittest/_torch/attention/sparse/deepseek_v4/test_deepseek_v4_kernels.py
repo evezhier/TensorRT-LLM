@@ -20,6 +20,8 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.kernels import (
     deepseek_v4_local_to_global_indices,
+)
+from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import (
     select_sparse_history_units,
 )
 

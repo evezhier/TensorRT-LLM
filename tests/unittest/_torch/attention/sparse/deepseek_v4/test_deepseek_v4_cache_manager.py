@@ -21,18 +21,17 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.backends.sparse import offload as sparse_offload
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     cache_manager as deepseek_v4_cache,
-)
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.offload import (
-    SparseOffloadPaddingRegion,
 )
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
 )
+from tensorrt_llm._torch.attention.backends.sparse.offload import SparseOffloadPaddingRegion
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
@@ -629,7 +628,7 @@ def test_sparse_offload_descriptors_reject_unpaired_nvfp4_arenas(invalid):
         )
     else:
         manager.impl.configure_buffers(41, [(main, 1)])
-    with pytest.raises(ValueError, match="Sparse NVFP4 COMPRESS"):
+    with pytest.raises(ValueError, match="block-scale buffer|data and scale arenas"):
         manager.get_sparse_offload_descriptors()
 
 
@@ -887,7 +886,7 @@ def sparse_scheduling_case():
         request_cache.page_index_owner = "runtime"
 
     with (
-        patch.object(deepseek_v4_cache, "Batch", side_effect=_SchedulingBatch) as create_batch,
+        patch.object(sparse_offload, "Batch", side_effect=_SchedulingBatch) as create_batch,
         patch.object(KVCacheManagerV2, "prepare_resources"),
         patch.object(manager, "_set_page_index_bufs", side_effect=restore) as restore_buffers,
         patch("torch.cuda.current_stream", return_value=Mock(cuda_stream=23)) as current_stream,

@@ -14,8 +14,8 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
+from ..offload import SparseOffloadState, allocate_sparse_offload_state
 from .indexer import DeepseekV4Indexer
-from .offload import SparseOffloadState
 from .params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
@@ -322,47 +322,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             raise ValueError("Sparse offload metadata must match the configured positive top-k")
         # Native fetch always processes every Batch row, including for smaller
         # graph profiles. Its selection width is fixed by BufferConfig.
-        batch = manager.max_batch_size
-
-        def allocate(name: str, shape: tuple[int, ...], value: int) -> torch.Tensor:
-            tensor = self.get_empty(
+        self.sparse_offload_state = allocate_sparse_offload_state(
+            lambda name, shape, dtype: self.get_empty(
                 self.cuda_graph_buffers,
                 shape,
-                dtype=torch.int32,
+                dtype=dtype,
                 cache_name=f"dsv4_sparse_offload_{name}",
                 capture_graph=self.is_cuda_graph,
-            )
-            tensor.fill_(value)
-            return tensor
-
-        self.sparse_offload_state = SparseOffloadState(
-            layers=layers,
-            active_request_count=allocate("active_request_count", (1,), 0),
-            selected_history_units=allocate(
-                "selected_history_units", (batch, self.sparse_mla_topk), -1
             ),
-            fetched_indices={
-                count: allocate(
-                    f"fetched_indices_{count}", (batch, count, self.sparse_mla_topk), -1
-                )
-                for count in sorted({len(descriptor.buffer_ids) for descriptor in layers.values()})
-            },
-            write_indices={
-                count: allocate(f"write_indices_{count}", (batch, count), -1)
-                for count in sorted({len(descriptor.buffer_ids) for descriptor in layers.values()})
-            },
-            scatter_start_positions=allocate("scatter_start_positions", (batch,), 0),
-            nvfp4_scratch=(
-                self.get_empty(
-                    self.cuda_graph_buffers,
-                    (batch, self.sparse_mla_topk, manager.head_dim),
-                    dtype=torch.float8_e4m3fn,
-                    cache_name="dsv4_sparse_offload_nvfp4_scratch",
-                    capture_graph=self.is_cuda_graph,
-                )
-                if manager._use_nvfp4_compress
-                else None
-            ),
+            layers,
+            max_batch_size=manager.max_batch_size,
+            topk=self.sparse_mla_topk,
+            nvfp4_head_dim=manager.head_dim if manager._use_nvfp4_compress else None,
         )
 
     def prepare_for_indexer_k_cache(self):
