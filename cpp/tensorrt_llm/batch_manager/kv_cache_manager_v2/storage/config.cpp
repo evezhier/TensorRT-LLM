@@ -222,7 +222,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     struct PoolGroupKey
     {
         std::vector<size_t> slotSizes;
-        std::vector<uint8_t> sparsity;
+        std::vector<bool> sparsity;
 
         bool operator<(PoolGroupKey const& other) const
         {
@@ -234,12 +234,18 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     for (auto& sg : slotGroups)
     {
         auto const sizes = sg.slotSizeList();
-        auto const sparsity = sg.sparsityList();
+        TypedVec<PoolIndex, bool> sparsity;
+        sparsity.reserve(sizes.size());
+        for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
+        {
+            sparsity.push_back(sg.isSparse(pool));
+        }
         poolGroups[{.slotSizes = sizes.raw(), .sparsity = sparsity.raw()}].push_back(std::move(sg));
     }
 
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
+    out.hostSparsePoolQuota = config.hostSparsePoolQuota;
     out.expansion = expansionMap;
 
     for (auto& [key, variants] : poolGroups)

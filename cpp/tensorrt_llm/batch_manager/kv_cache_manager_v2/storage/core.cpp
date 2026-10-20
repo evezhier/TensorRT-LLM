@@ -554,13 +554,13 @@ TypedVec<PoolIndex, size_t> PoolGroupBase::slotSize() const
 // ---------------------------------------------------------------------------
 
 GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
-    PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, uint8_t> const& sparsity)
+    PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity)
     : PoolGroupBase(numSlots)
-    , mSparsity(sparsity)
+    , mSparsity(std::move(sparsity))
 {
     if (mSparsity.empty())
     {
-        mSparsity = TypedVec<PoolIndex, uint8_t>(slotSizeList.size(), uint8_t{0});
+        mSparsity = TypedVec<PoolIndex, bool>(slotSizeList.size(), false);
     }
     TLLM_CHECK_WITH_INFO(
         mSparsity.size() == slotSizeList.size(), "GpuPoolGroup: one sparsity flag per pool is required");
@@ -583,7 +583,7 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
     for (PoolIndex p{0}; p < slotSizeList.size(); ++p)
     {
         size_t const sz = slotSizeList.at(p);
-        if (mSparsity.at(p) != 0)
+        if (isSparse(p))
         {
             // A sparse pool's pages: host memory, device-mapped, so the sparse cache fills
             // from them without a host round trip. No device VA is reserved for them.
@@ -676,8 +676,16 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(),
-            mPhysMemAllocator, slotDescList[pgIdx].sparsityList()));
+        auto const& slotDesc = slotDescList[pgIdx];
+        auto const sizes = slotDesc.slotSizeList();
+        TypedVec<PoolIndex, bool> sparsity;
+        sparsity.reserve(sizes.size());
+        for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
+        {
+            sparsity.push_back(slotDesc.isSparse(pool));
+        }
+        mPoolGroups.push_back(
+            std::make_unique<GpuPoolGroup>(slotCountList[pgIdx], sizes, mPhysMemAllocator, std::move(sparsity)));
     }
 }
 
@@ -750,21 +758,22 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
 // Mirrors Python CacheLevelStorage._grains_to_slots.
 // ---------------------------------------------------------------------------
 
-std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(
-    size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity)
+std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(size_t pgGrains,
+    TypedVec<PoolIndex, size_t> const& slotSizeList, std::vector<PoolIndex> const& which, size_t granularity)
 {
     TLLM_CHECK_WITH_INFO(granularity > 0, "Cache storage granularity must be positive");
-    TypedVec<PoolIndex, size_t> minPoolGrains(slotSizeList.size());
-    for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
+    // With nothing to divide the grains between there is no slot count to find, and the
+    // search below would run past SlotCount's range looking for one.
+    TLLM_CHECK_WITH_INFO(!which.empty(), "grainsToSlots needs at least one pool to size against");
+    // Indexed by the real pool index, so only the named entries are ever read; the rest
+    // stay zero and cost one word each.
+    TypedVec<PoolIndex, size_t> minPoolGrains(slotSizeList.size(), 0);
+    size_t minTotal = 0;
+    for (PoolIndex poolIdx : which)
     {
         TLLM_CHECK_WITH_INFO(slotSizeList[poolIdx] > 0, "Cache slot size must be positive");
         minPoolGrains[poolIdx] = divUp(slotSizeList[poolIdx], granularity);
-    }
-
-    size_t minTotal = 0;
-    for (auto g : minPoolGrains)
-    {
-        minTotal += g;
+        minTotal += minPoolGrains[poolIdx];
     }
     if (pgGrains < minTotal)
         return {0, 0};
@@ -772,13 +781,10 @@ std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(
     SlotCount numSlots{std::numeric_limits<SlotCount>::max()};
     size_t remainingPgGrains = pgGrains;
 
-    // Sort pools by slot size ascending.
-    std::vector<PoolIndex> poolOrder;
-    poolOrder.reserve(slotSizeList.stdSize());
-    for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
-    {
-        poolOrder.push_back(poolIdx);
-    }
+    // Sort the named pools by slot size ascending. Ties may fall either way: every term
+    // below is a function of the sizes alone, so an order that differs only among equal
+    // sizes produces the same result.
+    std::vector<PoolIndex> poolOrder = which;
     std::sort(poolOrder.begin(), poolOrder.end(),
         [&](PoolIndex a, PoolIndex b) { return slotSizeList[a] < slotSizeList[b]; });
 
@@ -800,7 +806,7 @@ std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(
     TLLM_CHECK_DEBUG(remainingPgGrains == 0);
     TLLM_CHECK_DEBUG(numSlots > 0);
 
-    auto slotsToGrains = [&](SlotCount slots) { return grainsForSlots(slots, slotSizeList, granularity); };
+    auto slotsToGrains = [&](SlotCount slots) { return grainsForSlots(slots, slotSizeList, which, granularity); };
     SlotCount lo = numSlots;
     SlotCount step = 1;
     SlotCount hi = lo + step;
@@ -834,12 +840,12 @@ std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(
 // Mirrors Python CacheLevelStorage._grains_for_slots.
 // ---------------------------------------------------------------------------
 
-size_t CacheLevelStorage::grainsForSlots(
-    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity)
+size_t CacheLevelStorage::grainsForSlots(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+    std::vector<PoolIndex> const& which, size_t granularity)
 {
     size_t total = 0;
-    for (auto s : slotSizeList)
-        total += divUp(slotCountToSizeT(numSlots) * s, granularity);
+    for (PoolIndex poolIdx : which)
+        total += divUp(slotCountToSizeT(numSlots) * slotSizeList[poolIdx], granularity);
     return total;
 }
 
@@ -848,148 +854,377 @@ size_t CacheLevelStorage::grainsForSlots(
 // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
 // ---------------------------------------------------------------------------
 
-TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size_t quota,
-    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& sizeLists,
-    TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-    TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
+TypedVec<PoolGroupIndex, std::vector<PoolIndex>> CacheLevelStorage::poolsPaidByQuota(
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+    std::optional<SecondaryPoolBudget> const& secondBudget)
 {
-    PoolGroupIndex numPg = sizeLists.size();
-    TLLM_CHECK_DEBUG(ratioList.size() == numPg);
-    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(ratioList.begin(), ratioList.end(), [](auto x) { return x > 0; }),
-        "ratioToSlotCountList: all ratios must be positive");
-    TLLM_CHECK_DEBUG(quota % granularity == 0);
-    size_t totalGrains = quota / granularity;
-    if (TLLM_UNLIKELY(gDebug))
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> ret;
+    ret.reserve(slotSizeLists.size());
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
-        [[maybe_unused]] size_t minGrains = 0;
-        for (auto const& sizes : sizeLists)
-            minGrains += toSizeT(sizes.size());
-        TLLM_CHECK_WITH_INFO(totalGrains >= minGrains,
-            "ratioToSlotCountList: insufficient total grains for at least 1 slot per pool group");
+        auto const numPools = slotSizeLists[pgIdx].size();
+        TypedVec<PoolIndex, bool> taken(numPools, false);
+        if (secondBudget.has_value())
+        {
+            for (PoolIndex poolIdx : secondBudget->pools[pgIdx])
+            {
+                TLLM_CHECK_WITH_INFO(poolIdx < numPools,
+                    "A second budget names pool %d of group %d, which has only %d pools", poolIdx.value(),
+                    pgIdx.value(), numPools.value());
+                // Naming a pool twice would charge it twice and leave the quota paying for
+                // one fewer than it thinks.
+                TLLM_CHECK_WITH_INFO(
+                    !taken[poolIdx], "A second budget names pool %d of group %d twice", poolIdx.value(), pgIdx.value());
+                taken[poolIdx] = true;
+            }
+        }
+        std::vector<PoolIndex> paid;
+        paid.reserve(toSizeT(numPools));
+        for (PoolIndex poolIdx{0}; poolIdx < numPools; ++poolIdx)
+        {
+            if (!taken[poolIdx])
+            {
+                paid.push_back(poolIdx);
+            }
+        }
+        ret.push_back(std::move(paid));
     }
+    return ret;
+}
 
-    TypedVec<PoolGroupIndex, SlotCount> slotCntList(numPg, 0);
-    size_t remainingGrains = totalGrains;
-    std::vector<PoolGroupIndex> activePgs;
-    activePgs.reserve(toSizeT(numPg));
+namespace
+{
+
+//! Bytes one pool group holds at `slots`, each pool rounded to the grain of the medium it
+//! lives in. This is the quantity the pool ratio speaks in: what the group actually
+//! occupies, device and host together.
+size_t allBytesForSlots(TypedVec<PoolIndex, size_t> const& sizes, std::vector<PoolIndex> const& second, size_t grain,
+    size_t secondGrain, SlotCount slots)
+{
+    auto const n = slotCountToSizeT(slots);
+    size_t total = 0;
+    for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+    {
+        bool const isSecond = std::ranges::find(second, poolIdx) != second.end();
+        auto const g = isSecond ? secondGrain : grain;
+        total += roundUp(n * sizes[poolIdx], g);
+    }
+    return total;
+}
+
+//! The most slots whose all-bytes cost fits `budget`.
+//!
+//! Bracketed, not galloped: `A(n) >= n * S` with `S` the summed slot size, so no count above
+//! `budget / S` can fit and bisection has an upper end without searching for one. Every pool
+//! of the group is in view, so there is no empty-selector case to guard.
+SlotCount maxSlotsForAllBytes(TypedVec<PoolIndex, size_t> const& sizes, std::vector<PoolIndex> const& second,
+    size_t grain, size_t secondGrain, size_t budget)
+{
+    size_t sumSizes = 0;
+    for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+    {
+        sumSizes += sizes[poolIdx];
+    }
+    TLLM_CHECK_WITH_INFO(sumSizes > 0, "A pool group must have a positive slot size");
+    SlotCount lo{0};
+    auto hi = slotCountValueFromSize(budget / sumSizes + 1);
+    if (allBytesForSlots(sizes, second, grain, secondGrain, hi) <= budget)
+    {
+        return hi;
+    }
+    while (lo + 1 < hi)
+    {
+        SlotCount const mid = lo + ((hi - lo) / 2);
+        if (allBytesForSlots(sizes, second, grain, secondGrain, mid) <= budget)
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+//! The most slots the grains already bought for `slots` will hold, in every pool at once.
+//!
+//! The counterpart of PoolGroupBase::getNumSlotsFromPools, and what makes a count
+//! self-consistent: growing to it costs nothing in any medium, so it never disturbs a
+//! budget. It replaces the tail bump loop the single-budget allocator used to run.
+//!
+//! Every pool is in view, including ones the second budget pays for and whether or not that
+//! budget has a quota. A host-backed pool nobody is bounding is still real memory: dropping
+//! it here would let a count grow to whatever the device grain absorbs and allocate host rows
+//! for all of it, which is the opposite of what the quota exists to do.
+SlotCount freeRun(TypedVec<PoolIndex, size_t> const& sizes, std::vector<PoolIndex> const& second, size_t grain,
+    size_t secondGrain, SlotCount slots)
+{
+    auto const n = slotCountToSizeT(slots);
+    SlotCount best{std::numeric_limits<SlotCount>::max()};
+    for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+    {
+        bool const isSecond = std::ranges::find(second, poolIdx) != second.end();
+        auto const g = isSecond ? secondGrain : grain;
+        auto const sz = sizes[poolIdx];
+        best = std::min(best, slotCountValueFromSize(divUp(n * sz, g) * g / sz));
+    }
+    return best;
+}
+
+} // namespace
+
+TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size_t quota,
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+    TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<SecondaryPoolBudget> const& secondBudget)
+{
+    PoolGroupIndex const numPg = slotSizeLists.size();
+    TLLM_CHECK_DEBUG(ratioList.size() == numPg);
+    TLLM_CHECK_WITH_INFO(granularity > 0, "Cache storage granularity must be positive");
+
+    bool const hasSecond = secondBudget.has_value();
+    bool const bounded = hasSecond && secondBudget->quota.has_value();
+    size_t const grain2 = hasSecond ? secondBudget->granularity : granularity;
+    TLLM_CHECK_WITH_INFO(!hasSecond || grain2 > 0, "A second budget needs a positive granularity");
+
+    // The quota pays for whatever the second budget does not name, so the two partition the
+    // group's pools by construction rather than by agreement between callers.
+    auto const pools = poolsPaidByQuota(slotSizeLists, secondBudget);
+    static std::vector<PoolIndex> const kNoPools;
+    auto secondPools = [&](PoolGroupIndex pgIdx) -> std::vector<PoolIndex> const&
+    { return hasSecond ? secondBudget->pools[pgIdx] : kNoPools; };
 
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
     {
-        activePgs.push_back(pgIdx);
+        TLLM_CHECK_WITH_INFO(ratioList[pgIdx] > 0.f, "ratioToSlotCountList: all ratios must be positive");
+        TLLM_CHECK_WITH_INFO(!pools[pgIdx].empty(),
+            "ratioToSlotCountList: pool group %d has no pool the primary quota pays for", pgIdx.value());
     }
 
-    // Iteratively peel off constrained PGs until all active PGs are
-    // unconstrained:
-    //   1. Distribute remaining quota among active PGs by ratio.
-    //   2. Any PG with slots <= min_slots is constrained — pin it to
-    //      min_slots and subtract its grains from the budget.
-    //   3. Repeat with the remaining PGs and re-normalized ratios.
-    // Each iteration removes at least one PG, so this terminates.
-    while (!activePgs.empty())
+    auto quotaGrains = [&](PoolGroupIndex pgIdx, SlotCount slots)
+    { return grainsForSlots(slots, slotSizeLists[pgIdx], pools[pgIdx], granularity); };
+    auto secondGrains = [&](PoolGroupIndex pgIdx, SlotCount slots)
+    { return grainsForSlots(slots, slotSizeLists[pgIdx], secondPools(pgIdx), grain2); };
+    // What the ratio speaks in: every pool, each in the grain of its own medium.
+    auto allBytes = [&](PoolGroupIndex pgIdx, SlotCount slots)
+    { return allBytesForSlots(slotSizeLists[pgIdx], secondPools(pgIdx), granularity, grain2, slots); };
+
+    size_t const budgetGrains = quota / granularity;
+    size_t const budget2Grains = bounded ? *secondBudget->quota / grain2 : 0;
+
+    // The floors are not negotiable, so they come off the top before anything is shared.
+    // Snapping each to its free run costs no grain in any medium, and starting there is what
+    // makes "never decrease" enough to keep them.
+    TypedVec<PoolGroupIndex, SlotCount> slotCntList(numPg, 0);
+    size_t floorQuota = 0;
+    size_t floorSecond = 0;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
     {
-        // Distribute remainingGrains among active PGs by ratio.
-        size_t nActive = activePgs.size();
-        std::vector<float> activeRatio(nActive);
-        for (size_t i = 0; i < nActive; ++i)
-            activeRatio[i] = ratioList[activePgs[i]];
+        slotCntList[pgIdx] = freeRun(
+            slotSizeLists[pgIdx], secondPools(pgIdx), granularity, grain2, std::max(minSlots[pgIdx], SlotCount{0}));
+        floorQuota += quotaGrains(pgIdx, slotCntList[pgIdx]);
+        floorSecond += secondGrains(pgIdx, slotCntList[pgIdx]);
+    }
+    if (bounded)
+    {
+        // The only way the two hard bounds can conflict, and it names neither the ratio nor
+        // the quota -- so it is a property of the configuration, caught the first time this
+        // runs and unable to begin failing at a later rebalance.
+        TLLM_CHECK_WITH_INFO(floorSecond <= budget2Grains,
+            "Second memory budget of %zu bytes cannot hold the %zu the batches in `constraints` need. Raise the "
+            "budget or lower the constraints.",
+            *secondBudget->quota, floorSecond * grain2);
+    }
+    TLLM_CHECK_WITH_INFO(floorQuota <= budgetGrains, "Insufficient quota to satisfy min_slots constraints");
 
-        std::vector<SlotCount> slotsForActive(nActive, 0);
-        std::vector<size_t> grainsForActive(nActive, 0);
-        size_t budget = remainingGrains;
+    size_t remainingQuota = budgetGrains - floorQuota;
+    size_t remainingSecond = bounded ? budget2Grains - floorSecond : 0;
 
-        // Sort indices by ratio ascending.
-        std::vector<size_t> idxLst(nActive);
-        std::iota(idxLst.begin(), idxLst.end(), size_t{0});
-        std::sort(idxLst.begin(), idxLst.end(), [&](size_t a, size_t b) { return activeRatio[a] < activeRatio[b]; });
+    // One demand curve, driven by the combined all-bytes budget divided by the ratio. A
+    // group's demand at level `x` is what `x * r` buys of its own all-bytes cost per slot,
+    // so when nothing binds every group sits at the same level -- and equal levels are
+    // exactly the requested ratio. The per-medium budgets then act as caps on that demand.
+    auto demand = [&](PoolGroupIndex pgIdx, double level)
+    {
+        auto const share = static_cast<size_t>(std::max(0.0, level * static_cast<double>(ratioList[pgIdx])));
+        auto const want = maxSlotsForAllBytes(slotSizeLists[pgIdx], secondPools(pgIdx), granularity, grain2, share);
+        return std::max(slotCntList[pgIdx], want);
+    };
 
-        for (size_t i = 0; i < idxLst.size(); ++i)
+    // A level wide enough that every group's demand is capped by a budget rather than by it.
+    double maxLevel = 0.0;
+    {
+        double minRatio = 1.0;
+        for (auto r : ratioList)
         {
-            size_t idx = idxLst[i];
-            double ratioSum = 0.0;
-            for (size_t j = i; j < idxLst.size(); ++j)
-                ratioSum += static_cast<double>(activeRatio[idxLst[j]]);
-            double pct = (ratioSum > 0.0) ? static_cast<double>(activeRatio[idx]) / ratioSum : 1.0;
-            auto [slots, used] = grainsToSlots(static_cast<size_t>(std::nearbyint(static_cast<double>(budget) * pct)),
-                sizeLists[activePgs[idx]], granularity);
-            slotsForActive[idx] = slots;
-            grainsForActive[idx] = used;
-            TLLM_CHECK_DEBUG(used <= budget);
-            budget -= used;
+            minRatio = std::min(minRatio, static_cast<double>(r));
+        }
+        auto const totalBytes = static_cast<double>(budgetGrains) * static_cast<double>(granularity)
+            + static_cast<double>(budget2Grains) * static_cast<double>(grain2);
+        maxLevel = (totalBytes + 1.0) / std::max(minRatio, 1e-12);
+    }
+
+    std::vector<PoolGroupIndex> active;
+    active.reserve(toSizeT(numPg));
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        active.push_back(pgIdx);
+    }
+
+    // Raise the level until one budget cannot pay for the next step, freezing the groups the
+    // second budget holds down and returning what they do not spend of the first.
+    //
+    // Each round either settles everyone and breaks, or freezes a non-empty `held` and drops it
+    // from `active`. So `active` strictly shrinks -- at most one round per pool group, with no
+    // round that changes nothing. Nothing re-enters `active` and neither remainder grows, so the
+    // search cannot oscillate between two levels.
+    while (!active.empty())
+    {
+        // How far the second budget alone would let the groups it pays for rise.
+        double levelSecond = maxLevel;
+        if (bounded)
+        {
+            bool anyOnSecond = false;
+            for (PoolGroupIndex pgIdx : active)
+            {
+                anyOnSecond = anyOnSecond || !secondPools(pgIdx).empty();
+            }
+            if (anyOnSecond)
+            {
+                double lo = 0.0;
+                double hi = maxLevel;
+                for (int step = 0; step < 64; ++step)
+                {
+                    double const mid = lo + (hi - lo) / 2.0;
+                    size_t spent = 0;
+                    for (PoolGroupIndex pgIdx : active)
+                    {
+                        if (!secondPools(pgIdx).empty())
+                        {
+                            spent += secondGrains(pgIdx, demand(pgIdx, mid)) - secondGrains(pgIdx, slotCntList[pgIdx]);
+                        }
+                    }
+                    (spent <= remainingSecond ? lo : hi) = mid;
+                }
+                levelSecond = lo;
+            }
         }
 
-        // Identify constrained PGs (slots <= min_slots).
-        std::vector<size_t> constrained;
-        std::vector<size_t> unconstrained;
-        for (size_t idx = 0; idx < nActive; ++idx)
+        auto capped = [&](PoolGroupIndex pgIdx, double level)
+        { return demand(pgIdx, secondPools(pgIdx).empty() ? level : std::min(level, levelSecond)); };
+
+        // How far the quota lets everyone rise, with the second budget's cap already applied.
+        double levelQuota = 0.0;
         {
-            PoolGroupIndex pgIdx = activePgs[idx];
-            SlotCount const minSlotCount = minSlots[pgIdx];
-            if (slotsForActive[idx] <= minSlotCount)
-                constrained.push_back(idx);
-            else
-                unconstrained.push_back(idx);
+            double lo = 0.0;
+            double hi = maxLevel;
+            for (int step = 0; step < 64; ++step)
+            {
+                double const mid = lo + (hi - lo) / 2.0;
+                size_t spent = 0;
+                for (PoolGroupIndex pgIdx : active)
+                {
+                    spent += quotaGrains(pgIdx, capped(pgIdx, mid)) - quotaGrains(pgIdx, slotCntList[pgIdx]);
+                }
+                (spent <= remainingQuota ? lo : hi) = mid;
+            }
+            levelQuota = lo;
         }
 
-        if (constrained.empty())
+        std::vector<PoolGroupIndex> held;
+        for (PoolGroupIndex pgIdx : active)
         {
-            // All active PGs are unconstrained — accept their allocations.
-            for (size_t idx = 0; idx < nActive; ++idx)
-                slotCntList[activePgs[idx]] = slotsForActive[idx];
+            if (!secondPools(pgIdx).empty() && demand(pgIdx, levelSecond) < demand(pgIdx, levelQuota))
+            {
+                held.push_back(pgIdx);
+            }
+        }
+
+        if (held.empty())
+        {
+            for (PoolGroupIndex pgIdx : active)
+            {
+                auto const slots = capped(pgIdx, levelQuota);
+                remainingQuota -= quotaGrains(pgIdx, slots) - quotaGrains(pgIdx, slotCntList[pgIdx]);
+                if (bounded)
+                {
+                    remainingSecond -= secondGrains(pgIdx, slots) - secondGrains(pgIdx, slotCntList[pgIdx]);
+                }
+                slotCntList[pgIdx] = slots;
+            }
             break;
         }
 
-        // Pin constrained PGs to min_slots and subtract from budget.
-        for (size_t idx : constrained)
+        // Settle the held groups and hand back the quota grains they will not use, so the
+        // groups the second budget does not touch can take them.
+        for (PoolGroupIndex pgIdx : held)
         {
-            PoolGroupIndex pgIdx = activePgs[idx];
-            SlotCount const minSlotCount = minSlots[pgIdx];
-            size_t minGrains = grainsForSlots(minSlotCount, sizeLists[pgIdx], granularity);
-            auto [slots, used] = grainsToSlots(minGrains, sizeLists[pgIdx], granularity);
+            auto const slots = demand(pgIdx, levelSecond);
+            remainingQuota -= quotaGrains(pgIdx, slots) - quotaGrains(pgIdx, slotCntList[pgIdx]);
+            remainingSecond -= secondGrains(pgIdx, slots) - secondGrains(pgIdx, slotCntList[pgIdx]);
             slotCntList[pgIdx] = slots;
-            // remainingGrains is unsigned, so an over-subtraction would wrap past the
-            // `remainingGrains == 0` guard below instead of reporting an exhausted budget.
-            TLLM_CHECK_WITH_INFO(used <= remainingGrains, "Insufficient quota to satisfy min_slots constraints");
-            remainingGrains -= used;
         }
-
-        if (unconstrained.empty())
+        std::vector<PoolGroupIndex> rest;
+        rest.reserve(active.size() - held.size());
+        for (PoolGroupIndex pgIdx : active)
         {
-            // All PGs are constrained — nothing left to redistribute.
-            break;
+            if (std::ranges::find(held, pgIdx) == held.end())
+            {
+                rest.push_back(pgIdx);
+            }
         }
-
-        if (remainingGrains == 0)
-            throw std::runtime_error("Insufficient quota to satisfy min_slots constraints");
-
-        // Continue with unconstrained PGs only.
-        std::vector<PoolGroupIndex> newActivePgs;
-        newActivePgs.reserve(unconstrained.size());
-        for (size_t idx : unconstrained)
-            newActivePgs.push_back(activePgs[idx]);
-        activePgs = std::move(newActivePgs);
+        active = std::move(rest);
     }
 
-    // _g2s may under-count slots due to imperfect grain distribution
-    // across pools. Try bumping each PG's slot count while it still fits
-    // within the same grain budget.
-    for (PoolGroupIndex pgIdx{0}; pgIdx < sizeLists.size(); ++pgIdx)
+    // A single level cannot spend an integral remainder: after it stops, one group's next
+    // step is unaffordable while another's still fits. Give each remaining step to whichever
+    // group would sit lowest afterwards, which is where the ratio wants it.
+    //
+    // Each iteration raises exactly one group's count, so there is no zero-change round and no
+    // way back to a count already visited. Every step crosses a grain in some medium and quota
+    // grains grow without bound in the slot count, so every group eventually prices itself out.
+    // The level search has already spent all but a fraction of a step, which is what keeps the
+    // count of iterations small rather than merely finite.
+    for (;;)
     {
-        size_t grainsNow = grainsForSlots(slotCntList[pgIdx], sizeLists[pgIdx], granularity);
-        while (grainsForSlots(slotCntList[pgIdx] + 1, sizeLists[pgIdx], granularity) <= grainsNow)
-            slotCntList[pgIdx] += 1;
+        auto best = numPg;
+        double bestLevel = 0.0;
+        SlotCount bestSlots{0};
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+        {
+            // Strictly greater than the current count, so every accepted step is progress and
+            // the loop cannot spin.
+            auto const next
+                = freeRun(slotSizeLists[pgIdx], secondPools(pgIdx), granularity, grain2, slotCntList[pgIdx] + 1);
+            TLLM_CHECK_DEBUG(next > slotCntList[pgIdx]);
+            auto const dq = quotaGrains(pgIdx, next) - quotaGrains(pgIdx, slotCntList[pgIdx]);
+            auto const ds = secondGrains(pgIdx, next) - secondGrains(pgIdx, slotCntList[pgIdx]);
+            if (dq > remainingQuota || (bounded && ds > remainingSecond))
+            {
+                continue;
+            }
+            double const level = static_cast<double>(allBytes(pgIdx, next)) / static_cast<double>(ratioList[pgIdx]);
+            if (best == numPg || level < bestLevel)
+            {
+                best = pgIdx;
+                bestLevel = level;
+                bestSlots = next;
+            }
+        }
+        if (best == numPg)
+        {
+            break;
+        }
+        remainingQuota -= quotaGrains(best, bestSlots) - quotaGrains(best, slotCntList[best]);
+        if (bounded)
+        {
+            remainingSecond -= secondGrains(best, bestSlots) - secondGrains(best, slotCntList[best]);
+        }
+        slotCntList[best] = bestSlots;
     }
 
     return slotCntList;
-}
-
-// Instance convenience wrapper.
-TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::computeSlotCountList(
-    TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-    std::optional<size_t> quota) const
-{
-    size_t q = quota.value_or(totalQuota());
-    TLLM_CHECK_DEBUG(ratioList.size() == mPoolGroups.size());
-    return ratioToSlotCountList(q, chargeableSlotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

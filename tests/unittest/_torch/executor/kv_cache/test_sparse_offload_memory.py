@@ -21,8 +21,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     SparseArenaShape,
     SparseBatchShape,
     gpu_pool_granule_bytes,
-    host_bounded_pool_ratio,
-    host_bounded_quota,
     life_cycle_pages,
     plan_host_history_bytes,
     solve_sparse_offload_capacity,
@@ -493,37 +491,21 @@ def test_pool_ratio_buys_the_same_requests_in_every_life_cycle() -> None:
         life_cycles, capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
     )
 
-    # Host pages cost the quota nothing, so only device bytes per request count.
-    request_bytes = [65_536 * 2, 4676 * 1024, 16_784 * 2]
+    # Every pool counts, host-backed ones included: the ratio is compared against a layout
+    # measured the same way, and is projected onto cold levels where one pool holds dense and
+    # sparse buffers together. Host pages costing the GPU quota nothing is a fact about the
+    # quota, not about the ratio.
+    request_bytes = [
+        (life_cycle.device_bytes + life_cycle.host_bytes)
+        * life_cycle.pages_per_request(
+            capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
+        )
+        for life_cycle in life_cycles
+    ]
     assert ratio == pytest.approx([b / sum(request_bytes) for b in request_bytes])
+    # The history life cycle is the one with host-backed pages, so counting them moves it.
+    assert ratio[1] > 0.9, "the offloaded history dominates once its host pages are counted"
     assert sum(ratio) == pytest.approx(1.0, abs=1e-9)
-
-
-@pytest.mark.cpu_only
-def test_host_bounded_quota_keeps_the_host_pools_within_budget() -> None:
-    life_cycles = life_cycle_pages(_v4_flash_like_layers(), TOKENS_PER_BLOCK)
-    ratio = sparse_offload_pool_ratio(
-        life_cycles, capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
-    )
-    budget = 100 << 30
-
-    quota = host_bounded_quota(life_cycles, ratio, host_budget=budget, quota=1 << 50)
-
-    # The no-window life cycle buys its share at 4,676 device bytes per slot, and
-    # every slot also holds 20,736 host bytes. The other life cycles' three pools
-    # can leave a 32 MiB granule each unused, and two more go to rounding.
-    usable = budget - 5 * (32 << 20) * 20_736 / 4676
-    assert ratio[1] * quota / 4676 * 20_736 <= usable
-    assert ratio[1] * (quota + 1) / 4676 * 20_736 > usable
-    # A quota the budget already covers is left alone.
-    assert host_bounded_quota(life_cycles, ratio, host_budget=budget, quota=1 << 30) == 1 << 30
-    # A budget smaller than the held-back granules bounds the quota at zero.
-    assert host_bounded_quota(life_cycles, ratio, host_budget=1 << 20, quota=1 << 50) == 0
-    # Without host pages, the host budget bounds nothing.
-    dense_only = [life_cycles[0], life_cycles[2]]
-    assert host_bounded_quota(dense_only, [0.5, 0.5], host_budget=0, quota=1 << 50) == 1 << 50
-    with pytest.raises(ValueError, match="2 shares for 3 life cycles"):
-        host_bounded_quota(life_cycles, [0.5, 0.5], host_budget=budget, quota=1 << 50)
 
 
 def _history_beside_five_window_pools() -> list[LifeCyclePage]:
@@ -552,71 +534,6 @@ def _native_slots(life_cycles: list[LifeCyclePage], ratio: list[float], quota: i
         granule,
         [1] * len(life_cycles),
     )
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("budget_mib", range(100 << 10, (100 << 10) + 16 * 7, 7))
-def test_host_bounded_quota_holds_after_native_rounding(budget_mib: int) -> None:
-    life_cycles = _history_beside_five_window_pools()
-    ratio = sparse_offload_pool_ratio(
-        life_cycles, capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
-    )
-    budget = budget_mib << 20
-
-    quota = host_bounded_quota(life_cycles, ratio, host_budget=budget, quota=1 << 40)
-
-    # The history's life cycle has the largest share, so native also gives it
-    # every granule the others leave unused.
-    granule = gpu_pool_granule_bytes(quota)
-    assert granule == 32 << 20
-    slots = _native_slots(life_cycles, ratio, quota)
-    history = life_cycles[1]
-    assert slots[1] * history.host_bytes <= budget
-    # Seven granules are held back: one per windowed pool, and two for rounding.
-    host_per_granule = granule * history.host_bytes / history.device_bytes
-    assert slots[1] * history.host_bytes > budget - 8 * host_per_granule
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("budget_mib", range(100 << 10, (100 << 10) + 16 * 7, 7))
-def test_host_bounded_pool_ratio_holds_after_native_rounding(budget_mib: int) -> None:
-    life_cycles = _history_beside_five_window_pools()
-    ratio = sparse_offload_pool_ratio(
-        life_cycles, capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
-    )
-    budget, quota = budget_mib << 20, 1 << 40
-    bounded = host_bounded_quota(life_cycles, ratio, host_budget=budget, quota=quota)
-
-    split = host_bounded_pool_ratio(life_cycles, ratio, bounded_quota=bounded, quota=quota)
-
-    # The whole quota is split, with the history held to what fits its budget.
-    slots = _native_slots(life_cycles, split, quota)
-    assert slots[1] * life_cycles[1].host_bytes <= budget
-    # The windowed life cycles get the device bytes a lowered quota left unused.
-    lowered = _native_slots(life_cycles, ratio, bounded)
-    assert slots[0] > lowered[0] and slots[2] > lowered[2]
-
-
-@pytest.mark.cpu_only
-def test_host_bounded_pool_ratio_gives_device_only_life_cycles_the_rest() -> None:
-    life_cycles = life_cycle_pages(_v4_flash_like_layers(), TOKENS_PER_BLOCK)
-    ratio = sparse_offload_pool_ratio(
-        life_cycles, capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
-    )
-
-    split = host_bounded_pool_ratio(life_cycles, ratio, bounded_quota=1 << 30, quota=4 << 30)
-
-    assert split[1] == pytest.approx(ratio[1] / 4)
-    # The windowed life cycles keep their proportions and take what the history gives up.
-    assert split[0] / ratio[0] == pytest.approx(split[2] / ratio[2])
-    assert split[0] > ratio[0]
-    assert sum(split) == pytest.approx(1.0, abs=1e-9)
-    # With nothing to give the rest to, or nothing that fits, there is no split.
-    assert (
-        host_bounded_pool_ratio([life_cycles[1]], [1.0], bounded_quota=1 << 30, quota=4 << 30)
-        is None
-    )
-    assert host_bounded_pool_ratio(life_cycles, ratio, bounded_quota=0, quota=4 << 30) is None
 
 
 @pytest.mark.cpu_only

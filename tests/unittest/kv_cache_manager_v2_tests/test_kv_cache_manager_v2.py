@@ -253,6 +253,288 @@ class TestCacheLevelStorage(unittest.TestCase):
         self.assertGreaterEqual(slots, min_slots)
         self.assertLessEqual(used, grains)
 
+    # One mebibyte per slot against a one-mebibyte grain, so a slot is a grain and the
+    # arithmetic a reader has to follow is the sharing rather than the rounding.
+    GRAIN = 1 << 20
+    TWO_MEDIA = [1 << 20, 1 << 20]
+    ONE_MEDIUM = [1 << 20]
+    HOST = [1]
+
+    def _split(self, quota, host_quota, min_slots, ratio, groups=2, device_only=()):
+        """Slot counts for `groups` groups of one device pool and, usually, one host pool.
+
+        A group named in `device_only` holds a device pool alone, which is how a group that
+        costs the host budget nothing is really shaped -- the quota pays for every pool the
+        host budget does not name, so there is no way to leave one unpaid.
+        """
+        return _introspection.ratio_to_slot_count_list(
+            quota,
+            [self.ONE_MEDIUM if g in device_only else self.TWO_MEDIA for g in range(groups)],
+            ratio,
+            self.GRAIN,
+            min_slots,
+            second_quota=host_quota,
+            second_granularity=self.GRAIN,
+            second_pools=[[] if g in device_only else self.HOST for g in range(groups)],
+        )
+
+    def test_a_group_with_no_pool_on_the_second_budget_is_never_bound_by_it(self) -> None:
+        """An empty selector is how "this group costs that medium nothing" is said."""
+        slots = self._split(
+            quota=200 << 20,
+            host_quota=10 << 20,
+            min_slots=[1, 1],
+            ratio=[0.5, 0.5],
+            device_only=(0,),
+        )
+        self.assertGreater(slots[0], 10, "group 0 pays no host budget, so it is not held to it")
+        self.assertLessEqual(slots[1], 10)
+
+    def test_a_second_budget_nobody_exceeds_changes_nothing(self) -> None:
+        generous = self._split(
+            quota=60 << 20, host_quota=1000 << 20, min_slots=[1, 1], ratio=[0.5, 0.5]
+        )
+        # Without a second budget the quota pays for both pools, so the comparison is
+        # against a one-pool group of the same device cost per slot.
+        unbounded = _introspection.ratio_to_slot_count_list(
+            60 << 20, [self.ONE_MEDIUM] * 2, [0.5, 0.5], self.GRAIN, [1, 1]
+        )
+        self.assertEqual(generous, unbounded)
+
+    def test_a_host_bound_group_releases_its_device_budget(self) -> None:
+        """The reason this is one pass and not a quota followed by a clamp.
+
+        Group 0 has no host pool and group 1 does. Starve the host budget and group 1 is
+        held down -- the device grains it then cannot use must reach group 0 rather than
+        going unspent, which is precisely what clamping afterwards failed to do.
+        """
+        held = self._split(
+            quota=200 << 20,
+            host_quota=4 << 20,
+            min_slots=[1, 1],
+            ratio=[0.5, 0.5],
+            device_only=(0,),
+        )
+        free = self._split(
+            quota=200 << 20,
+            host_quota=1000 << 20,
+            min_slots=[1, 1],
+            ratio=[0.5, 0.5],
+            device_only=(0,),
+        )
+        self.assertLessEqual(held[1], 4, "the host budget bound group 1")
+        self.assertGreater(
+            held[0], free[0], "and group 0 grew into the device budget group 1 gave up"
+        )
+
+    def test_both_budgets_are_kept_and_the_ratio_gives_way(self) -> None:
+        """Both bounds hold exactly; only the ratio is negotiable."""
+        for ratio in ([0.5, 0.5], [0.9, 0.1], [0.01, 0.99]):
+            with self.subTest(ratio=ratio):
+                slots = self._split(
+                    quota=120 << 20, host_quota=60 << 20, min_slots=[5, 5], ratio=ratio
+                )
+                self.assertLessEqual(sum(slots), 60, "the host budget was never exceeded")
+                self.assertLessEqual(sum(slots), 120, "nor the device quota")
+                self.assertGreaterEqual(slots[0], 5)
+                self.assertGreaterEqual(slots[1], 5)
+
+    def test_a_second_budget_too_small_for_the_constraints_is_rejected(self) -> None:
+        """Both budgets are hard, so their only true conflict is a configuration error.
+
+        It names neither the ratio nor the device quota, which is what makes it a
+        construction-time property: a rebalance changes those and cannot start failing.
+        """
+        with self.assertRaisesRegex((ValueError, RuntimeError), "cannot hold"):
+            self._split(quota=200 << 20, host_quota=40 << 20, min_slots=[50, 50], ratio=[0.5, 0.5])
+
+    def test_an_empty_pool_selector_is_refused_rather_than_hung(self) -> None:
+        """grains_to_slots searches for a slot count; with no pool there is none to find.
+
+        It used to run past SlotCount's range looking for one, which is a hang rather than
+        an answer -- the kind of failure that is only ever seen as a stuck process.
+        """
+        with self.assertRaisesRegex((ValueError, RuntimeError), "at least one pool"):
+            _introspection.grains_to_slots(16, [1 << 20], 1 << 20, pools=[])
+
+    def test_slot_counts_are_maximal_for_the_grains_they_cost(self) -> None:
+        """Grains -> slots -> grains has to be a fixed point, or sizing disagrees with itself.
+
+        grains_to_slots can return fewer slots than the grains it consumed would buy, when
+        those grains divide badly across a group's pools. A count left that way is short of
+        what it already paid for, and is not the count a re-derivation from the same bytes
+        returns -- which is what the bump at the end of the allocator exists to prevent.
+        A second budget must not cost the primary one that property.
+        """
+        # Sizes that do not divide the grain evenly are where the under-count shows up.
+        uneven = [[3 << 20, 5 << 20], [7 << 20, 1 << 20]]
+        # The quota pays for whatever `second` does not name, so each case says only which
+        # pools the second budget takes.
+        cases = {
+            "one budget": dict(second=None, second_quota=None),
+            "two budgets, ample second": dict(second=[[1], [1]], second_quota=256 << 20),
+            "one group outside the second budget": dict(second=[[1], []], second_quota=256 << 20),
+        }
+        for name, case in cases.items():
+            with self.subTest(case=name):
+                slots = _introspection.ratio_to_slot_count_list(
+                    512 << 20,
+                    uneven,
+                    [0.5, 0.5],
+                    self.GRAIN,
+                    [1, 1],
+                    second_quota=case["second_quota"],
+                    second_granularity=self.GRAIN if case["second"] else None,
+                    second_pools=case["second"],
+                )
+                for group, count in enumerate(slots):
+                    taken = set(case["second"][group]) if case["second"] else set()
+                    primary = [p for p in range(len(uneven[group])) if p not in taken]
+                    cost = _introspection.grains_for_slots(
+                        count, uneven[group], self.GRAIN, pools=primary
+                    )
+                    recovered, _ = _introspection.grains_to_slots(
+                        cost, uneven[group], self.GRAIN, pools=primary
+                    )
+                    self.assertEqual(
+                        recovered,
+                        count,
+                        f"{name}: group {group} holds {count} slots but its own grains buy "
+                        f"{recovered}, so re-deriving from the same bytes would disagree",
+                    )
+                if case["second"]:
+                    spent = sum(
+                        _introspection.grains_for_slots(
+                            slots[g], uneven[g], self.GRAIN, pools=case["second"][g]
+                        )
+                        for g in range(len(slots))
+                    )
+                    self.assertLessEqual(
+                        spent * self.GRAIN,
+                        case["second_quota"],
+                        f"{name}: the bump spent past the second budget",
+                    )
+
+    def test_the_division_settles_promptly_on_mismatched_grains(self) -> None:
+        """A dead loop is not the only way the greedy finish can go wrong.
+
+        A dense pool far smaller than the device grain beside an unbudgeted host pool is the
+        shape where one device-grain step spans thousands of host-grain steps, and a step that
+        costs the quota nothing cannot be refused on budget grounds. Such a loop still
+        terminates, so only a clock catches it -- an assertion on the slot counts never will.
+        """
+        sizes = [[256, 1024], [4096]]
+        start = time.monotonic()
+        slots = _introspection.ratio_to_slot_count_list(
+            1 << 30,
+            sizes,
+            [0.5, 0.5],
+            32 << 20,
+            [1, 1],
+            second_quota=None,
+            second_granularity=4096,
+            second_pools=[[1], []],
+        )
+        elapsed = time.monotonic() - start
+        self.assertLess(
+            elapsed,
+            2.0,
+            f"the division took {elapsed:.1f}s, so it is stepping rather than jumping",
+        )
+        self.assertGreater(slots[0], 0)
+        self.assertGreater(slots[1], 0)
+
+    def _all_bytes(self, slots, sizes, second_pools=None, second_granularity=None):
+        """What a slot count costs, each pool in the grain of the medium backing it.
+
+        The measure CacheLevelStorage::allBytes() reports, rebuilt from the two selectors
+        the allocator is given.
+        """
+        taken = set(second_pools or ())
+        primary = [p for p in range(len(sizes)) if p not in taken]
+        total = (
+            _introspection.grains_for_slots(slots, sizes, self.GRAIN, pools=primary) * self.GRAIN
+        )
+        if taken:
+            total += (
+                _introspection.grains_for_slots(
+                    slots, sizes, second_granularity, pools=sorted(taken)
+                )
+                * second_granularity
+            )
+        return total
+
+    def test_feeding_back_the_layouts_own_ratio_changes_nothing(self) -> None:
+        """The allocator must be a fixed point of its own output, or rebalancing never stops.
+
+        _needAdjustment compares the ratio a rebalance would target against the ratio the
+        current layout reports, and fires when they differ. Both are all-bytes measures, so
+        if the slot counts this returns imply a ratio that it would answer differently, the
+        manager re-adjusts to the same layout forever on an unchanged profile.
+        """
+        cases = {
+            "single budget, uneven sizes": dict(
+                sizes=[[3 << 20, 5 << 20], [7 << 20, 1 << 20], [2 << 20]],
+                ratio=[0.2, 0.5, 0.3],
+                min_slots=[1, 1, 1],
+                quota=512 << 20,
+                second_quota=None,
+                second_pools=None,
+            ),
+            # The case the device-only ratio got wrong: a host-backed pool is most of the
+            # group's bytes and none of its quota, so the two measures diverge sharply.
+            "host-backed pool dominates the bytes": dict(
+                sizes=[[1 << 20, 64 << 20], [1 << 20]],
+                ratio=[0.5, 0.5],
+                min_slots=[1, 1],
+                quota=200 << 20,
+                second_quota=4096 << 20,
+                second_pools=[[1], []],
+            ),
+            "second budget binds": dict(
+                sizes=[[1 << 20, 8 << 20], [1 << 20, 1 << 20]],
+                ratio=[0.7, 0.3],
+                min_slots=[2, 2],
+                quota=400 << 20,
+                second_quota=64 << 20,
+                second_pools=[[1], [1]],
+            ),
+        }
+        for name, case in cases.items():
+            with self.subTest(case=name):
+                second_granularity = self.GRAIN if case["second_pools"] else None
+
+                def solve(ratio, case=case, second_granularity=second_granularity):
+                    return _introspection.ratio_to_slot_count_list(
+                        case["quota"],
+                        case["sizes"],
+                        ratio,
+                        self.GRAIN,
+                        case["min_slots"],
+                        second_quota=case["second_quota"],
+                        second_granularity=second_granularity,
+                        second_pools=case["second_pools"],
+                    )
+
+                first = solve(case["ratio"])
+                achieved = [
+                    self._all_bytes(
+                        first[g],
+                        case["sizes"][g],
+                        case["second_pools"][g] if case["second_pools"] else None,
+                        second_granularity,
+                    )
+                    for g in range(len(first))
+                ]
+                total = sum(achieved)
+                again = solve([b / total for b in achieved])
+                self.assertEqual(
+                    again,
+                    first,
+                    f"{name}: {first} reports ratio {[b / total for b in achieved]}, which "
+                    f"the allocator answers with {again} -- a rebalance that never settles",
+                )
+
     def test_ratio_to_slot_count_list_preserves_min_slots(self) -> None:
         granularity = 16 << 20
         slot_size_lists = [
@@ -543,6 +825,70 @@ class TestSparseTierFlexibility(unittest.TestCase):
                     self.assertGreater(manager.get_sparse_cache_max_units(0), 0)
                 finally:
                     manager.shutdown()
+
+    @staticmethod
+    def _manager_with_host_quota(tiers, host_quota) -> KVCacheManager:
+        config = KVCacheManagerConfig(
+            tokens_per_block=128,
+            cache_tiers=tiers,
+            constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=1024, history_length=0)] * 2)],
+            layers=[
+                AttentionLayerConfig(
+                    0,
+                    [
+                        BufferConfig("key", 4096, is_sparse=True),
+                        BufferConfig("index", 256),
+                    ],
+                    sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+                )
+            ],
+            host_sparse_pool_quota=host_quota,
+        )
+        return KVCacheManager(config)
+
+    def test_the_host_quota_bounds_what_the_sparse_pools_pin(self):
+        """The host-backed pools have no budget of their own; this is the one that bounds them.
+
+        Their row count follows from the device-backed pools the GPU quota sizes, so without
+        this a deployment can only reach them by shrinking the device cache it does want.
+        """
+        tiers = [GpuCacheTierConfig(64 << 20)]
+        unbounded = self._manager_with_host_quota(tiers, None)
+        try:
+            pinned = unbounded.get_sparse_host_bytes()
+        finally:
+            unbounded.shutdown()
+        self.assertGreater(pinned, 0)
+
+        capped = self._manager_with_host_quota(tiers, pinned // 2)
+        try:
+            self.assertLessEqual(capped.get_sparse_host_bytes(), pinned // 2)
+            self.assertLess(capped.get_sparse_host_bytes(), pinned)
+        finally:
+            capped.shutdown()
+
+    def test_a_host_quota_above_what_is_pinned_changes_nothing(self):
+        tiers = [GpuCacheTierConfig(64 << 20)]
+        unbounded = self._manager_with_host_quota(tiers, None)
+        try:
+            pinned = unbounded.get_sparse_host_bytes()
+        finally:
+            unbounded.shutdown()
+
+        generous = self._manager_with_host_quota(tiers, pinned * 4)
+        try:
+            self.assertEqual(generous.get_sparse_host_bytes(), pinned)
+        finally:
+            generous.shutdown()
+
+    def test_a_zero_host_quota_is_refused(self):
+        """Zero asks for host-backed pools with no room for a slot, which is a mistake.
+
+        Whether a pool is host-backed is declared per buffer, so this is not the way to
+        turn them off.
+        """
+        with self.assertRaisesRegex(Exception, "must be positive"):
+            self._manager_with_host_quota([GpuCacheTierConfig(64 << 20)], 0)
 
     def test_a_sparse_pool_names_the_host_memory_it_actually_is(self):
         """A GPU-tier group is not uniform, so the medium has to be read per pool.
@@ -7515,7 +7861,13 @@ class TestInitRatioConfig(unittest.TestCase):
         with self.assertRaisesRegex((ValueError, RuntimeError), "max_util_for_resume must be in"):
             KVCacheManager(cfg)
 
-    def test_ratio_slot_count_rounding_matches_python(self):
+    def test_a_slot_one_byte_under_a_grain_still_costs_a_whole_grain(self):
+        """Rounding is per pool and per grain, so a slightly smaller slot buys nothing.
+
+        Both groups cost one grain a slot -- `grain - 1` rounds up -- so five grains buy
+        five slots however they are split. Which group takes the odd one is decided by the
+        ratio, and these two tie exactly, so this does not pin that.
+        """
         grain = 2 << 20
         cfg = KVCacheManagerConfig(
             tokens_per_block=self.TOKENS_PER_BLOCK,
@@ -7546,8 +7898,10 @@ class TestInitRatioConfig(unittest.TestCase):
         slots_by_size = {
             tuple(stat_slot_sizes(stat)): stat.total for stat in manager.get_storage_statistics()
         }
-        self.assertEqual(slots_by_size[(grain - 1,)], 2)
-        self.assertEqual(slots_by_size[(grain,)], 3)
+        small = slots_by_size[(grain - 1,)]
+        full = slots_by_size[(grain,)]
+        self.assertEqual(small + full, 5, "five grains buy five slots, not one more")
+        self.assertEqual({small, full}, {2, 3}, "and they are split as evenly as five allows")
         manager.shutdown()
 
     @parameterized.expand([(0,), (64,), (50,), (256,)])

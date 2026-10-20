@@ -307,6 +307,43 @@ static kv::TypedVec<kv::PoolGroupIndex, kv::TypedVec<kv::PoolIndex, size_t>> typ
     return result;
 }
 
+//! Pool selectors, defaulting to every pool of each group when not given -- which is what
+//! a single-budget caller means, and keeps the simple form of these helpers simple.
+static kv::TypedVec<kv::PoolGroupIndex, std::vector<kv::PoolIndex>> typedPoolSelectors(
+    std::optional<std::vector<std::vector<int32_t>>> const& pools,
+    kv::TypedVec<kv::PoolGroupIndex, kv::TypedVec<kv::PoolIndex, size_t>> const& sizes)
+{
+    kv::TypedVec<kv::PoolGroupIndex, std::vector<kv::PoolIndex>> result;
+    if (!pools.has_value())
+    {
+        for (auto const& group : sizes)
+        {
+            std::vector<kv::PoolIndex> all;
+            for (kv::PoolIndex p{0}; p < group.size(); ++p)
+            {
+                all.push_back(p);
+            }
+            result.push_back(std::move(all));
+        }
+        return result;
+    }
+    for (auto const& group : *pools)
+    {
+        std::vector<kv::PoolIndex> picked;
+        picked.reserve(group.size());
+        for (int32_t p : group)
+        {
+            if (p < 0)
+            {
+                throw std::invalid_argument("pool indices must be non-negative");
+            }
+            picked.push_back(kv::PoolIndex{p});
+        }
+        result.push_back(std::move(picked));
+    }
+    return result;
+}
+
 static kv::TypedVec<kv::PoolGroupIndex, kv::SlotCount> typedSlotCounts(std::vector<kv::SlotCount> const& slotCounts)
 {
     kv::TypedVec<kv::PoolGroupIndex, kv::SlotCount> result;
@@ -1753,7 +1790,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::vector<kv::BatchDesc> constraints, std::optional<kv::BatchDesc> typicalStep,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly, bool enablePartialCommit)
+                bool textOnly, bool enablePartialCommit, std::optional<size_t> hostSparsePoolQuota)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1777,6 +1814,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
                 cfg->enablePartialCommit = enablePartialCommit;
+                cfg->hostSparsePoolQuota = hostSparsePoolQuota;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1786,7 +1824,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_match_backoff") = 0, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("typical_step") = std::nullopt, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
-            nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true)
+            nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
+            nb::arg("host_sparse_pool_quota").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1796,6 +1835,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
+        .def_rw("host_sparse_pool_quota", &kv::KVCacheManagerConfig::hostSparsePoolQuota,
+            "Host bytes the GPU tier's host-backed pools may take, or None for unbounded.\n\n"
+            "A sparse buffer's pages are host memory, so the device quota does not pay for them and "
+            "nothing else bounds them: a slot spans every pool of its group, so their row count "
+            "follows from the device-backed pools the quota does size. This is the bound they "
+            "otherwise lack. It only lowers a slot count, and pool groups holding such pools share "
+            "it by the same ratio that divides the device quota.\n\n"
+            "Kept exactly, as is the feasibility floor `constraints` implies; the ratio is what gives "
+            "way between them. The two can only conflict if the floors alone exceed this budget, "
+            "which construction rejects.")
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
             "One positive, normalized cache-tier quota weight per layer group.")
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
@@ -2410,33 +2459,55 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "grains_for_slots",
-        [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity)
+        [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,
+            std::optional<std::vector<int32_t>> const& pools)
         {
             if (numSlots < 0)
             {
                 throw std::invalid_argument("num_slots must be non-negative");
             }
-            return kv::CacheLevelStorage::grainsForSlots(numSlots, typedPoolSizeList(slotSizeList), granularity);
+            auto const sizes = typedPoolSizeList(slotSizeList);
+            auto const which = typedPoolSelectors(
+                pools.has_value() ? std::optional{std::vector<std::vector<int32_t>>{*pools}} : std::nullopt,
+                kv::TypedVec<kv::PoolGroupIndex, kv::TypedVec<kv::PoolIndex, size_t>>{{sizes}});
+            return kv::CacheLevelStorage::grainsForSlots(numSlots, sizes, which[kv::PoolGroupIndex{0}], granularity);
         },
-        nb::arg("num_slots"), nb::arg("slot_size_list"), nb::arg("granularity"),
+        nb::arg("num_slots"), nb::arg("slot_size_list"), nb::arg("granularity"), nb::arg("pools").none() = std::nullopt,
         nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "grains_to_slots",
-        [](size_t pgGrains, std::vector<size_t> const& slotSizeList, size_t granularity)
+        [](size_t pgGrains, std::vector<size_t> const& slotSizeList, size_t granularity,
+            std::optional<std::vector<int32_t>> const& pools)
         {
+            auto const sizes = typedPoolSizeList(slotSizeList);
+            auto const which = typedPoolSelectors(
+                pools.has_value() ? std::optional{std::vector<std::vector<int32_t>>{*pools}} : std::nullopt,
+                kv::TypedVec<kv::PoolGroupIndex, kv::TypedVec<kv::PoolIndex, size_t>>{{sizes}});
             auto [slots, used]
-                = kv::CacheLevelStorage::grainsToSlots(pgGrains, typedPoolSizeList(slotSizeList), granularity);
+                = kv::CacheLevelStorage::grainsToSlots(pgGrains, sizes, which[kv::PoolGroupIndex{0}], granularity);
             return std::make_tuple(slots, used);
         },
-        nb::arg("pg_grains"), nb::arg("slot_size_list"), nb::arg("granularity"),
+        nb::arg("pg_grains"), nb::arg("slot_size_list"), nb::arg("granularity"), nb::arg("pools").none() = std::nullopt,
         nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "ratio_to_slot_count_list",
         [](size_t quota, std::vector<std::vector<size_t>> const& slotSizeLists, std::vector<float> const& ratioList,
-            size_t granularity, std::vector<kv::SlotCount> const& minSlots)
+            size_t granularity, std::vector<kv::SlotCount> const& minSlots, std::optional<size_t> secondQuota,
+            std::optional<size_t> secondGranularity,
+            std::optional<std::vector<std::vector<int32_t>>> const& secondPools)
         {
-            auto slotCountList = kv::CacheLevelStorage::ratioToSlotCountList(quota, typedSlotSizeLists(slotSizeLists),
-                kv::TypedVec<kv::PoolGroupIndex, float>{ratioList}, granularity, typedSlotCounts(minSlots));
+            auto const sizes = typedSlotSizeLists(slotSizeLists);
+            std::optional<kv::SecondaryPoolBudget> second;
+            if (secondQuota.has_value() || secondPools.has_value())
+            {
+                kv::SecondaryPoolBudget budget;
+                budget.quota = secondQuota;
+                budget.granularity = secondGranularity.value_or(granularity);
+                budget.pools = typedPoolSelectors(secondPools, sizes);
+                second = std::move(budget);
+            }
+            auto slotCountList = kv::CacheLevelStorage::ratioToSlotCountList(quota, sizes,
+                kv::TypedVec<kv::PoolGroupIndex, float>{ratioList}, granularity, typedSlotCounts(minSlots), second);
             std::vector<kv::SlotCount> result;
             result.reserve(slotCountList.stdSize());
             for (kv::SlotCount slotCount : slotCountList)
@@ -2446,7 +2517,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return result;
         },
         nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
-        nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("min_slots"), nb::arg("second_quota").none() = std::nullopt,
+        nb::arg("second_granularity").none() = std::nullopt, nb::arg("second_pools").none() = std::nullopt,
+        nb::call_guard<nb::gil_scoped_release>());
 
     // CUDA virtual-memory primitives, reached through _introspection because they carry no
     // stability promise: the native disaggregated bounce buffer reserves one contiguous fabric

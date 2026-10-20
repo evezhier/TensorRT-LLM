@@ -151,15 +151,10 @@ struct SlotDescVariant
     LifeCycleId lifeCycleId{0};
     TypedVec<PoolIndex, CoalescedBuffer> coalescedBuffers; // sorted size desc
 
-    //! Whether each pool of this group is sparse, in pool order. uint8_t rather than bool
-    //! because TypedVec hands out `T&`, which std::vector<bool>'s proxy cannot satisfy.
-    [[nodiscard]] TypedVec<PoolIndex, uint8_t> sparsityList() const
+    //! Whether one pool of this group is sparse.
+    [[nodiscard]] bool isSparse(PoolIndex poolIdx) const
     {
-        TypedVec<PoolIndex, uint8_t> out;
-        out.reserve(coalescedBuffers.size());
-        for (auto const& cb : coalescedBuffers)
-            out.push_back(static_cast<uint8_t>(cb.isSparse));
-        return out;
+        return coalescedBuffers.at(poolIdx).isSparse;
     }
 
     // Slot size for each pool in this group.
@@ -191,21 +186,20 @@ struct SlotDesc
 
     //! Life cycles share a pool group only when their pools agree position-wise on
     //! sparsity as well as size, so this is uniform across variants.
-    [[nodiscard]] TypedVec<PoolIndex, uint8_t> sparsityList() const
+    [[nodiscard]] bool isSparse(PoolIndex poolIdx) const
     {
-        return getUniformAttribute(variants, [](auto const& v) { return v.sparsityList(); });
+        return getUniformAttribute(variants, [poolIdx](auto const& v) { return v.isSparse(poolIdx); });
     }
 
-    //! Bytes of one slot that the GPU tier's quota pays for: the non-sparse pools alone.
-    //! A sparse pool's pages are host memory, so they consume none of that budget.
-    [[nodiscard]] size_t chargeableSlotSize() const
+    //! Bytes of one slot that the GPU tier's quota pays for: the dense pools alone. A
+    //! sparse pool's pages are host memory, so they consume none of that budget.
+    [[nodiscard]] size_t denseSlotSize() const
     {
         auto const sizes = slotSizeList();
-        auto const sparse = sparsityList();
         size_t total = 0;
         for (PoolIndex p{0}; p < sizes.size(); ++p)
         {
-            if (sparse.at(p) == 0)
+            if (!isSparse(p))
             {
                 total += sizes.at(p);
             }
@@ -278,6 +272,10 @@ struct StorageConfig
 {
     TypedVec<CacheLevel, CacheTierConfig> cacheTiers;
     TypedVec<PoolGroupIndex, SlotDesc> slotDescList;
+
+    //! Host bytes the GPU tier's host-backed pools may take, or unset for unbounded. A
+    //! sizing input like the tier quotas, and carried here for the same reason.
+    std::optional<size_t> hostSparsePoolQuota;
 
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;

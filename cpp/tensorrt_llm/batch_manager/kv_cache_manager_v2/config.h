@@ -527,6 +527,20 @@ struct KVCacheManagerConfig
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
 
+    // Host memory the GPU tier's host-backed pools may take, in bytes. Unset leaves them
+    // unbounded.
+    //
+    // A sparse buffer's pages are host memory, so the device quota does not pay for them and
+    // nothing else bounds them either: a slot spans every pool of its group, so their row
+    // count follows from the device-backed pools the quota does size. This is the bound they
+    // otherwise lack. It only ever lowers a slot count, and when several pool groups hold
+    // such pools they share it by the same ratio that divides the device quota.
+    //
+    // Kept exactly, as is the feasibility floor `constraints` implies; the pool ratio is what
+    // gives way between them. The two can only conflict if the floors alone exceed this
+    // budget, which construction rejects.
+    std::optional<size_t> hostSparsePoolQuota;
+
     // Publish a finalized partial block for reuse when committing stops.
     // Beam search disables this while retaining full-block reuse.
     bool enablePartialCommit = true;

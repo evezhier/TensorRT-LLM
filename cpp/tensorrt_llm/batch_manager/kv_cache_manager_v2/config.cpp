@@ -60,6 +60,14 @@ void KVCacheManagerConfig::validate() const
         throw AssertionError("KVCacheManagerConfig: first cache tier must be GPU memory");
     }
 
+    // Zero would ask for host-backed pools with no room for a single slot, which is a
+    // configuration error rather than a way to turn them off: whether a pool is host-backed
+    // is a property of the buffer, declared in the layer config.
+    if (hostSparsePoolQuota.has_value() && *hostSparsePoolQuota == 0)
+    {
+        throw AssertionError("KVCacheManagerConfig: host_sparse_pool_quota must be positive when set");
+    }
+
     // Check for duplicate layer ids.
     std::set<LayerId> seenLayerIds;
     for (auto const& layer : layers)

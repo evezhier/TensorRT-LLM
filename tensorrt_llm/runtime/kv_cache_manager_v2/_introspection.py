@@ -454,14 +454,28 @@ def sparse_resolve(
     )
 
 
-def grains_for_slots(num_slots: int, slot_size_list: list[int], granularity: int) -> int:
-    """Return the grain count required for a pool group slot count."""
-    return int(_cpp().grains_for_slots(num_slots, slot_size_list, granularity))
+def grains_for_slots(
+    num_slots: int,
+    slot_size_list: list[int],
+    granularity: int,
+    pools: list[int] | None = None,
+) -> int:
+    """Return the grain count required for a pool group slot count.
+
+    ``pools`` names which of ``slot_size_list``'s pools to count, defaulting to all of
+    them -- which is what a caller with a single budget means.
+    """
+    return int(_cpp().grains_for_slots(num_slots, slot_size_list, granularity, pools))
 
 
-def grains_to_slots(pg_grains: int, slot_size_list: list[int], granularity: int) -> tuple[int, int]:
+def grains_to_slots(
+    pg_grains: int,
+    slot_size_list: list[int],
+    granularity: int,
+    pools: list[int] | None = None,
+) -> tuple[int, int]:
     """Return (slot count, consumed grains) for a pool group grain budget."""
-    slots, used = _cpp().grains_to_slots(pg_grains, slot_size_list, granularity)
+    slots, used = _cpp().grains_to_slots(pg_grains, slot_size_list, granularity, pools)
     return int(slots), int(used)
 
 
@@ -471,10 +485,28 @@ def ratio_to_slot_count_list(
     ratio_list: list[float],
     granularity: int,
     min_slots: list[int],
+    second_quota: int | None = None,
+    second_granularity: int | None = None,
+    second_pools: list[list[int]] | None = None,
 ) -> list[int]:
-    """Return slot counts by pool group for a quota and ratio list."""
+    """Return slot counts by pool group for a quota and ratio list.
+
+    ``slot_size_lists`` holds every pool's size. A second medium's budget is given by
+    ``second_quota`` with its own ``second_granularity`` and ``second_pools``; the quota
+    pays for every pool that budget does not name, so the two cannot overlap or leave a
+    pool unpaid.
+    """
     return list(
-        _cpp().ratio_to_slot_count_list(quota, slot_size_lists, ratio_list, granularity, min_slots)
+        _cpp().ratio_to_slot_count_list(
+            quota,
+            slot_size_lists,
+            ratio_list,
+            granularity,
+            min_slots,
+            second_quota,
+            second_granularity,
+            second_pools,
+        )
     )
 
 

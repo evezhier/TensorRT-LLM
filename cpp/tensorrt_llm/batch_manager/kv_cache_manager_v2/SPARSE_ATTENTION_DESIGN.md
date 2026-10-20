@@ -280,10 +280,18 @@ It is one token rather than anything derived from the reservation's width. What 
 *could* pin says nothing about what a step produces: the fetch cannot serve a multi-token
 step at any width.
 
-The lease therefore depends on configuration alone. It is taken once at `resume()` and
-fails there if the arena is full, so the fetch path never has to handle exhaustion. Because
-every request of a life cycle needs exactly the same number of cells, the arena is a
-fixed-size-block free list rather than a general allocator.
+The lease therefore depends on configuration alone. It is taken when the cache is seated in
+a `Batch` and returned when it leaves, so a request holds cells exactly while it is being
+stepped: one still receiving its disaggregated history, or sitting a step out, holds none.
+Seating cannot fail for want of a cell, because the arena is sized from the same
+`constraints` the Batch takes its rows from -- a free row therefore has a free lease, and
+the fetch path never has to handle exhaustion. Because every request of a life cycle needs
+exactly the same number of cells, the arena is a fixed-size-block free list rather than a
+general allocator.
+
+Leaving returns the lease with every entry free, so it discards whatever the GPU cache held.
+`flushSparseUnits()` is what preserves anything worth keeping, and a Batch that churns its
+membership every step cold-starts every request's cache.
 
 `resize()` still checks the gap against this bound. It is the host-side counterpart of the
 resolve kernel's in-flight overflow report: one catches a request outgrowing its cache
@@ -839,11 +847,19 @@ It also owns three things the sparse path depends on:
   the write-back read.
 - **the write-back**, as `flushSparseUnits()` — see "Locking and flush".
 
-**Dirty rows — planned, not built.** `publish()` restages every row. The intended refinement
-is that a `_KVCache` knows its `Batch` and row (it does, for detach), any lock-changing
-operation marks that row dirty, and `Batch` republishes only the dirty ones, following the
-existing `mark_stats_dirty` / `clear_stats_dirty` / `get_dirty_stats_kv_cache_ids` pattern.
-Until then a step restages the whole table, which is a cost rather than a wrong answer.
+**The upload is whole-table by decision.** `publish()` stages every row and sends the table
+in one `cuMemcpyHtoDAsync` on the upload stream, which overlaps compute. Sending only the
+rows whose locks moved would replace that single driver call with one per row, and the cost
+of those launches outweighs the bytes they save. The table is large -- four layer groups,
+about 32 MiB a step at a 1M `max_seq_len` and B = 256 -- but size is not the figure that
+decides it.
+
+**Dirty rows — planned, not built.** What dirty tracking would still save is the host-side
+restaging, not the transfer: a `_KVCache` knows its `Batch` and row (it does, for detach),
+any lock-changing operation could mark that row dirty, and `Batch` could restage only those,
+following the existing `mark_stats_dirty` / `clear_stats_dirty` /
+`get_dirty_stats_kv_cache_ids` pattern. Until then a step restages the whole table, which is
+a cost rather than a wrong answer.
 
 Rejecting direct mutation instead was considered and rejected: `commit` changes locks and
 runs every decode step, so strictness would require a batched twin for every mutator before
@@ -859,8 +875,18 @@ after a partial failure must reflect the post-rollback state.
 **Rows are slots.** Removing a request leaves a hole to be reused rather than shifting later
 rows, which would invalidate the whole table and destabilise the shapes graph capture needs.
 The `_torch` layer already works this way with `index_mapper_capacity` and a `copy_idx`
-gather. Membership is exclusive, and closing a member or destroying a batch with live
-members needs defined behaviour, since `SharedPtr` refcounts here are non-atomic.
+gather. Membership is exclusive: a row already occupied is refused rather than rebound,
+because nothing downstream would notice the substitution.
+
+**A row owns its member.** `mRows` holds a `shared_ptr`, so a seated cache cannot be
+destroyed under the Batch and a caller may keep only the Batch; `removeKvCache()` hands the
+reference back, which makes "the Batch kept it alive" and "here it is back" one operation.
+The binding pinned every cache ever added for the Batch's whole life and released none of
+them, which was the wrong shape as well as a leak: what a row needs is a reference for
+exactly as long as it is seated. `KvCache` points back with a raw `mBatch`, so there is no
+cycle, and `_detach()` -- the path for a member destroyed while seated -- is now unreachable
+by construction and says so with a fatal check rather than carrying teardown that could
+never run.
 
 ## Sizing
 
@@ -972,6 +998,9 @@ layout of its own:
 
 - **One region per pool**, sized `maxLeases * buffersInPool * cellsPerBuffer * cellBytes`.
   A lease is an index rather than a cell offset, because a pool's cells-per-lease is its own.
+  A pool index no sparse buffer of the life cycle uses keeps its place in the list and sizes
+  to nothing: the arena is indexed by the storage pool index rather than by a dense numbering
+  of its own, and an empty region costs only the entry that says where the next one starts.
 - **Buffers ordered `(layer, pool)`.** A layer's buffers stay consecutive, which the fetch
   needs to name them as a range; and within a layer a pool's buffers are consecutive too,
   which the copy needs for the same reason. `bufferLayer` stays non-decreasing.
@@ -1109,15 +1138,117 @@ only `coldTier = srcIsHot ? dstTier : srcTier`, and the copy-engine path needs b
 hot, which never happens; host memory is device-accessible, so a mixed group needs no second
 tier.
 
-**A sparse pool's bytes are excluded from the quota, and its slot count is free.** A slot is
-one row spanning every pool of its group, so once a group holds at least one device-backed
-pool, the quota sizes that pool and the sparse pools inherit the same row count. The quota
-therefore charges only the non-sparse pools — a sparse pool's size enters the computation as
-zero — and nothing else is needed.
+**A sparse pool's bytes are excluded from the device quota.** A slot is one row spanning
+every pool of its group, so once a group holds at least one device-backed pool, the quota
+sizes that pool and the sparse pools inherit the same row count. The quota therefore charges
+only the dense pools.
 
-This is why a pool group must hold **at least one non-sparse pool**: a wholly sparse group
-would have no chargeable bytes per slot and so no slot count to derive. That is a validation,
-not a heuristic.
+This is why a pool group must hold **at least one dense pool**: a wholly sparse group would
+have no device bytes per slot and so no slot count to derive. That is a validation, not a
+heuristic.
+
+**But the row count is not free.** Inheriting it gave the sparse pools no bound of their own:
+their host memory grew with whatever the device quota bought, and the only way to hold it
+down was to shrink the device cache that everything else shares.
+`KVCacheManagerConfig::hostSparsePoolQuota` is that bound, and the allocator takes it as a
+second budget over a disjoint set of the same pools rather than as a clamp applied afterwards.
+
+The two budgets **partition** a group's pools — dense charged to the device quota, sparse to
+the host budget, each in its own allocation grain — so one slot count settles both at once.
+`ratioToSlotCountList` therefore takes every pool's size once, plus an index list naming the
+pools each budget answers for. Three properties follow, and the first is the reason this is
+one pass rather than two:
+
+- **A group bound by one budget releases what it does not use of the other.** Clamping the
+  slot count afterwards could only lower it; the device bytes a host-bound group then stopped
+  using went to nobody, and a group with no sparse pool at all -- which can never be
+  host-bound -- was left short for no reason.
+- **Both budgets and `min_slots` are kept exactly; the pool ratio is what gives way.** The
+  floors come off the top before anything is shared, so no division of the rest can break one.
+- **Their only conflict is a configuration error, and it is caught once.** The floors can
+  exceed a budget, but that names neither the ratio nor the device quota -- the two things a
+  rebalance changes. So it is rejected the first time the allocator runs and cannot begin to
+  fail later.
+
+The split belongs to the hot level alone and is not a property a level can report about
+itself: a cold group is a single pool holding dense and sparse buffers together, and a GPU
+tier may itself be a cold level. The pools a quota pays for are therefore derived as the
+complement of the ones the host budget names -- never passed alongside them -- so the two
+cannot overlap, and no pool can be left for neither to pay.
+
+#### The quota excludes sparse pools; the ratio counts them
+
+These are deliberately different currencies, and the asymmetry looks like a bug until the
+third party is in view.
+
+- **The quota** (`totalQuota()`, `denseNumBytes`) counts only dense pools. Host-backed bytes
+  consume none of the device memory it measures.
+- **The ratio** (`ratioList()`, and the profiler's) weighs *every* pool, host-backed
+  included. It has to: it is projected onto cold levels, where a single pool holds dense and
+  sparse buffers together, and it is compared against the achieved layout, which is measured
+  the same way.
+
+The consequence is easy to miss. `KvCacheManager::_needAdjustment` compares the layout's
+current ratio against the target `constrainPoolGroupRatio` produces, and rebalances when they
+differ. `constrainPoolGroupRatio` derives that target by *running the allocator* and
+normalising the bytes it would produce -- so it must run it with the **same budgets**, the
+sparse host quota included. Omit the budget there and the target describes a layout the
+allocator will not produce: every comparison mismatches, and a rebalance re-triggers on every
+check even though the profiler's answer never moved. The ratio, the measurement and the
+constraint all have to speak all-bytes for that loop to settle.
+
+What the asymmetry *does* require is that the division be driven by all-bytes demand, not
+that the ratio be re-expressed per budget. Dividing the device quota alone by an all-bytes
+ratio does not realise that ratio: a sparse-heavy group takes a device share its device cost
+per slot does not warrant, and converts it into more slots than asked for.
+
+The release step does not rescue this. It returns the device grains a group cannot use
+*because the host budget held it* -- so where the host budget is generous, nothing is held,
+nothing is released, and the over-share stands. The fix belongs in how the budgets are
+divided: demand is computed from each group's all-bytes cost per slot, so the achieved
+all-bytes shares track the ratio, and the per-medium budgets act as caps on that demand.
+Re-expressing the ratio itself in a single medium's currency would be wrong for the reasons
+above -- it has to stay comparable with what `ratioList()` measures and with what a cold
+level inherits.
+
+#### How the division runs
+
+The allocator is a search over one scalar, and all-bytes is what that scalar buys.
+
+Write `A(pg, n)` for what `n` slots of group `pg` cost in all-bytes — every pool rounded up
+to the grain of the medium backing it, which is exactly `CacheLevelStorage::allBytes()`. For
+a *level* of all-bytes spending `L`, each group's demand is
+
+    demand(pg, L) = max( minSlots[pg], maxSlotsForAllBytes(L · r[pg]) )
+
+i.e. the most slots whose all-bytes cost fits that group's share of `L`, never below its
+floor. `demand` is monotonic in `L`, so each budget admits a largest feasible level, found by
+bisection: `levelQuota` for the device quota, `levelSecond` for the host budget. Both must
+hold, so the search is run against both and the binding one wins.
+
+Three details make the result exact rather than approximately right.
+
+- **Floors come off the top.** Each group starts at `minSlots`, snapped up by `freeRun` to
+  the largest count costing no more grains in any medium — a count short of what it has
+  already paid for is not the count a re-derivation from the same bytes returns, and that
+  disagreement is the grains↔slots round-trip bug in its original form. Host-backed pools
+  count here even when no host quota is set: a pool nothing is bounding is still real memory,
+  and letting the snap ignore it grows the floor to whatever the device grain absorbs.
+- **A group frozen by one budget releases the other.** When the host budget pins a group, its
+  slot count stops rising, and the device grains its demand would have claimed are returned to
+  the search rather than reserved. This is what makes one pass strictly better than a quota
+  followed by a clamp.
+- **A bounded greedy finish spends the remainder.** Bisection lands on a level, not on an
+  integral allocation; leftover grains in either budget are then handed out one group at a
+  time, each step choosing the group whose resulting `A(pg, n)/r[pg]` is lowest. That is a
+  leximin step on achieved all-bytes shares: equal shares mean the achieved ratio *is* `r`,
+  so raising the currently worst-served group is the move that gets closest to it.
+
+The fixed-point property falls out of measuring demand and achievement in the same currency:
+feed the allocator the normalised all-bytes ratio of its own output and it returns the same
+slot counts, which is what stops `_needAdjustment` from re-firing on an unchanged profile.
+`test_feeding_back_the_layouts_own_ratio_changes_nothing` pins it, including the case where a
+host-backed pool is most of a group's bytes and none of its quota.
 
 A level's quota measures one medium, which is why host-backed bytes cannot be drawn from it:
 they consume none of the device bytes it counts, so charging them would cap sparse history at
@@ -1143,8 +1274,9 @@ encoded while the cache still held a cell copied from it. It cannot:
   `LOCKED` forbids eviction outright (*Page status*).
 - Eviction is the only route to migration, and migration across the hot boundary is the only
   thing that invokes the codec.
-- The lease and the locks share a lifetime: taken at `resume()`, released together in
-  `_freeReservedGpuSlots()`. A cell therefore exists only while its page is locked.
+- The lease is held inside the locks' lifetime, not alongside it: seating requires a resumed
+  cache, which has already locked the pages it requires, and leaving returns the lease. A
+  cell therefore exists only while its page is locked, with room to spare at both ends.
 
 `commit()` does downgrade a lock to a holder, but only for a page it is discarding in favour
 of an existing tree page -- not one the request goes on to read.

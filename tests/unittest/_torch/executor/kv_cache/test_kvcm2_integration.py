@@ -41,8 +41,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     SPARSE_ARENA_ALIGNMENT,
     HostHistoryReservations,
-    host_bounded_quota,
-    life_cycle_pages,
     sparse_arena_bytes,
     sparse_arena_shapes,
     sparse_batch_shape,
@@ -2873,11 +2871,12 @@ def _native_config_with_sparse_arena(
             tokens_per_block=tokens_per_block, cache_tiers=cache_tiers, layers=layers
         )
 
-    def bound_quota_by_host_history(
-        self: KVCacheManagerV2, kv_cache_config: KvCacheConfig, quota: int, **kwargs: object
-    ) -> int:
+    def plan_host_history_budget(
+        self: KVCacheManagerV2, kv_cache_config: KvCacheConfig, **kwargs: object
+    ) -> None:
+        # Settles the budget only. The device quota is no longer lowered here: the
+        # manager divides it against the host budget itself.
         self._host_history_budget = host_history_budget
-        return quota
 
     with (
         patch.dict(os.environ, {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""}),
@@ -2897,7 +2896,7 @@ def _native_config_with_sparse_arena(
             "_get_sparse_batch_buffer_bytes",
             return_value=(batch_buffer_bytes, 4096 if batch_buffer_bytes else 0),
         ) as get_batch_buffer_bytes,
-        patch.object(KVCacheManagerV2, "_bound_quota_by_host_history", bound_quota_by_host_history),
+        patch.object(KVCacheManagerV2, "_plan_host_history_budget", plan_host_history_budget),
     ):
         KVCacheManagerV2(
             kv_cache_config or KvCacheConfig(max_gpu_total_bytes=budget),
@@ -3606,7 +3605,7 @@ def _base_config(layers: list, initial_pool_ratio: list[float] | None = None):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("pinned", [False, True])
-def test_offload_splits_the_quota_by_decode_bytes_unless_pinned(pinned: bool) -> None:
+def test_offload_splits_the_ratio_by_all_bytes_unless_pinned(pinned: bool) -> None:
     manager = _offload_manager()
     build_base, build_cache = _base_config(_offload_layers(), [0.25, 0.75] if pinned else None)
 
@@ -3621,67 +3620,15 @@ def test_offload_splits_the_quota_by_decode_bytes_unless_pinned(pinned: bool) ->
     if pinned:
         assert config.initial_pool_ratio == [0.25, 0.75]
         return
-    # A 16-token request holds four pages of 256 device bytes in the no-window
-    # life cycle and three pages of 4 KiB in the window-8 one; host pages are free.
-    assert config.initial_pool_ratio == pytest.approx([1024 / 13_312, 12_288 / 13_312])
-
-
-@pytest.mark.cpu_only
-def test_device_quota_is_bounded_by_the_host_budget() -> None:
-    manager = _offload_manager(host_history_size=200 << 20)
-    manager._sparse_batch_staging_bytes = 4 << 20
-    build_base, build_cache = _base_config(_offload_layers()[:1])
-
-    with build_base, build_cache:
-        quota = manager._bound_quota_by_host_history(
-            KvCacheConfig(), 1 << 30, tokens_per_block=TOKENS_PER_BLOCK, max_leases=3
-        )
-
-    # The staging buffers come out of the host history size.
-    assert manager._host_history_budget == 196 << 20
-    # Each slot costs 256 quota bytes and 1 KiB of host memory. With no other
-    # life cycle to leave granules unused, two 2 MiB granules' worth of host
-    # memory are held back for rounding, and with none to take the rest of the
-    # quota, the whole quota is lowered.
-    assert quota == ((196 << 20) - 2 * 4 * (2 << 20)) // 4
-    assert manager._host_bounded_pool_ratio is None
-    with build_base, build_cache:
-        assert (
-            manager._bound_quota_by_host_history(
-                KvCacheConfig(), 1 << 20, tokens_per_block=TOKENS_PER_BLOCK, max_leases=3
-            )
-            == 1 << 20
-        )
-
-
-@pytest.mark.cpu_only
-def test_host_bound_gives_device_only_life_cycles_the_rest_of_the_quota() -> None:
-    manager = _offload_manager(host_history_size=200 << 20)
-    build_base, build_cache = _base_config(_offload_layers())
-
-    with build_base, build_cache:
-        quota = manager._bound_quota_by_host_history(
-            KvCacheConfig(), 1 << 30, tokens_per_block=TOKENS_PER_BLOCK, max_leases=3
-        )
-        config = manager._build_manager_config(
-            KvCacheConfig(),
-            tokens_per_block=TOKENS_PER_BLOCK,
-            cache_tiers=[GpuCacheTierConfig(quota=quota)],
-            max_leases=3,
-        )
-
-    # The history's life cycle gets the device bytes the bounded quota would
-    # have given it, and the windowed one keeps everything else.
-    ratio = [1024 / 13_312, 12_288 / 13_312]
-    bounded = host_bounded_quota(
-        life_cycle_pages(_offload_layers(), TOKENS_PER_BLOCK),
-        ratio,
-        host_budget=200 << 20,
-        quota=1 << 30,
-    )
-    assert bounded < quota == 1 << 30
-    history_share = ratio[0] * bounded / quota
-    assert config.initial_pool_ratio == pytest.approx([history_share, 1 - history_share])
+    # A 16-token request holds four pages in the no-window life cycle and three pages of
+    # 4 KiB in the window-8 one. A no-window page is 1280 bytes: 1024 host-backed sparse
+    # beside 256 device. The ratio weighs both media -- it is projected onto cold levels,
+    # where one pool holds them together, and compared against a layout measured the same
+    # way. That host bytes cost the GPU quota nothing is a fact about the quota alone.
+    no_window = 4 * (1024 + 256)
+    windowed = 3 * 4096
+    total = no_window + windowed
+    assert config.initial_pool_ratio == pytest.approx([no_window / total, windowed / total])
 
 
 @pytest.mark.cpu_only
@@ -3724,7 +3671,14 @@ def test_host_backed_bytes_count_only_the_sparse_pools() -> None:
 
 
 @pytest.mark.cpu_only
-def test_offload_bounds_the_device_quota_and_shrinks_the_auto_host_tier(monkeypatch) -> None:
+def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
+    """The device quota is not lowered to fit the host budget; the manager divides both.
+
+    Bounding the quota beforehand shrank every pool group, device-only ones included, to
+    hold back host memory only some of them spend. The manager is given the budget instead
+    and holds the host-backed pools inside it while the rest keep the device bytes.
+    """
+
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
     fake_impl.layer_grouping = [[0]]
@@ -3783,11 +3737,16 @@ def test_offload_bounds_the_device_quota_and_shrinks_the_auto_host_tier(monkeypa
     config = create_impl.call_args.args[0]
     gpu_tier, host_tier = config.cache_tiers
     assert config.initial_pool_ratio == [1.0]
-    # The 200 MiB of host history less the sparse Batch's one-page staging copy,
-    # and less two 2 MiB granules' worth held back for rounding, at 1 KiB per
-    # 256-byte slot, buys about 46 MiB of the 64 MiB budget.
-    assert gpu_tier.quota == ((200 << 20) - 4096 - 2 * 4 * (2 << 20)) // 4
-    # The automatic host tier takes half of what the 200 MiB leaves of the 250 MiB.
+    # Only the offload allocations come off the 64 MiB budget now. Under the old
+    # bound this was about 46 MiB, the host budget divided by the 4 host bytes each
+    # device byte carries -- a reduction every pool group paid, not just the ones
+    # holding host-backed pools.
+    assert gpu_tier.quota > (63 << 20)
+    # The 200 MiB of host history less the sparse Batch's one-page staging copy. No
+    # granule holdback: the manager counts host bytes in their own grain, so there is
+    # no device-side rounding to guess at from out here.
+    assert config.host_sparse_pool_quota == (200 << 20) - 4096
+    # The automatic host tier still takes half of what the 200 MiB leaves of the 250 MiB.
     assert host_tier.quota == (50 << 20) // 2
 
 

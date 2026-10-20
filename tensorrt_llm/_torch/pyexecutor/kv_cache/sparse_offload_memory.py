@@ -563,8 +563,13 @@ def sparse_offload_pool_ratio(
         One positive share per life cycle, summing to 1; the order and meaning of
         ``KVCacheManagerConfig.initial_pool_ratio``.
     """
+    # Device and host bytes together. The manager's pool ratio counts every pool, host-backed
+    # ones included -- it is projected onto cold levels, where one pool holds dense and sparse
+    # buffers together, and a rebalance compares it against a layout measured the same way.
+    # Weighing device bytes alone here would hand the manager a ratio in one currency and
+    # measure the result in another.
     weights = [
-        life_cycle.device_bytes
+        (life_cycle.device_bytes + life_cycle.host_bytes)
         * life_cycle.pages_per_request(
             capacity=capacity,
             capacity_headroom=capacity_headroom,
@@ -573,101 +578,9 @@ def sparse_offload_pool_ratio(
         for life_cycle in life_cycles
     ]
     if any(weight <= 0 for weight in weights):
-        raise ValueError(f"Every life cycle needs device bytes to share the quota, got {weights}")
+        raise ValueError(f"Every life cycle needs bytes to share the quota, got {weights}")
     total = sum(weights)
     return [weight / total for weight in weights]
-
-
-def host_bounded_quota(
-    life_cycles: Sequence[LifeCyclePage],
-    pool_ratio: Sequence[float],
-    *,
-    host_budget: int,
-    quota: int,
-) -> int:
-    """Return ``quota``, lowered so the host-backed pools it sizes fit in ``host_budget``.
-
-    A life cycle gets the slots its share of the quota buys at its device bytes
-    per slot, and each of those slots also holds its host bytes. The native
-    manager splits the quota in whole granules: it rounds the quota up to one,
-    rounds each pool group's share to the nearest one, and gives the group with
-    the largest share every granule the others cannot fill with a whole slot.
-    A group leaves fewer granules unused than one more slot would take, at most
-    one per pool when slots are smaller than a granule. The host memory those
-    granules could buy is held back for every life cycle with host-backed pages,
-    so the pools stay within the budget whichever group takes them.
-
-    Args:
-        life_cycles: The manager's life cycles, in native order.
-        pool_ratio: The quota's split across ``life_cycles``.
-        host_budget: Host bytes the host-backed pools may take.
-        quota: The device quota before the bound.
-
-    Raises:
-        ValueError: ``pool_ratio`` does not have one share per life cycle.
-    """
-    if len(pool_ratio) != len(life_cycles):
-        raise ValueError(
-            f"The pool ratio has {len(pool_ratio)} shares for {len(life_cycles)} life cycles"
-        )
-    granule_bytes = gpu_pool_granule_bytes(quota)
-    # The most granules each life cycle's pools can leave unused.
-    spare_granules = [
-        sum(ceil_div(pool_bytes, granule_bytes) for pool_bytes in life_cycle.device_pool_bytes)
-        for life_cycle in life_cycles
-    ]
-    host_per_quota_byte = 0.0
-    held_back = 0.0
-    for life_cycle, share, own_spare in zip(life_cycles, pool_ratio, spare_granules):
-        if not life_cycle.host_bytes:
-            continue
-        host_per_device_byte = life_cycle.host_bytes / life_cycle.device_bytes
-        host_per_quota_byte += share * host_per_device_byte
-        # The other groups' unused granules, and two for rounding the quota and
-        # this group's share.
-        extra_granules = 2 + sum(spare_granules) - own_spare
-        held_back += extra_granules * granule_bytes * host_per_device_byte
-    if not host_per_quota_byte:
-        return quota
-    return min(quota, int(max(0.0, host_budget - held_back) / host_per_quota_byte))
-
-
-def host_bounded_pool_ratio(
-    life_cycles: Sequence[LifeCyclePage],
-    pool_ratio: Sequence[float],
-    *,
-    bounded_quota: int,
-    quota: int,
-) -> list[float] | None:
-    """Return a split of ``quota`` that holds host-backed life cycles to ``bounded_quota``.
-
-    Lowering the whole quota to the :func:`host_bounded_quota` result shrinks
-    every life cycle with the host-backed ones. This split keeps ``quota``
-    instead. Each life cycle with host-backed pages gets the device bytes its
-    share of ``bounded_quota`` buys, so its host pools stay within their
-    budget, and the device-only life cycles divide the rest in proportion to
-    their shares.
-
-    Args:
-        life_cycles: The manager's life cycles, in native order.
-        pool_ratio: The split ``bounded_quota`` was computed for.
-        bounded_quota: The quota at which the host-backed pools fit.
-        quota: The device quota to split.
-
-    Returns:
-        One positive share per life cycle, summing to 1; None when no life cycle
-        is device-only or nothing fits.
-    """
-    host_share = sum(share for lc, share in zip(life_cycles, pool_ratio) if lc.host_bytes)
-    device_share = sum(share for lc, share in zip(life_cycles, pool_ratio) if not lc.host_bytes)
-    if bounded_quota <= 0 or device_share <= 0:
-        return None
-    host_scale = bounded_quota / quota
-    device_scale = (1.0 - host_share * host_scale) / device_share
-    return [
-        share * (host_scale if life_cycle.host_bytes else device_scale)
-        for life_cycle, share in zip(life_cycles, pool_ratio)
-    ]
 
 
 def plan_host_history_bytes(

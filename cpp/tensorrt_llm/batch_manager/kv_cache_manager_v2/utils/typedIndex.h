@@ -186,6 +186,11 @@ public:
     using ContainerType = std::vector<T>;
     using iterator = typename ContainerType::iterator;
     using const_iterator = typename ContainerType::const_iterator;
+    //! The container's own reference types rather than `T&`/`T const&`, so that
+    //! TypedVec<Index, bool> works: std::vector<bool> hands out a proxy, not a `bool&`.
+    //! For every other T these are exactly `T&` and `T const&`.
+    using reference = typename ContainerType::reference;
+    using const_reference = typename ContainerType::const_reference;
 
     TypedVec() = default;
 
@@ -209,22 +214,22 @@ public:
     {
     }
 
-    [[nodiscard]] T& operator[](Index index) noexcept
+    [[nodiscard]] reference operator[](Index index) noexcept
     {
         return mData[toSizeT(index)];
     }
 
-    [[nodiscard]] T const& operator[](Index index) const noexcept
+    [[nodiscard]] const_reference operator[](Index index) const noexcept
     {
         return mData[toSizeT(index)];
     }
 
-    [[nodiscard]] T& at(Index index)
+    [[nodiscard]] reference at(Index index)
     {
         return mData.at(toSizeT(index));
     }
 
-    [[nodiscard]] T const& at(Index index) const
+    [[nodiscard]] const_reference at(Index index) const
     {
         return mData.at(toSizeT(index));
     }
@@ -275,7 +280,7 @@ public:
     }
 
     template <typename... Args>
-    T& emplace_back(Args&&... args)
+    reference emplace_back(Args&&... args)
     {
         return mData.emplace_back(std::forward<Args>(args)...);
     }
@@ -285,22 +290,22 @@ public:
         mData.pop_back();
     }
 
-    [[nodiscard]] T& front()
+    [[nodiscard]] reference front()
     {
         return mData.front();
     }
 
-    [[nodiscard]] T const& front() const
+    [[nodiscard]] const_reference front() const
     {
         return mData.front();
     }
 
-    [[nodiscard]] T& back()
+    [[nodiscard]] reference back()
     {
         return mData.back();
     }
 
-    [[nodiscard]] T const& back() const
+    [[nodiscard]] const_reference back() const
     {
         return mData.back();
     }

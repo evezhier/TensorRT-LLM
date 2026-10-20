@@ -414,6 +414,16 @@ class KVCacheManagerConfig:
     enable_stats: bool = True
     text_only: bool = False
     enable_partial_commit: bool = True
+    # Host bytes the GPU tier's host-backed pools may take, or None for unbounded. A sparse
+    # buffer's pages are host memory, so the device quota does not pay for them and nothing
+    # else bounds them: a slot spans every pool of its group, so their row count follows from
+    # the device-backed pools the quota does size. This only lowers a slot count, and pool
+    # groups holding such pools share it by the ratio that divides the device quota.
+    #
+    # Kept exactly, as is the feasibility floor ``constraints`` implies; the pool ratio is what
+    # gives way between them. The two can only conflict if the floors alone exceed this
+    # budget, which construction rejects.
+    host_sparse_pool_quota: int | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

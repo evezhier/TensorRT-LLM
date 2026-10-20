@@ -272,34 +272,36 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     TLLM_CHECK_DEBUG_WITH_INFO(
         std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[kHotLevel]), "First cache tier must be GPU");
 
-    // Slot size lists for all pool groups, as the GPU quota sees them: sparse pools are
-    // host memory and are left out. A slot spans every pool of its group, so their row
-    // count follows from the device-backed pools the quota does size -- which is why they
-    // need no budget, and no heuristic, of their own.
+    // Every pool's size, and which of them are sparse. One array of sizes, so the two budgets
+    // cannot disagree about what a pool costs; the selector only says who pays.
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizeLists;
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools;
     slotSizeLists.reserve(hotSlotDescList.size());
+    sparsePools.reserve(hotSlotDescList.size());
     for (auto const& sd : hotSlotDescList)
     {
         auto const all = sd.slotSizeList();
-        auto const sparsity = sd.sparsityList();
-        // Only the sums matter downstream, so a sparse pool is left out rather than given a
-        // zero size: the slot count then follows from the device-backed pools alone.
-        TypedVec<PoolIndex, size_t> sizes;
+        std::vector<PoolIndex> sparse;
+        size_t dense = 0;
         for (PoolIndex p{0}; p < all.size(); ++p)
         {
-            if (sparsity.at(p) == 0)
+            if (sd.isSparse(p))
             {
-                sizes.push_back(all.at(p));
+                sparse.push_back(p);
+            }
+            else
+            {
+                ++dense;
             }
         }
-        bool const anyChargeable = !sizes.empty();
-        // Without one, the group has no bytes per slot and so no slot count to derive.
-        // Only the GPU tier needs this: sparsity exists at the hot level alone, so a cold
-        // level's groups are entirely device-independent and size from their own quota.
-        TLLM_CHECK_WITH_INFO(anyChargeable,
+        // Without a dense pool the group has no device bytes per slot and so no slot
+        // count to derive. Only the GPU tier needs this: sparsity exists at the hot level
+        // alone, so a cold level's groups size entirely from their own quota.
+        TLLM_CHECK_WITH_INFO(dense > 0,
             "A pool group must hold at least one non-sparse pool; a wholly sparse group has no device "
             "bytes from which to size its slots");
-        slotSizeLists.push_back(std::move(sizes));
+        slotSizeLists.push_back(all);
+        sparsePools.push_back(std::move(sparse));
     }
 
     size_t const gpuQuota = cacheTierQuota(config.cacheTiers[kHotLevel]);
@@ -338,20 +340,20 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
     else if (typicalBatch.has_value())
     {
-        lifeCycleRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
+        lifeCycleRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity, sparsePools);
     }
     else if (!constraints.empty())
     {
         auto lifeCycleSlots
             = computeSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
-        lifeCycleRatio = normalizeToRatio(slotsToBytes(lifeCycleSlots, gpuGranularity));
+        lifeCycleRatio = normalizeToRatio(slotsToBytes(lifeCycleSlots, gpuGranularity, sparsePools));
     }
     else
     {
         // Fallback: average history length 2048.
         BatchDesc fallback;
         fallback.kvCaches.push_back(KVCacheDesc{2049, 2048});
-        lifeCycleRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
+        lifeCycleRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity, sparsePools);
     }
 
     auto const hotRatio = toPoolGroupRatio(kHotLevel, lifeCycleRatio);
@@ -366,7 +368,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // Their bytes are excluded from the quota rather than sized from it: a slot spans every
     // pool of its group, so a sparse pool's row count follows from the group's device-backed
     // pools, which the quota does size.
-    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
+    mHostSparsePoolQuota = config.hostSparsePoolQuota;
+    // Derived from the descriptors here because the level's storage does not exist yet; every
+    // path afterwards asks the pool groups themselves, which carry the same sparsity.
+    auto gpuSlotCounts = computeSlotCountForLevel(
+        config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots, _hostSparsePoolBudget(sparsePools));
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get());
 
@@ -464,6 +470,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
         auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
+        // No second budget: a cold group is a single pool holding whatever the codec packs
+        // into it, dense and sparse buffers alike, so its quota pays for all of it.
         auto slotCounts
             = computeSlotCountForLevel(config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
         auto* gpuPhysMemAllocator
@@ -1737,14 +1745,19 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         = level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
     // Chargeable, not total: a rebalance that charged host bytes to the device budget would
     // under-size the level and evict live pages to reach it.
+    // Empty everywhere but the hot level, where it is what the host budget pays for.
+    auto const secondBudget = _hostSparsePoolBudget(lvlStorage.sparsePools());
     size_t minQuota
-        = minQuotaForLevel(lvlStorage.chargeableSlotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
+        = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots, secondBudget);
     if (quota < minQuota)
     {
         throw std::invalid_argument("Quota " + std::to_string(quota)
             + " is insufficient for min_slots constraints (requires at least " + std::to_string(minQuota) + ")");
     }
-    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
+    // Rebalancing moves the device budget, which moves the slot counts the host-backed pools
+    // follow, so the host budget is divided again alongside it rather than assumed still met.
+    auto newNumSlots = CacheLevelStorage::ratioToSlotCountList(
+        quota, lvlStorage.slotSizeLists(), ratioList, lvlStorage.poolSizeGranularity(), minSlots, secondBudget);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
@@ -1854,10 +1867,11 @@ TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(
 }
 
 TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
-    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t deviceGranularity,
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const
 {
     auto const numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
-    return normalizeToRatio(slotsToBytes(numSlots, granularity));
+    return normalizeToRatio(slotsToBytes(numSlots, deviceGranularity, sparsePools));
 }
 
 // ---------------------------------------------------------------------------
@@ -2037,30 +2051,20 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupSlotsForBatc
 // slotsToBytes
 // ---------------------------------------------------------------------------
 
-TypedVec<LifeCycleId, size_t> StorageManager::slotsToBytes(
-    TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const
+TypedVec<LifeCycleId, size_t> StorageManager::slotsToBytes(TypedVec<LifeCycleId, SlotCount> const& numSlots,
+    size_t deviceGranularity, TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const
 {
     TypedVec<LifeCycleId, size_t> numBytes(numLifeCycles(), 0);
     for (LifeCycleId lifeCycle{0}; lifeCycle < numSlots.size(); ++lifeCycle)
     {
         auto const poolGroup = getPoolGroupIndex(kHotLevel, lifeCycle);
-        for (auto const poolSize : slotSize(kHotLevel, poolGroup))
+        auto const& sparse = sparsePools.at(poolGroup);
+        auto const& sizes = slotSize(kHotLevel, poolGroup);
+        for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
         {
-            numBytes[lifeCycle] += roundUp(slotCountToSizeT(numSlots[lifeCycle]) * poolSize, granularity);
-        }
-    }
-    return numBytes;
-}
-
-TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
-    TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const
-{
-    TypedVec<PoolGroupIndex, size_t> numBytes(numPoolGroups(), 0);
-    for (PoolGroupIndex pgIdx{0}; pgIdx < numSlots.size(); ++pgIdx)
-    {
-        for (auto poolSize : slotSize(pgIdx))
-        {
-            numBytes[pgIdx] += roundUp(slotCountToSizeT(numSlots[pgIdx]) * poolSize, granularity);
+            auto const grain
+                = std::ranges::find(sparse, pool) == sparse.end() ? deviceGranularity : HostMem::kAlignment;
+            numBytes[lifeCycle] += roundUp(slotCountToSizeT(numSlots[lifeCycle]) * sizes[pool], grain);
         }
     }
     return numBytes;
@@ -2072,14 +2076,37 @@ TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    std::optional<SecondaryPoolBudget> const& secondBudget) const
 {
     CacheTier tier = cacheTierOf(tierConfig);
     size_t quota = cacheTierQuota(tierConfig);
     size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
                                                     : CacheLevelManager::cacheTierGranularity(tier, quota);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
-    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
+    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots, secondBudget), roundUp(quota, granularity));
+    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots, secondBudget);
+}
+
+//! The sparse host budget as the allocator takes it, or nullopt when unbounded.
+//!
+//! Host-backed pools round to HostMem::kAlignment, not to the device granularity, so the
+//! budget is counted in that grain: charging them in device grains would over-count every
+//! pool of every group by up to one device grain.
+std::optional<SecondaryPoolBudget> StorageManager::_hostSparsePoolBudget(
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools) const
+{
+    // Returned whenever the level has a sparse pool, bounded or not: the allocator needs to
+    // know which pools this level's quota does not pay for before it needs to know whether
+    // anything limits them. Only `quota` carries the latter.
+    if (std::none_of(sparsePools.begin(), sparsePools.end(), [](auto const& pools) { return !pools.empty(); }))
+    {
+        return std::nullopt;
+    }
+    SecondaryPoolBudget budget;
+    budget.quota = mHostSparsePoolQuota;
+    budget.granularity = HostMem::kAlignment;
+    budget.pools = std::move(sparsePools);
+    return budget;
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,15 +2114,18 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
 // ---------------------------------------------------------------------------
 
 size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    std::optional<SecondaryPoolBudget> const& secondBudget) const
 {
+    auto const pools = CacheLevelStorage::poolsPaidByQuota(slotSizeLists, secondBudget);
     size_t total = 0;
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
-        // Sparse pools are absent from these lists, so they add nothing to the floor.
-        for (auto slotSize : slotSizeLists[pgIdx])
+        // Only the pools this quota pays for: a sparse pool's floor is charged to the host
+        // budget instead, and counting it here would inflate the device quota's own.
+        for (PoolIndex poolIdx : pools[pgIdx])
         {
-            total += roundUp(slotCountToSizeT(minSlots[pgIdx]) * slotSize, granularity);
+            total += roundUp(slotCountToSizeT(minSlots[pgIdx]) * slotSizeLists[pgIdx][poolIdx], granularity);
         }
     }
     return total;
@@ -2109,10 +2139,15 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     TypedVec<PoolGroupIndex, float> const& ratio) const
 {
     auto& gpuStorage = *mLevels[kHotLevel].storage;
-    size_t granularity = gpuStorage.poolSizeGranularity();
-    auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots);
-    auto numBytes = slotsToBytes(slotCountList, granularity);
-    return normalizeToRatio(numBytes);
+    // The same budgets the allocator will actually use, or the ratio this derives would
+    // describe a layout the next rebalance cannot produce.
+    auto slotCountList = CacheLevelStorage::ratioToSlotCountList(gpuStorage.totalQuota(), gpuStorage.slotSizeLists(),
+        ratio, gpuStorage.poolSizeGranularity(), mMinSlots, _hostSparsePoolBudget(gpuStorage.sparsePools()));
+    // All-bytes, each medium in its own grain -- the same measure ratioList() reports, so
+    // the target this derives and the layout a rebalance then achieves are comparable. They
+    // have to be: _needAdjustment treats this as a prediction of the allocator's own output
+    // and re-fires until the two agree.
+    return normalizeToRatio(gpuStorage.allBytes(slotCountList));
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

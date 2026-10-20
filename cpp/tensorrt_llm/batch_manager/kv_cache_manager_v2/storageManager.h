@@ -367,22 +367,32 @@ private:
         int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse,
         float maxUtilForResume = 1.0f) const;
     TypedVec<LifeCycleId, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
-        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const;
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t deviceGranularity,
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const;
     // Project source-level lifecycle byte weights onto destination pool groups while preserving the implied
     // lifecycle slot-count proportions.
     TypedVec<PoolGroupIndex, float> projectPoolGroupRatio(
         CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const;
-    TypedVec<LifeCycleId, size_t> slotsToBytes(
-        TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
-    TypedVec<PoolGroupIndex, size_t> slotsToBytes(
-        TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
-    //! `slotSizeLists` omits sparse pools: their pages are host memory and are not charged
-    //! to this level's quota.
+    //! Bytes a hot-level slot count costs, each pool rounded to the grain of the medium that
+    //! backs it: `deviceGranularity` for a dense pool, the host alignment for a sparse one.
+    //! This is the same measure as CacheLevelStorage::allBytes(), which the resulting ratio is
+    //! compared against; the storage does not exist yet here, so `sparsePools` names the sparse
+    //! pools of each group instead of PoolGroupBase::isSparse().
+    TypedVec<LifeCycleId, size_t> slotsToBytes(TypedVec<LifeCycleId, SlotCount> const& numSlots,
+        size_t deviceGranularity, TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const;
+    //! `slotSizeLists` holds every pool's size. The level's quota pays for all of them bar
+    //! the ones `secondBudget` names, which are host memory charged to it instead.
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt) const;
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        std::optional<SecondaryPoolBudget> const& secondBudget) const;
+    //! The host memory budget for `sparsePools`, as the allocator takes it, or nullopt when
+    //! `hostSparsePoolQuota` leaves them unbounded.
+    [[nodiscard]] std::optional<SecondaryPoolBudget> _hostSparsePoolBudget(
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools) const;
 
     // Internal helpers.
     // Register the slot descriptors for the next cache level and derive its slot-size table.
@@ -464,6 +474,12 @@ private:
     // Slot sizes per (level, pool group), built from mSlotDescLists.
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
+
+    //! Host memory the hot level's host-backed pools may take, when the configuration bounds
+    //! it. Kept because a rebalance moves the slot counts those pools follow, so the bound
+    //! has to be reapplied rather than assumed still satisfied.
+    std::optional<size_t> mHostSparsePoolQuota;
+
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;

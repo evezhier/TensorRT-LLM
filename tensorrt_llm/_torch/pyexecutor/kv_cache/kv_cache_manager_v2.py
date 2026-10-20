@@ -133,8 +133,6 @@ from ..resource_manager import (
 from ..scheduler import ScheduledRequests
 from .sparse_offload_memory import (
     HostHistoryReservations,
-    host_bounded_pool_ratio,
-    host_bounded_quota,
     life_cycle_pages,
     plan_host_history_bytes,
     solve_sparse_offload_capacity,
@@ -1314,7 +1312,6 @@ class KVCacheManagerV2(BaseResourceManager):
     _sparse_batch_staging_bytes: int = 0
     # The device quota's split when the host budget holds the host-backed life
     # cycles to less than their share; None to split by decode bytes.
-    _host_bounded_pool_ratio: Optional[List[float]] = None
 
     def __init__(
         self,
@@ -1701,9 +1698,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._sparse_kv_offload is not None:
             if offload_error is None:
                 try:
-                    quota = self._bound_quota_by_host_history(
+                    self._plan_host_history_budget(
                         kv_cache_config,
-                        quota,
                         tokens_per_block=tokens_per_block,
                         max_leases=self.max_batch_size,
                     )
@@ -3175,11 +3171,11 @@ class KVCacheManagerV2(BaseResourceManager):
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
         config = self._reserve_sparse_arena_leases(config, max_leases)
-        if self._sparse_kv_offload is not None and self._host_bounded_pool_ratio is not None:
-            # The host budget caps the host-backed life cycles; see
-            # _bound_quota_by_host_history.
-            config = replace(config, initial_pool_ratio=list(self._host_bounded_pool_ratio))
-        elif self._sparse_kv_offload is not None and config.initial_pool_ratio is None:
+        if self._sparse_kv_offload is not None and self._host_history_budget > 0:
+            # The manager divides the device quota and this budget together, holding the
+            # host-backed pools inside it rather than being handed a quota already lowered.
+            config = replace(config, host_sparse_pool_quota=self._host_history_budget)
+        if self._sparse_kv_offload is not None and config.initial_pool_ratio is None:
             # Split the quota the way decoding requests use it, so the host-backed
             # pools it sizes hold as many requests as the device-backed ones.
             config = replace(
@@ -3269,17 +3265,14 @@ class KVCacheManagerV2(BaseResourceManager):
         typical_seq_len = self._get_typical_seq_len(kv_cache_config)
         return typical_seq_len if typical_seq_len is not None else self.max_seq_len
 
-    def _bound_quota_by_host_history(
-        self, kv_cache_config: KvCacheConfig, quota: int, *, tokens_per_block: int, max_leases: int
-    ) -> int:
-        """Return the device quota at which the host-backed pools fit the host budget.
+    def _plan_host_history_budget(
+        self, kv_cache_config: KvCacheConfig, *, tokens_per_block: int, max_leases: int
+    ) -> None:
+        """Settle the host memory the offloaded history may pin.
 
-        Host-backed sparse pools take the slot count the device quota buys for
-        their pool group, so the quota's split is what bounds their host memory.
-        When the budget binds and some life cycles are device-only, ``quota`` is
-        kept: the split holds the host-backed life cycles to what fits, and the
-        device-only ones take the rest (``_host_bounded_pool_ratio``). Otherwise
-        the whole quota is lowered.
+        The manager is given this budget and holds its host-backed pools inside it while
+        dividing the device quota, so nothing is lowered here: a bound applied before the
+        manager and again inside it would size the level twice.
         """
         config = self._build_manager_config(
             kv_cache_config,
@@ -3299,33 +3292,10 @@ class KVCacheManagerV2(BaseResourceManager):
             - host_tier_bytes,
             staging_bytes=self._sparse_batch_staging_bytes,
         )
-        life_cycles = life_cycle_pages(config.layers, tokens_per_block)
-        bounded = host_bounded_quota(
-            life_cycles,
-            config.initial_pool_ratio,
-            host_budget=self._host_history_budget,
-            quota=quota,
-        )
-        if bounded >= quota:
-            return quota
-        ratio = host_bounded_pool_ratio(
-            life_cycles, config.initial_pool_ratio, bounded_quota=bounded, quota=quota
-        )
-        if ratio is None:
-            logger.info(
-                f"Lowered the device KV quota from {quota / (1 << 30):.2f}GiB to "
-                f"{bounded / (1 << 30):.2f}GiB so the host-backed sparse history fits its "
-                f"{self._host_history_budget / (1 << 30):.2f}GiB host budget."
-            )
-            return bounded
-        self._host_bounded_pool_ratio = ratio
         logger.info(
-            "Held the host-backed sparse history's life cycles to the device bytes a "
-            f"{bounded / (1 << 30):.2f}GiB quota gives them, so their pools fit the "
-            f"{self._host_history_budget / (1 << 30):.2f}GiB host budget; the device-only life "
-            f"cycles share the rest of the {quota / (1 << 30):.2f}GiB device KV quota."
+            f"Sparse KV cache offload may pin {self._host_history_budget / (1 << 30):.2f}GiB of "
+            "host memory for its history; the cache manager holds its host-backed pools to it."
         )
-        return quota
 
     @staticmethod
     def _reserve_sparse_arena_leases(
