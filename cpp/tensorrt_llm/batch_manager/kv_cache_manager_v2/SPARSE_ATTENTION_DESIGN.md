@@ -3,7 +3,8 @@
 Target: the **decode instance of a disaggregated deployment**.
 
 **Implemented**: the resolve, copy, index and flush-list kernels; `Batch`; the per-request
-reservation and device state; the write-back at `resize()`; `fetch_sparse_pages` and
+reservation and device state; the batch-wide write-back as `Batch::flushSparseUnits()`,
+which `resize()` checks has run rather than performing itself; `fetch_sparse_pages` and
 `prepare_sparse_write_indices`; sparse buffers across more than one pool; sparsity as a pool
 attribute, so one layer may hold both sparse and dense buffers.
 
