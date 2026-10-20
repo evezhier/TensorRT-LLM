@@ -144,17 +144,19 @@ def test_decode_step_writes_fetches_and_advances_history(manager):
     topk[0, : TOPK - 2] = torch.arange(TOPK - 2, dtype=torch.int32)
     topk[0, TOPK - 2] = prompt_len - 1
     topk[0, TOPK - 1] = prompt_len
-    rows = torch.zeros(1, dtype=torch.int32, device="cuda")
+    request_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
     kv_lengths = torch.tensor([prompt_len + 1], dtype=torch.int32, device="cuda")
     out = torch.empty((1, TOPK), dtype=torch.int32, device="cuda")
+    assert state.batch_rows.tolist() == [0] + [-1] * (MAX_BATCH_SIZE - 1)
     for layer in range(NUM_LAYERS):
         writes = manager.prepare_sparse_write_indices(state, layer)
         assert writes[0, 0].item() >= 0
         assert (writes[1:, 0] == -1).all()
-        fetched = manager.fetch_sparse_indices(state, layer, topk, rows, kv_lengths)
+        fetched = manager.fetch_sparse_indices(state, layer, topk, request_indices, kv_lengths)
         merge_sparse_arena_indices(
             topk,
-            rows,
+            request_indices,
+            state.batch_rows,
             state.active_request_count,
             kv_lengths,
             state.history_lengths,
@@ -198,7 +200,9 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
 
     The GPU cache holds a few selections, so a long decode evicts rows and fetches
     them back from the host pages the write-back filled. Requests join at different
-    steps, so the Batch's rows carry different histories.
+    steps, so the Batch's rows carry different histories. Input runs newest first,
+    as on a disaggregated decode worker, while each request keeps the Batch row it
+    joined in, so input positions and Batch rows disagree.
     """
     generator = torch.Generator().manual_seed(seed)
     manager = _manager(num_layers=num_layers)
@@ -213,6 +217,7 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
         topk=TOPK,
     )
     active: list[LlmRequest] = []
+    permuted = False
     for step in range(6 * TOKENS_PER_BLOCK):
         manager.prepare_resources(SimpleNamespace(context_requests=[], generation_requests=[]))
         for request in requests:
@@ -221,37 +226,44 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
                 active.append(request)
         for request in active:
             assert manager.try_allocate_generation(request)
-        scheduled = SimpleNamespace(context_requests=[], generation_requests=list(active))
+        scheduled = SimpleNamespace(context_requests=[], generation_requests=active[::-1])
         manager.prepare_resources(scheduled)
-        request_ids = [request.py_request_id for request in active]
+        request_ids = [request.py_request_id for request in scheduled.generation_requests]
         manager.prepare_sparse_offload(state, request_ids, beam_width=1)
+        # The rows the manager recorded at add_kv_cache are still the native ones.
+        for member in manager._sparse_batch_members.values():
+            assert manager._sparse_batch.row_of(member.cache) == member.row
+        batch_rows = state.batch_rows.tolist()[: len(active)]
+        permuted |= batch_rows != list(range(len(active)))
         histories = [manager.kv_cache_map[rid].history_length for rid in request_ids]
         topk = torch.full((len(active), TOPK), -1, dtype=torch.int32)
-        for row, history in enumerate(histories):
+        for position, history in enumerate(histories):
             # Unit 0 came with the prompt and was never written; select from the rest,
             # always including the token written this step.
             candidates = torch.randperm(history, generator=generator)[: TOPK - 1]
             candidates = candidates[candidates > 0][: TOPK - 1].to(torch.int32)
-            topk[row, : candidates.numel()] = candidates
-            topk[row, -1] = history
+            topk[position, : candidates.numel()] = candidates
+            topk[position, -1] = history
         topk = topk.cuda()
-        rows = torch.arange(len(active), dtype=torch.int32, device="cuda")
+        request_indices = torch.arange(len(active), dtype=torch.int32, device="cuda")
         kv_lengths = torch.tensor([h + 1 for h in histories], dtype=torch.int32, device="cuda")
         out = torch.empty((len(active), TOPK), dtype=torch.int32, device="cuda")
         for layer in range(num_layers):
             writes = manager.prepare_sparse_write_indices(state, layer)
-            for row, (rid, history) in enumerate(zip(request_ids, histories)):
+            for row, rid, history in zip(batch_rows, request_ids, histories):
                 write_row = writes[row, 0].item()
                 assert write_row >= 0, (rid, history, layer)
                 # The token's row: its position, its layer, its request.
                 arenas[layer][write_row, :3] = torch.tensor(
                     [history, layer, rid], dtype=torch.int32, device="cuda"
                 )
-            assert (writes[len(active) :, 0] == -1).all()
-            fetched = manager.fetch_sparse_indices(state, layer, topk, rows, kv_lengths)
+            free_rows = [row for row in range(MAX_BATCH_SIZE) if row not in batch_rows]
+            assert (writes[free_rows, 0] == -1).all()
+            fetched = manager.fetch_sparse_indices(state, layer, topk, request_indices, kv_lengths)
             merge_sparse_arena_indices(
                 topk,
-                rows,
+                request_indices,
+                state.batch_rows,
                 state.active_request_count,
                 kv_lengths,
                 state.history_lengths,
@@ -260,21 +272,22 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
                 out,
                 unit_tokens=1,
             )
-            for row, rid in enumerate(request_ids):
-                valid = topk[row] >= 0
-                got = arenas[layer][out[row][valid].long(), :3]
-                units = topk[row][valid]
+            for position, rid in enumerate(request_ids):
+                valid = topk[position] >= 0
+                got = arenas[layer][out[position][valid].long(), :3]
+                units = topk[position][valid]
                 expected = torch.stack(
                     (units, torch.full_like(units, layer), torch.full_like(units, rid)), dim=1
                 )
                 wrong = (got != expected).any(dim=1)
                 assert not wrong.any(), (
-                    f"request {rid}, history {histories[row]}, layer {layer}: units "
+                    f"request {rid}, history {histories[position]}, layer {layer}: units "
                     f"{units[wrong].tolist()} read {got[wrong].tolist()}"
                 )
         manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
         for rid, history in zip(request_ids, histories):
             assert manager.kv_cache_map[rid].history_length == history + 1
+    assert permuted == (num_requests > 1)
     for request in active:
         manager.free_resources(request)
     manager.shutdown()

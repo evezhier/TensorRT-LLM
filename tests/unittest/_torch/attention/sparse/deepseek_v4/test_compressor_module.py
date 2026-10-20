@@ -1903,7 +1903,9 @@ def _run_compressor_with_fake_postprocess(
         metadata.num_tokens = 1
         metadata.num_gen_tokens_per_seq = 1
         metadata.cu_seq_lens_cuda = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
-        writes = torch.full((4, 2, 1), sparse_write_index, device=DEVICE, dtype=torch.int32)
+        # Write rows by Batch row: the one request sits in row 2, not at its input position.
+        writes = torch.full((4, 2), -1, device=DEVICE, dtype=torch.int32)
+        writes[2] = sparse_write_index
         is_nvfp4 = kv_cache_dtype == "nvfp4"
         descriptor = SimpleNamespace(
             data_buffer_index=1,
@@ -1911,6 +1913,7 @@ def _run_compressor_with_fake_postprocess(
         )
         metadata.sparse_offload_state = SimpleNamespace(
             layers={0: descriptor},
+            batch_rows=torch.tensor([2, -1, -1, -1], device=DEVICE, dtype=torch.int32),
             scatter_start_positions=torch.zeros(4, device=DEVICE, dtype=torch.int32),
         )
         data = torch.empty(
@@ -1942,7 +1945,6 @@ def _run_compressor_with_fake_postprocess(
             return_value=writes
         )
         seen["prepare"] = metadata.kv_cache_manager.prepare_sparse_compressor_write_indices
-        seen["writes"] = writes
 
     def fake_prefill_reduction(*args):
         seen["kv_score_dtype"] = args[0].dtype
@@ -2051,7 +2053,7 @@ def test_compressor_routes_only_main_writes_to_arena(
     assert seen["kv_cache_scale"] is seen["arena"][1]
     assert seen["tokens_per_block"] == 1
     assert seen["block_table"].shape == (1, 1) and seen["block_table"].is_contiguous()
-    torch.testing.assert_close(seen["block_table"], seen["writes"][:1, 1])
+    assert seen["block_table"].tolist() == [[write_index]]
     assert seen["start_pos"].data_ptr() == seen["zero_positions"].data_ptr()
     assert (seen["start_pos"] == 0).all()
     assert (seen["num_outputs"] == int(write_index >= 0)).all()

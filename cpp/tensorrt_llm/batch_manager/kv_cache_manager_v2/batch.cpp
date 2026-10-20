@@ -1158,64 +1158,6 @@ void Batch::move(int dstRow, int srcRow)
     _seedRowWatermarks(srcRow, 0, 0);
 }
 
-void Batch::reorder(std::vector<KvCache*> const& kvCaches)
-{
-    if (kvCaches.size() != static_cast<size_t>(numKvCaches()))
-    {
-        throw std::invalid_argument("Batch::reorder requires every current member exactly once");
-    }
-    std::vector<bool> seen(mRows.size(), false);
-    for (auto const* cache : kvCaches)
-    {
-        if (cache == nullptr || cache->mBatch != this)
-        {
-            throw std::invalid_argument("Batch::reorder requires members of this Batch");
-        }
-        auto const row = static_cast<size_t>(cache->mBatchRow);
-        if (seen[row])
-        {
-            throw std::invalid_argument("Batch::reorder requires unique members");
-        }
-        seen[row] = true;
-    }
-
-    waitPublished();
-    for (size_t row = 0; row < kvCaches.size(); ++row)
-    {
-        int const oldRow = kvCaches[row]->mBatchRow;
-        int const newRow = static_cast<int>(row);
-        if (oldRow == newRow)
-        {
-            continue;
-        }
-        for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
-        {
-            auto* const oldIndices = _stagingRow(lc, oldRow);
-            auto* const newIndices = _stagingRow(lc, newRow);
-            std::swap_ranges(oldIndices, oldIndices + mMaxBlocksPerSeq, newIndices);
-        }
-        std::swap(mRows[static_cast<size_t>(oldRow)], mRows[row]);
-        std::swap(mFlushedHistory[static_cast<size_t>(oldRow)], mFlushedHistory[row]);
-        for (int const movedRow : {oldRow, newRow})
-        {
-            auto const& cache = mRows[static_cast<size_t>(movedRow)];
-            if (cache != nullptr)
-            {
-                cache->mBatchRow = movedRow;
-                for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
-                {
-                    // The row's contents have already moved. Rebind its sole writer
-                    // without copying from the old row or ending cache membership.
-                    cache->mBasePageIndices[kDefaultBeamIndex][lc]
-                        = Span<int>{_stagingRow(lc, movedRow), mMaxBlocksPerSeq};
-                }
-            }
-            _seedRowWatermarks(
-                movedRow, cache == nullptr ? 0 : cache->historyLength(), cache == nullptr ? 0 : cache->capacity());
-        }
-    }
-}
-
 void Batch::_detach(KvCache& kvCache) noexcept
 {
     if (kvCache.mBatch != this || kvCache.mBatchRow < 0)

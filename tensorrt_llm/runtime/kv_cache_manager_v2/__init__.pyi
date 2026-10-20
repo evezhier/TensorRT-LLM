@@ -978,14 +978,6 @@ class Batch:
         once rather than publishing per operation.
         """
 
-    def reorder(self, kv_caches: list[_KVCache]) -> None:
-        """Pack every current member into this order without releasing its GPU cache lease.
-
-        Requires every member exactly once. Moves page-index bindings and flush watermarks
-        with the members, after waiting for the previous staging upload. Call ``publish``
-        before device consumers use the new order; device buffer addresses stay unchanged.
-        """
-
     @property
     def num_index_tables(self) -> int: ...
     def index_table(self, table_id: int) -> list[IndexTableRequest]:

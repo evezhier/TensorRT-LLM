@@ -64,11 +64,13 @@ def _deepseek_v4_local_to_global_kernel(
     write_indices_ptr,
     history_lengths_ptr,
     compressed_lengths_ptr,
+    batch_rows_ptr,
     fetch_stride0,
     fetch_stride1,
     write_stride,
     history_stride,
     length_stride,
+    batch_rows_stride,
     MERGE_SPARSE_INDICES: tl.constexpr,
     SPARSE_BATCH_SIZE: tl.constexpr,
     sparse_num_lengths,
@@ -114,8 +116,13 @@ def _deepseek_v4_local_to_global_kernel(
     if MASK_DECODE_PADDING:
         active = tl.load(active_request_count_ptr)
         live = (token_id < active) & (req >= 0) & (req < active)
+    # Sparse offload state belongs to the request's native Batch row, which need
+    # not equal its input position; block tables and lengths follow the position.
+    row = req
     if MERGE_SPARSE_INDICES:
         live = live & (req < SPARSE_BATCH_SIZE) & (req < sparse_num_lengths)
+        row = tl.load(batch_rows_ptr + req * batch_rows_stride, mask=live, other=-1)
+        live = live & (row >= 0) & (row < SPARSE_BATCH_SIZE)
 
     # Load all SWA local indices for this token
     swa_ids = tl.arange(0, num_swa_indices)
@@ -154,16 +161,16 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_local_idx = tl.load(compressed_ptr)
 
         if MERGE_SPARSE_INDICES:
-            history = tl.load(history_lengths_ptr + req * history_stride, mask=live, other=0)
+            history = tl.load(history_lengths_ptr + row * history_stride, mask=live, other=0)
             history_units = history // UNIT_TOKENS
             length = tl.load(compressed_lengths_ptr + req * length_stride, mask=live, other=0)
             valid = live & (compressed_local_idx >= 0) & (compressed_local_idx < length)
             fetched = tl.load(
-                fetched_indices_ptr + req * fetch_stride0 + compressed_ids * fetch_stride1,
+                fetched_indices_ptr + row * fetch_stride0 + compressed_ids * fetch_stride1,
                 mask=valid & (compressed_local_idx < history_units),
                 other=-1,
             )
-            write = tl.load(write_indices_ptr + req * write_stride, mask=live, other=-1)
+            write = tl.load(write_indices_ptr + row * write_stride, mask=live, other=-1)
             compressed_global_index = tl.where(
                 valid & (compressed_local_idx == history_units), write, fetched
             )
@@ -237,6 +244,7 @@ def deepseek_v4_local_to_global_indices(
     compressed_write_indices: torch.Tensor | None = None,
     compressed_history_lengths: torch.Tensor | None = None,
     compressed_lengths: torch.Tensor | None = None,
+    compressed_batch_rows: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """
     Convert local token indices to global KV cache pool indices.
@@ -277,17 +285,23 @@ def deepseek_v4_local_to_global_indices(
             when consuming an offload read table. Compiled out by default to
             preserve the original non-offload indexing behavior.
         compressed_fetched_indices: CUDA int32 [B, K] physical history indices,
-            in Batch row order and original top-k column order. Supply all four
+            in Batch row order and original top-k column order. Supply all five
             sparse tensors and active_request_count together for single-token
             decode. The kernel merges history and in-flight destinations into
             query order while preparing SWA indices; no compressed page table
             or additional address conversion is used.
-        compressed_write_indices: CUDA int32 [B] prepared in-flight destinations.
-            May be a strided data-column view shared by paired NVFP4 pools.
-        compressed_history_lengths: CUDA int32 [B] published history token counts.
-        compressed_lengths: CUDA int32 [R] complete compressed-row counts in Batch
-            order, with Q <= R <= B. A selected unit equal to history // compress_ratio
-            and below this count uses the write index. Invalid indices remain -1.
+        compressed_write_indices: CUDA int32 [B] prepared in-flight destinations,
+            by Batch row. May be a strided data-column view shared by paired
+            NVFP4 pools.
+        compressed_history_lengths: CUDA int32 [B] published history token counts,
+            by Batch row.
+        compressed_lengths: CUDA int32 [R] complete compressed-row counts by
+            request, in req_id's numbering, with Q <= R <= B. A selected unit
+            equal to history // compress_ratio and below this count uses the
+            write index. Invalid indices remain -1.
+        compressed_batch_rows: CUDA int32 [B] native Batch row of each request,
+            in req_id's numbering, or -1 for no live request. A request whose
+            row is -1 gets no indices in either pool.
 
     Returns:
         A combined index tensor, or separate SWA and compressed tensors when
@@ -324,10 +338,12 @@ def deepseek_v4_local_to_global_indices(
         (compressed_write_indices, "compressed_write_indices", 1),
         (compressed_history_lengths, "compressed_history_lengths", 1),
         (compressed_lengths, "compressed_lengths", 1),
+        (compressed_batch_rows, "compressed_batch_rows", 1),
     )
     merge_sparse_indices = any(tensor is not None for tensor, _, _ in sparse_tensors)
     sparse_batch_size = sparse_num_lengths = 0
     fetch_stride0 = fetch_stride1 = write_stride = history_stride = length_stride = 0
+    batch_rows_stride = 0
     if merge_sparse_indices:
         if (
             not has_compressed
@@ -345,6 +361,7 @@ def deepseek_v4_local_to_global_indices(
             width != num_compressed_indices
             or compressed_write_indices.shape != (sparse_batch_size,)
             or compressed_history_lengths.shape != (sparse_batch_size,)
+            or compressed_batch_rows.shape != (sparse_batch_size,)
             or not num_tokens <= sparse_num_lengths <= sparse_batch_size
         ):
             raise ValueError(
@@ -361,6 +378,7 @@ def deepseek_v4_local_to_global_indices(
         write_stride = compressed_write_indices.stride(0)
         history_stride = compressed_history_lengths.stride(0)
         length_stride = compressed_lengths.stride(0)
+        batch_rows_stride = compressed_batch_rows.stride(0)
         tokens_per_block_compressed = 1
         compressed_buffer_offset_in_tokens = 0
         max_blocks_compressed = 0
@@ -504,11 +522,13 @@ def deepseek_v4_local_to_global_indices(
         write_indices_ptr=compressed_write_indices,
         history_lengths_ptr=compressed_history_lengths,
         compressed_lengths_ptr=compressed_lengths,
+        batch_rows_ptr=compressed_batch_rows,
         fetch_stride0=fetch_stride0,
         fetch_stride1=fetch_stride1,
         write_stride=write_stride,
         history_stride=history_stride,
         length_stride=length_stride,
+        batch_rows_stride=batch_rows_stride,
         MERGE_SPARSE_INDICES=merge_sparse_indices,
         SPARSE_BATCH_SIZE=sparse_batch_size,
         sparse_num_lengths=sparse_num_lengths,

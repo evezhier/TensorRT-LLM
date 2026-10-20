@@ -33,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
     DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import DeepseekV4AttentionType
+from tensorrt_llm._torch.attention.backends.sparse.offload import _SparseBatchMember
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm.bindings import DataType
@@ -128,6 +129,7 @@ def test_sparse_metadata_uses_native_capacity_and_configured_width():
     assert state.fetched_indices[1].shape == (4, 1, 8)
     assert state.scatter_start_positions.shape == (4,)
     assert (state.scatter_start_positions == 0).all()
+    assert state.batch_rows.shape == (4,) and (state.batch_rows == -1).all()
     assert state.history_lengths is None and state.batch is None
     assert (state.selected_history_units == -1).all()
 
@@ -155,6 +157,7 @@ def test_sparse_offload_buffers_are_persistent_and_separate(graph):
     tensors = [
         state.selected_history_units,
         state.active_request_count,
+        state.batch_rows,
         state.scatter_start_positions,
         *state.fetched_indices.values(),
         *state.write_indices.values(),
@@ -173,6 +176,7 @@ def test_sparse_offload_buffers_are_persistent_and_separate(graph):
         assert reused.fetched_indices[2].data_ptr() == state.fetched_indices[2].data_ptr()
         assert reused.write_indices[2].data_ptr() == state.write_indices[2].data_ptr()
         assert reused.scatter_start_positions.data_ptr() == state.scatter_start_positions.data_ptr()
+        assert reused.batch_rows.data_ptr() == state.batch_rows.data_ptr()
 
 
 class _PublishedBatch:
@@ -186,17 +190,24 @@ class _PublishedBatch:
         return self.history
 
 
-def _publish(manager, request_ids):
+def _publish(manager, request_ids, rows=None):
+    """Seat the live requests in ``rows``, by default in input order from row 0."""
     if manager._sparse_batch is None:
         manager._sparse_batch = _PublishedBatch(manager.max_batch_size)
+    live = [request for request in request_ids if request != CUDA_GRAPH_DUMMY_REQUEST_ID]
+    rows = range(len(live)) if rows is None else rows
     manager._sparse_batch_members = {
-        request: manager.kv_cache_map[request]
-        for request in request_ids
-        if request != CUDA_GRAPH_DUMMY_REQUEST_ID
+        request: _SparseBatchMember(
+            cache=manager.kv_cache_map[request],
+            row=row,
+            blocks=manager.kv_cache_map[request].num_blocks,
+        )
+        for request, row in zip(live, rows, strict=True)
     }
     manager._sparse_batch_prepared = True
-    values = [cache.history_length for cache in manager._sparse_batch_members.values()]
-    values += [0] * (manager.max_batch_size - len(values))
+    values = [0] * manager.max_batch_size
+    for member in manager._sparse_batch_members.values():
+        values[member.row] = member.cache.history_length
     with torch.cuda.stream(manager._stream):
         manager._sparse_batch.history.copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
 
@@ -216,7 +227,9 @@ def test_prepare_sparse_offload_binds_batch_without_copying_watermarks():
             assert state.batch is batch
         batch = state.batch
         assert state.history_lengths.data_ptr() == batch.history.data_ptr()
-        assert state.active_request_count.item() == len(manager._sparse_batch_members)
+        live = len(manager._sparse_batch_members)
+        assert state.active_request_count.item() == live
+        assert state.batch_rows.tolist() == list(range(live)) + [-1] * (4 - live)
         assert (state.selected_history_units == -1).all()
         assert (state.fetched_indices[1] == -1).all()
         batch.history[0] = 77
@@ -224,8 +237,35 @@ def test_prepare_sparse_offload_binds_batch_without_copying_watermarks():
 
 
 @_requires_cuda
+def test_prepare_sparse_offload_maps_input_positions_to_batch_rows():
+    """Rows are slots: requests keep theirs whatever their input order."""
+    manager = _manager()
+    manager._stream = torch.cuda.current_stream()
+    state = _metadata(manager).sparse_offload_state
+    _publish(manager, [20, 10, 30], rows=[3, 0, 2])
+    for request_ids, expected in (
+        ([20, 10, 30], [3, 0, 2, -1]),
+        ([30, 20, 10], [2, 3, 0, -1]),
+        ([10, 30, 20, CUDA_GRAPH_DUMMY_REQUEST_ID], [0, 2, 3, -1]),
+    ):
+        manager.prepare_sparse_offload(state, request_ids, beam_width=1)
+        assert state.batch_rows.tolist() == expected
+        assert state.active_request_count.item() == 3
+
+
+@_requires_cuda
 @pytest.mark.parametrize(
-    "invalid", ["unpublished", "order", "beam", "capacity", "replacement", "capture"]
+    "invalid",
+    [
+        "unpublished",
+        "missing",
+        "stranger",
+        "duplicate",
+        "beam",
+        "capacity",
+        "replacement",
+        "capture",
+    ],
 )
 def test_sparse_offload_rejects_invalid_preparation(invalid):
     manager = _manager()
@@ -235,8 +275,12 @@ def test_sparse_offload_rejects_invalid_preparation(invalid):
     ids, beam = [20, 10], 1
     if invalid == "unpublished":
         manager._sparse_batch_prepared = False
-    elif invalid == "order":
-        ids.reverse()
+    elif invalid == "missing":
+        ids = [20, CUDA_GRAPH_DUMMY_REQUEST_ID]
+    elif invalid == "stranger":
+        ids = [20, 30]
+    elif invalid == "duplicate":
+        ids = [20, 20]
     elif invalid == "beam":
         beam = 2
     elif invalid == "capacity":
@@ -305,7 +349,7 @@ class _FetchDouble:
             out[:, i, :].copy_(torch.where(selected >= 0, selected + offset, -1))
 
 
-def _fetch_case(multiple_roles=False):
+def _fetch_case(multiple_roles=False, rows=None):
     manager = _manager()
     manager._stream = torch.cuda.current_stream()
     if multiple_roles:
@@ -325,7 +369,7 @@ def _fetch_case(multiple_roles=False):
         )
     manager.kv_cache_map[20].history_length = 7
     manager.kv_cache_map[10].history_length = 12
-    _publish(manager, [20, 10])
+    _publish(manager, [20, 10], rows)
     state = _metadata(manager).sparse_offload_state
     manager.prepare_sparse_offload(state, [20, 10], beam_width=1)
     manager.impl.fetch_sparse_pages = _FetchDouble()
@@ -334,18 +378,33 @@ def _fetch_case(multiple_roles=False):
         dtype=torch.int32,
         device="cuda",
     )
-    rows = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
+    # Query 0 is request 10 at input position 1; query 1 is request 20 at position 0.
+    requests = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
     lengths = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
-    return SimpleNamespace(manager=manager, state=state, topk=topk, rows=rows, lengths=lengths)
+    return SimpleNamespace(
+        manager=manager, state=state, topk=topk, requests=requests, lengths=lengths
+    )
 
 
 def _fetch(case, layer=2):
-    return case.manager.fetch_sparse_indices(case.state, layer, case.topk, case.rows, case.lengths)
+    return case.manager.fetch_sparse_indices(
+        case.state, layer, case.topk, case.requests, case.lengths
+    )
+
+
+def _expected_selection(manager, by_request):
+    """Each member's expected selection, in its Batch row; free rows select nothing."""
+    expected = torch.full((manager.max_batch_size, 8), -1, dtype=torch.int32, device="cuda")
+    for request, member in manager._sparse_batch_members.items():
+        expected[member.row] = torch.tensor(by_request[request], dtype=torch.int32)
+    return expected
 
 
 @_requires_cuda
-def test_prepare_writes_and_attention_merge_on_ordered_streams():
-    case = _fetch_case()
+@pytest.mark.parametrize("rows", [None, [3, 1]])
+def test_prepare_writes_and_attention_merge_on_ordered_streams(rows):
+    case = _fetch_case(rows=rows)
+    row_20 = case.manager._sparse_batch_members[20].row
     producer = torch.cuda.Stream()
     seen = []
 
@@ -355,7 +414,8 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams():
         assert batch is case.state.batch and buffers == case.state.layers[2].buffer_ids
         seen.append(out.data_ptr())
         out.fill_(-1)
-        out[0, 0] = 77  # history=7, capacity=8: row 1 is newly complete.
+        # Request 20 has history 7 and capacity 8, so its unit 1 is newly complete.
+        out[row_20, 0] = 77
 
     case.manager.impl.prepare_sparse_write_indices = prepare
     producer.wait_stream(torch.cuda.current_stream())
@@ -368,7 +428,7 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams():
     ):
         fetched = _fetch(case)
         out = deepseek_v4_local_to_global_indices(
-            req_id=case.rows,
+            req_id=case.requests,
             block_table_swa=torch.zeros((2, 1), dtype=torch.int32, device="cuda"),
             swa_local_indices=torch.full((2, 4), -1, dtype=torch.int32, device="cuda"),
             swa_pool_base_ptr=4096,
@@ -382,6 +442,7 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams():
             compressed_write_indices=writes[:, 0],
             compressed_history_lengths=case.state.history_lengths,
             compressed_lengths=case.lengths,
+            compressed_batch_rows=case.state.batch_rows,
             active_request_count=case.state.active_request_count,
             mask_invalid_pages=True,
         )
@@ -465,6 +526,7 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
     state = SimpleNamespace(
         layers=manager.get_sparse_offload_descriptors(),
         active_request_count=torch.tensor([1], dtype=torch.int32),
+        batch_rows=torch.tensor([0, -1, -1, -1], dtype=torch.int32),
         write_indices={physical.shape[1]: writes},
         history_lengths=torch.tensor([4, 0, 0, 0], dtype=torch.int32),
         write_layer=2,
@@ -552,6 +614,7 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
         converted["compressed_write_indices"], writes[:, descriptor.data_buffer_index]
     )
     assert converted["compressed_history_lengths"] is state.history_lengths
+    assert converted["compressed_batch_rows"] is state.batch_rows
     torch.testing.assert_close(
         result[0][:, :4], torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
     )
@@ -566,18 +629,18 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
 
 @_requires_cuda
 @pytest.mark.parametrize("multiple_roles", [False, True])
-def test_fetch_uses_batch_order_and_preserves_topk_slots(multiple_roles):
-    case = _fetch_case(multiple_roles)
+@pytest.mark.parametrize("rows", [None, [2, 0], [3, 1]])
+def test_fetch_uses_batch_rows_and_preserves_topk_slots(multiple_roles, rows):
+    case = _fetch_case(multiple_roles, rows)
     original = case.topk.clone()
     with (
         patch.object(torch.Tensor, "item", side_effect=AssertionError("host read")),
         patch.object(torch.Tensor, "cpu", side_effect=AssertionError("host read")),
     ):
         out = _fetch(case)
-    expected = torch.tensor(
-        [[-1, 0, -1, -1, -1, -1, -1, -1], [2, -1, 0, 1, -1, -1, -1, -1], [-1] * 8, [-1] * 8],
-        dtype=torch.int32,
-        device="cuda",
+    expected = _expected_selection(
+        case.manager,
+        {20: [-1, 0, -1, -1, -1, -1, -1, -1], 10: [2, -1, 0, 1, -1, -1, -1, -1]},
     )
     torch.testing.assert_close(case.state.selected_history_units, expected)
     torch.testing.assert_close(case.topk, original)
@@ -653,12 +716,18 @@ def test_fetch_graph_replay_refreshes_batch_watermarks_and_padding():
     with torch.cuda.graph(graph):
         out = _fetch(case)
     ptr = out.data_ptr()
-    for ids, history in (([10, 20], 8), ([20, CUDA_GRAPH_DUMMY_REQUEST_ID], 12), ([], 0)):
+    for ids, rows, history in (
+        ([10, 20], None, 8),
+        # Both requests moved rows, and row 0 is free: the replay follows the map.
+        ([10, 20], [3, 1], 8),
+        ([20, CUDA_GRAPH_DUMMY_REQUEST_ID], [2], 12),
+        ([], None, 0),
+    ):
         case.manager.kv_cache_map[20].history_length = history
         case.manager.kv_cache_map[10].history_length = history
-        _publish(case.manager, ids)
+        _publish(case.manager, ids, rows)
         case.manager.prepare_sparse_offload(case.state, ids, beam_width=1)
-        case.rows.copy_(
+        case.requests.copy_(
             torch.tensor([0, 0], dtype=torch.int32, device="cuda")
             if len(case.manager._sparse_batch_members) < 2
             else torch.tensor([1, 0], dtype=torch.int32, device="cuda")
@@ -669,13 +738,12 @@ def test_fetch_graph_replay_refreshes_batch_watermarks_and_padding():
         case.lengths.fill_(4)
         graph.replay()
         expected = torch.full_like(case.state.selected_history_units, -1)
-        live = len(case.manager._sparse_batch_members)
-        for row in range(live):
-            expected[row, 0] = 0
+        for member in case.manager._sparse_batch_members.values():
+            expected[member.row, 0] = 0
             if history // 4 > 1:
-                expected[row, 2] = 1
+                expected[member.row, 2] = 1
             if history // 4 > 2:
-                expected[row, 3] = 2
+                expected[member.row, 3] = 2
         for role in range(out.shape[1]):
             torch.testing.assert_close(
                 out[:, role], torch.where(expected >= 0, expected + (role % 2) * 101, -1)

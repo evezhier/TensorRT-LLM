@@ -25,7 +25,12 @@ from typing import TYPE_CHECKING, Callable, Collection, Iterable
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, nvtx_range_debug
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    convert_to_torch_tensor,
+    nvtx_range_debug,
+    prefer_pinned,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     AttentionLayerConfig,
@@ -90,10 +95,11 @@ class SparseOffloadState:
     """Fixed-capacity storage owned by one serial attention metadata instance.
 
     Index and count tensors are int32. Selections are [B, K], fetch outputs are
-    [B, F, K], write destinations are [B, F], and the active count is [1].
-    B is the native Batch capacity, including when an attention graph uses
-    fewer query rows. Storage is shared by layers with the same buffer count F.
-    Reuse must follow the previous layer's attention on the consuming stream.
+    [B, F, K], write destinations are [B, F], the active count is [1] and the
+    Batch row map is [B]. B is the native Batch capacity, including when an
+    attention graph uses fewer query rows. Storage is shared by layers with the
+    same buffer count F. Reuse must follow the previous layer's attention on the
+    consuming stream.
 
     NVFP4 additionally uses persistent FP8 scratch [B, K, head_dim] for the
     dequantized rows consumed by attention. Arena allocations remain owned by
@@ -103,8 +109,12 @@ class SparseOffloadState:
 
     ``history_lengths`` is a zero-copy view of Batch's published token counts,
     bound outside capture. Batch owns the page tables and watermarks; metadata
-    does not maintain another copy. Query-to-Batch row mappings are supplied
-    to selection on the GPU. Fetch output remains in Batch row order.
+    does not maintain another copy. A request keeps its Batch row while it stays
+    scheduled, so rows need not follow the input order or be contiguous.
+    ``batch_rows`` maps each request's input position to its row, and positions
+    past the live requests to -1; it is refreshed outside capture each step.
+    Selections, fetch output, write destinations and watermarks are indexed by
+    Batch row; per-request inputs and attention outputs by input position.
 
     ``prepared`` means preparation was enqueued successfully; stream ordering
     establishes device readiness. ``is_prefill`` is set by host batch validation
@@ -120,6 +130,7 @@ class SparseOffloadState:
 
     layers: dict[int, SparseOffloadLayerDescriptor]
     active_request_count: torch.Tensor
+    batch_rows: torch.Tensor
     selected_history_units: torch.Tensor
     fetched_indices: dict[int, torch.Tensor]
     write_indices: dict[int, torch.Tensor]
@@ -149,9 +160,10 @@ class SparseOffloadState:
             buffer_counts: The distinct sparse buffer counts F of the layers.
             nvfp4_head_dim: Head dim of the dequantized rows with NVFP4, else None.
         """
-        # The active count, the selections and the scatter start positions, then
-        # the fetch outputs and write destinations of each buffer count.
-        index_entries = 1 + max_batch_size * topk + max_batch_size
+        # The active count, the selections, the scatter start positions and the
+        # Batch row map, then the fetch outputs and write destinations of each
+        # buffer count.
+        index_entries = 1 + max_batch_size * topk + 2 * max_batch_size
         index_entries += sum(max_batch_size * count * (topk + 1) for count in buffer_counts)
         nvfp4_bytes = 0
         if nvfp4_head_dim is not None:
@@ -187,6 +199,7 @@ def allocate_sparse_offload_state(
     return SparseOffloadState(
         layers=layers,
         active_request_count=index_tensor("active_request_count", (1,), 0),
+        batch_rows=index_tensor("batch_rows", (max_batch_size,), -1),
         selected_history_units=index_tensor(
             "selected_history_units", (max_batch_size, topk), BAD_PAGE_INDEX
         ),
@@ -251,6 +264,20 @@ class _SparseArenaLayout:
     max_leases: int
 
 
+@dataclass(slots=True)
+class _SparseBatchMember:
+    """A request seated in the native Batch."""
+
+    cache: _KVCache
+    # The row add_kv_cache returned. The runtime never moves a seated member, so the
+    # row holds while the request stays scheduled, and with it the GPU cache lease.
+    row: int
+    # Page-table columns the row may have written since it joined. A cache
+    # writes page indices only below its block count, so the host snapshot
+    # copies no further than this.
+    blocks: int
+
+
 class SparseOffloadCacheMixin:
     """KV cache manager side of sparse KV cache offload, model-agnostic.
 
@@ -262,6 +289,11 @@ class SparseOffloadCacheMixin:
     the post-forward update, the scheduled requests are members of a native
     Batch, which owns their host page-index rows; every path that mutates a
     request's cache releases the Batch first.
+
+    Batch rows are slots. A request keeps its row, and with it the GPU cache
+    lease, for as long as it stays scheduled; a departing request frees its row
+    and an arriving one takes the lowest free row. Attention finds each request's
+    row through ``SparseOffloadState.batch_rows`` rather than by input position.
     """
 
     _enable_kv_cache_offload: bool = False
@@ -273,7 +305,7 @@ class SparseOffloadCacheMixin:
         self._enable_kv_cache_offload = enabled
         self._sparse_offload_topk = topk
         self._sparse_batch = None
-        self._sparse_batch_members: dict[int, _KVCache] = {}
+        self._sparse_batch_members: dict[int, _SparseBatchMember] = {}
         self._sparse_batch_prepared = False
 
     def _sparse_offload_nvfp4_head_dim(self) -> int | None:
@@ -345,8 +377,9 @@ class SparseOffloadCacheMixin:
         """Publish scheduler or warmup requests, or join an already published batch.
 
         Attention metadata calls this outside capture with its final request order.
-        Graph padding may append dummy rows; the live request order must still agree
-        with scheduling. Warmup requests can reach this without prepare_resources().
+        Graph padding may append dummy requests; the live requests must be the
+        scheduled ones, in any order. Warmup requests can reach this without
+        prepare_resources().
         """
         if self._sparse_batch_prepared:
             self.get_sparse_batch(request_ids)
@@ -355,12 +388,13 @@ class SparseOffloadCacheMixin:
             self._prepare_sparse_batch(request_ids)
 
     def _prepare_sparse_batch(self, request_ids: list[int]) -> None:
-        """Publish scheduled caches in model input order before a forward.
+        """Publish the scheduled caches before a forward.
 
-        Continuing requests keep their Batch membership and sparse GPU residency across
-        steps. Members write their page indices into Batch staging; the runtime's host
-        tables, which dense consumers read, receive a snapshot after scheduling and row
-        reordering.
+        Continuing requests keep their Batch row, membership and sparse GPU residency
+        across steps, whatever their input order; departing requests free their rows
+        and arriving ones take the lowest free rows. Members write their page indices
+        into Batch staging; the runtime's host tables, which dense consumers read,
+        receive a snapshot after scheduling.
         """
         if not self._has_sparse_offload_layers():
             return
@@ -408,11 +442,13 @@ class SparseOffloadCacheMixin:
                 request_id for request_id in self._sparse_batch_members if request_id not in caches
             )
             for request_id, cache in caches.items():
-                if request_id not in self._sparse_batch_members:
-                    batch.add_kv_cache(cache)
-                    self._sparse_batch_members[request_id] = cache
-            batch.reorder(list(caches.values()))
-            self._sparse_batch_members = caches
+                member = self._sparse_batch_members.get(request_id)
+                if member is None:
+                    self._sparse_batch_members[request_id] = _SparseBatchMember(
+                        cache=cache, row=batch.add_kv_cache(cache), blocks=cache.num_blocks
+                    )
+                else:
+                    member.blocks = max(member.blocks, cache.num_blocks)
             self._refresh_sparse_page_index_bufs()
             stream = torch.cuda.current_stream(self._stream.device)
             # Reusing the device mirror follows the previous forward. Publish on
@@ -426,41 +462,60 @@ class SparseOffloadCacheMixin:
                 self._release_sparse_batch()
 
     def get_sparse_batch(self, request_ids: list[int]) -> Batch:
-        """Return the published Batch after checking the attention metadata's row order.
+        """Return the published Batch after checking the attention metadata's requests.
 
-        Rows follow context requests then generation requests. CUDA graph padding is a
-        trailing suffix of free rows, whose page indices are BAD_PAGE_INDEX and whose
-        watermarks are zero. Fetch inputs must use Batch.max_batch_size rows, even when
-        a smaller attention profile is executing.
+        The live requests must be the Batch's members, each once, in any order: each
+        keeps its own row, which ``prepare_sparse_offload`` maps from the input
+        position. CUDA graph padding is a trailing suffix of dummy requests, which map
+        to no row. Fetch inputs must use Batch.max_batch_size rows, even when a smaller
+        attention profile is executing.
         """
         if self._sparse_batch is None or not self._sparse_batch_prepared:
             raise RuntimeError("Sparse Batch must be prepared before model execution")
-        live_ids = list(self._sparse_batch_members)
+        members = self._sparse_batch_members
+        live_ids = request_ids[: len(members)]
         if (
             len(request_ids) > self._sparse_batch.max_batch_size
-            or request_ids[: len(live_ids)] != live_ids
-            or any(req != CUDA_GRAPH_DUMMY_REQUEST_ID for req in request_ids[len(live_ids) :])
+            or len(live_ids) != len(members)
+            or set(live_ids) != members.keys()
+            or any(req != CUDA_GRAPH_DUMMY_REQUEST_ID for req in request_ids[len(members) :])
         ):
-            raise ValueError("Attention request order does not match the published sparse Batch")
+            raise ValueError("Attention requests do not match the published sparse Batch")
         return self._sparse_batch
 
     def _refresh_sparse_page_index_bufs(self) -> None:
-        """Snapshot Batch-owned page indices into the runtime's host tables for dense consumers."""
+        """Snapshot Batch-owned page indices into the runtime's host tables for dense consumers.
+
+        Copies each member's row up to the widest block count any member has had since
+        joining. Past that, both tables hold BAD_PAGE_INDEX for every member: a cache
+        writes only below its block count, and its binding filled the rest.
+        """
         if not self._sparse_batch_members:
             return
         assert self._sparse_batch is not None
-        indices = torch.tensor(
+        members = sorted(self._sparse_batch_members.items(), key=lambda item: item[1].row)
+        width = max(member.blocks for _, member in members)
+        if width == 0:
+            return
+        slots = torch.tensor(
             [
                 self.index_mapper.get_index(request_id) * self.max_beam_width
-                for request_id in self._sparse_batch_members
+                for request_id, _ in members
             ],
             dtype=torch.long,
             device="cpu",
         )
+        first, last = members[0][1].row, members[-1][1].row
+        # Members without free rows between them are one slice; otherwise gather them.
+        rows = (
+            None
+            if last - first + 1 == len(members)
+            else torch.tensor([member.row for _, member in members], dtype=torch.long)
+        )
         for pool_id in range(self.num_pools):
-            table = torch.from_dlpack(self._sparse_batch.coalesced_page_table(pool_id))
-            self.host_kv_cache_block_offsets[pool_id, :, 0, :].index_copy_(
-                0, indices, table[: len(self._sparse_batch_members)]
+            table = torch.from_dlpack(self._sparse_batch.coalesced_page_table(pool_id))[:, :width]
+            self.host_kv_cache_block_offsets[pool_id, :, 0, :width].index_copy_(
+                0, slots, table[first : last + 1] if rows is None else table.index_select(0, rows)
             )
 
     def _release_sparse_batch(self, request_ids: Iterable[int] | None = None) -> None:
@@ -470,15 +525,15 @@ class SparseOffloadCacheMixin:
         self._sparse_batch.wait_published()
         request_ids = list(self._sparse_batch_members if request_ids is None else request_ids)
         for request_id in request_ids:
-            cache = self._sparse_batch_members.get(request_id)
-            if cache is None:
+            member = self._sparse_batch_members.get(request_id)
+            if member is None:
                 continue
             self._sparse_batch_prepared = False
-            self._sparse_batch.remove_kv_cache(cache)
+            self._sparse_batch.remove_kv_cache(member.cache)
             del self._sparse_batch_members[request_id]
             # Removal restores the cache's internal indices. Rebind the runtime's
             # host table so subsequent resizes also reach the dense consumers.
-            self._set_page_index_bufs(request_id, cache)
+            self._set_page_index_bufs(request_id, member.cache)
 
     def suspend_request(self, req: llm_request.LlmRequest) -> None:
         self._release_sparse_batch([req.py_request_id])
@@ -586,17 +641,12 @@ class SparseOffloadCacheMixin:
         if batch is not None:
             batch.wait_published()
             histories = [0] * batch.max_batch_size
-            for cache in self._sparse_batch_members.values():
-                row = batch.row_of(cache)
-                if row >= 0:
-                    histories[row] = cache.history_length
+            for member in self._sparse_batch_members.values():
+                histories[member.row] = member.cache.history_length
             for request in scheduled_batch.generation_requests:
-                cache = self.kv_cache_map.get(request.py_request_id)
-                if cache is None or not cache.is_active:
-                    continue
-                row = batch.row_of(cache)
-                if row >= 0:
-                    histories[row] = cache.history_length + 1
+                member = self._sparse_batch_members.get(request.py_request_id)
+                if member is not None and member.cache.is_active:
+                    histories[member.row] = member.cache.history_length + 1
             batch.flush_sparse_units(histories)
 
         # The flush watermark belongs to the attached Batch row. Keep membership
@@ -816,12 +866,14 @@ class SparseOffloadCacheMixin:
         *,
         beam_width: int,
     ) -> None:
-        """Bind the published Batch and refresh the active count outside capture.
+        """Bind the published Batch and refresh the per-step mapping outside capture.
 
-        Scheduling publishes the page tables and watermarks in request order.
-        The native Batch and its device views persist across steps and graph
-        profiles; only trailing dummy requests may extend the scheduled rows.
-        This prepares fetch metadata, not write destinations.
+        Scheduling publishes the page tables and watermarks by Batch row. This maps
+        each request in ``request_ids``, the attention metadata's input order, to its
+        row, and sets the active count. The native Batch and its device views persist
+        across steps and graph profiles; only trailing dummy requests may extend the
+        scheduled requests, and they map to no row. This prepares fetch metadata, not
+        write destinations.
         """
         state.prepared = False
         state.write_layer = None
@@ -841,7 +893,15 @@ class SparseOffloadCacheMixin:
             if state.batch is None:
                 state.history_lengths = torch.from_dlpack(batch.history_lengths())
                 state.batch = batch
-            state.active_request_count.fill_(len(self._sparse_batch_members))
+            live = len(self._sparse_batch_members)
+            rows = [self._sparse_batch_members[request_id].row for request_id in request_ids[:live]]
+            rows += [-1] * (batch.max_batch_size - live)
+            # Pinned memory returns to the caching host allocator only after the copy runs.
+            state.batch_rows.copy_(
+                torch.tensor(rows, dtype=torch.int32, pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+            state.active_request_count.fill_(live)
             state.selected_history_units.fill_(BAD_PAGE_INDEX)
             for out in state.fetched_indices.values():
                 out.fill_(BAD_PAGE_INDEX)
@@ -854,10 +914,12 @@ class SparseOffloadCacheMixin:
     ) -> torch.Tensor:
         """Reserve this layer's in-flight arena rows on the current stream.
 
-        Return int32[B, F] in Batch and descriptor buffer order; a row without a
-        unit in flight gets -1. The caller must join Batch publication before
-        this call, and the writer must finish before fetch/attention or a history
-        update. No KV is fetched here.
+        Return int32[B, F] in Batch row and descriptor buffer order; a row without
+        a unit in flight gets -1. A writer addressing requests by input position
+        reads request i's entries at Batch row ``state.batch_rows[i]``, for example
+        through ``gather_sparse_batch_rows``. The caller must join Batch publication
+        before this call, and the writer must finish before fetch/attention or a
+        history update. No KV is fetched here.
         """
         if (
             not self._enable_kv_cache_offload
@@ -885,15 +947,16 @@ class SparseOffloadCacheMixin:
         state: SparseOffloadState,
         layer_idx: int,
         topk_indices: torch.Tensor,
-        request_rows: torch.Tensor,
+        request_indices: torch.Tensor,
         unit_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """Fetch one layer's history into compact per-buffer arena indices.
 
-        Inputs are CUDA int32: top-k unit ordinals [Q, K], query-to-Batch rows
-        [Q], and selectable unit counts [R] in scheduler/request order. Live
-        query rows are a permutation of the active Batch prefix, one query per
-        request. Q and R may be smaller than Batch.max_batch_size.
+        Inputs are CUDA int32: top-k unit ordinals [Q, K], each query's request
+        by input position [Q], and selectable unit counts [R] by input position.
+        Live queries name distinct requests, one query per request; the prepared
+        ``state.batch_rows`` maps each to its Batch row. Q and R may be smaller
+        than Batch.max_batch_size.
 
         Return int32[B, F, K] in Batch row order and descriptor.buffer_ids order.
         Each index is relative to that buffer's sparse arena base. Top-k slots
@@ -917,7 +980,8 @@ class SparseOffloadCacheMixin:
         with torch.cuda.device(state.selected_history_units.device):
             select_sparse_history_units(
                 topk_indices,
-                request_rows,
+                request_indices,
+                state.batch_rows,
                 state.active_request_count,
                 unit_lengths,
                 state.history_lengths,

@@ -68,7 +68,7 @@ V4_FLASH_BATCH = SparseBatchShape(
 # The Batch and DeepSeek-V4's attention metadata offload state, of which the eager
 # and the CUDA graph metadata each hold one: 64 MiB of dequantized NVFP4 rows and
 # 1.5 MiB of indices.
-V4_FLASH_BATCH_BUFFER_BYTES = V4_FLASH_BATCH.device_bytes + 2 * 68_684_804
+V4_FLASH_BATCH_BUFFER_BYTES = V4_FLASH_BATCH.device_bytes + 2 * 68_685_828
 
 
 def _layer(

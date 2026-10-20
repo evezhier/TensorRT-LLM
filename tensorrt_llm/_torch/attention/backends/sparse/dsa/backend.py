@@ -21,7 +21,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import MlaLatentWriteTarget, TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..offload_kernels import merge_sparse_arena_indices
+from ..offload_kernels import gather_sparse_batch_rows, merge_sparse_arena_indices
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -295,16 +295,17 @@ class DSATrtllmAttention(TrtllmAttention):
         num_tokens = topk_indices.shape[0]
         topk = metadata.sparse_mla_topk
         topk_indices = topk_indices[:, :topk]
-        request_rows = metadata.req_idx_per_token[:num_tokens]
+        request_indices = metadata.req_idx_per_token[:num_tokens]
         kv_lengths = metadata.kv_lens_cuda[: metadata.num_seqs]
         fetched = metadata.kv_cache_manager.fetch_sparse_indices(
-            state, self.layer_idx, topk_indices, request_rows, kv_lengths
+            state, self.layer_idx, topk_indices, request_indices, kv_lengths
         )
         descriptor = state.layers[self.layer_idx]
         data_index = descriptor.data_buffer_index
         indices = merge_sparse_arena_indices(
             topk_indices,
-            request_rows,
+            request_indices,
+            state.batch_rows,
             state.active_request_count,
             kv_lengths,
             state.history_lengths,
@@ -336,10 +337,13 @@ class DSATrtllmAttention(TrtllmAttention):
         manager = metadata.kv_cache_manager
         write_indices = manager.prepare_sparse_write_indices(state, self.layer_idx)
         data_index = state.layers[self.layer_idx].data_buffer_index
-        write_rows = write_indices[:, data_index]
-        # One token per request, in Batch row order: each request's one-token page
-        # is its write row. A row without a unit in flight writes nothing.
-        metadata.sparse_latent_block_offsets[0, :, 0, 0].copy_(write_rows)
+        # One token per request, in input order: each request's one-token page is
+        # its Batch row's write row. A request without a unit in flight writes nothing.
+        write_rows = gather_sparse_batch_rows(
+            write_indices[:, data_index],
+            state.batch_rows,
+            out=metadata.sparse_latent_block_offsets[0, :, 0, 0],
+        )
         num_tokens = latent_cache.shape[0]
         write_slots = metadata.sparse_latent_write_slots[:num_tokens]
         write_slots.copy_((write_rows[:num_tokens] >= 0).to(torch.int32) - 1)

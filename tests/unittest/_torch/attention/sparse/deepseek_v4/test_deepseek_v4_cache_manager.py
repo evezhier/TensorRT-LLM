@@ -829,13 +829,6 @@ class _SchedulingBatch:
         cache.page_index_owner = "cache"
         self.leaves.append(cache.id)
 
-    def reorder(self, caches: list[_HistoryCache]) -> None:
-        assert not self.upload_pending
-        assert {cache.id for cache in caches} == {
-            cache.id for cache in self.rows if cache is not None
-        }
-        self.rows[:] = list(caches) + [None] * (self.max_batch_size - len(caches))
-
     def coalesced_page_table(self, pool_id: int) -> torch.Tensor:
         return torch.tensor(
             [
@@ -878,7 +871,8 @@ def sparse_scheduling_case():
     scheduled = SimpleNamespace(context_requests=[], generation_requests=[request, other_request])
     manager.num_pools = 2
     manager.index_mapper = Mock()
-    manager.index_mapper.get_index.side_effect = {20: 3, 10: 1}.__getitem__
+    slots = {20: 3, 10: 1}
+    manager.index_mapper.get_index.side_effect = slots.__getitem__
     manager.host_kv_cache_block_offsets = torch.full((2, 4, 1, 6), -99, dtype=torch.int32)
 
     def restore(request_id, request_cache):
@@ -897,6 +891,7 @@ def sparse_scheduling_case():
             cache=cache,
             request=request,
             scheduled=scheduled,
+            slots=slots,
             create_batch=create_batch,
             restore_buffers=restore_buffers,
             current_stream=current_stream,
@@ -916,10 +911,11 @@ def test_sparse_batch_publishes_schedule_and_reuses_allocation(sparse_scheduling
     assert batch.snapshots[-1][2] == (None, 0, 0, (-1,) * manager.max_blocks_per_seq)
     case.current_stream.return_value.wait_stream.assert_called_with(manager._stream)
 
+    # A new schedule order moves nothing: each request keeps its row and lease.
     case.scheduled.generation_requests.reverse()
     manager.prepare_resources(case.scheduled)
     assert manager.get_sparse_batch([10, 20]) is batch
-    assert [row[0] for row in batch.snapshots[-1]] == [10, 20, None, None]
+    assert [row[0] for row in batch.snapshots[-1]] == [20, 10, None, None]
     call = case.create_batch.call_args
     assert call.args == (manager.impl, manager._stream.cuda_stream)
     assert call.kwargs["max_batch_size"] == 4
@@ -958,22 +954,24 @@ def test_sparse_batch_retains_continuing_members_and_refreshes_legacy_tables(
     assert batch.joins == [20, 10]
     assert not batch.leaves
     assert manager.get_sparse_batch([10, 20]) is batch
+    # Only the columns below the members' block counts are copied; past them the
+    # runtime's binding keeps its own BAD_PAGE_INDEX, here the -99 the test filled.
     for pool_id in range(manager.num_pools):
         assert manager.host_kv_cache_block_offsets[pool_id, 3 * max_beam_width, 0].tolist() == [
             4,
             8,
             9,
-            -1,
-            -1,
-            -1,
+            -99,
+            -99,
+            -99,
         ]
         assert manager.host_kv_cache_block_offsets[pool_id, max_beam_width, 0].tolist() == [
             0,
             7,
             8,
-            -1,
-            -1,
-            -1,
+            -99,
+            -99,
+            -99,
         ]
 
     case.scheduled.generation_requests = [case.request]
@@ -994,11 +992,13 @@ def test_sparse_batch_metadata_joins_scheduler_or_prepares_warmup(sparse_schedul
     case.manager.prepare_sparse_batch([20, 10, CUDA_GRAPH_DUMMY_REQUEST_ID])
     batch = case.manager.get_sparse_batch([20, 10])
     case.manager.prepare_sparse_batch([20, 10])
+    # Metadata may order the published requests differently; nothing is republished.
+    case.manager.prepare_sparse_batch([10, 20])
     assert len(batch.snapshots) == 1
     assert [row[0] for row in batch.snapshots[-1]] == [20, 10, None, None]
     case.current_stream.return_value.wait_stream.assert_called_with(case.manager._stream)
-    with pytest.raises(ValueError, match="request order"):
-        case.manager.prepare_sparse_batch([10, 20])
+    with pytest.raises(ValueError, match="do not match"):
+        case.manager.prepare_sparse_batch([20])
 
 
 @pytest.mark.cpu_only
@@ -1068,13 +1068,98 @@ def test_sparse_batch_rejects_invalid_schedule_before_binding(sparse_scheduling_
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "request_ids", [[10, 20], [20], [20, 10, 30], [20, -1, 10], [20, 10] + [-1] * 3]
+    "request_ids",
+    [
+        [20],
+        [20, 20],
+        [20, 10, 30],
+        [20, -1, 10],
+        [20, 10] + [-1] * 3,
+        [CUDA_GRAPH_DUMMY_REQUEST_ID, 20, 10],
+        [20, 10] + [CUDA_GRAPH_DUMMY_REQUEST_ID] * 3,
+    ],
 )
-def test_sparse_batch_checks_consumer_row_order(sparse_scheduling_case, request_ids):
+def test_sparse_batch_checks_consumer_requests(sparse_scheduling_case, request_ids):
     case = sparse_scheduling_case
     case.manager.prepare_resources(case.scheduled)
-    with pytest.raises(ValueError, match="request order"):
+    with pytest.raises(ValueError, match="do not match"):
         case.manager.get_sparse_batch(request_ids)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("request_ids", [[20, 10], [10, 20], [10, 20, CUDA_GRAPH_DUMMY_REQUEST_ID]])
+def test_sparse_batch_accepts_members_in_any_order(sparse_scheduling_case, request_ids):
+    case = sparse_scheduling_case
+    case.manager.prepare_resources(case.scheduled)
+    assert case.manager.get_sparse_batch(request_ids) is case.manager._sparse_batch
+
+
+def _add_scheduled_request(case: SimpleNamespace, request_id: int, slot: int) -> _HistoryCache:
+    cache = _HistoryCache(case.manager.tokens_per_block, case.manager._stream.cuda_stream)
+    cache.id = request_id
+    cache.page_index_owner = "runtime"
+    case.manager.kv_cache_map[request_id] = cache
+    case.slots[request_id] = slot
+    return cache
+
+
+@pytest.mark.cpu_only
+def test_sparse_batch_rows_are_slots_that_arrivals_refill(sparse_scheduling_case):
+    """A departure leaves a free row, which the next arrival takes; nobody else moves."""
+    case = sparse_scheduling_case
+    manager = case.manager
+    _add_scheduled_request(case, 30, slot=0)
+    third = SimpleNamespace(py_request_id=30, is_disagg_generation_init_state=False)
+    other = case.scheduled.generation_requests[1]
+
+    def schedule(*requests):
+        case.scheduled.generation_requests = list(requests)
+        manager.prepare_resources(case.scheduled)
+        return {rid: member.row for rid, member in manager._sparse_batch_members.items()}
+
+    assert schedule(case.request, other) == {20: 0, 10: 1}
+    batch = manager._sparse_batch
+    assert schedule(other) == {10: 1}
+    assert batch.rows == [None, manager.kv_cache_map[10], None, None]
+    # The arrival runs first in the input but takes the lowest free row.
+    assert schedule(third, other) == {10: 1, 30: 0}
+    assert manager.get_sparse_batch([30, 10]) is batch
+    assert schedule(other, third) == {10: 1, 30: 0}
+    assert batch.joins == [20, 10, 30]
+    assert batch.leaves == [20]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("hole", [False, True])
+def test_sparse_batch_snapshot_follows_rows_with_or_without_holes(sparse_scheduling_case, hole):
+    case = sparse_scheduling_case
+    manager = case.manager
+    third = _add_scheduled_request(case, 30, slot=0)
+    third.pages = [5, 6, 7]
+    scheduled = case.scheduled.generation_requests + [
+        SimpleNamespace(py_request_id=30, is_disagg_generation_init_state=False)
+    ]
+    case.scheduled.generation_requests = scheduled
+    manager.prepare_resources(case.scheduled)
+    assert {rid: member.row for rid, member in manager._sparse_batch_members.items()} == {
+        20: 0,
+        10: 1,
+        30: 2,
+    }
+    if hole:
+        # Request 10 leaves row 1 free, so rows 0 and 2 are gathered.
+        case.scheduled.generation_requests = [scheduled[2], scheduled[0]]
+    # A member that grew writes its new pages through its Batch row.
+    case.cache.pages = [4, 8, 9, 11]
+    case.cache.num_blocks = 4
+    third.pages = [5, 6, 12]
+    manager.prepare_resources(case.scheduled)
+    host = manager.host_kv_cache_block_offsets
+    for pool_id in range(manager.num_pools):
+        assert host[pool_id, 3, 0].tolist() == [4, 8, 9, 11, -99, -99]
+        assert host[pool_id, 0, 0].tolist() == [5, 6, 12, -1, -99, -99]
+        if not hole:
+            assert host[pool_id, 1, 0].tolist() == [0, 7, 8, -1, -99, -99]
 
 
 def _gen_init_request(request_id: int) -> SimpleNamespace:
@@ -3912,9 +3997,9 @@ def test_offload_scratch_counts_both_attention_metadata_copies() -> None:
     # A copy holds 64 MiB of FP8 rows dequantized from NVFP4, [256, 512, 512], and
     # int32 indices: the selections [256, 512], the fetch outputs [256, 2, 512] and
     # write destinations [256, 2] of the data and scale buffers, the scatter start
-    # positions [256] and the active count.
-    per_copy = 256 * 512 * 512 + 4 * (256 * 512 + 256 * 2 * 512 + 256 * 2 + 256 + 1)
-    assert per_copy == 68_684_804
+    # positions [256], the Batch row map [256] and the active count.
+    per_copy = 256 * 512 * 512 + 4 * (256 * 512 + 256 * 2 * 512 + 256 * 2 + 256 + 256 + 1)
+    assert per_copy == 68_685_828
     # The eager attention metadata holds one, and the CUDA graph metadata share one.
     assert manager.get_sparse_offload_scratch_bytes(config) == 2 * per_copy
 

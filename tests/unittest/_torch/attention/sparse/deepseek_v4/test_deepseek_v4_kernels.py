@@ -32,17 +32,25 @@ _requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA 
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("active", [0, 2, 4])
 @pytest.mark.parametrize("split_extra", [False, True])
-def test_sparse_index_preparation_merges_history_and_writes(strided, active, split_extra):
-    # Request order differs from query order. Some rows complete a unit, one has
-    # no newly completed row, and another has no valid write destination.
+@pytest.mark.parametrize("batch_rows", [[0, 1, 2, 3], [2, 0, 3, 1]])
+def test_sparse_index_preparation_merges_history_and_writes(
+    strided, active, split_extra, batch_rows
+):
+    # Request order differs from query order, and Batch rows need not follow
+    # either. Some rows complete a unit, one has no newly completed row, and
+    # another has no valid write destination.
     topk = _cuda_tensor([[1, -1, 0, 99], [32, 31, 0, -2], [0, -1, -1, -1], [0, 1, 2, -1]], strided)
-    rows = _cuda_tensor([1, 0, 3, 2], strided)
+    requests = _cuda_tensor([1, 0, 3, 2], strided)
     lengths = _cuda_tensor([33, 2, 3, 1], strided)
-    history = _cuda_tensor([131, 8, 11, 3], strided)
-    fetched = _cuda_tensor(torch.arange(4 * 3 * 4).reshape(4, 3, 4) + 100, strided)[:, 1]
-    writes = _cuda_tensor([[7, 7, 50], [-1, -1, -1], [5, 5, 42], [-1, -1, -1]], strided)[:, 1]
+    # Watermarks, fetches and writes of requests 0..3, stored at their Batch rows.
+    by_row = torch.tensor(batch_rows).argsort()
+    history = _cuda_tensor(torch.tensor([131, 8, 11, 3])[by_row], strided)
+    fetched = _cuda_tensor((torch.arange(4 * 3 * 4).reshape(4, 3, 4) + 100)[by_row], strided)[:, 1]
+    writes = _cuda_tensor(
+        torch.tensor([[7, 7, 50], [-1, -1, -1], [5, 5, 42], [-1, -1, -1]])[by_row], strided
+    )[:, 1]
     kwargs = dict(
-        req_id=rows,
+        req_id=requests,
         block_table_swa=_cuda_tensor([[2], [3], [5], [9]]),
         swa_local_indices=_cuda_tensor([[0, 1, -1, 3]] * 4),
         swa_pool_base_ptr=4096,
@@ -56,24 +64,27 @@ def test_sparse_index_preparation_merges_history_and_writes(strided, active, spl
         compressed_write_indices=writes,
         compressed_history_lengths=history,
         compressed_lengths=lengths,
+        compressed_batch_rows=_cuda_tensor(batch_rows, strided),
         active_request_count=_cuda_tensor([active]),
         mask_invalid_pages=True,
         split_extra=split_extra,
     )
     out = deepseek_v4_local_to_global_indices(**kwargs)
     expected = torch.full((4, 8), -1, dtype=torch.int32)
-    for query, request in enumerate(rows.cpu().tolist()):
+    for query, request in enumerate(requests.cpu().tolist()):
         if query >= active or request >= active:
             continue
+        # The SWA table and the lengths follow the request; sparse state, its row.
         page = [2, 3, 5, 9][request]
+        row = batch_rows[request]
         expected[query, :4] = torch.tensor([page * 4, page * 4 + 1, -1, page * 4 + 3])
         for slot, unit in enumerate(topk.cpu().tolist()[query]):
             if not 0 <= unit < lengths[request].item():
                 continue
-            if unit < history[request].item() // 4:
-                expected[query, 4 + slot] = fetched[request, slot].cpu()
-            elif unit == history[request].item() // 4:
-                expected[query, 4 + slot] = writes[request].cpu()
+            if unit < history[row].item() // 4:
+                expected[query, 4 + slot] = fetched[row, slot].cpu()
+            elif unit == history[row].item() // 4:
+                expected[query, 4 + slot] = writes[row].cpu()
     if split_extra:
         torch.testing.assert_close(out[0].cpu(), expected[:, :4])
         torch.testing.assert_close(out[1].cpu(), expected[:, 4:])
@@ -85,15 +96,16 @@ def test_sparse_index_preparation_merges_history_and_writes(strided, active, spl
 def test_sparse_index_preparation_replays_with_new_watermarks_and_padding():
     # The graph has two query rows; native Batch retains four rows. Invalid
     # request IDs in graph padding must never index either cache's metadata.
-    rows = _cuda_tensor([0, 999])
+    requests = _cuda_tensor([0, 999])
     topk = _cuda_tensor([[0, 1, 2, -1], [0, 1, 2, 3]])
     fetched = _cuda_tensor([[71, 29, 88, -1]] * 4)
     writes = _cuda_tensor([7, -1, -1, -1], strided=True)
     history = _cuda_tensor([7, 0, 0, 0])
     lengths = _cuda_tensor([2, 0])
+    batch_rows = _cuda_tensor([0, -1, -1, -1])
     active = _cuda_tensor([1])
     kwargs = dict(
-        req_id=rows,
+        req_id=requests,
         block_table_swa=_cuda_tensor([[2], [3]]),
         swa_local_indices=_cuda_tensor([[0, 1, -1, 3]] * 2),
         swa_pool_base_ptr=4096,
@@ -107,6 +119,7 @@ def test_sparse_index_preparation_replays_with_new_watermarks_and_padding():
         compressed_write_indices=writes,
         compressed_history_lengths=history,
         compressed_lengths=lengths,
+        compressed_batch_rows=batch_rows,
         active_request_count=active,
         mask_invalid_pages=True,
     )
@@ -114,16 +127,21 @@ def test_sparse_index_preparation_replays_with_new_watermarks_and_padding():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = deepseek_v4_local_to_global_indices(**kwargs)
-    for history_tokens, length, destination, active_count, compressed in (
-        (7, 2, 7, 1, [71, 7, -1, -1]),
-        (8, 2, -1, 1, [71, 29, -1, -1]),
-        (11, 3, 5, 1, [71, 29, 5, -1]),
-        (11, 3, -1, 1, [71, 29, -1, -1]),
-        (11, 3, 5, 0, [-1] * 4),
+    for row, history_tokens, length, destination, active_count, compressed in (
+        (0, 7, 2, 7, 1, [71, 7, -1, -1]),
+        (0, 8, 2, -1, 1, [71, 29, -1, -1]),
+        (0, 11, 3, 5, 1, [71, 29, 5, -1]),
+        (0, 11, 3, -1, 1, [71, 29, -1, -1]),
+        (0, 11, 3, 5, 0, [-1] * 4),
+        # The request now sits in Batch row 2; the replay follows the new map.
+        (2, 11, 3, 5, 1, [71, 29, 5, -1]),
     ):
-        history[0] = history_tokens
+        history.zero_()
+        writes.fill_(-1)
+        batch_rows[0] = row
+        history[row] = history_tokens
         lengths[0] = length
-        writes[0] = destination
+        writes[row] = destination
         active[0] = active_count
         graph.replay()
         swa = [8, 9, -1, 11] if active_count else [-1] * 4
@@ -144,42 +162,56 @@ def _cuda_tensor(value: torch.Tensor | list, strided: bool = False) -> torch.Ten
     return view
 
 
-def _selection_reference(topk, rows, active, lengths, history):
+def _selection_reference(topk, requests, batch_rows, active, lengths, history):
     out = torch.full((history.numel(), topk.shape[1]), -1, dtype=torch.int32)
-    for query, row in enumerate(rows.tolist()):
-        if query >= active or not 0 <= row < min(active, history.numel(), lengths.numel()):
+    for query, request in enumerate(requests.tolist()):
+        if query >= active or not 0 <= request < min(active, history.numel(), lengths.numel()):
+            continue
+        row = batch_rows[request].item()
+        if not 0 <= row < history.numel():
             continue
         for k, unit in enumerate(topk[query].tolist()):
-            if 0 <= unit < min(lengths[row], history[row] // 4):
+            if 0 <= unit < min(lengths[request], history[row] // 4):
                 out[row, k] = unit
     return out
 
 
 @_requires_cuda
 @pytest.mark.parametrize("strided", [False, True])
-def test_select_history_units_uses_compressed_boundaries_and_preserves_slots(strided):
-    history = torch.tensor([0, 3, 4, 7, 8, 127, 128, 129, 999, 999], dtype=torch.int32)
-    lengths = (history[:8] + 1) // 4
-    rows = torch.tensor([7, 4, 1, 6, 0, 5, 3, 2], dtype=torch.int32)
+@pytest.mark.parametrize("permuted", [False, True])
+def test_select_history_units_uses_compressed_boundaries_and_preserves_slots(strided, permuted):
+    # Requests 0..7 in Batch rows; when permuted, rows 4 and 6 are free.
+    rows = [9, 2, 5, 0, 7, 1, 3, 8] if permuted else list(range(8))
+    batch_rows = torch.tensor(rows + [-1, -1], dtype=torch.int32)
+    request_history = torch.tensor([0, 3, 4, 7, 8, 127, 128, 129], dtype=torch.int32)
+    history = torch.full((10,), 999, dtype=torch.int32)
+    history[rows] = request_history
+    lengths = (request_history + 1) // 4
+    requests = torch.tensor([7, 4, 1, 6, 0, 5, 3, 2], dtype=torch.int32)
     topk = torch.tensor([[31, -1, 0, 32, 1, 30, -2, 1000]] * 8, dtype=torch.int32)
     out = _cuda_tensor(torch.full((10, 8), 999, dtype=torch.int32), strided)
     gpu_topk = _cuda_tensor(topk, strided)
     select_sparse_history_units(
         gpu_topk,
-        _cuda_tensor(rows, strided),
+        _cuda_tensor(requests, strided),
+        _cuda_tensor(batch_rows, strided),
         _cuda_tensor([8]),
         _cuda_tensor(lengths, strided),
         _cuda_tensor(history, strided),
         out,
         unit_tokens=4,
     )
-    expected = _selection_reference(topk, rows, 8, lengths, history)
+    expected = _selection_reference(topk, requests, batch_rows, 8, lengths, history)
     torch.testing.assert_close(out.cpu(), expected)
     torch.testing.assert_close(gpu_topk.cpu(), topk)
-    assert out[3, 2].item() == 0  # History token 7 already makes compressed unit 0 eligible.
-    assert out[3, 4].item() == -1  # Unit 1 is still in flight at history 7 / capacity 8.
-    assert out[5, 0].item() == -1 and out[6, 0].item() == 31
-    assert (out[8:] == -1).all()  # Full native Batch capacity is cleared.
+    # History token 7 already makes compressed unit 0 eligible.
+    assert out[rows[3], 2].item() == 0
+    # Unit 1 is still in flight at history 7 / capacity 8.
+    assert out[rows[3], 4].item() == -1
+    assert out[rows[5], 0].item() == -1 and out[rows[6], 0].item() == 31
+    # Full native Batch capacity is cleared, free rows included.
+    free = sorted(set(range(10)) - set(rows))
+    assert (out[free] == -1).all()
 
 
 @_requires_cuda
@@ -190,37 +222,56 @@ def test_select_history_units_scattered(topk_size):
         [torch.randperm(3000, generator=generator)[:topk_size] for _ in range(3)]
     ).to(torch.int32)
     topk[:, 1::5] = -1
-    rows = torch.tensor([2, 0, 1], dtype=torch.int32)
-    history = torch.tensor([12000, 4127, 0, 0, 0], dtype=torch.int32)
+    requests = torch.tensor([2, 0, 1], dtype=torch.int32)
+    batch_rows = torch.tensor([3, 0, 4, -1, -1], dtype=torch.int32)
+    history = torch.tensor([4127, 0, 0, 12000, 0], dtype=torch.int32)
     lengths = torch.tensor([3000, 1032, 1], dtype=torch.int32)
     out = torch.empty((5, topk_size), dtype=torch.int32, device="cuda")
     select_sparse_history_units(
         _cuda_tensor(topk),
-        _cuda_tensor(rows),
+        _cuda_tensor(requests),
+        _cuda_tensor(batch_rows),
         _cuda_tensor([3]),
         _cuda_tensor(lengths),
         _cuda_tensor(history),
         out,
         unit_tokens=4,
     )
-    torch.testing.assert_close(out.cpu(), _selection_reference(topk, rows, 3, lengths, history))
+    torch.testing.assert_close(
+        out.cpu(), _selection_reference(topk, requests, batch_rows, 3, lengths, history)
+    )
 
 
 @_requires_cuda
-def test_select_history_units_masks_invalid_request_ids_and_padding():
-    rows = [-1, 999, 0, 0]
+def test_select_history_units_masks_invalid_request_ids_rows_and_padding():
+    # Queries 0 and 1 carry invalid request IDs, query 3 is graph padding, and
+    # request 1 maps to no Batch row.
     out = torch.full((6, 2), 99, dtype=torch.int32, device="cuda")
     select_sparse_history_units(
         _cuda_tensor([[0, 1]] * 4),
-        _cuda_tensor(rows),
+        _cuda_tensor([-1, 999, 0, 0]),
+        _cuda_tensor([5, -1, 2, -1, -1, -1]),
         _cuda_tensor([3]),
         _cuda_tensor([2] * 4),
         _cuda_tensor([8] * 6),
         out,
         unit_tokens=4,
     )
-    torch.testing.assert_close(out[0], _cuda_tensor([0, 1]))
-    assert (out[1:] == -1).all()
+    torch.testing.assert_close(out[5], _cuda_tensor([0, 1]))
+    assert (out[:5] == -1).all()
+    out.fill_(99)
+    select_sparse_history_units(
+        _cuda_tensor([[0, 1]] * 2),
+        _cuda_tensor([1, 0]),
+        _cuda_tensor([5, -1, 2, -1, -1, -1]),
+        _cuda_tensor([2]),
+        _cuda_tensor([2] * 2),
+        _cuda_tensor([8] * 6),
+        out,
+        unit_tokens=4,
+    )
+    torch.testing.assert_close(out[5], _cuda_tensor([0, 1]))
+    assert (out[:5] == -1).all()
 
 
 @_requires_cuda
@@ -230,6 +281,7 @@ def test_select_history_units_empty_shapes(batch, queries, topk):
     select_sparse_history_units(
         torch.empty((queries, topk), dtype=torch.int32, device="cuda"),
         torch.zeros(queries, dtype=torch.int32, device="cuda"),
+        torch.full((batch,), -1, dtype=torch.int32, device="cuda"),
         _cuda_tensor([0]),
         torch.zeros(queries, dtype=torch.int32, device="cuda"),
         torch.zeros(batch, dtype=torch.int32, device="cuda"),
@@ -240,11 +292,15 @@ def test_select_history_units_empty_shapes(batch, queries, topk):
 
 
 @_requires_cuda
-@pytest.mark.parametrize("invalid", ["dtype", "cpu", "width", "rows", "history", "lengths", "unit"])
+@pytest.mark.parametrize(
+    "invalid",
+    ["dtype", "cpu", "width", "requests", "batch_rows", "history", "lengths", "unit"],
+)
 def test_select_history_units_rejects_invalid_layout(invalid):
     topk = _cuda_tensor([[0, 1], [1, 0]])
-    rows, active, lengths, history = (
+    requests, batch_rows, active, lengths, history = (
         _cuda_tensor([0, 1]),
+        _cuda_tensor([0, 1, -1, -1]),
         _cuda_tensor([2]),
         _cuda_tensor([2, 2]),
         _cuda_tensor([8] * 4),
@@ -256,8 +312,10 @@ def test_select_history_units_rejects_invalid_layout(invalid):
         topk = topk.cpu()
     elif invalid == "width":
         topk = topk[:, :1]
-    elif invalid == "rows":
-        rows = rows[:1]
+    elif invalid == "requests":
+        requests = requests[:1]
+    elif invalid == "batch_rows":
+        batch_rows = batch_rows[:2]
     elif invalid == "history":
         history = history[:2]
     elif invalid == "lengths":
@@ -267,7 +325,8 @@ def test_select_history_units_rejects_invalid_layout(invalid):
     with pytest.raises(ValueError):
         select_sparse_history_units(
             topk,
-            rows,
+            requests,
+            batch_rows,
             active,
             lengths,
             history,

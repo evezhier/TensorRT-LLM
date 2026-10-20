@@ -327,6 +327,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         ][:, data_index],
                         compressed_history_lengths=sparse_state.history_lengths,
                         compressed_lengths=compressed_lengths,
+                        compressed_batch_rows=sparse_state.batch_rows,
                         active_request_count=sparse_state.active_request_count,
                     )
                     compress_pool_base_ptr = descriptor.arena_base_addresses[data_index]

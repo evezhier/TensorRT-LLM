@@ -3668,75 +3668,6 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def test_reordering_retains_cached_data_and_scales(self) -> None:
-        ctypes, cudart, torch = self._deps()
-        manager = self._manager()
-        caches = []
-        batch = None
-        roles = (("key", self.DATA), ("key_scale", self.SCALE))
-        try:
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                batch = Batch(
-                    manager,
-                    handle,
-                    max_batch_size=2,
-                    max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
-                )
-                lg = manager.get_layer_group_id(0)
-                patterns = []
-                for request in range(2):
-                    cache = manager.create_kv_cache()
-                    caches.append(cache)
-                    self.assertTrue(cache.resume(handle))
-                    self.assertTrue(cache.resize(2 * self.TPB, 2 * self.TPB))
-                    page = int(cache.get_base_page_indices(lg)[0])
-                    values = []
-                    for buffer, (role, size) in enumerate(roles):
-                        pattern = self._pattern(size, 7 + 11 * request + 3 * buffer)
-                        values.append(pattern)
-                        pool = int(manager.get_mem_pool_base_address(LayerId(0), role))
-                        stride = manager.get_page_stride(LayerId(0), role)
-                        ctypes.memmove(pool + page * stride, pattern, size)
-                    patterns.append(values)
-                    batch.add_kv_cache(cache)
-                batch.publish()
-                selected = torch.tensor([[0, -1], [0, -1]], dtype=torch.int32, device="cuda")
-                out = torch.empty((2, 2, self.SELECTED), dtype=torch.int32, device="cuda")
-                buffers = [BufferId(0, role) for role, _ in roles]
-                manager.fetch_sparse_pages(batch, buffers, selected, out, handle)
-                torch.cuda.synchronize()
-                original_indices = out.cpu().clone()
-                self.assertEqual(batch.peek_hit_miss_counter(), (0, 2))
-
-                batch.reorder(caches[::-1])
-                batch.publish()
-                manager.fetch_sparse_pages(batch, buffers, selected, out, handle)
-                torch.cuda.synchronize()
-                self.assertEqual(batch.peek_hit_miss_counter(), (2, 2))
-                self.assertTrue(torch.equal(out.cpu(), original_indices.flip(0)))
-                for row in range(2):
-                    for buffer, (role, size) in enumerate(roles):
-                        arena = int(manager.get_sparse_cache_base_address(LayerId(0), role))
-                        index = int(out[row, buffer, 0])
-                        got = bytearray(size)
-                        sink = (ctypes.c_ubyte * size).from_buffer(got)
-                        (err,) = cudart.cudaMemcpy(
-                            ctypes.addressof(sink),
-                            arena + index * size,
-                            size,
-                            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
-                        )
-                        self.assertEqual(int(err), 0)
-                        self.assertEqual(bytes(got), patterns[1 - row][buffer])
-        finally:
-            for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
-                    batch.remove_kv_cache(cache)
-                cache.close()
-            manager.shutdown()
-
 
 class TestSparseFlush(unittest.TestCase):
     """Writing a unit back to its host page once the watermark passes it."""
@@ -4071,53 +4002,6 @@ class TestBatch(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_reorder_preserves_bindings_watermarks_and_device_addresses(self) -> None:
-        import torch
-
-        manager = self._manager()
-        caches = []
-        batch = None
-        try:
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
-                lg = manager.get_layer_group_id(0)
-                table = torch.from_dlpack(batch.gpu_coalesced_page_table(lg))
-                address = table.data_ptr()
-                for history in (17, 31, 63):
-                    cache = manager.create_kv_cache()
-                    caches.append(cache)
-                    self.assertTrue(cache.resume(handle))
-                    self.assertTrue(cache.resize(128, history))
-                    batch.add_kv_cache(cache)
-                batch.flush_sparse_units([17, 31, 63])
-                batch.publish()
-                order = [caches[2], caches[0], caches[1]]
-                batch.reorder(order)
-                self.assertEqual([batch.row_of(cache) for cache in order], [0, 1, 2])
-                self.assertEqual([batch.flushed_history(row) for row in range(3)], [63, 17, 31])
-
-                # Growth must update the new row, and removing a member must clear it.
-                self.assertTrue(caches[2].resize(257))
-                batch.remove_kv_cache(caches[0])
-                order = [caches[1], caches[2]]
-                batch.reorder(order)
-                batch.publish()
-                torch.cuda.synchronize()
-                self.assertEqual(table.data_ptr(), address)
-                for row, cache in enumerate(order):
-                    self.assertEqual(table[row].tolist(), list(cache.get_base_page_indices(lg)))
-                self.assertTrue(bool((table[2] == BAD_PAGE_INDEX).all()))
-                self.assertEqual(torch.from_dlpack(batch.history_lengths()).tolist(), [31, 63, 0])
-                self.assertEqual(torch.from_dlpack(batch.capacities()).tolist(), [128, 257, 0])
-                self.assertEqual([batch.flushed_history(row) for row in range(2)], [31, 63])
-        finally:
-            for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
-                    batch.remove_kv_cache(cache)
-                cache.close()
-            manager.shutdown()
-
     def test_indexing_a_row_gives_its_member_or_none(self) -> None:
         """The inverse of row_of(). None is an empty row, never a bad index."""
         manager = self._manager()
@@ -4235,31 +4119,6 @@ class TestBatch(unittest.TestCase):
                 # Still usable afterwards: a refusal must not have half-moved anything.
                 batch.move(2, 1)
                 self.assertEqual([batch.row_of(cache) for cache in caches], [0, 2])
-        finally:
-            for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
-                    batch.remove_kv_cache(cache)
-                cache.close()
-            manager.shutdown()
-
-    def test_reorder_rejects_invalid_members_without_changing_rows(self) -> None:
-        manager = self._manager()
-        caches = []
-        batch = None
-        try:
-            with TemporaryCudaStream([]) as stream:
-                handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
-                for _ in range(3):
-                    cache = manager.create_kv_cache()
-                    caches.append(cache)
-                    self.assertTrue(cache.resume(handle))
-                batch.add_kv_cache(caches[0], 2)
-                batch.add_kv_cache(caches[1], 1)
-                for invalid in ([caches[0]], [caches[1], caches[1]], [caches[1], caches[2]]):
-                    with self.assertRaises(ValueError):
-                        batch.reorder(invalid)
-                    self.assertEqual([batch.row_of(cache) for cache in caches], [2, 1, -1])
         finally:
             for cache in caches:
                 if batch is not None and batch.row_of(cache) >= 0:

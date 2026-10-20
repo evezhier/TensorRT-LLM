@@ -297,13 +297,6 @@ public:
     //! their addresses; the move reaches them on the next publish.
     void move(int dstRow, int srcRow);
 
-    //! Pack all current members into the supplied order without releasing their arena leases.
-    //!
-    //! Every member must occur exactly once. Page-index bindings and flush watermarks move
-    //! with the members; device tables retain their addresses and change on the next publish.
-    //! Waits for the previous staging upload before changing any host row.
-    void reorder(std::vector<KvCache*> const& kvCaches);
-
     //! Resize every member, then publish once.
     //!
     //! The sanctioned way to advance a batched step, and the reason it exists: it waits on
@@ -354,7 +347,7 @@ public:
     //! it by waitPublished()** -- a KvCache::resize(), a commit(), a beam fork, an SWA
     //! recycle, anything that locks or unlocks a page. Writing sooner races the copy and
     //! publishes a torn table. This Batch's own mutators are not in that list: resize(),
-    //! move(), reorder(), addKvCache() and removeKvCache() each wait for themselves.
+    //! move(), addKvCache() and removeKvCache() each wait for themselves.
     //!
     //! Throws when the previous publish has not been waited on, which is how that rule is
     //! enforced: this call stages the watermarks and views itself, so it would be writing

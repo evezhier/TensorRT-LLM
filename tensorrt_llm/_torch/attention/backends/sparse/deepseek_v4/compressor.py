@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
+from ..offload_kernels import gather_sparse_batch_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -203,8 +204,11 @@ class Compressor(nn.Module):
             writes = metadata.kv_cache_manager.prepare_sparse_compressor_write_indices(
                 sparse_state, self.layer_idx
             )
-            data_index = descriptor.data_buffer_index
-            sparse_write_indices = writes[:bsz, data_index]
+            # Native write rows are by Batch row; the scatter addresses requests
+            # by input position.
+            sparse_write_indices = gather_sparse_batch_rows(
+                writes[:, descriptor.data_buffer_index], sparse_state.batch_rows[:bsz]
+            )
             kv_cache, kv_cache_scale = metadata.kv_cache_manager.get_sparse_compress_buffers(
                 self.layer_idx
             )
@@ -224,7 +228,7 @@ class Compressor(nn.Module):
             block_table = metadata.indexer_k_cache_block_offsets
         else:
             block_table = (
-                sparse_write_indices.contiguous().view(bsz, 1)
+                sparse_write_indices.view(bsz, 1)
                 if sparse_write_indices is not None
                 else metadata.compress_block_tables[self.compress_ratio]
             )
