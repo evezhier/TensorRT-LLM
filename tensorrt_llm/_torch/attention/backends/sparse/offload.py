@@ -209,6 +209,35 @@ def allocate_sparse_offload_state(
     )
 
 
+def get_sparse_offload_metadata_layers(metadata) -> dict[int, SparseOffloadLayerDescriptor]:
+    """Validate an attention metadata's fixed offload configuration and return its layers.
+
+    Offload runs single-beam and non-speculative, so per-batch beam and draft
+    values start at defaults; the manager's configured limits are checked too,
+    before any offload buffer is allocated. History policies are bound after
+    manager construction, before metadata initialization, so they are checked
+    once here rather than on each batch. An empty result means this pipeline
+    stage has no offloaded layer.
+    """
+    manager = metadata.kv_cache_manager
+    if (
+        metadata.beam_width != 1
+        or manager.max_beam_width != 1
+        or metadata.max_draft_tokens
+        or manager.max_draft_len
+        or manager.max_total_draft_tokens
+        or metadata.draft_kv_cache_manager is not None
+    ):
+        raise NotImplementedError("Sparse offload requires single-beam, non-speculative execution")
+    manager._validate_sparse_history_policy()
+    layers = manager.get_sparse_offload_descriptors()
+    if layers and (
+        metadata.sparse_mla_topk <= 0 or metadata.sparse_mla_topk != manager._sparse_offload_topk
+    ):
+        raise ValueError("Sparse offload metadata must match the configured positive top-k")
+    return layers
+
+
 @dataclass(frozen=True, slots=True)
 class _SparseArenaLayout:
     """Where every sparse buffer sits in its pool's arena region."""

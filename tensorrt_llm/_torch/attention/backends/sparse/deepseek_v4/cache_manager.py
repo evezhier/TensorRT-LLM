@@ -16,7 +16,7 @@
 from collections import defaultdict
 from dataclasses import replace
 from math import ceil, gcd
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -69,9 +69,6 @@ from .params import (
     compress_ratio_has_attention,
     is_overlap_compressor,
 )
-
-if TYPE_CHECKING:
-    pass
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
 KV_CACHE_COPY_ALIGNMENT = 16

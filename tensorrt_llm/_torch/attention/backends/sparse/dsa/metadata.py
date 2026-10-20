@@ -20,7 +20,11 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
-from ..offload import SparseOffloadState, allocate_sparse_offload_state
+from ..offload import (
+    SparseOffloadState,
+    allocate_sparse_offload_state,
+    get_sparse_offload_metadata_layers,
+)
 from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -253,23 +257,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.sparse_metadata_params.enable_kv_cache_offload and is_dsa_cache_manager(manager)
         ):
             return
-        if (
-            self.beam_width != 1
-            or manager.max_beam_width != 1
-            or self.max_draft_tokens
-            or manager.max_draft_len
-            or manager.max_total_draft_tokens
-            or self.draft_kv_cache_manager is not None
-        ):
-            raise NotImplementedError(
-                "Sparse offload requires single-beam, non-speculative execution"
-            )
-        # History policies are bound after manager construction, before metadata
-        # initialization. Validate them once here, not on each batch.
-        manager._validate_sparse_history_policy()
-        layers = manager.get_sparse_offload_descriptors()
-        if self.sparse_mla_topk <= 0 or self.sparse_mla_topk != manager._sparse_offload_topk:
-            raise ValueError("Sparse offload metadata must match the configured positive top-k")
+        layers = get_sparse_offload_metadata_layers(self)
         batch = manager.max_batch_size
 
         def allocate(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:

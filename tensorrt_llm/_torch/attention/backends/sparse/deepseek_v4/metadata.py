@@ -14,7 +14,11 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
-from ..offload import SparseOffloadState, allocate_sparse_offload_state
+from ..offload import (
+    SparseOffloadState,
+    allocate_sparse_offload_state,
+    get_sparse_offload_metadata_layers,
+)
 from .indexer import DeepseekV4Indexer
 from .params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
@@ -297,29 +301,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if not self.sparse_metadata_params.enable_kv_cache_offload:
             return
         manager = self.kv_cache_manager
-        # Per-batch beam/draft values start at defaults. Also check the manager's
-        # configured limits before allocating any offload buffers.
-        if (
-            self.beam_width != 1
-            or manager.max_beam_width != 1
-            or self.max_draft_tokens
-            or manager.max_draft_len
-            or manager.max_total_draft_tokens
-            or self.draft_kv_cache_manager is not None
-        ):
-            raise NotImplementedError(
-                "Sparse offload requires single-beam, non-speculative execution"
-            )
-        # Compression policies are bound after manager construction, before
-        # metadata initialization. Validate them once here, not on each batch.
-        manager._validate_sparse_history_policy()
         # Descriptors include every sparse role in native fetch order.
-        layers = manager.get_sparse_offload_descriptors()
+        layers = get_sparse_offload_metadata_layers(self)
         if not layers:
             # This PP stage has no ratio-4 main KV to stage.
             return
-        if self.sparse_mla_topk <= 0 or self.sparse_mla_topk != manager._sparse_offload_topk:
-            raise ValueError("Sparse offload metadata must match the configured positive top-k")
         # Native fetch always processes every Batch row, including for smaller
         # graph profiles. Its selection width is fixed by BufferConfig.
         self.sparse_offload_state = allocate_sparse_offload_state(
