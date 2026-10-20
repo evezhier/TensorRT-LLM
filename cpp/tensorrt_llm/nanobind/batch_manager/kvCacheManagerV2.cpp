@@ -416,9 +416,11 @@ static DeviceArray3D makeDeviceArray3D(CUdeviceptr data, int32_t d0, int32_t d1,
 }
 
 //! The host counterpart, for staging a consumer reads rather than copies.
-using HostArray2D = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+//! Read-only: the staging block behind it is the members' to write, through their page
+//! locks, and a publish may be reading it.
+using HostArray2D = nb::ndarray<int32_t const, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
-static HostArray2D makeHostArray2D(int32_t* data, int32_t rows, int32_t cols, nb::handle owner)
+static HostArray2D makeHostArray2D(int32_t const* data, int32_t rows, int32_t cols, nb::handle owner)
 {
     return HostArray2D{data, {static_cast<size_t>(rows), static_cast<size_t>(cols)}, owner, {}, nb::dtype<int32_t>(),
         nb::device::cpu::value, 0};
@@ -2605,6 +2607,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "remove_row", [](kv::Batch& self, int row) { return self.removeKvCache(row); }, nb::arg("row"),
             "The same, by the row add_kv_cache returned. None when nothing is seated there, so a "
             "caller sweeping rows need not ask twice about each one.")
+        .def("move", &kv::Batch::move, nb::arg("dst_row"), nb::arg("src_row"), nb::call_guard<nb::gil_scoped_release>(),
+            "Move the member at src_row to the empty dst_row, leaving src_row free.\n\n"
+            "Membership does not lapse: the sparse cache lease, its contents and the stream "
+            "binding all survive, which is what separates this from remove_row() followed by "
+            "add_kv_cache() - that pair hands the lease back with every entry free. It also "
+            "writes each life cycle's index-table row once instead of twice.\n\n"
+            "Raises when either row is out of range, src_row holds nothing, or dst_row is "
+            "occupied. Waits for the previous staging upload. Device tables reach the new row on "
+            "the next publish(), so a step may resize, move and publish once rather than "
+            "publishing per operation.")
         .def("reorder", &kv::Batch::reorder, nb::arg("kv_caches"), nb::call_guard<nb::gil_scoped_release>(),
             "Pack every current member into the supplied order without releasing its sparse cache lease. "
             "Requires every member exactly once. Waits for the previous staging upload; publish() "
@@ -2726,9 +2738,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("layer_group_id"),
             "int32[max_batch, max_blocks_per_seq] coalesced page indices for one layer group, "
-            "as a DLPack array on the host. Pinned, and written by the members themselves, so a "
-            "consumer needing these numbers reads them here rather than keeping a buffer of its "
-            "own. An entry names a coalesced slot; the converted tables name one buffer inside "
+            "as a read-only DLPack array on the host. Pinned, and written by the members "
+            "themselves, so a consumer needing these numbers reads them here rather than keeping "
+            "a buffer of its own. Writing here would race a publish already reading the same "
+            "memory, and would be lost in any case: a resize() rewrites only what it changes. "
+            "An entry names a coalesced slot; the converted tables name one buffer inside "
             "one.")
         .def(
             "gpu_coalesced_page_table",
@@ -2770,6 +2784,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "int32[max_batch] per-row capacity, in tokens. Published with history_lengths().")
 
         .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
+        .def(
+            "__getitem__", [](kv::Batch const& self, int row) { return self[row]; }, nb::arg("row"),
+            "The member seated in `row`, or None when that row is free. The inverse of "
+            "row_of(). Raises IndexError when the row is beyond max_batch_size, so None "
+            "always means an empty row rather than a bad index.")
         .def(
             "peek_hit_miss_counter",
             [](kv::Batch const& self)

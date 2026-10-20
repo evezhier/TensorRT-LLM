@@ -1147,6 +1147,52 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_move_keeps_the_lease_that_leaving_would_drop(self):
+        """The whole reason move() exists rather than remove_row() + add_kv_cache().
+
+        That pair hands the arena lease back, and a lease comes back with every entry free,
+        so it discards residency the member is still entitled to -- which is exactly what
+        the test above pins. A move is not a departure, so the cells, and the base they
+        start at, are the same ones afterwards.
+        """
+        manager = self._manager(max_cached_units=4)
+        try:
+            lc_id = manager.get_layer_group_id(0)
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=3,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_requests(),
+                )
+                self.assertTrue(cache.resume(handle))
+                self.assertEqual(batch.add_kv_cache(cache, 2), 2)
+                before = _introspection.sparse_cache_resident_ordinals(cache, lc_id)
+                base = _introspection.sparse_cache_base_cell(cache, lc_id)
+                self.assertNotEqual(before, [])
+
+                batch.move(0, 2)
+
+                self.assertEqual(batch.row_of(cache), 0)
+                self.assertEqual(
+                    _introspection.sparse_cache_resident_ordinals(cache, lc_id),
+                    before,
+                    "a move is not a departure, so the cache state stays",
+                )
+                self.assertEqual(
+                    _introspection.sparse_cache_base_cell(cache, lc_id),
+                    base,
+                    "and it is the same lease, not a fresh one taken from the arena",
+                )
+                self.assertEqual(batch.num_kv_caches, 1, "one lease held throughout")
+                batch.remove_kv_cache(cache)
+                cache.close()
+        finally:
+            manager.shutdown()
+
     @staticmethod
     def _hot_slots(manager: KVCacheManager) -> int:
         return sum(s.total for s in manager.get_storage_statistics(CacheLevel(0)))
@@ -4065,6 +4111,130 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(torch.from_dlpack(batch.history_lengths()).tolist(), [31, 63, 0])
                 self.assertEqual(torch.from_dlpack(batch.capacities()).tolist(), [128, 257, 0])
                 self.assertEqual([batch.flushed_history(row) for row in range(2)], [31, 63])
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_indexing_a_row_gives_its_member_or_none(self) -> None:
+        """The inverse of row_of(). None is an empty row, never a bad index."""
+        manager = self._manager()
+        caches = []
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                cache = manager.create_kv_cache()
+                caches.append(cache)
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache, 1)
+
+                seated = batch[1]
+                self.assertIsNotNone(seated)
+                # Compared through row_of rather than identity: whether nanobind hands back
+                # the same Python object is its business, not this API's contract.
+                self.assertEqual(batch.row_of(seated), 1)
+                self.assertIsNone(batch[0], "a free row reads as empty")
+                self.assertIsNone(batch[2])
+
+                # Out of range is a different answer from empty, and must not be confusable.
+                for bad in (3, -1, 99):
+                    with self.assertRaises(IndexError):
+                        batch[bad]
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_move_carries_bindings_and_watermarks_to_the_empty_row(self) -> None:
+        import torch
+
+        manager = self._manager()
+        caches = []
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                lg = manager.get_layer_group_id(0)
+                table = torch.from_dlpack(batch.gpu_coalesced_page_table(lg))
+                address = table.data_ptr()
+                for history in (17, 31):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(handle))
+                    self.assertTrue(cache.resize(128, history))
+                    batch.add_kv_cache(cache)
+                batch.flush_sparse_units([17, 31, 0])
+                batch.publish()
+
+                # Row 1 to the free row 2. Row 0 is a bystander and must not move.
+                batch.move(2, 1)
+                self.assertEqual([batch.row_of(cache) for cache in caches], [0, 2])
+                self.assertEqual(batch.flushed_history(2), 31, "the watermark travels")
+                self.assertEqual(batch.flushed_history(0), 17, "the bystander is untouched")
+
+                batch.publish()
+                torch.cuda.synchronize()
+                self.assertEqual(table.data_ptr(), address, "device tables keep their addresses")
+                self.assertEqual(table[0].tolist(), list(caches[0].get_base_page_indices(lg)))
+                self.assertEqual(table[2].tolist(), list(caches[1].get_base_page_indices(lg)))
+                self.assertTrue(
+                    bool((table[1] == BAD_PAGE_INDEX).all()),
+                    "the vacated row publishes as free, not as a stale copy of the member",
+                )
+                self.assertEqual(torch.from_dlpack(batch.history_lengths()).tolist(), [17, 0, 31])
+                self.assertEqual(torch.from_dlpack(batch.capacities()).tolist(), [128, 0, 128])
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_move_rejects_a_bad_pair_without_changing_rows(self) -> None:
+        manager = self._manager()
+        caches = []
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                for _ in range(2):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(caches[0], 0)
+                batch.add_kv_cache(caches[1], 1)
+
+                # Matched on the message rather than the type, so each case is pinned to the
+                # reason it is refused: a type alone would not distinguish them.
+                #
+                # (dst, src). dst == src is both faults at once, and is reported as the
+                # occupied destination -- a row cannot be occupied and empty together.
+                rejected = {
+                    (0, 1): "destination row is already occupied",
+                    (1, 1): "destination row is already occupied",
+                    (0, 0): "destination row is already occupied",
+                    (1, 2): "source row holds no member",
+                    (3, 0): "beyond max_batch_size",
+                    (2, 3): "beyond max_batch_size",
+                    (-1, 0): "beyond max_batch_size",
+                    (2, -1): "beyond max_batch_size",
+                }
+                for (dst, src), message in rejected.items():
+                    with self.assertRaisesRegex(Exception, message):
+                        batch.move(dst, src)
+                    self.assertEqual([batch.row_of(cache) for cache in caches], [0, 1])
+
+                # Still usable afterwards: a refusal must not have half-moved anything.
+                batch.move(2, 1)
+                self.assertEqual([batch.row_of(cache) for cache in caches], [0, 2])
         finally:
             for cache in caches:
                 if batch is not None and batch.row_of(cache) >= 0:

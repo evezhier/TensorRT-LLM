@@ -549,6 +549,13 @@ public:
         return mLifeCycles;
     }
 
+    //! How many life cycles the manager was built with. Structural: the registry is filled
+    //! at construction and never grows, so this is fixed for the manager's lifetime.
+    LifeCycleId numLifeCycles() const noexcept
+    {
+        return mLifeCycles.size();
+    }
+
     BlockRadixTree& radixTree() noexcept
     {
         return *mRadixTree;

@@ -69,7 +69,12 @@ struct ConvertedIndexTable
 //! binding alive for the whole decode; which side allocates it never mattered to that.
 struct CoalescedPageTable
 {
-    int32_t* data = nullptr;
+    //! Const: this points straight into the pinned staging block, which publish() uploads
+    //! asynchronously. A caller writing here would race that copy with nothing able to
+    //! notice -- the Batch cannot know when it happened -- and would anyway be overwritten,
+    //! since a resize() rewrites only the entries it changes and keeps no record of edits
+    //! made behind it. The page indices are the members' to write, through their locks.
+    int32_t const* data = nullptr;
     int32_t numRows = 0;
     int32_t blocksPerRow = 0;
 };
@@ -274,6 +279,24 @@ public:
     //! a caller sweeping rows should not have to ask twice about each one.
     std::shared_ptr<KvCache> removeKvCache(int row);
 
+    //! Move the member at `srcRow` to the empty `dstRow`, leaving `srcRow` free.
+    //!
+    //! Membership does not lapse: the arena lease, the GPU cache contents behind it and the
+    //! stream binding all survive, which is what separates this from removeKvCache() followed
+    //! by addKvCache(). That pair would hand the lease back -- a lease returns with every
+    //! entry free -- and so would discard residency the member is still entitled to.
+    //!
+    //! It also writes each life cycle's index-table row once rather than twice: the pair
+    //! poisons the old row and then copies the indices into the new one, where this hands the
+    //! row's contents straight across.
+    //!
+    //! Throws when either row is out of range, when `srcRow` holds nothing, or when `dstRow`
+    //! is occupied -- including `dstRow == srcRow`, which is both at once.
+    //!
+    //! Waits for the previous staging upload before touching either row. Device tables retain
+    //! their addresses; the move reaches them on the next publish.
+    void move(int dstRow, int srcRow);
+
     //! Pack all current members into the supplied order without releasing their arena leases.
     //!
     //! Every member must occur exactly once. Page-index bindings and flush watermarks move
@@ -328,9 +351,10 @@ public:
     //!
     //! The copy is asynchronous and reads pinned memory, so it is still in flight when this
     //! returns. **Every later host write to a member's page indices must be separated from
-    //! it by waitPublished()** -- a resize(), a commit(), a beam fork, an SWA recycle,
-    //! anything that locks or unlocks a page. Writing sooner races the copy and publishes a
-    //! torn table.
+    //! it by waitPublished()** -- a KvCache::resize(), a commit(), a beam fork, an SWA
+    //! recycle, anything that locks or unlocks a page. Writing sooner races the copy and
+    //! publishes a torn table. This Batch's own mutators are not in that list: resize(),
+    //! move(), reorder(), addKvCache() and removeKvCache() each wait for themselves.
     //!
     //! Throws when the previous publish has not been waited on, which is how that rule is
     //! enforced: this call stages the watermarks and views itself, so it would be writing
@@ -373,7 +397,8 @@ public:
 
     [[nodiscard]] GpuCoalescedPageTable gpuCoalescedPageTable(LayerGroupId layerGroupId) const;
 
-    //! One layer group's page table on the host, as a publish will upload it.
+    //! One layer group's page table on the host, as a publish will upload it. Read-only:
+    //! the entries are the members' to write, through their page locks.
     [[nodiscard]] CoalescedPageTable coalescedPageTable(LayerGroupId layerGroupId) const;
 
     //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
@@ -448,11 +473,15 @@ public:
         return mMaxBlocksPerSeq;
     }
 
-    //! Members, by row; null where a row is free.
-    [[nodiscard]] std::vector<std::shared_ptr<KvCache>> const& rows() const noexcept
-    {
-        return mRows;
-    }
+    //! The member seated in `row`, or null when that row is free.
+    //!
+    //! The inverse of rowOf(). Throws when `row` is out of range, like removeKvCache(int):
+    //! a free row is an ordinary answer, so null means empty and never means "no such row".
+    //!
+    //! The reference stays valid for the Batch's lifetime -- the row vector is sized once at
+    //! construction -- but what it holds changes as members are seated and removed, so it is
+    //! a view of the slot rather than of a member.
+    [[nodiscard]] std::shared_ptr<KvCache> const& operator[](int row) const;
 
 private:
     friend class KvCache;
@@ -461,8 +490,19 @@ private:
     //! reference, so the destructor cannot run -- and kept as the assertion of that.
     void _detach(KvCache& kvCache) noexcept;
 
+    //! Whether the last publish() is still reading the staging rows.
+    //!
+    //! For a seated member to check before writing its page indices, which live in those
+    //! rows. publish() enforces the same separation from its own side, and refuses outright;
+    //! this exists because a member mutated before publish() has already raced by then, so
+    //! the write is where the problem is visible.
+    [[nodiscard]] bool _publishInFlight() const noexcept
+    {
+        return !mPublished.isClosed();
+    }
+
     //! Host-side page-index row for one (layer group, row), inside the pinned staging block.
-    [[nodiscard]] int32_t* _stagingRow(LayerGroupId layerGroupId, int row) const;
+    [[nodiscard]] int32_t* _stagingRow(LifeCycleId lifeCycleId, int row) const;
 
     //! Bytes of a device block: the page table, the row state and the views.
     [[nodiscard]] size_t _deviceBytes() const noexcept;
@@ -513,12 +553,12 @@ private:
     [[nodiscard]] size_t _viewsOffsetBytes() const noexcept;
     [[nodiscard]] size_t _totalBytes() const noexcept;
 
-    KvCacheManager* mManager = nullptr;
+    //! Const: the manager is fixed at construction and outlives the Batch.
+    KvCacheManager* const mManager;
     CUstream mCudaStream = nullptr;
     int mMaxBatchSize = 0;
     int mMaxBlocksPerSeq = 0;
     std::optional<int> mMaxTotalInputTokens;
-    LifeCycleId mNumLayerGroups{0};
 
     //! Owning: a seated member cannot be destroyed under the Batch, so a caller is free to
     //! keep only the Batch. Leaving returns the reference. KvCache points back with a raw

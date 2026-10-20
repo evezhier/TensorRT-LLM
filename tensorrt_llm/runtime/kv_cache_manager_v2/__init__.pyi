@@ -964,6 +964,20 @@ class Batch:
         about each one.
         """
 
+    def move(self, dst_row: int, src_row: int) -> None:
+        """Move the member at ``src_row`` to the empty ``dst_row``, leaving ``src_row`` free.
+
+        Membership does not lapse: the sparse cache lease, its contents and the stream
+        binding all survive, which is what separates this from :meth:`remove_row` followed
+        by :meth:`add_kv_cache` -- that pair hands the lease back with every entry free. It
+        also writes each life cycle's index-table row once instead of twice.
+
+        Raises when either row is out of range, ``src_row`` holds nothing, or ``dst_row`` is
+        occupied. Waits for the previous staging upload. Device tables keep their addresses
+        and reach the new row on the next ``publish``, so a step may resize, move and publish
+        once rather than publishing per operation.
+        """
+
     def reorder(self, kv_caches: list[_KVCache]) -> None:
         """Pack every current member into this order without releasing its GPU cache lease.
 
@@ -1018,6 +1032,13 @@ class Batch:
 
     def row_of(self, kv_cache: _KVCache) -> int:
         """Row of a member, or ``-1``."""
+
+    def __getitem__(self, row: int) -> _KVCache | None:
+        """The member seated in ``row``, or ``None`` when that row is free.
+
+        The inverse of :meth:`row_of`. Raises ``IndexError`` when ``row`` is beyond
+        ``max_batch_size``, so ``None`` always means an empty row rather than a bad index.
+        """
 
     @property
     def num_kv_caches(self) -> int:
@@ -1169,9 +1190,13 @@ class Batch:
     def coalesced_page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
         """``int32[max_batch, max_blocks_per_seq]`` coalesced page indices, on the host.
 
-        A DLPack array over the pinned staging the members write into, which a consumer
-        needing these numbers reads instead of keeping a buffer of its own. It keeps the
-        ``Batch`` alive for as long as the array exists.
+        A read-only DLPack array over the pinned staging the members write into, which a
+        consumer needing these numbers reads instead of keeping a buffer of its own. It keeps
+        the ``Batch`` alive for as long as the array exists.
+
+        Read-only because the entries belong to the members, written through their page
+        locks: a write here would race a publish already reading the same memory, and would
+        be lost anyway, since ``resize`` rewrites only the entries it changes.
 
         An entry names a coalesced slot, which may hold several buffers; a converted index
         names one buffer inside one. See :meth:`converted_index_table`.

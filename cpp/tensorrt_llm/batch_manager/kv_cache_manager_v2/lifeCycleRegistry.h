@@ -158,8 +158,13 @@ public:
     // Look up the id for a LifeCycle (throws if not found).
     LifeCycleId getId(LifeCycle const& lc) const;
 
-    // Number of unique life cycles.
-    LifeCycleId size() const noexcept;
+    // Number of unique life cycles. Inline: this is a loop bound in the hot paths, so a
+    // caller should get the vector's size rather than a call it cannot see through.
+    LifeCycleId size() const noexcept
+    {
+        check();
+        return mLifeCycleList.size();
+    }
 
     // Iteration over LifeCycles in registration order.
     TypedVec<LifeCycleId, LifeCycle> const& getAll() const noexcept
@@ -243,7 +248,16 @@ public:
     }
 
 private:
-    void check() const;
+    //! Gated on the package's cached gDebug: TLLM_CHECK_DEBUG_WITH_INFO's own gate is an
+    //! out-of-line call into another TU, which would undo size() being inline.
+    void check() const
+    {
+        if (TLLM_UNLIKELY(gDebug))
+        {
+            TLLM_CHECK_WITH_INFO(
+                toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size(), "corrupted life cycle registry");
+        }
+    }
 
     TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;

@@ -2849,6 +2849,28 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
 {
     if (ord == kBadBlockOrdinal)
         return kBadPageIndex.value(); // SSM pages use BAD_BLOCK_ORDINAL
+    // Every page-index write in the package arrives here, from SharedPageLock acquiring or
+    // releasing. For a seated member the buffer below is the Batch's pinned staging row, so
+    // writing while a publish still reads it uploads a torn table -- one that can pair one
+    // request's residency with another's lease. Checked here rather than at each public
+    // entry point because this is the one place they all funnel through, so a page-touching
+    // API added later is covered without being enumerated.
+    //
+    // A check and not a wait: waiting is correct only before the whole operation, which is
+    // what Batch's mutators do. Waiting at this depth would sync under the exclusive manager
+    // lock, and would hide earlier writes of the same operation that had already raced --
+    // the reason publish() refuses rather than waits.
+    //
+    // Gated on the package's cached gDebug rather than TLLM_CHECK_DEBUG_WITH_INFO, whose own
+    // gate is an out-of-line call into another TU wrapping a function-local static. This runs
+    // once per page per life cycle.
+    if (TLLM_UNLIKELY(gDebug))
+    {
+        TLLM_CHECK_WITH_INFO(mBatch == nullptr || !mBatch->_publishInFlight(),
+            "A publish is still reading the staged page indices of Batch row %d; call Batch::waitPublished() before "
+            "an operation that locks or unlocks a seated member's pages",
+            mBatchRow);
+    }
     auto& buf = mBasePageIndices[bi][lc];
     return std::visit(
         [&](auto& b) -> int

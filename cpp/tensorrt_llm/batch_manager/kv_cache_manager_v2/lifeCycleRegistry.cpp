@@ -88,16 +88,4 @@ LifeCycleId LifeCycleRegistry::getId(LifeCycle const& lc) const
     return it->second;
 }
 
-LifeCycleId LifeCycleRegistry::size() const noexcept
-{
-    check();
-    return mLifeCycleList.size();
-}
-
-inline void LifeCycleRegistry::check() const
-{
-    TLLM_CHECK_DEBUG_WITH_INFO(
-        toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size(), "corrupted life cycle registry");
-}
-
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

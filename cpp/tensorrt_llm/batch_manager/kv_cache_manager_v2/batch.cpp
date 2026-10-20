@@ -77,13 +77,12 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
             "Batch needs a row and block bound; pass them explicitly when the manager declares no constraints");
     }
 
-    mNumLayerGroups = manager.storage().numLifeCycles();
     mRows.assign(static_cast<size_t>(mMaxBatchSize), nullptr);
 
     // Prefer SHARED: one table per life cycle rather than one per layer. The manager
     // answers from configuration alone, so this cannot drift with what a member is doing.
-    mIndexModes = TypedVec<LifeCycleId, PageIndexMode>(mNumLayerGroups, PageIndexMode::PER_LAYER);
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    mIndexModes = TypedVec<LifeCycleId, PageIndexMode>(mManager->numLifeCycles(), PageIndexMode::PER_LAYER);
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         mIndexModes[lcId]
             = mode.value_or(manager.supportsIndexMode(PageIndexMode::SHARED, lcId) == std::optional<bool>(true)
@@ -105,7 +104,7 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
 
     // Views start default-constructed, so an unpublished batch reads as having no caches.
     auto* views = reinterpret_cast<SparseCacheView*>(reinterpret_cast<std::byte*>(staging) + _viewsOffsetBytes());
-    auto const numViews = static_cast<size_t>(mNumLayerGroups.value()) * static_cast<size_t>(mMaxBatchSize);
+    auto const numViews = static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
     std::fill(views, views + numViews, SparseCacheView{});
 
     // The staging mirrors the device block exactly, so publishing it is one linear copy.
@@ -139,9 +138,9 @@ void Batch::_allocateCopyDesc()
     // One descriptor per buffer, serving both directions, for every life cycle. Small
     // enough to share an allocation and a lifetime.
     std::vector<SparseCopyDesc> host;
-    std::vector<size_t> offset(static_cast<size_t>(mNumLayerGroups.value()), 0);
+    std::vector<size_t> offset(static_cast<size_t>(mManager->numLifeCycles().value()), 0);
 
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         auto& scratch = mScratch[lcId];
         if (scratch.selectionWidth == 0)
@@ -200,7 +199,7 @@ void Batch::_allocateCopyDesc()
     mCopyDesc = allocateDeviceMemory<SparseCopyDesc>(host.size());
     auto const* device = mCopyDesc.get();
     cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(device), host.data(), sizeof(SparseCopyDesc) * host.size()));
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         auto& scratch = mScratch[lcId];
         if (scratch.selectionWidth != 0)
@@ -230,13 +229,13 @@ int32_t Batch::_flushCapacity(LifeCycleId lifeCycle) const
 
 void Batch::_allocateStepScratch()
 {
-    mScratch = TypedVec<LifeCycleId, SparseStepScratch>(mNumLayerGroups, SparseStepScratch{});
+    mScratch = TypedVec<LifeCycleId, SparseStepScratch>(mManager->numLifeCycles(), SparseStepScratch{});
 
     // Sized up front from configuration, so no step has to allocate. Laid out as one block
     // because a per-group allocation would be a dozen tiny ones serving the same lifetime.
     auto const rows = static_cast<size_t>(mMaxBatchSize);
     size_t total = 0;
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         int const width = mManager->sparseCacheSelectionWidth(lcId);
         if (mManager->sparseCacheMaxUnits(lcId) <= 0 || width <= 0)
@@ -293,7 +292,7 @@ void Batch::_allocateStepScratch()
         counter += count;
         return ptr;
     };
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         auto& scratch = mScratch[lcId];
         if (scratch.selectionWidth == 0)
@@ -329,9 +328,8 @@ void Batch::_allocateStepScratch()
     }
 }
 
-SparseStepScratch const& Batch::sparseStepScratch(LayerGroupId layerGroupId) const
+SparseStepScratch const& Batch::sparseStepScratch(LifeCycleId lcId) const
 {
-    LifeCycleId const lcId{layerGroupId.value()};
     if (lcId >= mScratch.size())
     {
         throw std::out_of_range("Batch::sparseStepScratch: no such layer group");
@@ -361,13 +359,13 @@ size_t Batch::_rowElements() const noexcept
     return static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
 }
 
-PageIndexMode Batch::indexMode(LayerGroupId layerGroupId) const
+PageIndexMode Batch::indexMode(LifeCycleId lifeCycleId) const
 {
-    if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
+    if (lifeCycleId.value() < 0 || lifeCycleId >= mManager->numLifeCycles())
     {
         throw std::out_of_range("Batch::indexMode: unknown layer group");
     }
-    return mIndexModes[layerGroupId];
+    return mIndexModes[lifeCycleId];
 }
 
 void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
@@ -467,7 +465,7 @@ void Batch::_allocateFlushRanges()
     mFlushedHistory.assign(static_cast<size_t>(mMaxBatchSize), 0);
 
     bool anySparse = false;
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         anySparse = anySparse || mManager->sparseCacheMaxUnits(lcId) > 0;
     }
@@ -476,7 +474,8 @@ void Batch::_allocateFlushRanges()
         return;
     }
 
-    auto const elements = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mNumLayerGroups.value());
+    auto const elements
+        = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mManager->numLifeCycles().value());
     mFlushRanges = allocateDeviceMemory<int32_t>(elements);
     // An empty range asks for nothing, which is what a row that never flushes should read.
     cuCheck(cuMemsetD32(reinterpret_cast<CUdeviceptr>(mFlushRanges.get()), 0, elements));
@@ -517,7 +516,7 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
     // Every row is checked before any work is issued, so a move no reservation could cover
     // leaves the batch as it was.
     bool anyWork = false;
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
         if (mManager->sparseCacheMaxUnits(lcId) <= 0 || unitsPerPage <= 0)
@@ -587,7 +586,7 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
     auto staged = mUploadStream.recordEvent();
     staged.waitInStream(reinterpret_cast<CudaStream>(mCudaStream));
 
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         if (mManager->sparseCacheMaxUnits(lcId) <= 0)
         {
@@ -600,7 +599,7 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
 
 void Batch::_checkSparseRunsAreAddressable() const
 {
-    for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         auto const plan = mManager->sparseBufferPlan(lcId);
         if (plan.empty())
@@ -745,7 +744,7 @@ void Batch::_allocateIndexTables()
             auto const row = static_cast<size_t>(mMaxBatchSize);
             auto const lc = static_cast<size_t>(table.lifeCycle.value());
             auto const begs = reinterpret_cast<CUdeviceptr>(mScratchDevice.get());
-            auto const groups = static_cast<size_t>(mNumLayerGroups.value());
+            auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
             desc.scratchBegs = reinterpret_cast<int32_t const*>(begs + sizeof(int32_t) * lc * row);
             desc.scratchEnds = reinterpret_cast<int32_t const*>(begs + sizeof(int32_t) * (groups * row + lc * row));
             desc.scratchSlots = reinterpret_cast<int32_t const*>(
@@ -816,7 +815,7 @@ Batch::SparseIndexRun Batch::sparseIndexRun(LayerId layerId, DataRole const& rol
 size_t Batch::_scratchElements() const noexcept
 {
     auto const rows = static_cast<size_t>(mMaxBatchSize);
-    auto const groups = static_cast<size_t>(mNumLayerGroups.value());
+    auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
     // [begs][ends][slots], each indexed by life cycle then row.
     return 2 * groups * rows + groups * rows * static_cast<size_t>(mMaxScratchSlots);
 }
@@ -828,7 +827,7 @@ void Batch::_stageScratch()
         return;
     }
     auto const rows = static_cast<size_t>(mMaxBatchSize);
-    auto const groups = static_cast<size_t>(mNumLayerGroups.value());
+    auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
     auto* const begs = reinterpret_cast<int32_t*>(mScratchStaging->address());
     auto* const ends = begs + groups * rows;
     auto* const slots = ends + groups * rows;
@@ -836,7 +835,7 @@ void Batch::_stageScratch()
     for (size_t row = 0; row < mRows.size(); ++row)
     {
         auto const& kvCache = mRows[row];
-        for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+        for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
         {
             auto const flat = static_cast<size_t>(lcId.value()) * rows + row;
             auto* const rowSlots = slots + flat * static_cast<size_t>(mMaxScratchSlots);
@@ -914,7 +913,7 @@ void Batch::_drain() noexcept
 
 size_t Batch::_historyOffset() const noexcept
 {
-    return _rowElements() * static_cast<size_t>(mNumLayerGroups.value());
+    return _rowElements() * static_cast<size_t>(mManager->numLifeCycles().value());
 }
 
 size_t Batch::_capacityOffset() const noexcept
@@ -939,7 +938,8 @@ size_t Batch::_viewsOffsetBytes() const noexcept
 size_t Batch::_totalBytes() const noexcept
 {
     return _viewsOffsetBytes()
-        + sizeof(SparseCacheView) * static_cast<size_t>(mNumLayerGroups.value()) * static_cast<size_t>(mMaxBatchSize);
+        + sizeof(SparseCacheView) * static_cast<size_t>(mManager->numLifeCycles().value())
+        * static_cast<size_t>(mMaxBatchSize);
 }
 
 void Batch::_stageRowState()
@@ -956,13 +956,13 @@ void Batch::_stageRowState()
         history[row] = kvCache == nullptr ? 0 : kvCache->historyLength();
         capacity[row] = kvCache == nullptr ? 0 : kvCache->capacity();
 
-        for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
+        for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
         {
-            auto& slot = views[static_cast<size_t>(lg.value()) * mRows.size() + row];
+            auto& slot = views[static_cast<size_t>(lc.value()) * mRows.size() + row];
             // A free row, or a member holding no reservation for this group, leaves the
             // default view: null pointers the kernel reads as "nothing to resolve here".
-            slot = kvCache == nullptr || lg >= kvCache->mSparseCache.size() ? SparseCacheView{}
-                                                                            : kvCache->mSparseCache[lg].view();
+            slot = kvCache == nullptr || lc >= kvCache->mSparseCache.size() ? SparseCacheView{}
+                                                                            : kvCache->mSparseCache[lc].view();
         }
     }
 }
@@ -975,10 +975,10 @@ void Batch::_seedRowWatermarks(int row, int historyLength, int capacity)
     base[_capacityOffset() + index] = capacity;
 }
 
-int32_t* Batch::_stagingRow(LayerGroupId layerGroupId, int row) const
+int32_t* Batch::_stagingRow(LifeCycleId lifeCycleId, int row) const
 {
     auto* base = reinterpret_cast<int32_t*>(mStaging->address());
-    return base + static_cast<int64_t>(_rowElements()) * layerGroupId.value()
+    return base + static_cast<int64_t>(_rowElements()) * lifeCycleId.value()
         + static_cast<int64_t>(mMaxBlocksPerSeq) * row;
 }
 
@@ -1028,10 +1028,10 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     // indices in and keeps writing there, so the row needs no refresh of its own
     // afterwards -- and keeps doing so until the member leaves, which is why a step that
     // only advances its members has nothing to rebind.
-    for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
+    for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
     {
         // Beam 0 only; addKvCache rejects anything wider.
-        kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lg, _stagingRow(lg, row), mMaxBlocksPerSeq);
+        kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lc, _stagingRow(lc, row), mMaxBlocksPerSeq);
     }
 
     _seedRowWatermarks(row, kvCache.historyLength(), kvCache.capacity());
@@ -1045,7 +1045,7 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     // exactly when the GPU cache is needed. After the stream change, because acquiring one
     // clears its residency on that stream. Sized from the same `constraints` the rows come
     // from, so a free row always has a free lease and this cannot fail.
-    for (LifeCycleId lc{0}; lc < mNumLayerGroups; ++lc)
+    for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
     {
         auto& arena = mManager->sparseArena(lc);
         if (arena.empty() || !kvCache.mSparseCache[lc].empty())
@@ -1065,6 +1065,11 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     kvCache.mBatch = this;
     kvCache.mBatchRow = row;
     return row;
+}
+
+std::shared_ptr<KvCache> const& Batch::operator[](int row) const
+{
+    return mRows.at(static_cast<size_t>(row));
 }
 
 std::shared_ptr<KvCache> Batch::removeKvCache(int row)
@@ -1092,11 +1097,11 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
     // would use. Nothing binds a seated member's buffer, including the Batch.
     kvCache.mBatch = nullptr;
     kvCache.mBatchRow = -1;
-    for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
+    for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
     {
         // Hands the indices back to the cache's own storage before the row is reused.
-        kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lg, nullptr, 0);
-        auto* staged = _stagingRow(lg, row);
+        kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lc, nullptr, 0);
+        auto* staged = _stagingRow(lc, row);
         std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
     }
     // Leaving returns the lease, which discards whatever the GPU cache held: a lease comes
@@ -1109,6 +1114,48 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
     _seedRowWatermarks(row, 0, 0);
     mRows[static_cast<size_t>(row)] = nullptr;
     return leaving;
+}
+
+void Batch::move(int dstRow, int srcRow)
+{
+    if (dstRow < 0 || dstRow >= mMaxBatchSize || srcRow < 0 || srcRow >= mMaxBatchSize)
+    {
+        throw std::out_of_range("Batch::move: row is beyond max_batch_size");
+    }
+    // Checked before anything is touched, so a rejected move leaves the batch as it was.
+    // dstRow == srcRow fails here too: a row cannot be occupied and empty at once.
+    if (mRows[static_cast<size_t>(srcRow)] == nullptr)
+    {
+        throw LogicError("Batch::move: source row holds no member");
+    }
+    if (mRows[static_cast<size_t>(dstRow)] != nullptr)
+    {
+        throw LogicError("Batch::move: destination row is already occupied");
+    }
+
+    waitPublished();
+
+    for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
+    {
+        auto* const from = _stagingRow(lc, srcRow);
+        auto* const to = _stagingRow(lc, dstRow);
+        // Swapped rather than copied so the vacated row ends up holding what the empty
+        // destination held: every entry kBadPageIndex, which is what a free row must publish.
+        std::swap_ranges(from, from + mMaxBlocksPerSeq, to);
+    }
+    std::swap(mRows[static_cast<size_t>(dstRow)], mRows[static_cast<size_t>(srcRow)]);
+    std::swap(mFlushedHistory[static_cast<size_t>(dstRow)], mFlushedHistory[static_cast<size_t>(srcRow)]);
+
+    auto& kvCache = *mRows[static_cast<size_t>(dstRow)];
+    kvCache.mBatchRow = dstRow;
+    for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
+    {
+        // The row's contents have already moved. Rebind its sole writer without copying from
+        // the old row or ending membership -- mBatch and the arena lease are untouched.
+        kvCache.mBasePageIndices[kDefaultBeamIndex][lc] = Span<int>{_stagingRow(lc, dstRow), mMaxBlocksPerSeq};
+    }
+    _seedRowWatermarks(dstRow, kvCache.historyLength(), kvCache.capacity());
+    _seedRowWatermarks(srcRow, 0, 0);
 }
 
 void Batch::reorder(std::vector<KvCache*> const& kvCaches)
@@ -1141,10 +1188,10 @@ void Batch::reorder(std::vector<KvCache*> const& kvCaches)
         {
             continue;
         }
-        for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
+        for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
         {
-            auto* const oldIndices = _stagingRow(lg, oldRow);
-            auto* const newIndices = _stagingRow(lg, newRow);
+            auto* const oldIndices = _stagingRow(lc, oldRow);
+            auto* const newIndices = _stagingRow(lc, newRow);
             std::swap_ranges(oldIndices, oldIndices + mMaxBlocksPerSeq, newIndices);
         }
         std::swap(mRows[static_cast<size_t>(oldRow)], mRows[row]);
@@ -1155,12 +1202,12 @@ void Batch::reorder(std::vector<KvCache*> const& kvCaches)
             if (cache != nullptr)
             {
                 cache->mBatchRow = movedRow;
-                for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
+                for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
                 {
                     // The row's contents have already moved. Rebind its sole writer
                     // without copying from the old row or ending cache membership.
-                    cache->mBasePageIndices[kDefaultBeamIndex][lg]
-                        = Span<int>{_stagingRow(lg, movedRow), mMaxBlocksPerSeq};
+                    cache->mBasePageIndices[kDefaultBeamIndex][lc]
+                        = Span<int>{_stagingRow(lc, movedRow), mMaxBlocksPerSeq};
                 }
             }
             _seedRowWatermarks(
@@ -1268,8 +1315,11 @@ void Batch::publish()
     // views staged just below. Waiting here would cover only the second, and would do it
     // while quietly hiding that the first had already raced.
     TLLM_CHECK_WITH_INFO(mPublished.isClosed(),
-        "Batch::publish: the previous publish is still reading the staged rows; call waitPublished() before "
-        "mutating any member or publishing again");
+        "Batch::publish: the previous publish is still reading the staged rows. Call waitPublished() before "
+        "whatever wrote them -- a direct resize(), a commit(), a beam fork, an SWA recycle, anything that locks "
+        "or unlocks a page -- and not merely before this call: moving the wait here silences this check while "
+        "leaving that earlier write racing the copy. Batch's own mutators, resize() and move() among them, "
+        "already wait.");
 
     // A SHARED life cycle gives every layer the same converted indices, which only holds
     // while no member substitutes scratch slots there. Prefill acquires those and decode
@@ -1281,7 +1331,7 @@ void Batch::publish()
         {
             continue;
         }
-        for (LifeCycleId lcId{0}; lcId < mNumLayerGroups; ++lcId)
+        for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
         {
             TLLM_CHECK_WITH_INFO(
                 mIndexModes[lcId] != PageIndexMode::SHARED || kvCache->supportsIndexMode(PageIndexMode::SHARED, lcId),
@@ -1338,41 +1388,41 @@ void Batch::waitPublished()
     mPublished.close();
 }
 
-CoalescedPageTable Batch::coalescedPageTable(LayerGroupId layerGroupId) const
+CoalescedPageTable Batch::coalescedPageTable(LifeCycleId lifeCycleId) const
 {
-    if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
+    if (lifeCycleId.value() < 0 || lifeCycleId >= mManager->numLifeCycles())
     {
         throw std::out_of_range("Batch::coalescedPageTable: unknown layer group");
     }
     CoalescedPageTable view;
-    view.data = _stagingRow(layerGroupId, 0);
+    view.data = _stagingRow(lifeCycleId, 0);
     view.numRows = mMaxBatchSize;
     view.blocksPerRow = mMaxBlocksPerSeq;
     return view;
 }
 
-GpuCoalescedPageTable Batch::gpuCoalescedPageTable(LayerGroupId layerGroupId) const
+GpuCoalescedPageTable Batch::gpuCoalescedPageTable(LifeCycleId lifeCycleId) const
 {
-    if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
+    if (lifeCycleId.value() < 0 || lifeCycleId >= mManager->numLifeCycles())
     {
         throw std::out_of_range("Batch::gpuCoalescedPageTable: unknown layer group");
     }
     GpuCoalescedPageTable view;
     view.data = reinterpret_cast<CUdeviceptr>(mDevice.get())
-        + sizeof(int32_t) * _rowElements() * static_cast<size_t>(layerGroupId.value());
+        + sizeof(int32_t) * _rowElements() * static_cast<size_t>(lifeCycleId.value());
     view.numRows = mMaxBatchSize;
     view.blocksPerRow = mMaxBlocksPerSeq;
     return view;
 }
 
-CUdeviceptr Batch::sparseCacheViews(LayerGroupId layerGroupId) const
+CUdeviceptr Batch::sparseCacheViews(LifeCycleId lifeCycleId) const
 {
-    if (layerGroupId.value() < 0 || layerGroupId >= mNumLayerGroups)
+    if (lifeCycleId.value() < 0 || lifeCycleId >= mManager->numLifeCycles())
     {
         throw std::out_of_range("Batch::sparseCacheViews: unknown layer group");
     }
     return reinterpret_cast<CUdeviceptr>(mDevice.get()) + _viewsOffsetBytes()
-        + sizeof(SparseCacheView) * static_cast<size_t>(layerGroupId.value()) * static_cast<size_t>(mMaxBatchSize);
+        + sizeof(SparseCacheView) * static_cast<size_t>(lifeCycleId.value()) * static_cast<size_t>(mMaxBatchSize);
 }
 
 WatermarkView Batch::watermarks() const
@@ -1412,7 +1462,7 @@ void Batch::resetHitMissCounter()
 size_t Batch::sparseArenaBytes() const
 {
     size_t total = 0;
-    for (LifeCycleId lc{0}; lc < mNumLayerGroups; ++lc)
+    for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
     {
         total += mManager->sparseArena(lc).numBytes();
     }
