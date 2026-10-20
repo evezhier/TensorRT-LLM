@@ -219,7 +219,6 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
     active: list[LlmRequest] = []
     permuted = False
     for step in range(6 * TOKENS_PER_BLOCK):
-        manager.prepare_resources(SimpleNamespace(context_requests=[], generation_requests=[]))
         for request in requests:
             if join_step[request.py_request_id] == step:
                 assert manager.prepare_disagg_gen_init(request)
