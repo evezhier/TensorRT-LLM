@@ -155,22 +155,20 @@ void Batch::_allocateCopyDesc()
 
         for (auto const& run : runs)
         {
-            // A run is consecutive buffers of one pool and, since buffers are ordered
-            // (layer, pool), of one layer. Its first buffer names the index table every
-            // buffer of the run is relative to -- the converted index carries each one's
-            // own offset within the coalesced page.
-            auto const& first = plan[static_cast<size_t>(run.bufferBase)].id;
-            auto const table = sparseIndexRun(first.layerId, first.role);
-
+            // A run is consecutive buffers of one pool, which can span layers: a pool holds
+            // every layer's buffer of one size. An index table request covers one layer's
+            // run of a pool (sparseIndexTableRequests), so each buffer names its own table,
+            // already offset to its entry, and the base that table's indices are relative to.
             for (int32_t i = 0; i < run.numBuffers; ++i)
             {
                 auto const buffer = run.bufferBase + i;
+                auto const& id = plan[static_cast<size_t>(buffer)].id;
+                auto const table = sparseIndexRun(id.layerId, id.role);
                 SparseCopyDesc desc;
                 desc.hostBase = static_cast<CUdeviceptr>(table.base);
                 desc.hostPageStride = run.hostPageStride;
                 // Pre-offset to this buffer's entry, so the kernel indexes the row alone.
-                desc.pageTable
-                    = reinterpret_cast<int32_t const*>(table.table) + static_cast<ptrdiff_t>(i) * table.entryStride;
+                desc.pageTable = reinterpret_cast<int32_t const*>(table.table);
                 desc.pageTableStride = static_cast<uint32_t>(table.rowStride);
                 desc.numBlocks = static_cast<uint32_t>(table.rowStride);
                 // The buffer's own slot in the pool, folded in so the kernel need not read
