@@ -186,6 +186,84 @@ __device__ int32_t blockExclusiveSum(int32_t* flags, int32_t n, typename BlockSc
     return carry;
 }
 
+//! Reserve one in-flight unit without building a selection probe index.
+__global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResolveArgs args)
+{
+    int32_t const row = static_cast<int32_t>(blockIdx.x);
+    SparseCacheView const view = args.views[row];
+    if (view.residentOrdinal == nullptr)
+    {
+        return;
+    }
+
+    gridDependencyWait();
+    int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
+    int32_t const inFlight = args.capacityTokens[row] / args.unitTokens - historyUnits;
+    KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= 1);
+    if (threadIdx.x == 0)
+    {
+        args.missCount[row] = 0;
+        args.inFlightSlot[row] = kNoSparseSlot;
+    }
+    if (inFlight == 0)
+    {
+        return;
+    }
+
+    int32_t const entries = view.entriesPerLayer;
+    auto* resident = view.residentOrdinal + static_cast<ptrdiff_t>(args.layerInGroup) * entries;
+    auto* order = view.lruOrder + static_cast<ptrdiff_t>(args.layerInGroup) * entries;
+    extern __shared__ int32_t previousOrder[];
+    using Reduce = cub::BlockReduce<int32_t, kThreads>;
+    __shared__ typename Reduce::TempStorage temp;
+    __shared__ int32_t matchPosition;
+    __shared__ int32_t chosenPosition;
+    __shared__ int32_t chosenSlot;
+
+    int32_t match = -1;
+    int32_t victim = -1;
+    for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
+    {
+        int32_t const slot = order[p];
+        int32_t const ordinal = resident[slot];
+        previousOrder[p] = slot;
+        if (ordinal == historyUnits)
+        {
+            match = p;
+        }
+        if (ordinal == kFreeOrdinal || ordinal < historyUnits)
+        {
+            victim = p;
+        }
+    }
+    int32_t const matched = Reduce(temp).Reduce(match, cuda::maximum<>{});
+    if (threadIdx.x == 0)
+    {
+        matchPosition = matched;
+    }
+    __syncthreads();
+    int32_t const lastVictim = Reduce(temp).Reduce(victim, cuda::maximum<>{});
+    if (threadIdx.x == 0)
+    {
+        chosenPosition = matchPosition >= 0 ? matchPosition : lastVictim;
+        KVCM2_SPARSE_REQUIRE(chosenPosition >= 0);
+        chosenSlot = previousOrder[chosenPosition];
+        resident[chosenSlot] = historyUnits;
+        args.inFlightSlot[row] = chosenSlot;
+    }
+    __syncthreads();
+
+    // Move the touched entry to the front, retaining every other entry's order.
+    for (int32_t p = static_cast<int32_t>(threadIdx.x); p < chosenPosition; p += kThreads)
+    {
+        order[p + 1] = previousOrder[p];
+    }
+    if (threadIdx.x == 0)
+    {
+        order[0] = chosenSlot;
+    }
+}
+
 //! One CTA per layer.
 //!
 //! Shared memory is carved by hand because the probe index is sized at launch; see
@@ -932,6 +1010,16 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     if (args.unitTokens <= 0)
     {
         throw std::invalid_argument("launchSparseResolve: unitTokens must be positive");
+    }
+
+    if (args.selectionWidth == 0 && args.maxInFlightUnits == 1
+        && sizeof(int32_t) * static_cast<size_t>(args.entriesPerLayer) <= 32U * 1024U)
+    {
+        size_t const shared = sizeof(int32_t) * static_cast<size_t>(args.entriesPerLayer);
+        tensorrt_llm::common::launchWithPdlWhenEnabled("sparsePrepareWrite", sparsePrepareWriteKernel,
+            dim3(static_cast<unsigned>(args.numRows)), dim3(kThreads), shared, reinterpret_cast<cudaStream_t>(stream),
+            args);
+        return;
     }
 
     // entriesPerLayer belongs to the layer group, so one size and one grid serve every row.
