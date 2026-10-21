@@ -422,10 +422,11 @@ class DSACacheManager(KVCacheManager):
 class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
     """KVCacheManagerV2-backed cache manager with a DSA indexer K-cache.
 
-    With KV cache offload, every layer's MLA latent (``KEY``) keeps its history
-    in host memory and is read through a per-request GPU cache of single-token
-    units; the indexer K-cache (``INDEX_KEY``) stays on the GPU. Full-indexer
-    and shared-indexer layers differ only in where their selection comes from.
+    With KV cache offload, every layer's MLA latent (``KEY``, with its
+    ``KEY_BLOCK_SCALE`` under NVFP4) keeps its history in host memory and is
+    read through a per-request GPU cache of single-token units; the indexer
+    K-cache (``INDEX_KEY``) stays on the GPU. Full-indexer and shared-indexer
+    layers differ only in where their selection comes from.
     """
 
     def __init__(
@@ -530,6 +531,7 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             raise ValueError("DSA requires at least one local attention layer")
         self._sparse_offload_descriptors: dict[int, SparseOffloadLayerDescriptor] = {}
         self._sparse_latent_write_pools: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._sparse_latent_nvfp4_arenas: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         if self._enable_kv_cache_offload:
             self._sparse_offload_descriptors = self.get_sparse_offload_descriptors()
             self._initialize_sparse_arena_padding(self._sparse_offload_descriptors)
@@ -537,6 +539,10 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
                 layer: self._latent_arena_pool_tensors(descriptor)
                 for layer, descriptor in self._sparse_offload_descriptors.items()
             }
+            if self.dtype == DataType.NVFP4:
+                self._sparse_latent_nvfp4_arenas = self._latent_nvfp4_arena_views(
+                    self._sparse_offload_descriptors
+                )
         primary_converters = [
             self.impl.get_page_index_converter(local_layer_idx, Role.KEY)
             for local_layer_idx in range(self.num_local_layers)
@@ -733,7 +739,8 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         if data_role == Role.ALL and self._sparse_kv_offload is not None:
             # Role.ALL is what the device estimators count; the latent's pages
             # are host memory.
-            cache_bytes -= self.get_layer_bytes_per_token(local_layer_idx, Role.KEY)
+            for role in self._sparse_latent_roles():
+                cache_bytes -= self.get_layer_bytes_per_token(local_layer_idx, role)
         if (
             data_role == Role.ALL
             and self._indexer_k_cache_layer_mask[self.pp_layers[local_layer_idx]]
@@ -747,9 +754,9 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             raise NotImplementedError(
                 "DSA KV cache offload does not support kv_cache_config.dtype='fp8_ds_mla'."
             )
-        if dtype not in (DataType.FP8, DataType.BF16):
+        if dtype not in (DataType.FP8, DataType.BF16, DataType.NVFP4):
             raise NotImplementedError(
-                f"DSA KV cache offload supports an FP8 or BF16 MLA latent, got {dtype}."
+                f"DSA KV cache offload supports an FP8, BF16 or NVFP4 MLA latent, got {dtype}."
             )
         if get_sm_version() < 100:
             raise NotImplementedError(
@@ -758,6 +765,12 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             )
         if self._sparse_offload_topk is None or self._sparse_offload_topk <= 0:
             raise ValueError("DSA KV cache offload requires a positive index_topk")
+
+    def _sparse_latent_roles(self) -> Tuple[DataRole, ...]:
+        """The latent buffers offload keeps in host memory: data, and NVFP4 block scales."""
+        if self.dtype == DataType.NVFP4:
+            return (Role.KEY, Role.KEY_BLOCK_SCALE)
+        return (Role.KEY,)
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """With offload, give every layer's MLA latent host-backed history and a GPU cache."""
@@ -769,6 +782,7 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             tokens_per_block=self.tokens_per_block,
             gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
         )
+        sparse_roles = self._sparse_latent_roles()
         layers = []
         for layer in config.layers:
             if not isinstance(layer, AttentionLayerConfig):
@@ -778,7 +792,7 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             # divides it into one-token units of the single-head latent.
             buffers = [
                 BufferConfig(role=buffer.role, size=buffer.size, is_sparse=True)
-                if buffer.role == Role.KEY
+                if buffer.role in sparse_roles
                 else buffer
                 for buffer in layer.buffers
             ]
@@ -804,6 +818,7 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
                 self.layer_offsets[layer],
                 Role.KEY,
                 unit_tokens=DSA_SPARSE_UNIT_TOKENS,
+                scale_role=Role.KEY_BLOCK_SCALE if self.dtype == DataType.NVFP4 else None,
                 name=f"Layer {layer}",
             )
             for layer in self.pp_layers
@@ -817,18 +832,74 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         The writer addresses its cache through host pool pointers [pool, 2] and a
         layer-to-pool mapping [layer, 2]. Pool 0 starts at the arena base, so a
         one-token page whose block offset is the write row lands in that row.
+        NVFP4 pointers are [pool, 2, 2], data then block scales; the scales'
+        arena pairs its rows with the data's, so the same row addresses both.
         """
-        pool_pointers = torch.tensor(
-            [[descriptor.arena_base_addresses[descriptor.data_buffer_index], 0]],
-            dtype=torch.int64,
-            device="cpu",
-        )
+        data_base = descriptor.arena_base_addresses[descriptor.data_buffer_index]
+        if descriptor.scale_buffer_index is None:
+            pointers = [[data_base, 0]]
+        else:
+            scale_base = descriptor.arena_base_addresses[descriptor.scale_buffer_index]
+            pointers = [[[data_base, scale_base], [0, 0]]]
+        pool_pointers = torch.tensor(pointers, dtype=torch.int64, device="cpu")
         pool_mapping = torch.zeros((1, 2), dtype=torch.int32, device="cpu")
         return pool_pointers, pool_mapping
 
     def get_sparse_latent_write_pool(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the host pool pointers and mapping that address a layer's latent arena."""
         return self._sparse_latent_write_pools[layer_idx]
+
+    def _latent_nvfp4_arena_views(
+        self, descriptors: dict[int, SparseOffloadLayerDescriptor]
+    ) -> dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+        """View each layer's NVFP4 latent arenas as the rows the NVFP4 gather reads.
+
+        Data views are packed bytes [rows, 1, data bytes] and scale views E4M3
+        [rows, 1, scale bytes], where a row is one token's unit and an arena row
+        index addresses it. All layers' buffers of one pool share its region,
+        and so its view.
+        """
+        views: dict[int, torch.Tensor] = {}
+
+        def view(
+            descriptor: SparseOffloadLayerDescriptor,
+            index: int,
+            dtype: torch.dtype,
+            row_bytes: int,
+        ) -> torch.Tensor:
+            base = descriptor.arena_base_addresses[index]
+            if base not in views:
+                rows = descriptor.arena_row_counts[index]
+                views[base] = convert_to_torch_tensor(
+                    TensorWrapper(base, dtype, (rows, 1, row_bytes))
+                )
+            return views[base]
+
+        arenas = {}
+        for layer, descriptor in descriptors.items():
+            local_layer_idx = self.layer_offsets[layer]
+            arenas[layer] = (
+                view(
+                    descriptor,
+                    descriptor.data_buffer_index,
+                    torch.uint8,
+                    self.get_layer_bytes_per_token(local_layer_idx, Role.KEY),
+                ),
+                view(
+                    descriptor,
+                    descriptor.scale_buffer_index,
+                    torch.float8_e4m3fn,
+                    self.get_layer_bytes_per_token(local_layer_idx, Role.KEY_BLOCK_SCALE),
+                ),
+            )
+        return arenas
+
+    def get_sparse_latent_nvfp4_arenas(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return a layer's NVFP4 latent data and block-scale arena views, indexed by arena row."""
+        return self._sparse_latent_nvfp4_arenas[layer_idx]
+
+    def _sparse_offload_nvfp4_head_dim(self) -> Optional[int]:
+        return self.head_dim if self.dtype == DataType.NVFP4 else None
 
     def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfigPy) -> int:
         """Count the offload state and the latent writer's one-token page table.

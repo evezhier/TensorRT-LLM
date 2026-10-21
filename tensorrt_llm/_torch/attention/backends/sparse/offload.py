@@ -300,6 +300,9 @@ class SparseOffloadCacheMixin:
     _sparse_offload_topk: int | None = None
     _sparse_batch: Batch | None = None
     _sparse_batch_prepared: bool = False
+    # Layers with block scales whose native write indices were seen to give data
+    # and scales the same arena rows.
+    _paired_write_layers: frozenset[int] = frozenset()
 
     def _init_sparse_offload(self, *, enabled: bool, topk: int | None) -> None:
         self._enable_kv_cache_offload = enabled
@@ -920,6 +923,10 @@ class SparseOffloadCacheMixin:
         through ``gather_sparse_batch_rows``. The caller must join Batch publication
         before this call, and the writer must finish before fetch/attention or a
         history update. No KV is fetched here.
+
+        A layer with block scales has its data and scale columns compared once,
+        outside graph capture, after a live row is seen: writers and the NVFP4
+        gather address scales with the data column.
         """
         if (
             not self._enable_kv_cache_offload
@@ -938,8 +945,37 @@ class SparseOffloadCacheMixin:
                 out=out,
                 stream=CudaStream(torch.cuda.current_stream().cuda_stream),
             )
+            if (
+                descriptor.scale_buffer_index is not None
+                and layer_idx not in self._paired_write_layers
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                self._check_paired_write_indices(out, descriptor, layer_idx)
         state.write_layer = layer_idx
         return out
+
+    def _check_paired_write_indices(
+        self, out: torch.Tensor, descriptor: SparseOffloadLayerDescriptor, layer_idx: int
+    ) -> None:
+        """Check that native gives a layer's data and block scales the same write rows.
+
+        Writers and the NVFP4 gather address scales with the data column.
+        Descriptor construction re-derives the arena layout to check that, so it
+        cannot see a native change; the indices themselves can. A layer counts as
+        checked once a live row has been compared. Reading the result waits for
+        the stream, so this runs only until then.
+        """
+        data = out[:, descriptor.data_buffer_index]
+        scale = out[:, descriptor.scale_buffer_index]
+        differs, live = torch.stack(((data != scale).any(), (data >= 0).any())).tolist()
+        if differs:
+            raise RuntimeError(
+                f"Sparse NVFP4 layer {layer_idx}: the KV cache manager wrote data and block "
+                "scales to different arena rows, but writers and attention address scales "
+                "with the data row. Its sparse arena no longer pairs the two buffers."
+            )
+        if live:
+            self._paired_write_layers = self._paired_write_layers | {layer_idx}
 
     @nvtx_range_debug("fetch_sparse_indices")
     def fetch_sparse_indices(

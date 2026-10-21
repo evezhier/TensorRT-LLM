@@ -285,7 +285,9 @@ class DSATrtllmAttention(TrtllmAttention):
 
         The selection holds token ordinals in query order, one query per request.
         History tokens come from the fetch, the token written this step from its
-        write row, and attention reads both through the layer's arena base.
+        write row, and attention reads both through the layer's arena base. An
+        NVFP4 latent is first dequantized to FP8 scratch rows, and attention reads
+        those instead, as it does from the GPU-resident NVFP4 cache.
         """
         state = metadata.sparse_offload_state
         if state is None or state.write_layer != self.layer_idx:
@@ -314,9 +316,27 @@ class DSATrtllmAttention(TrtllmAttention):
             metadata.sparse_offload_attn_indices[:num_tokens],
             unit_tokens=descriptor.unit_tokens,
         )
-        forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = descriptor.arena_base_addresses[
-            data_index
-        ]
+        if state.nvfp4_scratch is None:
+            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (
+                descriptor.arena_base_addresses[data_index]
+            )
+            return indices
+        # The data and scale arenas share their rows, so one index reads both. The
+        # gather replaces each arena row with its FP8 scratch row, -1 staying -1.
+        data_rows, scale_rows = metadata.kv_cache_manager.get_sparse_latent_nvfp4_arenas(
+            self.layer_idx
+        )
+        scratch = state.nvfp4_scratch[:num_tokens]
+        torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+            data_rows,
+            scale_rows,
+            indices,
+            scratch,
+            self._nvfp4_mla_kv_scale_quant_orig,
+            metadata.kv_cache_manager.mla_kv_cache_residual_dim,
+            data_rows.shape[0],
+        )
+        forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
         return indices
 
     def mla_rope_generation(
@@ -339,6 +359,7 @@ class DSATrtllmAttention(TrtllmAttention):
         data_index = state.layers[self.layer_idx].data_buffer_index
         # One token per request, in input order: each request's one-token page is
         # its Batch row's write row. A request without a unit in flight writes nothing.
+        # NVFP4 block scales go to the same row of their own arena.
         write_rows = gather_sparse_batch_rows(
             write_indices[:, data_index],
             state.batch_rows,

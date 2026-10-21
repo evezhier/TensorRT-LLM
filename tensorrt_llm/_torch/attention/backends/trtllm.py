@@ -127,8 +127,9 @@ class MlaLatentWriteTarget:
     cache arena: pool 0 of ``pool_pointers`` starts at the array, the layer's
     ``pool_mapping`` row selects pool 0, and each request owns a one-token page
     whose block offset in ``block_offsets`` [1, requests, 2, 1] is its row.
-    ``write_slots`` [tokens] is 0 for a token to store and -1 for a token to
-    skip, such as CUDA graph padding.
+    An NVFP4 cache's pointers are [1, 2, 2]: the block scales go to the same row
+    of a second array. ``write_slots`` [tokens] is 0 for a token to store and
+    -1 for a token to skip, such as CUDA graph padding.
     """
 
     block_offsets: torch.Tensor

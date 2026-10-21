@@ -241,22 +241,27 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
         self._init_dsa_sparse_offload_state()
 
+    def _offloads_dsa_latent(self) -> bool:
+        """Whether attention reads a DSA cache manager's MLA latent through the offload arena."""
+        return self.sparse_metadata_params.enable_kv_cache_offload and is_dsa_cache_manager(
+            self.kv_cache_manager
+        )
+
     def _init_dsa_sparse_offload_state(self) -> None:
         """Validate the fixed offload configuration and allocate its persistent state.
 
         Besides the shared offload state, the MLA latent writer gets a one-token
         page table [1, B, 2, 1] and per-token write slots [B]: the writer stores
-        each request's new latent row at its arena write row through them.
+        each request's new latent row at its arena write row through them. An
+        NVFP4 latent is dequantized for attention into the state's FP8 scratch.
         """
         self.sparse_offload_state: Optional[SparseOffloadState] = None
         self.sparse_latent_block_offsets: Optional[torch.Tensor] = None
         self.sparse_latent_write_slots: Optional[torch.Tensor] = None
         self.sparse_offload_attn_indices: Optional[torch.Tensor] = None
-        manager = self.kv_cache_manager
-        if not (
-            self.sparse_metadata_params.enable_kv_cache_offload and is_dsa_cache_manager(manager)
-        ):
+        if not self._offloads_dsa_latent():
             return
+        manager = self.kv_cache_manager
         layers = get_sparse_offload_metadata_layers(self)
         batch = manager.max_batch_size
 
@@ -272,7 +277,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Native fetch always processes every Batch row, including for smaller
         # graph profiles. Its selection width is fixed by the layer's sparse_cache.
         self.sparse_offload_state = allocate_sparse_offload_state(
-            allocate, layers, max_batch_size=batch, topk=self.sparse_mla_topk
+            allocate,
+            layers,
+            max_batch_size=batch,
+            topk=self.sparse_mla_topk,
+            nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
         )
         self.sparse_latent_block_offsets = allocate(
             "latent_block_offsets", (1, batch, 2, 1), torch.int32
@@ -831,6 +840,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.nvfp4_mla_fp8_scratch = None
         self.nvfp4_mla_compact_indices = None
         if getattr(self.kv_cache_manager, "dtype", None) != tensorrt_llm.bindings.DataType.NVFP4:
+            return
+        if self._offloads_dsa_latent():
+            # Offloaded rows are dequantized into the offload state's scratch instead.
             return
 
         # MTP verifies the current token and max_draft_tokens draft tokens for

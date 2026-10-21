@@ -8,7 +8,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
-from tensorrt_llm._torch.attention.backends.sparse.offload import allocate_sparse_offload_state
+from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmAttention
+from tensorrt_llm._torch.attention.backends.sparse.offload import (
+    SPARSE_OFFLOAD_STATE_COPIES,
+    SparseOffloadState,
+    allocate_sparse_offload_state,
+)
 from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import merge_sparse_arena_indices
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -30,6 +35,11 @@ TOKENS_PER_BLOCK = 64
 MAX_BATCH_SIZE = 4
 HEAD_DIM = 576
 INDEXER_BYTES_PER_TOKEN = 132
+# An NVFP4 latent token: 576 values and a 64-value RoPE residual, two values per
+# byte and one E4M3 block scale per 16 values.
+NVFP4_RESIDUAL_DIM = 64
+NVFP4_DATA_BYTES = (HEAD_DIM + NVFP4_RESIDUAL_DIM) // 2
+NVFP4_SCALE_BYTES = (HEAD_DIM + NVFP4_RESIDUAL_DIM) // 16
 
 
 def _pretrained_config(num_layers: int = NUM_LAYERS) -> SimpleNamespace:
@@ -45,7 +55,9 @@ def _pretrained_config(num_layers: int = NUM_LAYERS) -> SimpleNamespace:
     )
 
 
-def _manager(offload: bool = True, num_layers: int = NUM_LAYERS) -> DSACacheManagerV2:
+def _manager(
+    offload: bool = True, num_layers: int = NUM_LAYERS, dtype: DataType = DataType.FP8
+) -> DSACacheManagerV2:
     sparse_config = DeepSeekSparseAttentionConfig(
         index_head_dim=128,
         index_n_heads=32,
@@ -65,7 +77,7 @@ def _manager(offload: bool = True, num_layers: int = NUM_LAYERS) -> DSACacheMana
         max_seq_len=1024,
         max_batch_size=MAX_BATCH_SIZE,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
-        dtype=DataType.FP8,
+        dtype=dtype,
         sparse_attention_config=sparse_config,
         pretrained_config=_pretrained_config(num_layers),
     )
@@ -113,6 +125,50 @@ def test_offload_puts_every_latent_in_host_memory_and_keeps_the_indexer(manager)
         pool_pointers, pool_mapping = manager.get_sparse_latent_write_pool(layer)
         assert pool_pointers.tolist() == [[descriptor.arena_base_addresses[0], 0]]
         assert pool_mapping.tolist() == [[0, 0]]
+    assert manager._sparse_offload_nvfp4_head_dim() is None
+
+
+def test_nvfp4_offload_puts_block_scales_in_host_memory_beside_the_latent():
+    manager = _manager(dtype=DataType.NVFP4)
+    try:
+        for layer in manager.kv_cache_manager_py_config.layers:
+            roles = {str(buffer.role): buffer for buffer in layer.buffers}
+            assert roles[str(Role.KEY)].is_sparse
+            assert roles[str(Role.KEY_BLOCK_SCALE)].is_sparse
+        for local_layer in range(NUM_LAYERS):
+            expected = INDEXER_BYTES_PER_TOKEN if local_layer in FULL_INDEXER_LAYERS else 0
+            assert manager.get_layer_bytes_per_token(local_layer, Role.ALL) == expected
+            assert manager.get_layer_bytes_per_token(local_layer, Role.KEY) == NVFP4_DATA_BYTES
+            assert (
+                manager.get_layer_bytes_per_token(local_layer, Role.KEY_BLOCK_SCALE)
+                == NVFP4_SCALE_BYTES
+            )
+        for layer, descriptor in manager.get_sparse_offload_descriptors().items():
+            data, scales = descriptor.data_buffer_index, descriptor.scale_buffer_index
+            assert len(descriptor.buffer_ids) == 2 and {data, scales} == {0, 1}
+            # The writer and the gather address both arenas with the data's rows.
+            assert descriptor.arena_row_counts[data] == descriptor.arena_row_counts[scales]
+            data_base = descriptor.arena_base_addresses[data]
+            scale_base = descriptor.arena_base_addresses[scales]
+            pool_pointers, pool_mapping = manager.get_sparse_latent_write_pool(layer)
+            assert pool_pointers.tolist() == [[[data_base, scale_base], [0, 0]]]
+            assert pool_mapping.tolist() == [[0, 0]]
+            data_rows, scale_rows = manager.get_sparse_latent_nvfp4_arenas(layer)
+            assert (data_rows.data_ptr(), scale_rows.data_ptr()) == (data_base, scale_base)
+            assert (data_rows.dtype, scale_rows.dtype) == (torch.uint8, torch.float8_e4m3fn)
+            rows = descriptor.arena_row_counts[data]
+            assert data_rows.shape == (rows, 1, NVFP4_DATA_BYTES)
+            assert scale_rows.shape == (rows, 1, NVFP4_SCALE_BYTES)
+        # Attention reads the dequantized FP8 rows of each selection from offload scratch.
+        assert manager._sparse_offload_nvfp4_head_dim() == HEAD_DIM
+        state_bytes = super(DSACacheManagerV2, manager).get_sparse_offload_scratch_bytes(
+            manager.kv_cache_manager_py_config
+        )
+        assert state_bytes == SPARSE_OFFLOAD_STATE_COPIES * SparseOffloadState.device_bytes(
+            max_batch_size=MAX_BATCH_SIZE, topk=TOPK, buffer_counts={2}, nvfp4_head_dim=HEAD_DIM
+        )
+    finally:
+        manager.shutdown()
 
 
 def test_offload_refuses_the_unified_pool_view(manager):
@@ -181,35 +237,58 @@ def test_decode_step_writes_fetches_and_advances_history(manager):
     manager.free_resources(request)
 
 
-def _arena_rows(descriptor) -> torch.Tensor:
+def _arena_rows(descriptor, index: int, row_bytes: int) -> torch.Tensor:
+    """One buffer's arena as int32 words per row."""
     return convert_to_torch_tensor(
         TensorWrapper(
-            descriptor.arena_base_addresses[0],
+            descriptor.arena_base_addresses[index],
             torch.int32,
-            (descriptor.arena_row_counts[0], HEAD_DIM // 4),
+            (descriptor.arena_row_counts[index], row_bytes // 4),
         )
     )
 
 
 @pytest.mark.parametrize(
-    ("num_layers", "num_requests"), [(1, 1), (2, 1), (NUM_LAYERS, 1), (NUM_LAYERS, 3)]
+    ("num_layers", "num_requests", "dtype"),
+    [
+        (1, 1, DataType.FP8),
+        (2, 1, DataType.FP8),
+        (NUM_LAYERS, 1, DataType.FP8),
+        (NUM_LAYERS, 3, DataType.FP8),
+        (NUM_LAYERS, 1, DataType.NVFP4),
+        (NUM_LAYERS, 3, DataType.NVFP4),
+    ],
+    ids=["1layer", "2layers", "7layers", "7layers-3requests", "nvfp4", "nvfp4-3requests"],
 )
 @pytest.mark.parametrize("seed", [0, 1])
-def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, num_requests):
+def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, num_requests, dtype):
     """Every step writes each request's token row; later fetches must return it.
 
     The GPU cache holds a few selections, so a long decode evicts rows and fetches
     them back from the host pages the write-back filled. Requests join at different
     steps, so the Batch's rows carry different histories. Input runs newest first,
     as on a disaggregated decode worker, while each request keeps the Batch row it
-    joined in, so input positions and Batch rows disagree.
+    joined in, so input positions and Batch rows disagree. An NVFP4 latent's block
+    scales travel in their own buffer and must come back in the data's rows.
     """
     generator = torch.Generator().manual_seed(seed)
-    manager = _manager(num_layers=num_layers)
+    manager = _manager(num_layers=num_layers, dtype=dtype)
     requests = [_request(9 + index, 1) for index in range(num_requests)]
     join_step = {request.py_request_id: 40 * index for index, request in enumerate(requests)}
     descriptors = manager.get_sparse_offload_descriptors()
-    arenas = {layer: _arena_rows(descriptor) for layer, descriptor in descriptors.items()}
+    nvfp4 = dtype == DataType.NVFP4
+    arenas = {
+        layer: [_arena_rows(descriptor, descriptor.data_buffer_index, HEAD_DIM)]
+        for layer, descriptor in descriptors.items()
+    }
+    if nvfp4:
+        arenas = {
+            layer: [
+                _arena_rows(descriptor, descriptor.data_buffer_index, NVFP4_DATA_BYTES),
+                _arena_rows(descriptor, descriptor.scale_buffer_index, NVFP4_SCALE_BYTES),
+            ]
+            for layer, descriptor in descriptors.items()
+        }
     state = allocate_sparse_offload_state(
         lambda name, shape, dtype: torch.empty(shape, dtype=dtype, device="cuda"),
         descriptors,
@@ -248,17 +327,24 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
         kv_lengths = torch.tensor([h + 1 for h in histories], dtype=torch.int32, device="cuda")
         out = torch.empty((len(active), TOPK), dtype=torch.int32, device="cuda")
         for layer in range(num_layers):
+            descriptor = descriptors[layer]
+            data = descriptor.data_buffer_index
             writes = manager.prepare_sparse_write_indices(state, layer)
             for row, rid, history in zip(batch_rows, request_ids, histories):
-                write_row = writes[row, 0].item()
+                write_row = writes[row, data].item()
                 assert write_row >= 0, (rid, history, layer)
                 # The token's row: its position, its layer, its request.
-                arenas[layer][write_row, :3] = torch.tensor(
-                    [history, layer, rid], dtype=torch.int32, device="cuda"
-                )
+                for arena in arenas[layer]:
+                    arena[write_row, :3] = torch.tensor(
+                        [history, layer, rid], dtype=torch.int32, device="cuda"
+                    )
             free_rows = [row for row in range(MAX_BATCH_SIZE) if row not in batch_rows]
-            assert (writes[free_rows, 0] == -1).all()
+            assert (writes[free_rows, data] == -1).all()
             fetched = manager.fetch_sparse_indices(state, layer, topk, request_indices, kv_lengths)
+            if nvfp4:
+                scales = descriptor.scale_buffer_index
+                assert torch.equal(writes[:, data], writes[:, scales])
+                assert torch.equal(fetched[:, data], fetched[:, scales])
             merge_sparse_arena_indices(
                 topk,
                 request_indices,
@@ -266,23 +352,27 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
                 state.active_request_count,
                 kv_lengths,
                 state.history_lengths,
-                fetched[:, 0, :],
-                writes[:, 0],
+                fetched[:, data, :],
+                writes[:, data],
                 out,
                 unit_tokens=1,
             )
             for position, rid in enumerate(request_ids):
                 valid = topk[position] >= 0
-                got = arenas[layer][out[position][valid].long(), :3]
                 units = topk[position][valid]
                 expected = torch.stack(
                     (units, torch.full_like(units, layer), torch.full_like(units, rid)), dim=1
                 )
-                wrong = (got != expected).any(dim=1)
-                assert not wrong.any(), (
-                    f"request {rid}, history {histories[position]}, layer {layer}: units "
-                    f"{units[wrong].tolist()} read {got[wrong].tolist()}"
-                )
+                for arena in arenas[layer]:
+                    got = arena[out[position][valid].long(), :3]
+                    wrong = (got != expected).any(dim=1)
+                    assert not wrong.any(), (
+                        f"request {rid}, history {histories[position]}, layer {layer}: units "
+                        f"{units[wrong].tolist()} read {got[wrong].tolist()}"
+                    )
+        if nvfp4:
+            # The write rows were compared once per layer, and matched.
+            assert manager._paired_write_layers == frozenset(range(num_layers))
         manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
         for rid, history in zip(request_ids, histories):
             assert manager.kv_cache_map[rid].history_length == history + 1
@@ -290,6 +380,107 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
     for request in active:
         manager.free_resources(request)
     manager.shutdown()
+
+
+def test_nvfp4_attention_reads_the_selected_rows_dequantized():
+    """Attention reads FP8 scratch rows dequantized from the arena rows the merge picked.
+
+    Arena rows hold random NVFP4 bytes and scales. The reference dequantizes the
+    merged rows after copying them out of the arena, so it checks which rows the
+    gather read, from which views, and that each index became its scratch row.
+    """
+    manager = _manager(dtype=DataType.NVFP4)
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    layer = 2
+    try:
+        prompt_len = 3 * TOKENS_PER_BLOCK + 5
+        request = _request(7, prompt_len)
+        assert manager.prepare_disagg_gen_init(request)
+        assert manager.try_allocate_generation(request)
+        state = allocate_sparse_offload_state(
+            lambda name, shape, dtype: torch.empty(shape, dtype=dtype, device="cuda"),
+            manager.get_sparse_offload_descriptors(),
+            max_batch_size=MAX_BATCH_SIZE,
+            topk=TOPK,
+            nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
+        )
+        manager.prepare_sparse_batch([request.py_request_id])
+        manager.prepare_sparse_offload(state, [request.py_request_id], beam_width=1)
+        data_rows, scale_rows = manager.get_sparse_latent_nvfp4_arenas(layer)
+        data_rows.copy_(
+            torch.randint(
+                0, 256, data_rows.shape, dtype=torch.uint8, device="cuda", generator=generator
+            )
+        )
+        scale_rows.copy_(
+            torch.empty(scale_rows.shape, device="cuda")
+            .uniform_(0.25, 4.0, generator=generator)
+            .to(torch.float8_e4m3fn)
+        )
+        writes = manager.prepare_sparse_write_indices(state, layer)
+
+        # Older history, the last history token and the token written this step,
+        # with unselected slots between them.
+        topk = torch.full((1, TOPK), -1, dtype=torch.int32, device="cuda")
+        topk[0, : TOPK - 8] = torch.arange(TOPK - 8, dtype=torch.int32) * 3
+        topk[0, TOPK - 2] = prompt_len - 1
+        topk[0, TOPK - 1] = prompt_len
+        metadata = SimpleNamespace(
+            kv_cache_manager=manager,
+            sparse_offload_state=state,
+            num_contexts=0,
+            num_seqs=1,
+            sparse_mla_topk=TOPK,
+            req_idx_per_token=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            kv_lens_cuda=torch.tensor([prompt_len + 1], dtype=torch.int32, device="cuda"),
+            sparse_offload_attn_indices=torch.empty(
+                (MAX_BATCH_SIZE, TOPK), dtype=torch.int32, device="cuda"
+            ),
+        )
+        backend = SimpleNamespace(
+            layer_idx=layer,
+            _nvfp4_mla_kv_scale_quant_orig=torch.tensor([0.5], device="cuda"),
+        )
+        args = SimpleNamespace(sparse_runtime_params=SimpleNamespace(aux_kv_cache_pool_ptr=0))
+        indices = DSATrtllmAttention._sparse_offload_arena_indices(backend, topk, metadata, args)
+
+        descriptor = state.layers[layer]
+        data = descriptor.data_buffer_index
+        rows = torch.empty_like(topk)
+        merge_sparse_arena_indices(
+            topk,
+            metadata.req_idx_per_token,
+            state.batch_rows,
+            state.active_request_count,
+            metadata.kv_lens_cuda,
+            state.history_lengths,
+            state.fetched_indices[2][:, data, :],
+            writes[:, data],
+            rows,
+            unit_tokens=1,
+        )
+        valid = rows[0] >= 0
+        assert valid.sum().item() == TOPK - 6
+        assert rows[0, -1].item() == writes[0, data].item()
+        flat = rows.view(-1).clamp(min=0).long()
+        reference = torch.empty((1, TOPK, HEAD_DIM), dtype=torch.float8_e4m3fn, device="cuda")
+        compact = torch.where(valid, torch.arange(TOPK, device="cuda"), -1).to(torch.int32)[None]
+        torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+            data_rows[flat].contiguous(),
+            scale_rows.view(torch.uint8)[flat].contiguous().view(torch.float8_e4m3fn),
+            compact,
+            reference,
+            backend._nvfp4_mla_kv_scale_quant_orig,
+            NVFP4_RESIDUAL_DIM,
+            TOPK,
+        )
+        assert args.sparse_runtime_params.aux_kv_cache_pool_ptr == state.nvfp4_scratch.data_ptr()
+        torch.testing.assert_close(indices, compact)
+        scratch = state.nvfp4_scratch[0].view(torch.uint8)
+        assert torch.equal(scratch[valid], reference[0].view(torch.uint8)[valid])
+        manager.free_resources(request)
+    finally:
+        manager.shutdown()
 
 
 def test_offload_scratch_counts_the_latent_writer(manager):

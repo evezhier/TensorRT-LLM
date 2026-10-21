@@ -327,9 +327,6 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
     # The block size of the (indexer) compressed cache.
     # For other attention types, block size is tokens_per_block.
     compressed_block_sizes: List[int]
-    # Sparse NVFP4 layers whose native write indices were seen to give data and
-    # block scales the same arena rows.
-    _paired_write_layers: frozenset[int] = frozenset()
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int:
         """Retain DeepSeek-V4's max-length pool-sizing model by default."""
@@ -1874,42 +1871,11 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         Padding roles were initialized during manager construction. The fused
         compressor uses the data column as a one-row page table for data and
         NVFP4 scales, whose matching geometry is checked during descriptor construction
-        and, once per layer outside graph capture, against the indices native returns.
-        Each buffer still uses its own arena base and byte stride.
+        and, once per layer outside graph capture, by ``prepare_sparse_write_indices``
+        against the indices native returns. Each buffer still uses its own arena base
+        and byte stride.
         """
-        out = self.prepare_sparse_write_indices(state, layer_idx)
-        descriptor = state.layers[layer_idx]
-        if (
-            descriptor.scale_buffer_index is not None
-            and layer_idx not in self._paired_write_layers
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            with torch.cuda.device(out.device):
-                self._check_paired_write_indices(out, descriptor, layer_idx)
-        return out
-
-    def _check_paired_write_indices(
-        self, out: torch.Tensor, descriptor: SparseOffloadLayerDescriptor, layer_idx: int
-    ) -> None:
-        """Check that native gives a layer's data and block scales the same write rows.
-
-        The fused compressor and the NVFP4 gather address scales with the data
-        column. Descriptor construction re-derives the arena layout to check
-        that, so it cannot see a native change; the indices themselves can. A
-        layer counts as checked once a live row has been compared. Reading the
-        result waits for the stream, so this runs only until then.
-        """
-        data = out[:, descriptor.data_buffer_index]
-        scale = out[:, descriptor.scale_buffer_index]
-        differs, live = torch.stack(((data != scale).any(), (data >= 0).any())).tolist()
-        if differs:
-            raise RuntimeError(
-                f"Sparse NVFP4 layer {layer_idx}: the KV cache manager wrote data and block "
-                "scales to different arena rows, but the compressor and attention address "
-                "scales with the data row. Its sparse arena no longer pairs the two buffers."
-            )
-        if live:
-            self._paired_write_layers = self._paired_write_layers | {layer_idx}
+        return self.prepare_sparse_write_indices(state, layer_idx)
 
     @nvtx_range_debug("dsv4_copy_batch_compress_block_tables")
     def copy_batch_compress_block_tables(
