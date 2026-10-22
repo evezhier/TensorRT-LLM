@@ -6,8 +6,8 @@
   },
   {
     "path": "README.md",
-    "bytes": 13337,
-    "sha256": "4c99d05a6663156decc37c46532d03be5929e29c8e14c191f186d71e0e109407"
+    "bytes": 12588,
+    "sha256": "58107dfe9b784f594725018cf41bc571f0bb95069d0414bddd2addbd3f0e1eba"
   },
   {
     "path": "harness/analyze_decode.py",
@@ -156,12 +156,12 @@
   },
   {
     "path": "reproduce_32k.sh",
-    "bytes": 2398,
-    "sha256": "9d2bba355f40bfbc5c8c7824d646fc37d252bad25f17e07e2176a8c7f93f0476"
+    "bytes": 2449,
+    "sha256": "53ad4858cc91b1feb5c2650a166fddf8a05803e5bd8a2ac3d4d70ef3c8769e59"
   },
   {
     "path": "run_slurm.sh",
-    "bytes": 801,
-    "sha256": "e5ef46d3acc94c6bdc550df22edd9c110164f0b8a55e4f2472ceb5ad7c2a8390"
+    "bytes": 826,
+    "sha256": "a15b2860ce70a449c62fd2034ad95a1770248ef03665b99eddd895ea05b97420"
   }
 ]

@@ -3,9 +3,15 @@
 
 # Reproduce DeepSeek V4 Flash sparse KV offload at 32K
 
+Branch `feat/kvcm2-sparse-32k-repro` already contains the tested source changes
+and this harness. Build that checkout and run the harness directly. The source
+patches in `patches/` are retained for provenance; do not apply them again to
+this branch.
+
 This package reproduces the latest **post-residency-fix, unprofiled 32,768 input / 160 output token** comparison. The primary experiment uses **3 prefill workers and 1 decode worker**. A separate matched-batch experiment checks token parity while controlling decoder occupancy. The scripts do not run Nsight Systems or search for new capacity limits.
 
-The original run and full report are retained at `build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/final-report.json` and in the [benchmark report](https://chatgpt.com/space/page_bec74a2e48208191ade22eaebdb248de).
+The original run's full report is included at `../evidence/final-report.json`
+and in the [benchmark report](https://chatgpt.com/space/page_bec74a2e48208191ade22eaebdb248de).
 
 ## Hardware and source prerequisites
 
@@ -14,19 +20,24 @@ The original run and full report are retained at `build/sparse-disagg-e2e-artifa
 - Full **43-layer DeepSeek V4 Flash** weights at `$LLM_MODELS_ROOT/DeepSeek-V4-Flash`; a working source build with native libraries and Python bindings from the same source. The preflight checks that `Batch.reorder` is available and that Python imports the selected checkout.
 - Original container: `trtllm_pytorch-26.08-py3-x86_64-ubuntu24.04-skip-tritondevel-202609210610-19345.sqsh`, Python 3.12, SM100 build. The integration-test Python dependencies must be installed; the harness imports `tests/integration/defs/accuracy/test_disaggregated_serving.py`. Weights, container, native binaries and dependency directories are not bundled.
 
-The existing shared checkout is `build/deepseek-v4-sparse-disagg-e2e`, branch `experiment/deepseek-v4-sparse-disagg-e2e`, at **`f4c197fdea4baad546df0e6bba4065ce04e52213`**. The residency fix is committed locally; two host-memory-sizing files remain modified and were also part of the tested source. Keep those modifications for exact reproduction.
+The original measured checkout was `build/deepseek-v4-sparse-disagg-e2e`, branch
+`experiment/deepseek-v4-sparse-disagg-e2e`, at
+**`f4c197fdea4baad546df0e6bba4065ce04e52213`** with two host-memory-sizing
+files modified. This branch includes those source changes.
 
-For an independent checkout, the package includes both source patches. Starting from the lowsfer fork:
+Initialize submodules in this checkout, then build it in the compatible
+container:
 
 ```bash
-git fetch https://github.com/lowsfer/TensorRT-LLM.git kvcm2-sparse-attention-api
-git switch -c reproduce-sparse-32k 046f8c84d92a5492d7df908ad71f046cc7cd97ce
-git am /absolute/package/patches/0001-preserve-sparse-residency.patch
-git apply /absolute/package/patches/0002-host-memory-sizing.patch
 git submodule update --init --recursive
+python3 scripts/build_wheel.py --use_ccache -a "100-real" --skip_building_wheel --linking_install_binary
+pip install -e .
 ```
 
-Build/install this checkout with the repository's source-build procedure before running. Rebuild native `bindings` and `th_common`, including their `tensorrt_llm` dependency; copying Python changes onto old native binaries is insufficient. `reference/binary-manifest.json` records the original built-library hashes. The original measurements preceded the latest documentation-only upstream commit; the replayed fix preserves the tested executable code.
+Rebuild native `bindings` and `th_common`, including their `tensorrt_llm`
+dependency. `reference/binary-manifest.json` records the original built-library
+hashes. The original measurements preceded the latest documentation-only
+upstream commit; this branch preserves the tested executable code.
 
 ## Workload and settings
 
@@ -65,39 +76,41 @@ This gives **4,226 requests per mode**, 8,452 across both modes. Warmups are exc
 Inside a prepared container with all eight GPUs available, use a **new output directory**:
 
 ```bash
-export E2E_REPO=/absolute/built/TensorRT-LLM
 export LLM_MODELS_ROOT=/absolute/model-root
+cd /absolute/path/to/checked-out/TensorRT-LLM
 # Optional: extra Python dependency directories, separated by colons.
 # export REPRO_EXTRA_PYTHONPATH=/absolute/python-deps:/absolute/test-deps
-bash /absolute/package/reproduce_32k.sh serving /absolute/results/32k-serving-01
+bash examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/reproduce_32k.sh \
+    serving /absolute/results/32k-serving-01
 ```
 
 The wrapper copies the measured harness into the output directory, records source/runtime provenance, samples GPU telemetry, runs resident then offload, and runs the offline analyses. It refuses to overwrite an existing output directory. It never allocates GPUs itself.
 
-For the existing shared environment, the following Slurm wrapper replaces the expired job IDs in the original launch scripts. Obtain a new exclusive eight-GPU allocation with the CPU/RAM resources above, then set its job ID:
+For Slurm, obtain a new exclusive eight-GPU allocation with the CPU/RAM
+resources above. From this checkout, set its job ID and the site-specific
+container paths:
 
 ```bash
-REPRO_ROOT=/home/scratch.guijuz_coreai_1/TensorRT-LLM
-REPRO_ARTIFACTS="$REPRO_ROOT/build/sparse-disagg-e2e-artifacts"
-REPRO_PACKAGE="$REPRO_ARTIFACTS/reproduce-32k-p3d1"
-export E2E_REPO="$REPRO_ROOT/build/deepseek-v4-sparse-disagg-e2e"
-export LLM_MODELS_ROOT=/home/scratch.trt_llm_data_ci/llm-models
-export PYTHONUSERBASE=/home/scratch.guijuz_coreai_1/.claude_tmp/pyuser
-export REPRO_EXTRA_PYTHONPATH="$REPRO_ARTIFACTS/python-deps:$REPRO_ROOT/cpp/build/sparse-disagg.su5fQT/test-deps"
-export REPRO_IMAGE=/home/scratch.guijuz_coreai_1/.claude_tmp/images/trtllm_pytorch-26.08-py3-x86_64-ubuntu24.04-skip-tritondevel-202609210610-19345.sqsh
-export REPRO_MOUNTS="/home/scratch.guijuz_coreai_1:/home/scratch.guijuz_coreai_1,/home/scratch.trt_llm_data_ci:/home/scratch.trt_llm_data_ci,$REPRO_ARTIFACTS/flashinfer:/home/guijuz/.cache/tensorrt_llm/flashinfer"
+export LLM_MODELS_ROOT=/absolute/model-root
+export REPRO_IMAGE=/absolute/compatible-container.sqsh
+export REPRO_MOUNTS=/absolute/repo-parent:/absolute/repo-parent,/absolute/model-root:/absolute/model-root,/absolute/results-parent:/absolute/results-parent
 export REPRO_JOB_ID=YOUR_NEW_JOB_ID
 export REPRO_CPUS=160
-bash "$REPRO_PACKAGE/run_slurm.sh" serving "$REPRO_ARTIFACTS/my-32k-serving-01"
+bash examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_slurm.sh \
+    serving /absolute/results-parent/32k-serving-01
 ```
 
-Mount the checkout, package, weights, dependencies and output parent at the same paths inside the container. The serving GPU pinning assumes the full node's GPUs 0–7 are allocated to you. The wrapper takes one Slurm step for the complete sequence and leaves the allocation under your control.
+Mount the checkout, weights, dependencies and output parent at the same paths
+inside the container. The serving GPU pinning assumes the full node's GPUs 0–7
+are allocated to you. The wrapper takes one Slurm step for the complete sequence
+and leaves the allocation under your control.
 
 For matched parity controls, use a separate four-GPU allocation/container and fresh output:
 
 ```bash
 # In the four-GPU container; CUDA_VISIBLE_DEVICES lists your four allocated devices.
-bash /absolute/package/reproduce_32k.sh matched /absolute/results/32k-matched-01
+bash examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/reproduce_32k.sh \
+    matched /absolute/results/32k-matched-01
 ```
 
 This runs one prefill worker and one decoder. After cold/warm requests, it gates decode until all KV has arrived for batches **1, 96, 144 and 1,204** in both modes. Offload additionally runs **1,696 twice**. A 512-request ungated churn trial at concurrency 128 occurs between the 96 and 144 controls. The packaged controller automates that step in both modes; the original resident churn trial was manually enqueued. Each gated run requires both rank barriers to report the target count. Verify the recorded scheduled counts also remain at the target for all 159 decode iterations before calling a result a matched-batch comparison. These controls do not measure normal serving latency.

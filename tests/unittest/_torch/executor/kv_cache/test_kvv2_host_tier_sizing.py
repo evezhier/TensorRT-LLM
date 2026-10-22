@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for KVCacheManagerV2 rank-aware auto host tier sizing.
 
 The auto-provisioned host tier is computed per rank but drawn from a
@@ -9,8 +11,13 @@ can arrive at divergent quotas; ``TestSyncHostTierQuota`` covers the
 cross-rank ``allreduce(MIN)`` that reconciles them to the fleet minimum.
 """
 
+import resource
+from types import SimpleNamespace
+
 import pytest
 
+from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _compute_auto_host_tier_quota,
     _sync_host_tier_quota,
@@ -18,6 +25,65 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 GiB = 1 << 30
+
+
+@pytest.mark.cpu_only
+class TestHostMemoryLimits:
+    @pytest.mark.parametrize("memlock_limit", [8 * GiB, resource.RLIM_INFINITY])
+    @pytest.mark.parametrize("cgroup_available", [None, 16 * GiB])
+    def test_available_memory_includes_reclaimable_pages(
+        self, monkeypatch, memlock_limit, cgroup_available
+    ):
+        monkeypatch.setattr(
+            kv_cache_manager_v2.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(available=64 * GiB, free=4 * GiB),
+        )
+        monkeypatch.setattr(
+            kv_cache_manager_v2.os,
+            "sysconf",
+            lambda name: {"SC_PAGE_SIZE": 4096, "SC_AVPHYS_PAGES": 4 * GiB // 4096}[name],
+        )
+        monkeypatch.setattr(
+            kv_cache_manager_v2.Distributed,
+            "get",
+            lambda mapping: SimpleNamespace(local_world_size=2),
+        )
+        monkeypatch.setattr(resource, "getrlimit", lambda limit: (memlock_limit, memlock_limit))
+        monkeypatch.setattr(
+            rank_striped_read_ahead, "cgroup_available_host_memory", lambda: cgroup_available
+        )
+
+        limits = kv_cache_manager_v2.get_host_memory_limits(None)
+
+        expected_available = 64 * GiB if cgroup_available is None else 16 * GiB
+        assert limits.mem_available == expected_available
+        assert limits.rank_share == expected_available / 2
+        expected_pinnable = expected_available / 4
+        if memlock_limit != resource.RLIM_INFINITY:
+            expected_pinnable = min(expected_pinnable, 6.4 * GiB)
+        assert limits.auto_pinnable_bytes == expected_pinnable
+
+    @pytest.mark.parametrize("cgroup_available", [None, 16 * GiB])
+    def test_memory_read_failure_preserves_other_limits(self, monkeypatch, cgroup_available):
+        def unavailable_memory():
+            raise OSError("Host memory information is unavailable")
+
+        monkeypatch.setattr(kv_cache_manager_v2.psutil, "virtual_memory", unavailable_memory)
+        monkeypatch.setattr(
+            kv_cache_manager_v2.Distributed,
+            "get",
+            lambda mapping: SimpleNamespace(local_world_size=2),
+        )
+        monkeypatch.setattr(resource, "getrlimit", lambda limit: (8 * GiB, 8 * GiB))
+        monkeypatch.setattr(
+            rank_striped_read_ahead, "cgroup_available_host_memory", lambda: cgroup_available
+        )
+
+        limits = kv_cache_manager_v2.get_host_memory_limits(None)
+
+        assert limits.mem_available == (float("inf") if cgroup_available is None else 16 * GiB)
+        assert limits.auto_pinnable_bytes == (6.4 * GiB if cgroup_available is None else 4 * GiB)
 
 
 class TestComputeAutoHostTierQuota:
@@ -56,7 +122,7 @@ class TestComputeAutoHostTierQuota:
 
     def test_integrated_gpu_charges_device_quota_against_budget(self):
         # GB10 / DGX Spark. Host and device are one 119.69 GiB
-        # unified pool, so SC_AVPHYS_PAGES counts bytes the device quota is
+        # unified pool, so available host memory includes bytes the device quota is
         # about to take. Without the charge the tier was sized 93.58/2 =
         # 46.79 GiB on top of an 81.68 GiB device quota -- 128.5 GiB requested
         # from a 119.69 GiB pool -- and the worker was OOM-killed.
@@ -156,7 +222,7 @@ def _host_tier_sync_worker(per_rank_mem_gib):
     """Run on every MPI rank by the MpiPoolSession harness below.
 
     Each rank simulates reading a different amount of available host memory
-    (as ``os.sysconf("SC_AVPHYS_PAGES")`` would differ across co-scheduled
+    (as available host memory would differ across co-scheduled
     ranks), computes its own auto host-tier quota, then runs the real
     cross-rank sync. Returns this rank's pre- and post-sync quota so the parent
     process can assert on convergence.

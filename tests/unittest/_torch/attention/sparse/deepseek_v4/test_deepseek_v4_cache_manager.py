@@ -799,6 +799,8 @@ class _SchedulingBatch:
         self.snapshots = []
         self.upload_pending = False
         self.flushes = []
+        self.joins = []
+        self.leaves = []
 
     def row_of(self, cache):
         return self.rows.index(cache) if cache in self.rows else -1
@@ -818,6 +820,7 @@ class _SchedulingBatch:
         row = self.rows.index(None)
         self.rows[row] = cache
         cache.page_index_owner = "batch"
+        self.joins.append(cache.id)
         return row
 
     def remove_kv_cache(self, cache):
@@ -825,6 +828,25 @@ class _SchedulingBatch:
         assert cache.page_index_owner == "batch"
         self.rows[self.rows.index(cache)] = None
         cache.page_index_owner = "cache"
+        self.leaves.append(cache.id)
+
+    def reorder(self, caches: list[_HistoryCache]) -> None:
+        assert not self.upload_pending
+        assert {cache.id for cache in caches} == {
+            cache.id for cache in self.rows if cache is not None
+        }
+        self.rows[:] = list(caches) + [None] * (self.max_batch_size - len(caches))
+
+    def coalesced_page_table(self, pool_id: int) -> torch.Tensor:
+        return torch.tensor(
+            [
+                list(cache.pages) + [BAD_PAGE_INDEX] * (self.max_blocks_per_seq - len(cache.pages))
+                if cache is not None
+                else [BAD_PAGE_INDEX] * self.max_blocks_per_seq
+                for cache in self.rows
+            ],
+            dtype=torch.int32,
+        )
 
     def publish(self):
         assert not self.upload_pending
@@ -855,6 +877,10 @@ def sparse_scheduling_case():
     request.is_first_context_chunk = request.is_last_context_chunk = True
     other_request = SimpleNamespace(py_request_id=10, is_disagg_generation_init_state=False)
     scheduled = SimpleNamespace(context_requests=[], generation_requests=[request, other_request])
+    manager.num_pools = 2
+    manager.index_mapper = Mock()
+    manager.index_mapper.get_index.side_effect = {20: 3, 10: 1}.__getitem__
+    manager.host_kv_cache_block_offsets = torch.full((2, 4, 1, 6), -99, dtype=torch.int32)
 
     def restore(request_id, request_cache):
         assert request_cache.page_index_owner == "cache"
@@ -908,7 +934,56 @@ def test_sparse_batch_publishes_schedule_and_reuses_allocation(sparse_scheduling
         [(layer_id, DeepseekV4AttentionType.COMPRESS.role)]
         for layer_id in sorted(manager.impl.sparse)
     ]
-    assert case.restore_buffers.call_count == 2
+    case.restore_buffers.assert_not_called()
+    assert batch.joins == [20, 10]
+    assert not batch.leaves
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("max_beam_width", [1, 2])
+def test_sparse_batch_retains_continuing_members_and_refreshes_legacy_tables(
+    sparse_scheduling_case: SimpleNamespace, max_beam_width: int
+) -> None:
+    case = sparse_scheduling_case
+    manager = case.manager
+    manager.max_beam_width = max_beam_width
+    manager.host_kv_cache_block_offsets = torch.full(
+        (2, 4 * max_beam_width, 1, 6), -99, dtype=torch.int32
+    )
+    manager.prepare_resources(case.scheduled)
+    batch = manager.get_sparse_batch([20, 10])
+    case.cache.pages = [4, 8, 9]
+    case.scheduled.generation_requests.reverse()
+    manager.prepare_resources(case.scheduled)
+
+    assert batch.joins == [20, 10]
+    assert not batch.leaves
+    assert manager.get_sparse_batch([10, 20]) is batch
+    for pool_id in range(manager.num_pools):
+        assert manager.host_kv_cache_block_offsets[pool_id, 3 * max_beam_width, 0].tolist() == [
+            4,
+            8,
+            9,
+            -1,
+            -1,
+            -1,
+        ]
+        assert manager.host_kv_cache_block_offsets[pool_id, max_beam_width, 0].tolist() == [
+            0,
+            7,
+            8,
+            -1,
+            -1,
+            -1,
+        ]
+
+    case.scheduled.generation_requests = [case.request]
+    manager.prepare_resources(case.scheduled)
+    assert manager.get_sparse_batch([20]) is batch
+    assert batch.joins == [20, 10]
+    assert batch.leaves == [10]
+    assert batch.rows == [case.cache, None, None, None]
+    assert case.cache.page_index_owner == "batch"
 
 
 @pytest.mark.cpu_only
@@ -1031,6 +1106,36 @@ def test_sparse_batch_ignores_disagg_gen_init_preparation(sparse_scheduling_case
 
 
 @pytest.mark.cpu_only
+def test_disagg_gen_init_retains_continuing_sparse_cache_leases(
+    sparse_scheduling_case: SimpleNamespace,
+) -> None:
+    case = sparse_scheduling_case
+    case.manager.prepare_resources(case.scheduled)
+    batch = case.manager.get_sparse_batch([20, 10])
+    case.manager.prepare_resources(
+        SimpleNamespace(context_requests=[_gen_init_request(100)], generation_requests=[])
+    )
+    assert [cache.id for cache in batch.rows if cache is not None] == [20, 10]
+    assert not batch.leaves
+    case.manager.prepare_resources(case.scheduled)
+    assert case.manager.get_sparse_batch([20, 10]) is batch
+    assert batch.joins == [20, 10]
+
+
+@pytest.mark.cpu_only
+def test_releasing_unseated_request_preserves_the_published_batch(
+    sparse_scheduling_case: SimpleNamespace,
+) -> None:
+    case = sparse_scheduling_case
+    case.manager.prepare_resources(case.scheduled)
+    batch = case.manager.get_sparse_batch([20, 10])
+    with patch.object(KVCacheManagerV2, "free_resources"):
+        case.manager.free_resources(_gen_init_request(100))
+    assert case.manager.get_sparse_batch([20, 10]) is batch
+    assert not batch.leaves
+
+
+@pytest.mark.cpu_only
 def test_sparse_batch_publishes_only_requests_that_run_a_forward(sparse_scheduling_case):
     case = sparse_scheduling_case
     case.scheduled.context_requests = [_gen_init_request(100)]
@@ -1085,11 +1190,19 @@ def test_sparse_batch_detaches_before_cache_lifecycle_mutations(sparse_schedulin
     batch = manager.get_sparse_batch([20, 10])
 
     def mutate(*args):
-        assert batch.rows == [None] * 4
-        assert all(cache.page_index_owner == "runtime" for cache in manager.kv_cache_map.values())
+        if operation == "shutdown":
+            assert batch.rows == [None] * 4
+            assert all(
+                cache.page_index_owner == "runtime" for cache in manager.kv_cache_map.values()
+            )
+        else:
+            assert batch.rows == [None, manager.kv_cache_map[10], None, None]
+            assert case.cache.page_index_owner == "runtime"
+            assert manager.kv_cache_map[10].page_index_owner == "batch"
 
     with patch.object(KVCacheManagerV2, operation, side_effect=mutate) as parent:
         if operation.startswith("update_"):
+            case.scheduled.context_requests = [case.request]
             getattr(manager, operation)(case.scheduled)
         elif operation == "release_index_slot":
             manager.release_index_slot(20)
@@ -1122,7 +1235,7 @@ def test_sparse_batch_publishes_updated_history_on_next_step(sparse_scheduling_c
         manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
         manager.update_resources(case.scheduled)
     assert cache.history_length == cache.capacity == 8
-    assert cache.page_index_owner == "runtime"
+    assert cache.page_index_owner == ("runtime" if context else "batch")
     assert not batch.upload_pending
 
     # Scheduling reserves the next input token after the completed history update.
@@ -1150,7 +1263,7 @@ def test_sparse_overlap_history_advances_before_delayed_samples(
     # Forward N produces KV before the executor consumes sampling result N.
     manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
     assert cache.history_length == history_length + 1
-    assert cache.page_index_owner == "runtime"
+    assert cache.page_index_owner == "batch"
 
     assert cache.resize(history_length + 2, None)
     manager.prepare_resources(case.scheduled)
@@ -1196,7 +1309,7 @@ def test_sparse_history_does_not_advance_without_forward(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("copy_fails", [False, True])
-def test_sparse_forward_waits_for_input_copy_before_detaching(
+def test_sparse_forward_waits_for_input_copy_before_history_update(
     sparse_scheduling_case: SimpleNamespace, copy_fails: bool
 ) -> None:
     case = sparse_scheduling_case
@@ -1223,8 +1336,47 @@ def test_sparse_forward_waits_for_input_copy_before_detaching(
     else:
         manager.update_forward_resources(case.scheduled, wait_for_input_copy=wait)
         assert cache.history_length == 8
-        assert cache.page_index_owner == "runtime"
+        assert cache.page_index_owner == "batch"
     wait.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("history_length", [3, 127])
+def test_sparse_forward_keeps_flush_proof_attached_until_history_advances(
+    sparse_scheduling_case: SimpleNamespace, history_length: int
+) -> None:
+    case = sparse_scheduling_case
+    manager, cache, request = case.manager, case.cache, case.request
+    case.scheduled.generation_requests = [request]
+    cache.history_length, cache.capacity = history_length, history_length + 1
+    manager.prepare_resources(case.scheduled)
+    batch = manager.get_sparse_batch([20])
+    manager._stream.wait_stream.reset_mock()
+    flush = batch.flush_sparse_units
+    resize = cache.resize
+
+    def flush_after_forward(histories):
+        manager._stream.wait_stream.assert_called_once_with(case.current_stream.return_value)
+        flush(histories)
+
+    def advance_attached(capacity, history):
+        row = batch.row_of(cache)
+        assert row >= 0, "The native flush watermark belongs to the attached Batch row"
+        assert batch.flushes[-1][row] >= history
+        assert not batch.upload_pending, "History mutation must not race the staged table upload"
+        return resize(capacity, history)
+
+    with (
+        patch.object(batch, "flush_sparse_units", side_effect=flush_after_forward),
+        patch.object(cache, "resize", side_effect=advance_attached),
+    ):
+        manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
+
+    assert cache.history_length == history_length + 1
+    assert cache.page_index_owner == "batch"
+    assert batch.row_of(cache) == 0
+    assert batch.joins == [20]
+    assert not batch.leaves
 
 
 @pytest.mark.cpu_only

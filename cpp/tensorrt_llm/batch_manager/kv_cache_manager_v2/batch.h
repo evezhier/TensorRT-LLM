@@ -274,6 +274,13 @@ public:
     //! a caller sweeping rows should not have to ask twice about each one.
     std::shared_ptr<KvCache> removeKvCache(int row);
 
+    //! Pack all current members into the supplied order without releasing their arena leases.
+    //!
+    //! Every member must occur exactly once. Page-index bindings and flush watermarks move
+    //! with the members; device tables retain their addresses and change on the next publish.
+    //! Waits for the previous staging upload before changing any host row.
+    void reorder(std::vector<KvCache*> const& kvCaches);
+
     //! Resize every member, then publish once.
     //!
     //! The sanctioned way to advance a batched step, and the reason it exists: it waits on
