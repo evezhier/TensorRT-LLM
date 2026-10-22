@@ -1778,6 +1778,323 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
             non_blocking=True,
         )
 
+    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        self._sparse_batch_prepared = False
+        if self._sparse_batch is not None:
+            self._sparse_batch.wait_published()
+        if self._enable_kv_cache_offload and any(
+            not (request.is_first_context_chunk and request.is_last_context_chunk)
+            for request in scheduled_batch.context_requests
+        ):
+            # Attention metadata's prompt_lens contains the current chunk's
+            # length, so only the scheduled request can identify a first chunk
+            # that does not complete its prompt. Reject before model writes.
+            raise NotImplementedError("Sparse offload does not support chunked prefill")
+        super().prepare_resources(scheduled_batch)
+        if not self._enable_kv_cache_offload:
+            return
+        requests = scheduled_batch.context_requests + scheduled_batch.generation_requests
+        # Disaggregated gen-init requests are prepared before their KV transfer
+        # starts and run no forward this step, so they never join the Batch. A
+        # batch holding only those publishes nothing.
+        forward_request_ids = [
+            request.py_request_id
+            for request in requests
+            if not request.is_disagg_generation_init_state
+        ]
+        if forward_request_ids or not requests:
+            self.prepare_sparse_batch(forward_request_ids)
+
+    def prepare_sparse_batch(self, request_ids: list[int]) -> None:
+        """Publish scheduler or warmup requests, or join an already published batch.
+
+        Attention metadata calls this outside capture with its final request order.
+        Graph padding may append dummy rows; the live request order must still agree
+        with scheduling. Warmup requests can reach this without prepare_resources().
+        """
+        if self._sparse_batch_prepared:
+            self.get_sparse_batch(request_ids)
+            torch.cuda.current_stream(self._stream.device).wait_stream(self._stream)
+        else:
+            self._prepare_sparse_batch(request_ids)
+
+    def _prepare_sparse_batch(self, request_ids: list[int]) -> None:
+        """Publish scheduled caches in model input order before a forward.
+
+        Continuing requests keep their Batch membership and sparse GPU residency across
+        steps. Members write their page indices into Batch staging; the legacy SWA and
+        indexer tables receive a snapshot after scheduling and row reordering.
+        """
+        if not self._enable_kv_cache_offload or not any(
+            self._compress_ratios[layer] == DEEPSEEK_V4_SPARSE_RATIO for layer in self.pp_layers
+        ):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Sparse Batch publication must run outside CUDA graph capture")
+        if len(request_ids) > self.max_batch_size:
+            raise ValueError("Scheduled requests exceed sparse Batch capacity")
+        caches = {}
+        padding = False
+        for request_id in request_ids:
+            if request_id == CUDA_GRAPH_DUMMY_REQUEST_ID:
+                padding = True
+                continue
+            if padding:
+                raise ValueError("CUDA-graph dummy requests must form a trailing suffix")
+            if request_id in caches:
+                raise ValueError("Sparse Batch requires unique request IDs")
+            cache = self.kv_cache_map.get(request_id)
+            if cache is None or not cache.is_active:
+                raise ValueError("Sparse Batch requires active scheduled request caches")
+            if cache.beam_width != 1:
+                raise ValueError("Sparse Batch supports one beam per request")
+            if cache.cuda_stream != self._stream.cuda_stream:
+                raise RuntimeError("Sparse Batch requires the manager's cache stream")
+            if not 0 <= cache.history_length <= cache.capacity:
+                raise ValueError("Invalid KVCM history frontier")
+            if cache.num_blocks > self.max_blocks_per_seq:
+                raise ValueError("Request allocation exceeds sparse Batch page-table capacity")
+            caches[request_id] = cache
+
+        if self._sparse_batch is None:
+            self._sparse_batch = Batch(
+                self.impl,
+                CudaStream(self._stream.cuda_stream),
+                max_batch_size=self.max_batch_size,
+                max_blocks_per_seq=self.max_blocks_per_seq,
+                # The fetch and the write-back read converted indices, so every sparse
+                # buffer needs a table. Their shape follows from the pool layout.
+                index_tables=self.impl.sparse_index_table_requests(),
+            )
+        batch = self._sparse_batch
+        try:
+            batch.wait_published()
+            self._release_sparse_batch(
+                request_id for request_id in self._sparse_batch_members if request_id not in caches
+            )
+            for request_id, cache in caches.items():
+                if request_id not in self._sparse_batch_members:
+                    batch.add_kv_cache(cache)
+                    self._sparse_batch_members[request_id] = cache
+            batch.reorder(list(caches.values()))
+            self._sparse_batch_members = caches
+            self._refresh_sparse_page_index_bufs()
+            stream = torch.cuda.current_stream(self._stream.device)
+            # Reusing the device mirror follows the previous forward. Publish on
+            # the cache stream so metadata preparation can also join it there.
+            self._stream.wait_stream(stream)
+            batch.publish()
+            stream.wait_stream(self._stream)
+            self._sparse_batch_prepared = True
+        finally:
+            if not self._sparse_batch_prepared:
+                self._release_sparse_batch()
+
+    def get_sparse_batch(self, request_ids: list[int]) -> Batch:
+        """Return the published Batch after checking the attention metadata's row order.
+
+        Rows follow context requests then generation requests. CUDA graph padding is a
+        trailing suffix of free rows, whose page indices are BAD_PAGE_INDEX and whose
+        watermarks are zero. Fetch inputs must use Batch.max_batch_size rows, even when
+        a smaller attention profile is executing.
+        """
+        if self._sparse_batch is None or not self._sparse_batch_prepared:
+            raise RuntimeError("Sparse Batch must be prepared before model execution")
+        live_ids = list(self._sparse_batch_members)
+        if (
+            len(request_ids) > self._sparse_batch.max_batch_size
+            or request_ids[: len(live_ids)] != live_ids
+            or any(req != CUDA_GRAPH_DUMMY_REQUEST_ID for req in request_ids[len(live_ids) :])
+        ):
+            raise ValueError("Attention request order does not match the published sparse Batch")
+        return self._sparse_batch
+
+    def _refresh_sparse_page_index_bufs(self) -> None:
+        """Snapshot Batch-owned indices for the legacy SWA and indexer consumers."""
+        if not self._sparse_batch_members:
+            return
+        assert self._sparse_batch is not None
+        indices = torch.tensor(
+            [
+                self.index_mapper.get_index(request_id) * self.max_beam_width
+                for request_id in self._sparse_batch_members
+            ],
+            dtype=torch.long,
+            device="cpu",
+        )
+        for pool_id in range(self.num_pools):
+            table = torch.from_dlpack(self._sparse_batch.coalesced_page_table(pool_id))
+            self.host_kv_cache_block_offsets[pool_id, :, 0, :].index_copy_(
+                0, indices, table[: len(self._sparse_batch_members)]
+            )
+
+    def _release_sparse_batch(self, request_ids: Iterable[int] | None = None) -> None:
+        """Detach departing requests while retaining other members' GPU cache leases."""
+        if self._sparse_batch is None:
+            return
+        self._sparse_batch.wait_published()
+        request_ids = list(self._sparse_batch_members if request_ids is None else request_ids)
+        for request_id in request_ids:
+            cache = self._sparse_batch_members.get(request_id)
+            if cache is None:
+                continue
+            self._sparse_batch_prepared = False
+            self._sparse_batch.remove_kv_cache(cache)
+            del self._sparse_batch_members[request_id]
+            # Removal restores the cache's internal indices. Rebind the runtime's
+            # host table so subsequent resizes also reach SWA and indexer consumers.
+            self._set_page_index_bufs(request_id, cache)
+
+    def suspend_request(self, req: llm_request.LlmRequest) -> None:
+        self._release_sparse_batch([req.py_request_id])
+        self._order_sparse_history_update([req])
+        super().suspend_request(req)
+
+    def free_resources(self, request: llm_request.LlmRequest, pin_on_release: bool = False) -> None:
+        self._release_sparse_batch([request.py_request_id])
+        self._order_sparse_history_update([request])
+        super().free_resources(request, pin_on_release)
+
+    def release_index_slot(self, request_id: int) -> None:
+        self._release_sparse_batch([request_id])
+        super().release_index_slot(request_id)
+
+    def shutdown(self) -> None:
+        self._release_sparse_batch()
+        self._sparse_batch = None
+        super().shutdown()
+
+    def _validate_sparse_history_policy(self) -> None:
+        """Check fixed history policies during attention metadata initialization."""
+        if (
+            self.enable_block_reuse
+            or self.kv_compression_manages_history
+            or self._has_cp_helix
+            or self.is_draft
+        ):
+            raise NotImplementedError(
+                "Sparse offload requires block reuse, KV compression, CP Helix, and draft caches disabled"
+            )
+
+    def _order_sparse_history_update(self, requests: Iterable[llm_request.LlmRequest]) -> None:
+        """Order writeback after all model producers and attention readers.
+
+        The executor orders its calling stream after model forward.
+        Join it onto the cache stream before flushing completed units or resizing
+        request caches. prepare_sparse_batch() supplies the reverse dependency
+        for the next forward.
+        """
+        if not self._enable_kv_cache_offload:
+            return
+        active = False
+        for request in requests:
+            cache = self.kv_cache_map.get(request.py_request_id)
+            if cache is None or not cache.is_active:
+                continue
+            if cache.cuda_stream != self._stream.cuda_stream:
+                raise RuntimeError("Sparse history updates require the manager's cache stream")
+            active = True
+        if active:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Sparse history updates must run outside CUDA graph capture")
+            self._stream.wait_stream(torch.cuda.current_stream(self._stream.device))
+
+    def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        self._release_sparse_batch(
+            request.py_request_id for request in scheduled_batch.context_requests
+        )
+        self._order_sparse_history_update(scheduled_batch.context_requests)
+        super().update_context_resources(scheduled_batch)
+
+    def try_allocate_generation(self, req: llm_request.LlmRequest) -> bool:
+        """Reserve a decode request's next input token unless it is already reserved.
+
+        With offload, history advances right after each forward, so at scheduling
+        time a cache holding capacity beyond its history has already reserved this
+        step. Attention-DP padding dummies are created that way. Growing such a
+        cache again would exceed the sparse cache's one-token bound between
+        capacity and history. No growth is recorded, so a skipped step reverts
+        nothing.
+        """
+        if self._enable_kv_cache_offload:
+            if self._sparse_batch is not None:
+                self._sparse_batch.wait_published()
+            cache = self.kv_cache_map.get(req.py_request_id)
+            if cache is not None and cache.is_active and cache.capacity > cache.history_length:
+                return True
+        return super().try_allocate_generation(req)
+
+    def revert_allocate_generation(self, req: llm_request.LlmRequest) -> None:
+        if self._sparse_batch is not None:
+            self._sparse_batch.wait_published()
+        super().revert_allocate_generation(req)
+
+    def update_forward_resources(
+        self, scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+    ) -> None:
+        """Advance sparse decode history from executed inputs before the next schedule.
+
+        Offload decode validates one input token per request, with speculation
+        disabled. That input's KV is produced by this forward; the sampled
+        output has no KV yet. Queue writeback after the forward on the cache
+        stream, independently of when the executor consumes sampling results.
+        """
+        if not self._enable_kv_cache_offload or not scheduled_batch.generation_requests:
+            return
+        wait_for_input_copy()
+        self._order_sparse_history_update(scheduled_batch.generation_requests)
+        # Before any history moves: the write-back reads
+        # the converted indices the Batch published, so it has to run while the members are
+        # still seated. A row that is not advancing repeats its own history, which asks for
+        # nothing.
+        batch = self._sparse_batch
+        if batch is not None:
+            batch.wait_published()
+            histories = [0] * batch.max_batch_size
+            for cache in self._sparse_batch_members.values():
+                row = batch.row_of(cache)
+                if row >= 0:
+                    histories[row] = cache.history_length
+            for request in scheduled_batch.generation_requests:
+                cache = self.kv_cache_map.get(request.py_request_id)
+                if cache is None or not cache.is_active:
+                    continue
+                row = batch.row_of(cache)
+                if row >= 0:
+                    histories[row] = cache.history_length + 1
+            batch.flush_sparse_units(histories)
+
+        # The flush watermark belongs to the attached Batch row. Keep membership
+        # until resize has checked it and advanced the request's history.
+        for request in scheduled_batch.generation_requests:
+            request_id = request.py_request_id
+            cache = self.kv_cache_map.get(request_id)
+            if cache is None or not cache.is_active:
+                continue
+            history_length = cache.history_length + 1
+            if history_length > cache.capacity:
+                raise ValueError(f"Sparse decode request {request_id} has no reserved input token")
+            if not cache.resize(None, history_length):
+                raise ValueError(
+                    f"Failed to advance sparse KV history for request {request_id} "
+                    f"to {history_length} tokens after model forward"
+                )
+            self._allocated_draft_lens.pop(request_id, None)
+        self._sparse_batch_prepared = False
+
+    def update_resources(
+        self,
+        scheduled_batch: ScheduledRequests,
+        attn_metadata: "AttentionMetadata | None" = None,
+        kv_cache_dtype_byte_size: float | None = None,
+    ) -> None:
+        if self._enable_kv_cache_offload:
+            # Sparse decode has no speculative slots to rewind. History follows
+            # forward completion; delayed sampling updates must neither rewind it
+            # nor detach the Batch prepared for a later forward.
+            return
+        super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
+
     def get_sparse_offload_descriptors(self) -> dict[int, SparseOffloadLayerDescriptor]:
         """Describe each local ratio-4 layer's complete sparse fetch buffer set."""
         if not self._enable_kv_cache_offload:

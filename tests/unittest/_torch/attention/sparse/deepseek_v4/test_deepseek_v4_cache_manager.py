@@ -829,6 +829,13 @@ class _SchedulingBatch:
         cache.page_index_owner = "cache"
         self.leaves.append(cache.id)
 
+    def reorder(self, caches: list[_HistoryCache]) -> None:
+        assert not self.upload_pending
+        assert {cache.id for cache in caches} == {
+            cache.id for cache in self.rows if cache is not None
+        }
+        self.rows[:] = list(caches) + [None] * (self.max_batch_size - len(caches))
+
     def coalesced_page_table(self, pool_id: int) -> torch.Tensor:
         return torch.tensor(
             [
@@ -954,24 +961,22 @@ def test_sparse_batch_retains_continuing_members_and_refreshes_legacy_tables(
     assert batch.joins == [20, 10]
     assert not batch.leaves
     assert manager.get_sparse_batch([10, 20]) is batch
-    # Only the columns below the members' block counts are copied; past them the
-    # runtime's binding keeps its own BAD_PAGE_INDEX, here the -99 the test filled.
     for pool_id in range(manager.num_pools):
         assert manager.host_kv_cache_block_offsets[pool_id, 3 * max_beam_width, 0].tolist() == [
             4,
             8,
             9,
-            -99,
-            -99,
-            -99,
+            -1,
+            -1,
+            -1,
         ]
         assert manager.host_kv_cache_block_offsets[pool_id, max_beam_width, 0].tolist() == [
             0,
             7,
             8,
-            -99,
-            -99,
-            -99,
+            -1,
+            -1,
+            -1,
         ]
 
     case.scheduled.generation_requests = [case.request]

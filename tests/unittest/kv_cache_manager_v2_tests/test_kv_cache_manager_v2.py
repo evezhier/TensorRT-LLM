@@ -4233,6 +4233,78 @@ class TestBatch(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_reorder_preserves_bindings_watermarks_and_device_addresses(self) -> None:
+        import torch
+
+        manager = self._manager()
+        caches = []
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                lg = manager.get_layer_group_id(0)
+                table = torch.from_dlpack(batch.gpu_coalesced_page_table(lg))
+                address = table.data_ptr()
+                for history in (17, 31, 63):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(handle))
+                    self.assertTrue(cache.resize(128, history))
+                    batch.add_kv_cache(cache)
+                batch.flush_sparse_units([17, 31, 63])
+                batch.publish()
+                order = [caches[2], caches[0], caches[1]]
+                batch.reorder(order)
+                self.assertEqual([batch.row_of(cache) for cache in order], [0, 1, 2])
+                self.assertEqual([batch.flushed_history(row) for row in range(3)], [63, 17, 31])
+
+                # Growth must update the new row, and removing a member must clear it.
+                self.assertTrue(caches[2].resize(257))
+                batch.remove_kv_cache(caches[0])
+                order = [caches[1], caches[2]]
+                batch.reorder(order)
+                batch.publish()
+                torch.cuda.synchronize()
+                self.assertEqual(table.data_ptr(), address)
+                for row, cache in enumerate(order):
+                    self.assertEqual(table[row].tolist(), list(cache.get_base_page_indices(lg)))
+                self.assertTrue(bool((table[2] == BAD_PAGE_INDEX).all()))
+                self.assertEqual(torch.from_dlpack(batch.history_lengths()).tolist(), [31, 63, 0])
+                self.assertEqual(torch.from_dlpack(batch.capacities()).tolist(), [128, 257, 0])
+                self.assertEqual([batch.flushed_history(row) for row in range(2)], [31, 63])
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_reorder_rejects_invalid_members_without_changing_rows(self) -> None:
+        manager = self._manager()
+        caches = []
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                for _ in range(3):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(caches[0], 2)
+                batch.add_kv_cache(caches[1], 1)
+                for invalid in ([caches[0]], [caches[1], caches[1]], [caches[1], caches[2]]):
+                    with self.assertRaises(ValueError):
+                        batch.reorder(invalid)
+                    self.assertEqual([batch.row_of(cache) for cache in caches], [2, 1, -1])
+        finally:
+            for cache in caches:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
     def test_the_batch_keeps_a_seated_member_alive(self):
         """A caller may keep only the Batch: seating is what holds the cache up.
 

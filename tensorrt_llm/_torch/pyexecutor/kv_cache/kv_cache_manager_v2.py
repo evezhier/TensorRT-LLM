@@ -33,6 +33,7 @@ from typing import (
 )
 
 import numpy as np
+import psutil
 import torch
 from strenum import StrEnum
 
@@ -410,7 +411,7 @@ class HostMemoryLimits(NamedTuple):
 
     Attributes:
         local_ranks: Ranks sharing this node.
-        mem_available: The node's available memory in bytes; ``inf`` when unknown.
+        mem_available: Available host bytes within node and cgroup limits; ``inf`` when unknown.
         memlock_limit: The RLIMIT_MEMLOCK soft limit in bytes; ``inf`` when unlimited.
     """
 
@@ -420,7 +421,7 @@ class HostMemoryLimits(NamedTuple):
 
     @property
     def rank_share(self) -> float:
-        """This rank's share of the node's available memory."""
+        """This rank's share of the available host memory."""
         return self.mem_available / self.local_ranks
 
     @property
@@ -440,11 +441,18 @@ def get_host_memory_limits(mapping: Mapping) -> HostMemoryLimits:
     """
     import resource
 
+    from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
+        cgroup_available_host_memory,
+    )
+
     local_ranks = max(1, Distributed.get(mapping).local_world_size)
     try:
-        mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+        mem_available = psutil.virtual_memory().available
     except (ValueError, OSError):
         mem_available = float("inf")
+    cgroup_available = cgroup_available_host_memory()
+    if cgroup_available is not None:
+        mem_available = min(mem_available, cgroup_available)
     try:
         soft_limit, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
         memlock_limit = soft_limit if soft_limit != resource.RLIM_INFINITY else float("inf")
@@ -531,7 +539,7 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
     """Reduce the auto-provisioned host cache tier quota to the fleet minimum.
 
     ``_compute_auto_host_tier_quota`` reads rank-local host state
-    (``SC_AVPHYS_PAGES``, ``RLIMIT_MEMLOCK``), so co-scheduled ranks can arrive
+    (available host memory and ``RLIMIT_MEMLOCK``), so co-scheduled ranks can arrive
     at divergent host quotas (observed up to 10x). Divergent host-tier
     retention makes per-rank MAX_UTILIZATION schedulers disagree about which
     suspended requests can resume, which wedges collectives on
