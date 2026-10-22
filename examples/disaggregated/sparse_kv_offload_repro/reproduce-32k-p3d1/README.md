@@ -86,9 +86,24 @@ bash examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/reproduce
 
 The wrapper copies the measured harness into the output directory, records source/runtime provenance, samples GPU telemetry, runs resident then offload, and runs the offline analyses. It refuses to overwrite an existing output directory. It never allocates GPUs itself.
 
-For Slurm, obtain a new exclusive eight-GPU allocation with the CPU/RAM
-resources above. From this checkout, set its job ID and the site-specific
-container paths:
+To allocate the original one-node serving topology with `sbatch`, build this
+checkout first and submit from the repository root:
+
+```bash
+export LLM_MODELS_ROOT=/absolute/model-root
+export REPRO_IMAGE=/absolute/compatible-container.sqsh
+export REPRO_OUTPUT_ROOT=/absolute/results-parent
+sbatch --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
+    examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
+```
+
+The script requests one exclusive node with eight GPUs, 160 CPUs and 1,024 GiB
+of RAM, then writes to `32k-serving-JOB_ID` under `REPRO_OUTPUT_ROOT`. It mounts
+the checkout, model root and results parent at the same paths in the container.
+Set `REPRO_MOUNTS` if extra Python dependencies or caches live elsewhere.
+
+If you already have an eight-GPU Slurm allocation with the CPU/RAM resources
+above, use the lower-level wrapper from this checkout:
 
 ```bash
 export LLM_MODELS_ROOT=/absolute/model-root
