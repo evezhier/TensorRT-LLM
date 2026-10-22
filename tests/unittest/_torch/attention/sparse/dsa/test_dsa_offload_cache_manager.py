@@ -10,6 +10,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
 from tensorrt_llm._torch.attention.backends.sparse.dsa import custom_ops as dsa_custom_ops
 from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmAttention
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import forward_sparse_attn_custom_op
 from tensorrt_llm._torch.attention.backends.sparse.offload import (
     SPARSE_OFFLOAD_STATE_COPIES,
@@ -60,7 +61,10 @@ def _pretrained_config(num_layers: int = NUM_LAYERS) -> SimpleNamespace:
 
 
 def _manager(
-    offload: bool = True, num_layers: int = NUM_LAYERS, dtype: DataType = DataType.FP8
+    offload: bool = True,
+    num_layers: int = NUM_LAYERS,
+    dtype: DataType = DataType.FP8,
+    pretrained_config: SimpleNamespace | None = None,
 ) -> DSACacheManagerV2:
     sparse_config = DeepSeekSparseAttentionConfig(
         index_head_dim=128,
@@ -83,7 +87,7 @@ def _manager(
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         dtype=dtype,
         sparse_attention_config=sparse_config,
-        pretrained_config=_pretrained_config(num_layers),
+        pretrained_config=pretrained_config or _pretrained_config(num_layers),
     )
 
 
@@ -600,6 +604,137 @@ def test_overlapped_write_mapping_tracks_reordered_requests(monkeypatch, dtype, 
                 torch.testing.assert_close(
                     observed_slots[layer], (expected >= 0).to(torch.int32) - 1
                 )
+            manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
+        for request in requests:
+            manager.free_resources(request)
+    finally:
+        torch.cuda.synchronize()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("capture", [False, True], ids=["eager", "cuda-graph"])
+@pytest.mark.parametrize("explicit_pattern", [False, True], ids=["glm52", "glm53"])
+def test_shared_layer_prefetch_preserves_history(monkeypatch, dtype, capture, explicit_pattern):
+    """Lookahead fetch preserves rows through eviction, request reordering and replay."""
+    config = _pretrained_config()
+    if explicit_pattern:
+        config.index_topk_pattern = ["F", "S", "S", "F", "S", "F", "S"]
+    manager = _manager(dtype=dtype, pretrained_config=config)
+    requests = [_request(17, 1), _request(18, 1)]
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.kv_cache_manager = manager
+    metadata.sparse_metadata_params = SimpleNamespace(enable_kv_cache_offload=True)
+    metadata.beam_width = 1
+    metadata.max_draft_tokens = 0
+    metadata.draft_kv_cache_manager = None
+    metadata.sparse_mla_topk = TOPK
+    metadata.is_cuda_graph = False
+    metadata.cuda_graph_buffers = {}
+    metadata.get_empty = lambda buffers, shape, dtype, **kwargs: torch.empty(
+        shape, dtype=dtype, device="cuda"
+    )
+    metadata._init_dsa_sparse_offload_state()
+    expected_pairs = {0: 1, 1: 2, 3: 4, 5: 6} if explicit_pattern else {2: 3, 3: 4, 4: 5}
+    assert metadata.sparse_offload_next_shared_layer == expected_pairs
+    state = metadata.sparse_offload_state
+    # Inspect raw data and scale bytes separately; dequantization has its own test.
+    state.nvfp4_scratch = None
+    num_requests = len(requests)
+    metadata._num_tokens = num_requests
+    metadata._seq_lens = torch.ones(num_requests, dtype=torch.int32)
+    metadata._num_contexts = 0
+    metadata.shared_topk_indices = torch.full(
+        (num_requests, TOPK), -1, dtype=torch.int32, device="cuda"
+    )
+    metadata.req_idx_per_token = torch.arange(num_requests, dtype=torch.int32, device="cuda")
+    metadata.kv_lens_cuda = torch.empty(num_requests, dtype=torch.int32, device="cuda")
+    latent = torch.empty((num_requests, HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    token_values = torch.empty((num_requests, 3), dtype=torch.int32, device="cuda")
+    arenas = {}
+    backends = []
+    for layer, descriptor in state.layers.items():
+        if dtype == DataType.NVFP4:
+            arenas[layer] = [
+                _arena_rows(descriptor, descriptor.data_buffer_index, NVFP4_DATA_BYTES),
+                _arena_rows(descriptor, descriptor.scale_buffer_index, NVFP4_SCALE_BYTES),
+            ]
+        else:
+            arenas[layer] = [_arena_rows(descriptor, descriptor.data_buffer_index, HEAD_DIM)]
+        backend = object.__new__(DSATrtllmAttention)
+        backend.layer_idx = layer
+        backend.sparse_params = SimpleNamespace(enable_kv_cache_offload=True)
+        backends.append(backend)
+    observed = torch.empty(
+        (NUM_LAYERS, len(arenas[0]), num_requests, TOPK, 3), dtype=torch.int32, device="cuda"
+    )
+    args = SimpleNamespace(sparse_runtime_params=SimpleNamespace(aux_kv_cache_pool_ptr=0))
+
+    def write_token(self, fused_q, q_pe, latent_cache, metadata, **kwargs):
+        rows = kwargs["latent_write_target"].block_offsets[0, :num_requests, 0, 0].long()
+        token_values[:, 1] = self.layer_idx
+        for arena in arenas[self.layer_idx]:
+            arena[rows, :3] = token_values
+
+    monkeypatch.setattr(TrtllmAttention, "mla_rope_generation", write_token)
+
+    def forward():
+        for backend in backends:
+            backend.prepare_sparse_write(metadata)
+            backend.mla_rope_generation(None, None, latent, metadata)
+            indices = backend._sparse_offload_arena_indices(
+                metadata.shared_topk_indices, metadata, args
+            )
+            for buffer, arena in enumerate(arenas[backend.layer_idx]):
+                observed[backend.layer_idx, buffer].copy_(arena[indices.clamp_min(0).long(), :3])
+            backend.prefetch_next_sparse_history(metadata)
+
+    graph = None
+    generator = torch.Generator().manual_seed(17)
+    try:
+        for request in requests:
+            assert manager.prepare_disagg_gen_init(request)
+        for step in range(3 * TOKENS_PER_BLOCK):
+            for request in requests:
+                assert manager.try_allocate_generation(request)
+            ordered = requests if step % 2 == 0 else requests[::-1]
+            scheduled = SimpleNamespace(context_requests=[], generation_requests=ordered)
+            manager.prepare_resources(scheduled)
+            ids = [request.py_request_id for request in ordered]
+            manager.prepare_sparse_offload(state, ids, beam_width=1)
+            history = step + 1
+            selected = torch.full((num_requests, TOPK), -1, dtype=torch.int32)
+            for row in range(num_requests):
+                candidates = torch.randperm(history - 1, generator=generator)[: TOPK - 1] + 1
+                selected[row, : candidates.numel()] = candidates
+                selected[row, -1] = history
+            metadata.shared_topk_indices.copy_(selected)
+            metadata.kv_lens_cuda.fill_(history + 1)
+            token_values.copy_(torch.tensor([[history, 0, rid] for rid in ids], dtype=torch.int32))
+            with with_multi_stream(True):
+                if capture and graph is None:
+                    forward()
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        forward()
+                if graph is None:
+                    forward()
+                else:
+                    graph.replay()
+            assert metadata.sparse_offload_write_pending is None
+            assert metadata.sparse_offload_fetch_pending is None
+            actual = observed.cpu()
+            for layer in range(NUM_LAYERS):
+                for row, rid in enumerate(ids):
+                    units = selected[row][selected[row] >= 0]
+                    expected = torch.stack(
+                        (units, torch.full_like(units, layer), torch.full_like(units, rid)), dim=1
+                    )
+                    for buffer in range(len(arenas[layer])):
+                        torch.testing.assert_close(
+                            actual[layer, buffer, row][selected[row] >= 0], expected
+                        )
             manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
         for request in requests:
             manager.free_resources(request)

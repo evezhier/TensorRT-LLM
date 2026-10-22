@@ -921,8 +921,10 @@ class SparseOffloadCacheMixin:
         a unit in flight gets -1. A writer addressing requests by input position
         reads request i's entries at Batch row ``state.batch_rows[i]``, for example
         through ``gather_sparse_batch_rows``. The caller must join Batch publication
-        before this call, and the writer must finish before fetch/attention or a
-        history update. No KV is fetched here.
+        before this call. Reservation must finish before either the writer or
+        the history fetch; they may run concurrently because fetch excludes the
+        protected in-flight row. Both must finish before attention or a history
+        update. No KV is fetched here.
 
         A layer with block scales has its data and scale columns compared once,
         outside graph capture, after a live row is seen: writers and the NVFP4
@@ -1000,9 +1002,9 @@ class SparseOffloadCacheMixin:
         must supply the in-flight write index separately, without treating this
         output as an ordinal-indexed page table or rescaling its indices.
 
-        The caller joins selection producers before this call. Selection, fetch
-        and the consuming attention stay ordered on the current stream. Output
-        storage is reused by subsequent layers after attention consumes it.
+        The caller joins selection producers and write reservation before this
+        call, and joins the fetch before consuming its output on another stream.
+        Output storage is reused by subsequent layers after attention consumes it.
         """
         if (
             not self._enable_kv_cache_offload

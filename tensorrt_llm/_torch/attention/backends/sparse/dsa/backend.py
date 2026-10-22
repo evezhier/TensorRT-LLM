@@ -300,10 +300,15 @@ class DSATrtllmAttention(TrtllmAttention):
         topk_indices = topk_indices[:, :topk]
         request_indices = metadata.req_idx_per_token[:num_tokens]
         kv_lengths = metadata.kv_lens_cuda[: metadata.num_seqs]
-        fetched = metadata.kv_cache_manager.fetch_sparse_indices(
-            state, self.layer_idx, topk_indices, request_indices, kv_lengths
-        )
         descriptor = state.layers[self.layer_idx]
+        if getattr(metadata, "sparse_offload_fetch_pending", None) == self.layer_idx:
+            metadata.sparse_offload_fetch_event.wait()
+            fetched = state.fetched_indices[len(descriptor.buffer_ids)]
+            metadata.sparse_offload_fetch_pending = None
+        else:
+            fetched = metadata.kv_cache_manager.fetch_sparse_indices(
+                state, self.layer_idx, topk_indices, request_indices, kv_lengths
+            )
         data_index = descriptor.data_buffer_index
         indices = merge_sparse_arena_indices(
             topk_indices,
@@ -359,12 +364,50 @@ class DSATrtllmAttention(TrtllmAttention):
             metadata.sparse_offload_write_event.record()
         metadata.sparse_offload_write_pending = self.layer_idx
 
-    def _prepare_sparse_write_mapping(self, metadata: DSAtrtllmAttentionMetadata) -> None:
+    def prefetch_next_sparse_history(self, metadata: DSAtrtllmAttentionMetadata) -> None:
+        """Fetch the next shared-indexer layer during the current layer's MLP.
+
+        Call after this layer's attention consumes the shared offload scratch.
+        A shared layer already has its top-k; its reservation protects the new
+        token's row while the history fetch runs independently of its writer.
+        The writer joins reservation, and attention joins the fetch.
+        """
+        if not self.sparse_params.enable_kv_cache_offload or not do_multi_stream():
+            return
+        layer_idx = metadata.sparse_offload_next_shared_layer.get(self.layer_idx)
+        if layer_idx is None or metadata.sparse_offload_stream is None:
+            return
+        if (
+            metadata.sparse_offload_write_pending is not None
+            or metadata.sparse_offload_fetch_pending is not None
+        ):
+            raise RuntimeError("The preceding sparse offload work has not been consumed")
+        metadata.sparse_offload_start_event.record()
+        with torch.cuda.stream(metadata.sparse_offload_stream):
+            metadata.sparse_offload_start_event.wait()
+            self._prepare_sparse_write_mapping(metadata, layer_idx)
+            metadata.sparse_offload_write_event.record()
+            metadata.kv_cache_manager.fetch_sparse_indices(
+                metadata.sparse_offload_state,
+                layer_idx,
+                metadata.shared_topk_indices[: metadata.num_tokens, : metadata.sparse_mla_topk],
+                metadata.req_idx_per_token[: metadata.num_tokens],
+                metadata.kv_lens_cuda[: metadata.num_seqs],
+            )
+            metadata.sparse_offload_fetch_event.record()
+        metadata.sparse_offload_write_pending = layer_idx
+        metadata.sparse_offload_fetch_pending = layer_idx
+
+    def _prepare_sparse_write_mapping(
+        self, metadata: DSAtrtllmAttentionMetadata, layer_idx: Optional[int] = None
+    ) -> None:
         """Publish the reserved arena rows and the writer's one-token page table."""
+        if layer_idx is None:
+            layer_idx = self.layer_idx
         state = metadata.sparse_offload_state
         manager = metadata.kv_cache_manager
-        write_indices = manager.prepare_sparse_write_indices(state, self.layer_idx)
-        data_index = state.layers[self.layer_idx].data_buffer_index
+        write_indices = manager.prepare_sparse_write_indices(state, layer_idx)
+        data_index = state.layers[layer_idx].data_buffer_index
         write_rows = gather_sparse_batch_rows(
             write_indices[:, data_index],
             state.batch_rows,

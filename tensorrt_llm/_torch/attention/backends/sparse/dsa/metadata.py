@@ -261,13 +261,25 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.sparse_offload_attn_indices: Optional[torch.Tensor] = None
         self.sparse_offload_stream: Optional[torch.cuda.Stream] = None
         self.sparse_offload_write_pending: Optional[int] = None
+        self.sparse_offload_fetch_pending: Optional[int] = None
+        self.sparse_offload_next_shared_layer: dict[int, int] = {}
         if not self._offloads_dsa_latent():
             return
         self.sparse_offload_stream = torch.cuda.Stream()
         self.sparse_offload_start_event = torch.cuda.Event()
         self.sparse_offload_write_event = torch.cuda.Event()
+        self.sparse_offload_fetch_event = torch.cuda.Event()
         manager = self.kv_cache_manager
         layers = get_sparse_offload_metadata_layers(self)
+        local_layers = manager.pp_layers
+        indexer_mask = manager.indexer_k_cache_local_layer_mask
+        self.sparse_offload_next_shared_layer = {
+            previous: following
+            for previous, following, has_indexer in zip(
+                local_layers, local_layers[1:], indexer_mask[1:]
+            )
+            if not has_indexer and previous in layers and following in layers
+        }
         batch = manager.max_batch_size
 
         def allocate(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:

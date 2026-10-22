@@ -418,6 +418,7 @@ def _forward_dsa_attn(
     # capture requires the join within the same layer's forward.
     if self.mqa.indexer is not None:
         self.mqa.indexer.maybe_join_prev_topk_copy()
+    self.mqa.prefetch_next_sparse_history(attn_metadata)
 
 
 def should_use_short_mha(
