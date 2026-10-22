@@ -259,8 +259,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.sparse_latent_block_offsets: Optional[torch.Tensor] = None
         self.sparse_latent_write_slots: Optional[torch.Tensor] = None
         self.sparse_offload_attn_indices: Optional[torch.Tensor] = None
+        self.sparse_offload_stream: Optional[torch.cuda.Stream] = None
+        self.sparse_offload_write_pending: Optional[int] = None
         if not self._offloads_dsa_latent():
             return
+        self.sparse_offload_stream = torch.cuda.Stream()
+        self.sparse_offload_start_event = torch.cuda.Event()
+        self.sparse_offload_write_event = torch.cuda.Event()
         manager = self.kv_cache_manager
         layers = get_sparse_offload_metadata_layers(self)
         batch = manager.max_batch_size

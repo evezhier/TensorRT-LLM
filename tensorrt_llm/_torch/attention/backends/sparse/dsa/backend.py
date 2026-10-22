@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PositionalEmbeddingParams,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import MlaLatentWriteTarget, TrtllmAttention
+from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..offload_kernels import gather_sparse_batch_rows, merge_sparse_arena_indices
@@ -339,6 +340,38 @@ class DSATrtllmAttention(TrtllmAttention):
         forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
         return indices
 
+    def prepare_sparse_write(self, metadata: DSAtrtllmAttentionMetadata) -> None:
+        """Overlap this layer's write mapping with its independent projections."""
+        if not self.sparse_params.enable_kv_cache_offload or not do_multi_stream():
+            return
+        stream = metadata.sparse_offload_stream
+        if stream is None:
+            return
+        pending = metadata.sparse_offload_write_pending
+        if pending == self.layer_idx:
+            return
+        if pending is not None:
+            raise RuntimeError("The preceding sparse write mapping has not been consumed")
+        metadata.sparse_offload_start_event.record()
+        with torch.cuda.stream(stream):
+            metadata.sparse_offload_start_event.wait()
+            self._prepare_sparse_write_mapping(metadata)
+            metadata.sparse_offload_write_event.record()
+        metadata.sparse_offload_write_pending = self.layer_idx
+
+    def _prepare_sparse_write_mapping(self, metadata: DSAtrtllmAttentionMetadata) -> None:
+        """Publish the reserved arena rows and the writer's one-token page table."""
+        state = metadata.sparse_offload_state
+        manager = metadata.kv_cache_manager
+        write_indices = manager.prepare_sparse_write_indices(state, self.layer_idx)
+        data_index = state.layers[self.layer_idx].data_buffer_index
+        write_rows = gather_sparse_batch_rows(
+            write_indices[:, data_index],
+            state.batch_rows,
+            out=metadata.sparse_latent_block_offsets[0, :, 0, 0],
+        )
+        metadata.sparse_latent_write_slots.copy_((write_rows >= 0).to(torch.int32) - 1)
+
     def mla_rope_generation(
         self,
         fused_q: Optional[torch.Tensor],
@@ -355,19 +388,13 @@ class DSATrtllmAttention(TrtllmAttention):
                 fused_q, q_pe, latent_cache, metadata, *args, **kwargs
             )
         manager = metadata.kv_cache_manager
-        write_indices = manager.prepare_sparse_write_indices(state, self.layer_idx)
-        data_index = state.layers[self.layer_idx].data_buffer_index
-        # One token per request, in input order: each request's one-token page is
-        # its Batch row's write row. A request without a unit in flight writes nothing.
-        # NVFP4 block scales go to the same row of their own arena.
-        write_rows = gather_sparse_batch_rows(
-            write_indices[:, data_index],
-            state.batch_rows,
-            out=metadata.sparse_latent_block_offsets[0, :, 0, 0],
-        )
+        if getattr(metadata, "sparse_offload_write_pending", None) == self.layer_idx:
+            metadata.sparse_offload_write_event.wait()
+            metadata.sparse_offload_write_pending = None
+        else:
+            self._prepare_sparse_write_mapping(metadata)
         num_tokens = latent_cache.shape[0]
         write_slots = metadata.sparse_latent_write_slots[:num_tokens]
-        write_slots.copy_((write_rows[:num_tokens] >= 0).to(torch.int32) - 1)
         pool_pointers, pool_mapping = manager.get_sparse_latent_write_pool(self.layer_idx)
         kwargs["latent_write_target"] = MlaLatentWriteTarget(
             block_offsets=metadata.sparse_latent_block_offsets,

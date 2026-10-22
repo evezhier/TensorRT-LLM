@@ -8,13 +8,17 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
+from tensorrt_llm._torch.attention.backends.sparse.dsa import custom_ops as dsa_custom_ops
 from tensorrt_llm._torch.attention.backends.sparse.dsa.backend import DSATrtllmAttention
+from tensorrt_llm._torch.attention.backends.sparse.dsa.module import forward_sparse_attn_custom_op
 from tensorrt_llm._torch.attention.backends.sparse.offload import (
     SPARSE_OFFLOAD_STATE_COPIES,
     SparseOffloadState,
     allocate_sparse_offload_state,
 )
 from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import merge_sparse_arena_indices
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_version
@@ -489,3 +493,116 @@ def test_offload_scratch_counts_the_latent_writer(manager):
         manager.kv_cache_manager_py_config
     )
     assert with_writer - state_only == 2 * 3 * MAX_BATCH_SIZE * 4
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("capture", [False, True], ids=["eager", "cuda-graph"])
+@pytest.mark.parametrize("custom_op", [False, True], ids=["direct", "registered"])
+def test_overlapped_write_mapping_tracks_reordered_requests(monkeypatch, dtype, capture, custom_op):
+    """The writer joins reservation and reads current Batch rows on every replay."""
+    manager = _manager(num_layers=2, dtype=dtype)
+    requests = [_request(17, 1), _request(18, 1)]
+    descriptors = manager.get_sparse_offload_descriptors()
+    state = allocate_sparse_offload_state(
+        lambda name, shape, dtype: torch.empty(shape, dtype=dtype, device="cuda"),
+        descriptors,
+        max_batch_size=MAX_BATCH_SIZE,
+        topk=TOPK,
+    )
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        sparse_offload_state=state,
+        sparse_offload_stream=torch.cuda.Stream(),
+        sparse_offload_start_event=torch.cuda.Event(),
+        sparse_offload_write_event=torch.cuda.Event(),
+        sparse_offload_write_pending=None,
+        sparse_latent_block_offsets=torch.full(
+            (1, MAX_BATCH_SIZE, 2, 1), -1, dtype=torch.int32, device="cuda"
+        ),
+        sparse_latent_write_slots=torch.full(
+            (MAX_BATCH_SIZE,), -1, dtype=torch.int32, device="cuda"
+        ),
+    )
+    observed = torch.empty((2, MAX_BATCH_SIZE), dtype=torch.int32, device="cuda")
+    observed_slots = torch.empty_like(observed)
+    latent = torch.empty((len(requests), HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    backends = []
+    for layer in range(2):
+        backend = object.__new__(DSATrtllmAttention)
+        backend.layer_idx = layer
+        backend.sparse_params = SimpleNamespace(enable_kv_cache_offload=True)
+        backends.append(backend)
+
+    def consume_write_mapping(self, fused_q, q_pe, latent_cache, metadata, **kwargs):
+        target = kwargs["latent_write_target"]
+        observed[self.layer_idx].copy_(target.block_offsets[0, :, 0, 0])
+        observed_slots[self.layer_idx].copy_(metadata.sparse_latent_write_slots)
+
+    monkeypatch.setattr(TrtllmAttention, "mla_rope_generation", consume_write_mapping)
+
+    def project(hidden_states, position_ids, layer_idx):
+        assert metadata.sparse_offload_write_pending == int(layer_idx)
+        return [latent] * 4
+
+    def attend(q, compressed_kv, k_pe, latent_cache, intermediates, positions, layer_idx, output):
+        backend = backends[int(layer_idx)]
+        backend.prepare_sparse_write(metadata)
+        backend.mla_rope_generation(None, None, latent, metadata)
+
+    monkeypatch.setattr(dsa_custom_ops, "_extract_extra_attrs", lambda layer: (metadata, None))
+    monkeypatch.setattr(torch.ops.trtllm, "mla_dsa_proj", project)
+    monkeypatch.setattr(dsa_custom_ops, "maybe_bcg_mla_dsa_attn_inplace", attend)
+
+    def forward():
+        for backend in backends:
+            if custom_op:
+                mla = SimpleNamespace(mqa=backend, layer_idx_str=str(backend.layer_idx))
+                forward_sparse_attn_custom_op(mla, latent, None, [latent], None)
+                continue
+            backend.prepare_sparse_write(metadata)
+            # Entry through the attention custom op must reuse the pending mapping.
+            backend.prepare_sparse_write(metadata)
+            backend.mla_rope_generation(None, None, latent, metadata)
+
+    graph = None
+    try:
+        for request in requests:
+            assert manager.prepare_disagg_gen_init(request)
+        for step in range(6):
+            for request in requests:
+                assert manager.try_allocate_generation(request)
+            ordered = requests if step % 2 == 0 else requests[::-1]
+            scheduled = SimpleNamespace(context_requests=[], generation_requests=ordered)
+            manager.prepare_resources(scheduled)
+            manager.prepare_sparse_offload(
+                state, [request.py_request_id for request in ordered], beam_width=1
+            )
+            with with_multi_stream(True):
+                if capture and graph is None:
+                    forward()
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        forward()
+                if graph is None:
+                    forward()
+                else:
+                    graph.replay()
+            assert metadata.sparse_offload_write_pending is None
+            # The serial native API is idempotent for the same in-flight token.
+            # It independently checks the destinations consumed by the writer.
+            for layer in range(2):
+                writes = manager.prepare_sparse_write_indices(state, layer)
+                data = descriptors[layer].data_buffer_index
+                expected = torch.full_like(observed[layer], -1)
+                expected[: len(requests)] = writes[state.batch_rows[: len(requests)], data]
+                torch.testing.assert_close(observed[layer], expected)
+                torch.testing.assert_close(
+                    observed_slots[layer], (expected >= 0).to(torch.int32) - 1
+                )
+            manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
+        for request in requests:
+            manager.free_resources(request)
+    finally:
+        torch.cuda.synchronize()
+        manager.shutdown()
