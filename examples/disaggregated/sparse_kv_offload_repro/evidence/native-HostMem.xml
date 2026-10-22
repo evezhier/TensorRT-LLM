@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="9" failures="0" disabled="0" errors="0" time="3.892" timestamp="2026-10-18T21:12:02.059" name="AllTests">
+  <testsuite name="KvCacheManagerV2HostMemTest" tests="5" failures="0" disabled="0" skipped="0" errors="0" time="3.151" timestamp="2026-10-18T21:12:02.059">
+    <testcase name="SelectsConfiguredPageMode" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="101" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:02.059" classname="KvCacheManagerV2HostMemTest" />
+    <testcase name="ReadsPrefaultThreadConfiguration" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="116" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:02.059" classname="KvCacheManagerV2HostMemTest" />
+    <testcase name="ConvertsPrefaultEnomem" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="142" status="run" result="completed" time="0.003" timestamp="2026-10-18T21:12:02.059" classname="KvCacheManagerV2HostMemTest" />
+    <testcase name="PropagatesOtherPrefaultErrors" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="150" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:02.062" classname="KvCacheManagerV2HostMemTest" />
+    <testcase name="PrefaultedAllocationSupportsGpuRoundTrip" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="183" status="run" result="completed" time="3.148" timestamp="2026-10-18T21:12:02.062" classname="KvCacheManagerV2HostMemTest" />
+  </testsuite>
+  <testsuite name="UnsupportedPopulateWrite/PrefaultFallbackTest" tests="2" failures="0" disabled="0" skipped="0" errors="0" time="0." timestamp="2026-10-18T21:12:05.211">
+    <testcase name="TouchesMemory/0" value_param="22" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="130" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:05.211" classname="UnsupportedPopulateWrite/PrefaultFallbackTest" />
+    <testcase name="TouchesMemory/1" value_param="38" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="130" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:05.211" classname="UnsupportedPopulateWrite/PrefaultFallbackTest" />
+  </testsuite>
+  <testsuite name="ThpModes/HostMemPageModeTest" tests="2" failures="0" disabled="0" skipped="0" errors="0" time="0.74" timestamp="2026-10-18T21:12:05.211">
+    <testcase name="RegistersAndResizesWithPrefaultDisabled/0" value_param="&quot;0&quot;" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="169" status="run" result="completed" time="0.028" timestamp="2026-10-18T21:12:05.211" classname="ThpModes/HostMemPageModeTest" />
+    <testcase name="RegistersAndResizesWithPrefaultDisabled/1" value_param="&quot;1&quot;" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2HostMemTest.cpp" line="169" status="run" result="completed" time="0.711" timestamp="2026-10-18T21:12:05.239" classname="ThpModes/HostMemPageModeTest" />
+  </testsuite>
+</testsuites>

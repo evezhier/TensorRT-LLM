@@ -1,0 +1,83 @@
+{
+  "rank": 0,
+  "pid": 85168,
+  "input_tokens": 32768,
+  "tokens_per_block": 128,
+  "max_batch_size": 1024,
+  "max_admissible_sequences": 2048,
+  "gpu_pool_quota_bytes": 91536490496,
+  "sparse_arena_bytes": 0,
+  "sparse_batch_buffer_bytes": 0,
+  "sparse_batch_staging_bytes": 0,
+  "host_history_budget_bytes": 0,
+  "host_history_pool_bytes": 0,
+  "host_history_capacity_blocks": null,
+  "host_history_bytes_per_block": 0,
+  "gpu_pool_payload_bytes_per_request": 109911872,
+  "sparse_arena_shapes": [],
+  "physical_pools": [
+    {
+      "group": 0,
+      "memory_type": "VRAM",
+      "slot_bytes": 193536,
+      "num_slots": 155517,
+      "payload_bytes": 30098138112
+    },
+    {
+      "group": 0,
+      "memory_type": "VRAM",
+      "slot_bytes": 45696,
+      "num_slots": 155517,
+      "payload_bytes": 7106504832
+    },
+    {
+      "group": 0,
+      "memory_type": "VRAM",
+      "slot_bytes": 24192,
+      "num_slots": 155517,
+      "payload_bytes": 3762267264
+    },
+    {
+      "group": 0,
+      "memory_type": "VRAM",
+      "slot_bytes": 5760,
+      "num_slots": 155517,
+      "payload_bytes": 895777920
+    },
+    {
+      "group": 0,
+      "memory_type": "VRAM",
+      "slot_bytes": 720,
+      "num_slots": 155517,
+      "payload_bytes": 111972240
+    },
+    {
+      "group": 1,
+      "memory_type": "VRAM",
+      "slot_bytes": 10485760,
+      "num_slots": 1212,
+      "payload_bytes": 12708741120
+    },
+    {
+      "group": 1,
+      "memory_type": "VRAM",
+      "slot_bytes": 2818048,
+      "num_slots": 1212,
+      "payload_bytes": 3415474176
+    },
+    {
+      "group": 2,
+      "memory_type": "VRAM",
+      "slot_bytes": 22020096,
+      "num_slots": 1211,
+      "payload_bytes": 26666336256
+    },
+    {
+      "group": 2,
+      "memory_type": "VRAM",
+      "slot_bytes": 5505024,
+      "num_slots": 1211,
+      "payload_bytes": 6666584064
+    }
+  ]
+}

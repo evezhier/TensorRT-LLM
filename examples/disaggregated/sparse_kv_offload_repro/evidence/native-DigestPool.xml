@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="7" failures="0" disabled="0" errors="0" time="0.001" timestamp="2026-10-18T21:12:10.919" name="AllTests">
+  <testsuite name="DigestPoolTest" tests="7" failures="0" disabled="0" skipped="0" errors="0" time="0.001" timestamp="2026-10-18T21:12:10.919">
+    <testcase name="BulkHashEqualsPerElementForNormalTokens" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2DigestPoolTest.cpp" line="50" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:10.919" classname="DigestPoolTest" />
+    <testcase name="DigestValueEqualityAcrossDistinctSlots" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2DigestPoolTest.cpp" line="76" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:10.919" classname="DigestPoolTest" />
+    <testcase name="CopyDigestTokenClonesSlot" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2DigestPoolTest.cpp" line="97" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:10.919" classname="DigestPoolTest" />
+    <testcase name="MoveTransfersSlotWithoutCloning" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2DigestPoolTest.cpp" line="113" status="run" result="completed" time="0.001" timestamp="2026-10-18T21:12:10.919" classname="DigestPoolTest" />
+    <testcase name="CloneIndependenceAndFreeReuse" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2DigestPoolTest.cpp" line="140" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:10.921" classname="DigestPoolTest" />
+    <testcase name="FrontPackAndTailShrinkChurn" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2DigestPoolTest.cpp" line="173" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:10.921" classname="DigestPoolTest" />
+    <testcase name="MixedBlockHashesDeterministically" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2DigestPoolTest.cpp" line="230" status="run" result="completed" time="0." timestamp="2026-10-18T21:12:10.921" classname="DigestPoolTest" />
+  </testsuite>
+</testsuites>

@@ -1,0 +1,234 @@
+{
+  "mode": "resident",
+  "model": "/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V4-Flash",
+  "model_layers": 43,
+  "input_tokens": 32768,
+  "output_tokens": 160,
+  "prompt_sha256": "28000cb6de0614b6a863b26f8aaf8f90824c232677d777ef94ad0bd98be6a8fc",
+  "prompt_kind": "Synthetic identical repeated astronomy paragraph plus fixed question",
+  "context_config": {
+    "tensor_parallel_size": 2,
+    "moe_expert_parallel_size": 2,
+    "moe_config": {
+      "backend": "TRTLLM"
+    },
+    "disable_overlap_scheduler": false,
+    "enable_chunked_prefill": true,
+    "cuda_graph_config": {
+      "batch_sizes": [
+        1
+      ],
+      "enable_padding": true
+    },
+    "enable_autotuner": false,
+    "enable_iter_perf_stats": true,
+    "iter_stats_max_iterations": -1,
+    "max_batch_size": 1,
+    "max_seq_len": 33024,
+    "max_num_tokens": 2048,
+    "return_perf_metrics": true,
+    "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/perf",
+    "kv_cache_config": {
+      "dtype": "nvfp4",
+      "tokens_per_block": 128,
+      "enable_block_reuse": true,
+      "free_gpu_memory_fraction": 0.5,
+      "host_cache_size": 0,
+      "max_util_for_resume": 1.0,
+      "fp8_context_mla_kv_len_cap": 33024
+    },
+    "cache_transceiver_config": {
+      "backend": "NIXL",
+      "transceiver_runtime": "PYTHON",
+      "max_tokens_in_buffer": 33024,
+      "kv_transfer_timeout_ms": 3600000
+    },
+    "sparse_attention_config": {
+      "algorithm": "deepseek_v4",
+      "compress_ratios": [
+        0,
+        0,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        0
+      ],
+      "index_head_dim": 128,
+      "index_topk": 512,
+      "window_size": 128
+    }
+  },
+  "generation_config": {
+    "tensor_parallel_size": 2,
+    "moe_expert_parallel_size": 2,
+    "moe_config": {
+      "backend": "TRTLLM"
+    },
+    "disable_overlap_scheduler": false,
+    "enable_chunked_prefill": true,
+    "cuda_graph_config": {
+      "batch_sizes": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        768,
+        1024
+      ],
+      "enable_padding": true
+    },
+    "enable_autotuner": false,
+    "enable_iter_perf_stats": true,
+    "iter_stats_max_iterations": -1,
+    "max_batch_size": 1024,
+    "max_seq_len": 33024,
+    "max_num_tokens": 2048,
+    "return_perf_metrics": true,
+    "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/perf",
+    "kv_cache_config": {
+      "dtype": "nvfp4",
+      "tokens_per_block": 128,
+      "enable_block_reuse": false,
+      "free_gpu_memory_fraction": 0.95,
+      "host_cache_size": 0,
+      "max_util_for_resume": 1.0,
+      "fp8_context_mla_kv_len_cap": 33024,
+      "avg_seq_len": 32770
+    },
+    "cache_transceiver_config": {
+      "backend": "NIXL",
+      "transceiver_runtime": "PYTHON",
+      "max_tokens_in_buffer": 33024,
+      "kv_transfer_timeout_ms": 3600000
+    },
+    "sparse_attention_config": {
+      "algorithm": "deepseek_v4",
+      "compress_ratios": [
+        0,
+        0,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        0
+      ],
+      "index_head_dim": 128,
+      "index_topk": 512,
+      "window_size": 128
+    },
+    "enable_attention_dp": true
+  },
+  "disaggregation_config": {
+    "hostname": "localhost",
+    "backend": "pytorch",
+    "context_servers": {
+      "num_instances": 1
+    },
+    "generation_servers": {
+      "num_instances": 1
+    },
+    "schedule_style": "generation_first",
+    "return_perf_metrics": true,
+    "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/perf"
+  },
+  "capacity_gate_installed": true,
+  "physical_generation_gpu_ids": [
+    "2",
+    "3"
+  ],
+  "physical_context_gpu_ids": [
+    "0",
+    "1"
+  ],
+  "worker_http_connection_policy": "fresh_connection_per_request",
+  "worker_http_retries_disabled": true,
+  "deterministic_kernel_controls": {
+    "FORCE_DETERMINISTIC": "0",
+    "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1",
+    "FORCE_MOE_KERNEL_DETERMINISTIC": "1",
+    "FORCE_ALL_REDUCE_DETERMINISTIC": "1",
+    "FORCE_TOPK_KERNEL_DETERMINISTIC": "1",
+    "FORCE_MHC_KERNEL_DETERMINISTIC": "1"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "mode": "offload",
+  "prefill_workers": 3,
+  "generation_workers": 1,
+  "generation_gpus": [
+    6,
+    7
+  ],
+  "offered_concurrency": 1696
+}

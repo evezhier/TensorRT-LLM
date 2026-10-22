@@ -1,0 +1,273 @@
+diff --git a/tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py b/tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py
+index 1731d894a8..7a3dcd519e 100644
+--- a/tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py
++++ b/tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py
+@@ -1930,7 +1930,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+         return self._sparse_batch
+ 
+     def _release_sparse_batch(self) -> None:
+-        """Return host page-index ownership before updating or releasing request caches."""
++        """Return host page-index ownership before scheduler mutations or cache release."""
+         self._sparse_batch_prepared = False
+         if self._sparse_batch is None:
+             return
+@@ -1977,8 +1977,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+         """Order writeback after all model producers and attention readers.
+ 
+         The executor orders its calling stream after model forward.
+-        Join it onto the cache stream before resize writes back completed units
+-        or recycles pages. prepare_sparse_batch() supplies the reverse dependency
++        Join it onto the cache stream before flushing completed units or resizing
++        request caches. prepare_sparse_batch() supplies the reverse dependency
+         for the next forward.
+         """
+         if not self._enable_kv_cache_offload:
+@@ -2030,12 +2030,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+         if not self._enable_kv_cache_offload or not scheduled_batch.generation_requests:
+             return
+         wait_for_input_copy()
++        self._order_sparse_history_update(scheduled_batch.generation_requests)
+         # Before the batch is released and before any history moves: the write-back reads
+         # the converted indices the Batch published, so it has to run while the members are
+         # still seated. A row that is not advancing repeats its own history, which asks for
+         # nothing.
+         batch = self._sparse_batch
+         if batch is not None:
++            batch.wait_published()
+             histories = [0] * batch.max_batch_size
+             for cache in self._sparse_batch_members.values():
+                 row = batch.row_of(cache)
+@@ -2050,8 +2052,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+                     histories[row] = cache.history_length + 1
+             batch.flush_sparse_units(histories)
+ 
+-        self._release_sparse_batch()
+-        self._order_sparse_history_update(scheduled_batch.generation_requests)
++        # The flush watermark belongs to the attached Batch row. Keep membership
++        # until resize has checked it and advanced the request's history.
+         for request in scheduled_batch.generation_requests:
+             request_id = request.py_request_id
+             cache = self.kv_cache_map.get(request_id)
+@@ -2066,6 +2068,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+                     f"to {history_length} tokens after model forward"
+                 )
+             self._allocated_draft_lens.pop(request_id, None)
++        self._release_sparse_batch()
+ 
+     def update_resources(
+         self,
+diff --git a/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py b/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
+index 4b5f8cd84a..40f89e5b8d 100644
+--- a/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
++++ b/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
+@@ -33,6 +33,7 @@ from typing import (
+ )
+ 
+ import numpy as np
++import psutil
+ import torch
+ from strenum import StrEnum
+ 
+@@ -412,7 +413,7 @@ class HostMemoryLimits(NamedTuple):
+ 
+     Attributes:
+         local_ranks: Ranks sharing this node.
+-        mem_available: The node's available memory in bytes; ``inf`` when unknown.
++        mem_available: Available host bytes within node and cgroup limits; ``inf`` when unknown.
+         memlock_limit: The RLIMIT_MEMLOCK soft limit in bytes; ``inf`` when unlimited.
+     """
+ 
+@@ -422,7 +423,7 @@ class HostMemoryLimits(NamedTuple):
+ 
+     @property
+     def rank_share(self) -> float:
+-        """This rank's share of the node's available memory."""
++        """This rank's share of the available host memory."""
+         return self.mem_available / self.local_ranks
+ 
+     @property
+@@ -442,11 +443,18 @@ def get_host_memory_limits(mapping: Mapping) -> HostMemoryLimits:
+     """
+     import resource
+ 
++    from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
++        cgroup_available_host_memory,
++    )
++
+     local_ranks = max(1, Distributed.get(mapping).local_world_size)
+     try:
+-        mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
++        mem_available = psutil.virtual_memory().available
+     except (ValueError, OSError):
+         mem_available = float("inf")
++    cgroup_available = cgroup_available_host_memory()
++    if cgroup_available is not None:
++        mem_available = min(mem_available, cgroup_available)
+     try:
+         soft_limit, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+         memlock_limit = soft_limit if soft_limit != resource.RLIM_INFINITY else float("inf")
+@@ -533,7 +541,7 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
+     """Reduce the auto-provisioned host cache tier quota to the fleet minimum.
+ 
+     ``_compute_auto_host_tier_quota`` reads rank-local host state
+-    (``SC_AVPHYS_PAGES``, ``RLIMIT_MEMLOCK``), so co-scheduled ranks can arrive
++    (available host memory and ``RLIMIT_MEMLOCK``), so co-scheduled ranks can arrive
+     at divergent host quotas (observed up to 10x). Divergent host-tier
+     retention makes per-rank MAX_UTILIZATION schedulers disagree about which
+     suspended requests can resume, which wedges collectives on
+diff --git a/tests/unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py b/tests/unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py
+index bb42a7fea5..cc41cb580d 100644
+--- a/tests/unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py
++++ b/tests/unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py
+@@ -1227,6 +1227,43 @@ def test_sparse_forward_waits_for_input_copy_before_detaching(
+     wait.assert_called_once_with()
+ 
+ 
++@pytest.mark.cpu_only
++@pytest.mark.parametrize("history_length", [3, 127])
++def test_sparse_forward_keeps_flush_proof_attached_until_history_advances(
++    sparse_scheduling_case: SimpleNamespace, history_length: int
++) -> None:
++    case = sparse_scheduling_case
++    manager, cache, request = case.manager, case.cache, case.request
++    case.scheduled.generation_requests = [request]
++    cache.history_length, cache.capacity = history_length, history_length + 1
++    manager.prepare_resources(case.scheduled)
++    batch = manager.get_sparse_batch([20])
++    manager._stream.wait_stream.reset_mock()
++    flush = batch.flush_sparse_units
++    resize = cache.resize
++
++    def flush_after_forward(histories):
++        manager._stream.wait_stream.assert_called_once_with(case.current_stream.return_value)
++        flush(histories)
++
++    def advance_attached(capacity, history):
++        row = batch.row_of(cache)
++        assert row >= 0, "The native flush watermark belongs to the attached Batch row"
++        assert batch.flushes[-1][row] >= history
++        assert not batch.upload_pending, "History mutation must not race the staged table upload"
++        return resize(capacity, history)
++
++    with (
++        patch.object(batch, "flush_sparse_units", side_effect=flush_after_forward),
++        patch.object(cache, "resize", side_effect=advance_attached),
++    ):
++        manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
++
++    assert cache.history_length == history_length + 1
++    assert cache.page_index_owner == "runtime"
++    assert batch.row_of(cache) == -1
++
++
+ @pytest.mark.cpu_only
+ def test_sparse_forward_requires_reserved_input_capacity() -> None:
+     manager, cache, request, batch = _history_case()
+diff --git a/tests/unittest/_torch/executor/kv_cache/test_kvv2_host_tier_sizing.py b/tests/unittest/_torch/executor/kv_cache/test_kvv2_host_tier_sizing.py
+index 2855e8413b..6344b0b1cb 100644
+--- a/tests/unittest/_torch/executor/kv_cache/test_kvv2_host_tier_sizing.py
++++ b/tests/unittest/_torch/executor/kv_cache/test_kvv2_host_tier_sizing.py
+@@ -1,3 +1,5 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
+ """Tests for KVCacheManagerV2 rank-aware auto host tier sizing.
+ 
+ The auto-provisioned host tier is computed per rank but drawn from a
+@@ -9,8 +11,13 @@ can arrive at divergent quotas; ``TestSyncHostTierQuota`` covers the
+ cross-rank ``allreduce(MIN)`` that reconciles them to the fleet minimum.
+ """
+ 
++import resource
++from types import SimpleNamespace
++
+ import pytest
+ 
++from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead
++from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+     _compute_auto_host_tier_quota,
+     _sync_host_tier_quota,
+@@ -20,6 +27,65 @@ from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+ GiB = 1 << 30
+ 
+ 
++@pytest.mark.cpu_only
++class TestHostMemoryLimits:
++    @pytest.mark.parametrize("memlock_limit", [8 * GiB, resource.RLIM_INFINITY])
++    @pytest.mark.parametrize("cgroup_available", [None, 16 * GiB])
++    def test_available_memory_includes_reclaimable_pages(
++        self, monkeypatch, memlock_limit, cgroup_available
++    ):
++        monkeypatch.setattr(
++            kv_cache_manager_v2.psutil,
++            "virtual_memory",
++            lambda: SimpleNamespace(available=64 * GiB, free=4 * GiB),
++        )
++        monkeypatch.setattr(
++            kv_cache_manager_v2.os,
++            "sysconf",
++            lambda name: {"SC_PAGE_SIZE": 4096, "SC_AVPHYS_PAGES": 4 * GiB // 4096}[name],
++        )
++        monkeypatch.setattr(
++            kv_cache_manager_v2.Distributed,
++            "get",
++            lambda mapping: SimpleNamespace(local_world_size=2),
++        )
++        monkeypatch.setattr(resource, "getrlimit", lambda limit: (memlock_limit, memlock_limit))
++        monkeypatch.setattr(
++            rank_striped_read_ahead, "cgroup_available_host_memory", lambda: cgroup_available
++        )
++
++        limits = kv_cache_manager_v2.get_host_memory_limits(None)
++
++        expected_available = 64 * GiB if cgroup_available is None else 16 * GiB
++        assert limits.mem_available == expected_available
++        assert limits.rank_share == expected_available / 2
++        expected_pinnable = expected_available / 4
++        if memlock_limit != resource.RLIM_INFINITY:
++            expected_pinnable = min(expected_pinnable, 6.4 * GiB)
++        assert limits.auto_pinnable_bytes == expected_pinnable
++
++    @pytest.mark.parametrize("cgroup_available", [None, 16 * GiB])
++    def test_memory_read_failure_preserves_other_limits(self, monkeypatch, cgroup_available):
++        def unavailable_memory():
++            raise OSError("Host memory information is unavailable")
++
++        monkeypatch.setattr(kv_cache_manager_v2.psutil, "virtual_memory", unavailable_memory)
++        monkeypatch.setattr(
++            kv_cache_manager_v2.Distributed,
++            "get",
++            lambda mapping: SimpleNamespace(local_world_size=2),
++        )
++        monkeypatch.setattr(resource, "getrlimit", lambda limit: (8 * GiB, 8 * GiB))
++        monkeypatch.setattr(
++            rank_striped_read_ahead, "cgroup_available_host_memory", lambda: cgroup_available
++        )
++
++        limits = kv_cache_manager_v2.get_host_memory_limits(None)
++
++        assert limits.mem_available == (float("inf") if cgroup_available is None else 16 * GiB)
++        assert limits.auto_pinnable_bytes == (6.4 * GiB if cgroup_available is None else 4 * GiB)
++
++
+ class TestComputeAutoHostTierQuota:
+     def test_single_rank_uses_device_quota_when_memory_is_ample(self):
+         # 1 rank, 440 GiB available: cap = 220 GiB > quota -> quota wins.
+@@ -56,7 +122,7 @@ class TestComputeAutoHostTierQuota:
+ 
+     def test_integrated_gpu_charges_device_quota_against_budget(self):
+         # GB10 / DGX Spark. Host and device are one 119.69 GiB
+-        # unified pool, so SC_AVPHYS_PAGES counts bytes the device quota is
++        # unified pool, so available host memory includes bytes the device quota is
+         # about to take. Without the charge the tier was sized 93.58/2 =
+         # 46.79 GiB on top of an 81.68 GiB device quota -- 128.5 GiB requested
+         # from a 119.69 GiB pool -- and the worker was OOM-killed.
+@@ -156,7 +222,7 @@ def _host_tier_sync_worker(per_rank_mem_gib):
+     """Run on every MPI rank by the MpiPoolSession harness below.
+ 
+     Each rank simulates reading a different amount of available host memory
+-    (as ``os.sysconf("SC_AVPHYS_PAGES")`` would differ across co-scheduled
++    (as available host memory would differ across co-scheduled
+     ranks), computes its own auto host-tier quota, then runs the real
+     cross-rank sync. Returns this rank's pre- and post-sync quota so the parent
+     process can assert on convergence.

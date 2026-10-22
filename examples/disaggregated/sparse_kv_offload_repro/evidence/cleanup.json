@@ -1,0 +1,18 @@
+{
+  "checked_at_utc": "2026-10-19T05:35:01.929145+00:00",
+  "allocation_released": true,
+  "owned_job_ids": [
+    5115093,
+    5115369,
+    5115013
+  ],
+  "queue_result": "",
+  "completed": {
+    "native_and_python_validation": true,
+    "matched_resident": true,
+    "matched_offload": true,
+    "serving_resident": true,
+    "serving_offload": true
+  },
+  "scope": "Only allocations created for this task were cancelled; model controllers finished with exit code 0 before release."
+}

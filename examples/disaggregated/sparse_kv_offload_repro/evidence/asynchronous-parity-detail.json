@@ -1,0 +1,17 @@
+{
+  "resident_unique_outputs": 5,
+  "offload_unique_outputs": 3,
+  "offload_outputs_absent_from_resident_set": 0,
+  "resident_outputs_absent_from_offload_set": 2,
+  "exact_multiset_matched_requests": 508,
+  "requests_per_mode": 512,
+  "resident_unmatched_first_divergences_from_control": [
+    null,
+    35,
+    35
+  ],
+  "offload_unmatched_first_divergences_from_control": [
+    35,
+    41
+  ]
+}

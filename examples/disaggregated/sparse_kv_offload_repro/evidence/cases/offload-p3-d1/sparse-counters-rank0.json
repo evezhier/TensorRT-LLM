@@ -1,0 +1,8 @@
+{
+  "pid": 98790,
+  "hits": 3134588482,
+  "misses": 486667005,
+  "hit_ratio": 0.8656082105371761,
+  "sparse_arena_bytes": 6597287168,
+  "scope": "Entire process including warmups; sampled after all trials"
+}

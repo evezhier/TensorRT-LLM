@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="4" failures="0" disabled="0" errors="0" time="0.591" timestamp="2026-10-18T21:12:09.306" name="AllTests">
+  <testsuite name="KvCacheManagerV2ConcurrencyTest" tests="4" failures="0" disabled="0" skipped="0" errors="0" time="0.591" timestamp="2026-10-18T21:12:09.306">
+    <testcase name="LevelStatsAreConservedAcrossConcurrentDrains" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2ConcurrencyTest.cpp" line="47" status="run" result="completed" time="0.529" timestamp="2026-10-18T21:12:09.306" classname="KvCacheManagerV2ConcurrencyTest" />
+    <testcase name="ProbeReuseDoesNotMutateTheRadixTree" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2ConcurrencyTest.cpp" line="141" status="run" result="completed" time="0.017" timestamp="2026-10-18T21:12:09.836" classname="KvCacheManagerV2ConcurrencyTest" />
+    <testcase name="ConcurrentProbeReuseIsSafe" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2ConcurrencyTest.cpp" line="180" status="run" result="completed" time="0.019" timestamp="2026-10-18T21:12:09.853" classname="KvCacheManagerV2ConcurrencyTest" />
+    <testcase name="ProbeReuseInterleavesWithExclusiveWork" file="/home/scratch.guijuz_coreai_1/TensorRT-LLM/cpp/tests/unit_tests/batch_manager/kvCacheManagerV2ConcurrencyTest.cpp" line="252" status="run" result="completed" time="0.024" timestamp="2026-10-18T21:12:09.873" classname="KvCacheManagerV2ConcurrencyTest" />
+  </testsuite>
+</testsuites>

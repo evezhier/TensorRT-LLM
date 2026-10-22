@@ -1,0 +1,3402 @@
+{
+  "trials": [
+    {
+      "analysis_version": 4,
+      "result_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/001-warm-results.json",
+      "input_tokens": 32768,
+      "mode": "resident",
+      "command": {
+        "concurrency": 1,
+        "requests": 1,
+        "output_tokens": 160,
+        "gate": false,
+        "profile": false,
+        "purpose": "Prefill ratio comparison, same physical generation GPUs 6 and 7"
+      },
+      "requests": 1,
+      "output_tokens": 160,
+      "all_requests_passed": true,
+      "e2e_output_tokens_per_second": 34.71613620780448,
+      "generation_tokens_per_client_wall_second": 34.499160356505705,
+      "decode_worker_tokens_per_second": 62.597710498580824,
+      "scheduled_tokens_per_iteration_window_second": 62.92852375976593,
+      "scheduled_tokens_in_iteration_window": 158,
+      "iteration_start_window_seconds": 2.5107851028442383,
+      "iteration_token_coverage_complete": true,
+      "decode_worker_tokens_in_window": 159,
+      "decode_worker_window_seconds": 2.540029000000004,
+      "decode_iterations": 159,
+      "scheduled_generation_tokens": 159,
+      "expected_generation_tokens": 159,
+      "decode_step_cadence_ms": {
+        "count": 158,
+        "mean": 15.891044954710368,
+        "p50": 15.892505645751953,
+        "p95": 15.987944602966309,
+        "min": 14.986991882324219,
+        "max": 16.540050506591797
+      },
+      "iteration_lifecycle_ms": {
+        "count": 159,
+        "mean": 31.056681519034523,
+        "p50": 31.058788299560547,
+        "p95": 31.169819831848145,
+        "min": 30.49945831298828,
+        "max": 31.711816787719727
+      },
+      "host_step_ms": {
+        "count": 159,
+        "mean": 15.855010950340414,
+        "p50": 15.858650207519531,
+        "p95": 16.002941131591797,
+        "min": 15.136003494262695,
+        "max": 16.494035720825195
+      },
+      "scheduled_decode_count": {
+        "count": 159,
+        "mean": 1,
+        "p50": 1.0,
+        "p95": 1.0,
+        "min": 1,
+        "max": 1
+      },
+      "peak_decode_requests": 1,
+      "request_perf_coverage": {
+        "count": 1,
+        "expected": 1,
+        "complete": true
+      },
+      "generation_request_compute_seconds": {
+        "count": 1,
+        "mean": 2.540029000000004,
+        "p50": 2.540029000000004,
+        "p95": 2.540029000000004,
+        "min": 2.540029000000004,
+        "max": 2.540029000000004
+      },
+      "generation_request_mean_token_interval_ms": {
+        "count": 1,
+        "mean": 15.891158227848885,
+        "p50": 15.891158227848885,
+        "p95": 15.891158227848885,
+        "min": 15.891158227848885,
+        "max": 15.891158227848885
+      },
+      "generation_forward_event_ms": {
+        "count": 159,
+        "mean": 15.801987821950853,
+        "p50": 15.801088333129883,
+        "p95": 15.835510444641113,
+        "min": 15.758336067199707,
+        "max": 15.932607650756836
+      },
+      "generation_active_intervals": {
+        "start": 1239.236495,
+        "end": 1241.776524,
+        "seconds": 2.540029000000004,
+        "mean_active_requests": 1.0,
+        "peak_active_requests": 1,
+        "empty_seconds": 0.0,
+        "active_request_seconds": 2.540029000000004
+      },
+      "stage_seconds": {
+        "generation_receive_lifecycle": {
+          "count": 1,
+          "mean": 2.04220499999974,
+          "p50": 2.04220499999974,
+          "p95": 2.04220499999974,
+          "min": 2.04220499999974,
+          "max": 2.04220499999974
+        },
+        "receive_complete_to_first_scheduled": {
+          "count": 1,
+          "mean": 0.00492000000031112,
+          "p50": 0.00492000000031112,
+          "p95": 0.00492000000031112,
+          "min": 0.00492000000031112,
+          "max": 0.00492000000031112
+        },
+        "generation_first_scheduled_to_last_token": {
+          "count": 1,
+          "mean": 2.5406259999999747,
+          "p50": 2.5406259999999747,
+          "p95": 2.5406259999999747,
+          "min": 2.5406259999999747,
+          "max": 2.5406259999999747
+        },
+        "context_queue": {
+          "count": 1,
+          "mean": 0.055702000000110274,
+          "p50": 0.055702000000110274,
+          "p95": 0.055702000000110274,
+          "min": 0.055702000000110274,
+          "max": 0.055702000000110274
+        },
+        "context_scheduled_to_first_token": {
+          "count": 1,
+          "mean": 1.97826299999997,
+          "p50": 1.97826299999997,
+          "p95": 1.97826299999997,
+          "min": 1.97826299999997,
+          "max": 1.97826299999997
+        },
+        "context_ready_to_receive_complete": {
+          "count": 1,
+          "mean": 0.012425500000063039,
+          "p50": 0.012425500000063039,
+          "p95": 0.012425500000063039,
+          "min": 0.012425500000063039,
+          "max": 0.012425500000063039
+        }
+      },
+      "context_batch_histogram": {
+        "1": 16
+      },
+      "context_peak_queue": 0,
+      "generation_tokens_per_forward_to_last_token_window_second": 62.597710498580824,
+      "throughput_definition": "Complete per-request generation steps / elapsed first forward start to last token completion",
+      "arrival_requests_per_second": 0.3936962924439045,
+      "prefill_workers": 3,
+      "generation_workers": 1,
+      "generation_gpus": [
+        6,
+        7
+      ],
+      "trial": "001-warm",
+      "native_transfer": {
+        "send_request_count": 1,
+        "receive_request_count": 1,
+        "expected_completed_requests": 1,
+        "total_send_payload_bytes": 109924352,
+        "send_payload_bytes_per_request": {
+          "count": 1,
+          "mean": 109924352,
+          "p50": 109924352.0,
+          "p95": 109924352.0,
+          "p99": 109924352.0,
+          "min": 109924352,
+          "max": 109924352
+        },
+        "send_transfer_phase_ms": {
+          "count": 1,
+          "mean": 7.543,
+          "p50": 7.543,
+          "p95": 7.543,
+          "p99": 7.543,
+          "min": 7.543,
+          "max": 7.543
+        },
+        "send_prepare_phase_ms": {
+          "count": 1,
+          "mean": 2.837,
+          "p50": 2.837,
+          "p95": 2.837,
+          "p99": 2.837,
+          "min": 2.837,
+          "max": 2.837
+        },
+        "send_queue_phase_ms": {
+          "count": 1,
+          "mean": 0.121,
+          "p50": 0.121,
+          "p95": 0.121,
+          "p99": 0.121,
+          "min": 0.121,
+          "max": 0.121
+        },
+        "segments_per_request": {
+          "count": 1,
+          "mean": 1284,
+          "p50": 1284.0,
+          "p95": 1284.0,
+          "p99": 1284.0,
+          "min": 1284,
+          "max": 1284
+        },
+        "receive_lifecycle_ms": {
+          "count": 1,
+          "mean": 2042.205,
+          "p50": 2042.205,
+          "p95": 2042.205,
+          "p99": 2042.205,
+          "min": 2042.205,
+          "max": 2042.205
+        },
+        "send_phase_payload_mib_per_second": {
+          "count": 1,
+          "mean": 13897.922742940475,
+          "p50": 13897.922742940475,
+          "p95": 13897.922742940475,
+          "p99": 13897.922742940475,
+          "min": 13897.922742940475,
+          "max": 13897.922742940475
+        },
+        "definition": "Native NIXL send-task elapsed transfer phase, excluding its preparation and queue phases. For a request with multiple source ranks, bytes are summed and phase times take the maximum. Receive lifecycle includes waiting for context. Rates are task measurements, not hardware link bandwidth."
+      },
+      "started_at_utc": "2026-10-19T05:17:25.608682+00:00",
+      "completed_at_utc": "2026-10-19T05:17:30.217489+00:00",
+      "client_seconds": 4.608807819000049,
+      "latency_seconds": {
+        "count": 1,
+        "mean": 4.604887350000126,
+        "p50": 4.604887350000126,
+        "p95": 4.604887350000126,
+        "p99": 4.604887350000126,
+        "min": 4.604887350000126,
+        "max": 4.604887350000126
+      },
+      "ttft_seconds": {
+        "count": 1,
+        "mean": 2.0805661120000423,
+        "p50": 2.0805661120000423,
+        "p95": 2.0805661120000423,
+        "p99": 2.0805661120000423,
+        "min": 2.0805661120000423,
+        "max": 2.0805661120000423
+      },
+      "tpot_seconds": {
+        "count": 1,
+        "mean": 0.01587623420125839,
+        "p50": 0.01587623420125839,
+        "p95": 0.01587623420125839,
+        "p99": 0.01587623420125839,
+        "min": 0.01587623420125839,
+        "max": 0.01587623420125839
+      },
+      "metrics": {
+        "peak_concurrent_decode": 1,
+        "iterations_at_peak": 159,
+        "peak_decode_per_rank": {
+          "0": 1,
+          "1": 0
+        },
+        "decode_concurrency_histogram": {
+          "0": 132,
+          "1": 159
+        },
+        "gpu_memory_bytes": {
+          "context_servers:0": 139389239296,
+          "generation_servers:0": 186703085568,
+          "generation_servers:1": 186703085568
+        },
+        "max_paused_requests_per_rank": 0,
+        "max_queued_requests": 0,
+        "generation_kv_stat_peaks": {
+          "rank0:allocNewBlocks": 528,
+          "rank0:allocTotalBlocks": 528,
+          "rank0:cacheHitRate": 0.0,
+          "rank0:freeNumBlocks": 157937,
+          "rank0:maxNumBlocks": 157940,
+          "rank0:missedBlocks": 516,
+          "rank0:reusedBlocks": 0.0,
+          "rank0:tokensPerBlock": 128,
+          "rank0:usedNumBlocks": 265,
+          "rank1:allocNewBlocks": 528,
+          "rank1:allocTotalBlocks": 528,
+          "rank1:cacheHitRate": 0.0,
+          "rank1:freeNumBlocks": 157937,
+          "rank1:maxNumBlocks": 157940,
+          "rank1:missedBlocks": 516,
+          "rank1:reusedBlocks": 0.0,
+          "rank1:tokensPerBlock": 128,
+          "rank1:usedNumBlocks": 265
+        },
+        "decode_iteration_latency_ms": {
+          "count": 159,
+          "mean": 31.056681519034523,
+          "p50": 31.058788299560547,
+          "p95": 31.169819831848145,
+          "p99": 31.369709968566895,
+          "min": 30.49945831298828,
+          "max": 31.711816787719727
+        },
+        "context_schedule_histogram": [
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 0,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 2048,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 4096,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 6144,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 8192,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 10240,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 12288,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 14336,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 16384,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 18432,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 20480,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 22528,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 24576,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 26624,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 28672,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 30720,
+            "iterations": 1
+          }
+        ]
+      },
+      "context_gpu_forward_ms": {
+        "count": 15,
+        "mean": 121.98000640869141,
+        "p50": 120.98092651367188,
+        "p95": 125.80166854858398,
+        "min": 120.1704330444336,
+        "max": 130.54010009765625
+      },
+      "context_worker_request_counts": {
+        "perf_metrics-context-umb-b200-260-82628-20261019T051625Z.jsonl": 1
+      },
+      "gpu_telemetry": {
+        "0": {
+          "uuid": "GPU-e1ea2e95-d0c3-0482-48f8-acd57d98f58d",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 243.272,
+            "p50": 243.27,
+            "p95": 243.31,
+            "min": 243.22,
+            "max": 243.31
+          },
+          "peak_memory_mib": 132932.0
+        },
+        "1": {
+          "uuid": "GPU-93f15d5a-41c6-80a8-9fde-3ee3959474d1",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 244.67000000000002,
+            "p50": 244.66,
+            "p95": 244.74,
+            "min": 244.56,
+            "max": 244.74
+          },
+          "peak_memory_mib": 132240.0
+        },
+        "2": {
+          "uuid": "GPU-700aa2d2-90a4-d38f-57db-cac888db7523",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 249.4,
+            "p50": 249.37,
+            "p95": 249.512,
+            "min": 249.33,
+            "max": 249.54
+          },
+          "peak_memory_mib": 132868.0
+        },
+        "3": {
+          "uuid": "GPU-4834715f-9590-552c-3265-8660001654a3",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 245.65800000000002,
+            "p50": 245.66,
+            "p95": 245.728,
+            "min": 245.58,
+            "max": 245.74
+          },
+          "peak_memory_mib": 132176.0
+        },
+        "4": {
+          "uuid": "GPU-bfea489f-647b-5c3d-570c-882674218cae",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 21.4,
+            "p50": 6.0,
+            "p95": 56.199999999999996,
+            "min": 0.0,
+            "max": 60.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 363.376,
+            "p50": 289.01,
+            "p95": 525.63,
+            "min": 245.04,
+            "max": 530.39
+          },
+          "peak_memory_mib": 132932.0
+        },
+        "5": {
+          "uuid": "GPU-94e57c2c-c708-f3a6-1343-3f8acb363c12",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 35.8,
+            "p50": 0.0,
+            "p95": 94.0,
+            "min": 0.0,
+            "max": 97.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 366.874,
+            "p50": 284.56,
+            "p95": 535.126,
+            "min": 244.64,
+            "max": 538.63
+          },
+          "peak_memory_mib": 132240.0
+        },
+        "6": {
+          "uuid": "GPU-46fe2cd0-a682-def4-4019-a54267f3241b",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 83.6,
+            "p50": 100.0,
+            "p95": 100.0,
+            "min": 18.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 347.672,
+            "p50": 361.24,
+            "p95": 372.186,
+            "min": 274.93,
+            "max": 372.26
+          },
+          "peak_memory_mib": 178054.0
+        },
+        "7": {
+          "uuid": "GPU-d1160a28-0f0c-a6e5-496b-b8cf55e941e7",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 100.0,
+            "p50": 100.0,
+            "p95": 100.0,
+            "min": 100.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 338.228,
+            "p50": 351.44,
+            "p95": 361.11,
+            "min": 268.49,
+            "max": 361.33
+          },
+          "peak_memory_mib": 177364.0
+        }
+      },
+      "variant": "default",
+      "run_name": "resident-p3-d1",
+      "config": {
+        "mode": "resident",
+        "model": "/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V4-Flash",
+        "model_layers": 43,
+        "input_tokens": 32768,
+        "output_tokens": 160,
+        "prompt_sha256": "28000cb6de0614b6a863b26f8aaf8f90824c232677d777ef94ad0bd98be6a8fc",
+        "prompt_kind": "Synthetic identical repeated astronomy paragraph plus fixed question",
+        "context_config": {
+          "tensor_parallel_size": 2,
+          "moe_expert_parallel_size": 2,
+          "moe_config": {
+            "backend": "TRTLLM"
+          },
+          "disable_overlap_scheduler": false,
+          "enable_chunked_prefill": true,
+          "cuda_graph_config": {
+            "batch_sizes": [
+              1
+            ],
+            "enable_padding": true
+          },
+          "enable_autotuner": false,
+          "enable_iter_perf_stats": true,
+          "iter_stats_max_iterations": -1,
+          "max_batch_size": 128,
+          "max_seq_len": 33024,
+          "max_num_tokens": 2048,
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/perf",
+          "kv_cache_config": {
+            "dtype": "nvfp4",
+            "tokens_per_block": 128,
+            "enable_block_reuse": true,
+            "free_gpu_memory_fraction": 0.5,
+            "host_cache_size": 0,
+            "max_util_for_resume": 1.0,
+            "fp8_context_mla_kv_len_cap": 33024
+          },
+          "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 33024,
+            "kv_transfer_timeout_ms": 3600000
+          },
+          "sparse_attention_config": {
+            "algorithm": "deepseek_v4",
+            "compress_ratios": [
+              0,
+              0,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              0
+            ],
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "window_size": 128
+          }
+        },
+        "generation_config": {
+          "tensor_parallel_size": 2,
+          "moe_expert_parallel_size": 2,
+          "moe_config": {
+            "backend": "TRTLLM"
+          },
+          "disable_overlap_scheduler": false,
+          "enable_chunked_prefill": true,
+          "cuda_graph_config": {
+            "batch_sizes": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128,
+              256,
+              512,
+              768,
+              1024
+            ],
+            "enable_padding": true
+          },
+          "enable_autotuner": false,
+          "enable_iter_perf_stats": true,
+          "iter_stats_max_iterations": -1,
+          "max_batch_size": 1024,
+          "max_seq_len": 33024,
+          "max_num_tokens": 2048,
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/perf",
+          "kv_cache_config": {
+            "dtype": "nvfp4",
+            "tokens_per_block": 128,
+            "enable_block_reuse": false,
+            "free_gpu_memory_fraction": 0.95,
+            "host_cache_size": 0,
+            "max_util_for_resume": 1.0,
+            "fp8_context_mla_kv_len_cap": 33024,
+            "avg_seq_len": 32770
+          },
+          "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 33024,
+            "kv_transfer_timeout_ms": 3600000
+          },
+          "sparse_attention_config": {
+            "algorithm": "deepseek_v4",
+            "compress_ratios": [
+              0,
+              0,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              0
+            ],
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "window_size": 128
+          },
+          "enable_attention_dp": true
+        },
+        "disaggregation_config": {
+          "hostname": "localhost",
+          "backend": "pytorch",
+          "context_servers": {
+            "num_instances": 3
+          },
+          "generation_servers": {
+            "num_instances": 1
+          },
+          "schedule_style": "generation_first",
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/perf"
+        },
+        "capacity_gate_installed": false,
+        "physical_generation_gpu_ids": [
+          6,
+          7
+        ],
+        "physical_context_gpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "worker_http_connection_policy": "fresh_connection_per_request",
+        "worker_http_retries_disabled": true,
+        "deterministic_kernel_controls": {
+          "FORCE_DETERMINISTIC": "0",
+          "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1",
+          "FORCE_MOE_KERNEL_DETERMINISTIC": "1",
+          "FORCE_ALL_REDUCE_DETERMINISTIC": "1",
+          "FORCE_TOPK_KERNEL_DETERMINISTIC": "1",
+          "FORCE_MHC_KERNEL_DETERMINISTIC": "1"
+        }
+      }
+    },
+    {
+      "analysis_version": 4,
+      "result_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/100-performance-1-results.json",
+      "input_tokens": 32768,
+      "mode": "resident",
+      "command": {
+        "concurrency": 1204,
+        "requests": 4096,
+        "output_tokens": 160,
+        "gate": false,
+        "profile": false,
+        "purpose": "Prefill ratio comparison, same physical generation GPUs 6 and 7"
+      },
+      "requests": 4096,
+      "output_tokens": 160,
+      "all_requests_passed": true,
+      "e2e_output_tokens_per_second": 3310.6783697193523,
+      "generation_tokens_per_client_wall_second": 3289.9866299086066,
+      "decode_worker_tokens_per_second": 3386.3753716067313,
+      "scheduled_tokens_per_iteration_window_second": 3386.892701302395,
+      "scheduled_tokens_in_iteration_window": 651262,
+      "iteration_start_window_seconds": 192.28893780708313,
+      "iteration_token_coverage_complete": true,
+      "decode_worker_tokens_in_window": 651264,
+      "decode_worker_window_seconds": 192.3189040000002,
+      "decode_iterations": 7661,
+      "scheduled_generation_tokens": 651264,
+      "expected_generation_tokens": 651264,
+      "decode_step_cadence_ms": {
+        "count": 7660,
+        "mean": 25.10299449178631,
+        "p50": 24.778127670288086,
+        "p95": 28.518056869506836,
+        "min": 11.027097702026367,
+        "max": 48.08807373046875
+      },
+      "iteration_lifecycle_ms": {
+        "count": 7661,
+        "mean": 48.34505192465733,
+        "p50": 48.288822174072266,
+        "p95": 53.48849296569824,
+        "min": 30.298233032226562,
+        "max": 66.75434112548828
+      },
+      "host_step_ms": {
+        "count": 7661,
+        "mean": 25.048998500454008,
+        "p50": 24.5511531829834,
+        "p95": 28.624534606933594,
+        "min": 10.84136962890625,
+        "max": 44.21639442443848
+      },
+      "scheduled_decode_count": {
+        "count": 7661,
+        "mean": 85.01031196971675,
+        "p50": 88.0,
+        "p95": 90.0,
+        "min": 1,
+        "max": 95
+      },
+      "peak_decode_requests": 95,
+      "request_perf_coverage": {
+        "count": 4096,
+        "expected": 4096,
+        "complete": true
+      },
+      "generation_request_compute_seconds": {
+        "count": 4096,
+        "mean": 4.02877924609375,
+        "p50": 4.075888500000019,
+        "p95": 4.137043000000119,
+        "min": 3.115492000000131,
+        "max": 4.201513000000205
+      },
+      "generation_request_mean_token_interval_ms": {
+        "count": 4096,
+        "mean": 25.25001815602749,
+        "p50": 25.569610759493102,
+        "p95": 25.934920886075872,
+        "min": 19.478493670886518,
+        "max": 26.321664556961924
+      },
+      "generation_forward_event_ms": {
+        "count": 15312,
+        "mean": 24.578276821002444,
+        "p50": 24.28337574005127,
+        "p95": 26.40494050979614,
+        "min": 15.795167922973633,
+        "max": 30.504032135009766
+      },
+      "generation_active_intervals": {
+        "start": 1303.000944,
+        "end": 1495.319848,
+        "seconds": 192.3189040000002,
+        "mean_active_requests": 85.80477243152349,
+        "peak_active_requests": 95,
+        "empty_seconds": 0.0,
+        "active_request_seconds": 16501.87979200003
+      },
+      "stage_seconds": {
+        "generation_receive_lifecycle": {
+          "count": 4096,
+          "mean": 43.89487472949219,
+          "p50": 50.224228499999754,
+          "p95": 53.55253200000004,
+          "min": 0.3621769999999742,
+          "max": 56.71023500000001
+        },
+        "receive_complete_to_first_scheduled": {
+          "count": 4096,
+          "mean": 0.01828471459961223,
+          "p50": 0.01923199999987446,
+          "p95": 0.033416750000242246,
+          "min": 0.0009999999997489795,
+          "max": 0.04961800000000949
+        },
+        "generation_first_scheduled_to_last_token": {
+          "count": 4096,
+          "mean": 4.029584883056644,
+          "p50": 4.076655999999957,
+          "p95": 4.138149500000168,
+          "min": 3.1162279999998646,
+          "max": 4.202213000000029
+        },
+        "context_queue": {
+          "count": 4096,
+          "mean": 44.08003575878906,
+          "p50": 50.034020000000055,
+          "p95": 53.34108875000004,
+          "min": 0.029248000000279717,
+          "max": 55.62346699999989
+        },
+        "context_scheduled_to_first_token": {
+          "count": 4096,
+          "mean": 0.25814498754883086,
+          "p50": 0.25726749999989806,
+          "p95": 0.2677535000000262,
+          "min": 0.12076999999999316,
+          "max": 0.4572979999998097
+        },
+        "context_ready_to_receive_complete": {
+          "count": 4096,
+          "mean": 0.005651219360360948,
+          "p50": 0.005750749999833715,
+          "p95": 0.0106277500002534,
+          "min": 0.0005004999998163839,
+          "max": 0.03578849999985323
+        }
+      },
+      "context_batch_histogram": {
+        "1": 4096
+      },
+      "context_peak_queue": 117,
+      "generation_tokens_per_forward_to_last_token_window_second": 3386.3753716067313,
+      "throughput_definition": "Complete per-request generation steps / elapsed first forward start to last token completion",
+      "arrival_requests_per_second": 21.297958311992023,
+      "prefill_workers": 3,
+      "generation_workers": 1,
+      "generation_gpus": [
+        6,
+        7
+      ],
+      "trial": "100-performance-1",
+      "native_transfer": {
+        "send_request_count": 4096,
+        "receive_request_count": 4096,
+        "expected_completed_requests": 4096,
+        "total_send_payload_bytes": 450250145792,
+        "send_payload_bytes_per_request": {
+          "count": 4096,
+          "mean": 109924352,
+          "p50": 109924352.0,
+          "p95": 109924352.0,
+          "p99": 109924352.0,
+          "min": 109924352,
+          "max": 109924352
+        },
+        "send_transfer_phase_ms": {
+          "count": 4096,
+          "mean": 5.287959716796875,
+          "p50": 5.1385000000000005,
+          "p95": 9.337,
+          "p99": 11.31705,
+          "min": 0.783,
+          "max": 15.248
+        },
+        "send_prepare_phase_ms": {
+          "count": 4096,
+          "mean": 0.24619091796875,
+          "p50": 0.243,
+          "p95": 0.271,
+          "p99": 0.297,
+          "min": 0.227,
+          "max": 0.374
+        },
+        "send_queue_phase_ms": {
+          "count": 4096,
+          "mean": 0.203799560546875,
+          "p50": 0.182,
+          "p95": 0.42125,
+          "p99": 0.632,
+          "min": 0.071,
+          "max": 3.177
+        },
+        "segments_per_request": {
+          "count": 4096,
+          "mean": 1284,
+          "p50": 1284.0,
+          "p95": 1284.0,
+          "p99": 1284.0,
+          "min": 1284,
+          "max": 1284
+        },
+        "receive_lifecycle_ms": {
+          "count": 4096,
+          "mean": 43894.874729492185,
+          "p50": 50224.2285,
+          "p95": 53552.532,
+          "p99": 53673.251150000004,
+          "min": 362.177,
+          "max": 56710.235
+        },
+        "send_phase_payload_mib_per_second": {
+          "count": 4096,
+          "mean": 25052.7670041008,
+          "p50": 20401.290696228534,
+          "p95": 57862.387836575595,
+          "p99": 84839.713410005,
+          "min": 6875.133214192026,
+          "max": 133885.09738186462
+        },
+        "definition": "Native NIXL send-task elapsed transfer phase, excluding its preparation and queue phases. For a request with multiple source ranks, bytes are summed and phase times take the maximum. Receive lifecycle includes waiting for context. Rates are task measurements, not hardware link bandwidth."
+      },
+      "started_at_utc": "2026-10-19T05:18:25.817313+00:00",
+      "completed_at_utc": "2026-10-19T05:21:43.770706+00:00",
+      "client_seconds": 197.95338804099993,
+      "latency_seconds": {
+        "count": 4096,
+        "mean": 50.11095945882666,
+        "p50": 54.44929689950004,
+        "p95": 57.84324954474994,
+        "p99": 63.27656565010014,
+        "min": 10.201253237999936,
+        "max": 66.26902570000016
+      },
+      "ttft_seconds": {
+        "count": 4096,
+        "mean": 46.140847485759764,
+        "p50": 50.40155168900003,
+        "p95": 53.74796124749997,
+        "p99": 59.28429191055003,
+        "min": 6.360136808000107,
+        "max": 62.230687161000105
+      },
+      "tpot_seconds": {
+        "count": 4096,
+        "mean": 0.024969257692244617,
+        "p50": 0.02560030599685513,
+        "p95": 0.02604517583804995,
+        "p99": 0.02655580612610074,
+        "min": 4.119656603695646e-05,
+        "max": 0.03154661935848925
+      },
+      "metrics": {
+        "peak_concurrent_decode": 95,
+        "iterations_at_peak": 1,
+        "peak_decode_per_rank": {
+          "0": 60,
+          "1": 60
+        },
+        "decode_concurrency_histogram": {
+          "0": 22,
+          "1": 4,
+          "2": 6,
+          "3": 18,
+          "4": 8,
+          "5": 5,
+          "6": 14,
+          "7": 8,
+          "8": 9,
+          "9": 9,
+          "10": 8,
+          "11": 7,
+          "12": 7,
+          "13": 7,
+          "14": 9,
+          "15": 5,
+          "16": 8,
+          "17": 8,
+          "18": 5,
+          "19": 8,
+          "20": 8,
+          "21": 5,
+          "22": 8,
+          "23": 8,
+          "24": 1,
+          "25": 3,
+          "26": 6,
+          "27": 2,
+          "28": 7,
+          "29": 3,
+          "30": 3,
+          "31": 4,
+          "32": 2,
+          "33": 3,
+          "34": 6,
+          "35": 2,
+          "36": 2,
+          "37": 5,
+          "38": 2,
+          "39": 2,
+          "40": 7,
+          "41": 3,
+          "42": 1,
+          "43": 6,
+          "44": 3,
+          "45": 1,
+          "46": 7,
+          "47": 2,
+          "48": 4,
+          "49": 6,
+          "50": 5,
+          "51": 3,
+          "52": 6,
+          "53": 3,
+          "54": 6,
+          "55": 3,
+          "56": 5,
+          "57": 4,
+          "58": 6,
+          "59": 3,
+          "60": 6,
+          "61": 5,
+          "62": 1,
+          "63": 8,
+          "64": 3,
+          "65": 4,
+          "66": 5,
+          "67": 6,
+          "68": 1,
+          "69": 7,
+          "70": 4,
+          "71": 5,
+          "72": 8,
+          "73": 7,
+          "74": 2,
+          "75": 8,
+          "76": 2,
+          "77": 6,
+          "78": 8,
+          "79": 5,
+          "80": 3,
+          "81": 8,
+          "82": 6,
+          "83": 30,
+          "84": 590,
+          "85": 454,
+          "86": 622,
+          "87": 819,
+          "88": 1385,
+          "89": 2055,
+          "90": 950,
+          "91": 208,
+          "92": 36,
+          "93": 52,
+          "94": 22,
+          "95": 1
+        },
+        "gpu_memory_bytes": {
+          "context_servers:0": 139460608000,
+          "generation_servers:0": 186703085568,
+          "generation_servers:1": 186703085568
+        },
+        "max_paused_requests_per_rank": 0,
+        "max_queued_requests": 15,
+        "generation_kv_stat_peaks": {
+          "rank0:allocNewBlocks": 559152,
+          "rank0:allocTotalBlocks": 559152,
+          "rank0:cacheHitRate": 0.0,
+          "rank0:freeNumBlocks": 157937,
+          "rank0:maxNumBlocks": 157940,
+          "rank0:missedBlocks": 546444,
+          "rank0:reusedBlocks": 0.0,
+          "rank0:tokensPerBlock": 128,
+          "rank0:usedNumBlocks": 155446,
+          "rank1:allocNewBlocks": 559152,
+          "rank1:allocTotalBlocks": 559152,
+          "rank1:cacheHitRate": 0.0,
+          "rank1:freeNumBlocks": 157937,
+          "rank1:maxNumBlocks": 157940,
+          "rank1:missedBlocks": 546444,
+          "rank1:reusedBlocks": 0.0,
+          "rank1:tokensPerBlock": 128,
+          "rank1:usedNumBlocks": 155446
+        },
+        "decode_iteration_latency_ms": {
+          "count": 15312,
+          "mean": 48.35595503496152,
+          "p50": 48.28917980194092,
+          "p95": 53.48860025405884,
+          "p99": 55.45066118240356,
+          "min": 30.298233032226562,
+          "max": 66.75434112548828
+        },
+        "context_schedule_histogram": [
+          {
+            "requests": 1,
+            "tokens": 1,
+            "kv_tokens": 32767,
+            "iterations": 4096
+          }
+        ]
+      },
+      "context_gpu_forward_ms": {
+        "count": 4096,
+        "mean": 118.37449368089437,
+        "p50": 117.74017333984375,
+        "p95": 122.67893600463867,
+        "min": 114.14556884765625,
+        "max": 186.8573760986328
+      },
+      "context_worker_request_counts": {
+        "perf_metrics-context-umb-b200-260-82623-20261019T051624Z.jsonl": 1365,
+        "perf_metrics-context-umb-b200-260-82624-20261019T051627Z.jsonl": 1365,
+        "perf_metrics-context-umb-b200-260-82628-20261019T051625Z.jsonl": 1366
+      },
+      "gpu_telemetry": {
+        "0": {
+          "uuid": "GPU-e1ea2e95-d0c3-0482-48f8-acd57d98f58d",
+          "sample_count": 198,
+          "utilization_percent": {
+            "count": 198,
+            "mean": 16.767676767676768,
+            "p50": 16.0,
+            "p95": 21.0,
+            "min": 0.0,
+            "max": 57.0
+          },
+          "power_watts": {
+            "count": 198,
+            "mean": 251.08671717171717,
+            "p50": 251.375,
+            "p95": 252.4205,
+            "min": 243.13,
+            "max": 253.31
+          },
+          "peak_memory_mib": 133000.0
+        },
+        "1": {
+          "uuid": "GPU-93f15d5a-41c6-80a8-9fde-3ee3959474d1",
+          "sample_count": 198,
+          "utilization_percent": {
+            "count": 198,
+            "mean": 62.04040404040404,
+            "p50": 67.0,
+            "p95": 98.0,
+            "min": 0.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 198,
+            "mean": 254.249797979798,
+            "p50": 254.64999999999998,
+            "p95": 255.7715,
+            "min": 244.4,
+            "max": 257.67
+          },
+          "peak_memory_mib": 132310.0
+        },
+        "2": {
+          "uuid": "GPU-700aa2d2-90a4-d38f-57db-cac888db7523",
+          "sample_count": 198,
+          "utilization_percent": {
+            "count": 198,
+            "mean": 26.833333333333332,
+            "p50": 18.0,
+            "p95": 66.14999999999998,
+            "min": 0.0,
+            "max": 82.0
+          },
+          "power_watts": {
+            "count": 198,
+            "mean": 258.504898989899,
+            "p50": 258.775,
+            "p95": 260.5545,
+            "min": 250.11,
+            "max": 261.64
+          },
+          "peak_memory_mib": 133000.0
+        },
+        "3": {
+          "uuid": "GPU-4834715f-9590-552c-3265-8660001654a3",
+          "sample_count": 198,
+          "utilization_percent": {
+            "count": 198,
+            "mean": 47.505050505050505,
+            "p50": 55.5,
+            "p95": 86.14999999999998,
+            "min": 0.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 198,
+            "mean": 255.78671717171716,
+            "p50": 256.615,
+            "p95": 257.8345,
+            "min": 246.37,
+            "max": 258.49
+          },
+          "peak_memory_mib": 132310.0
+        },
+        "4": {
+          "uuid": "GPU-bfea489f-647b-5c3d-570c-882674218cae",
+          "sample_count": 198,
+          "utilization_percent": {
+            "count": 198,
+            "mean": 15.747474747474747,
+            "p50": 16.0,
+            "p95": 19.0,
+            "min": 0.0,
+            "max": 57.0
+          },
+          "power_watts": {
+            "count": 198,
+            "mean": 252.31080808080807,
+            "p50": 252.695,
+            "p95": 253.6315,
+            "min": 244.39,
+            "max": 254.11
+          },
+          "peak_memory_mib": 133000.0
+        },
+        "5": {
+          "uuid": "GPU-94e57c2c-c708-f3a6-1343-3f8acb363c12",
+          "sample_count": 198,
+          "utilization_percent": {
+            "count": 198,
+            "mean": 61.474747474747474,
+            "p50": 65.0,
+            "p95": 87.14999999999998,
+            "min": 0.0,
+            "max": 98.0
+          },
+          "power_watts": {
+            "count": 198,
+            "mean": 253.55171717171717,
+            "p50": 254.095,
+            "p95": 255.21,
+            "min": 243.43,
+            "max": 256.32
+          },
+          "peak_memory_mib": 132310.0
+        },
+        "6": {
+          "uuid": "GPU-46fe2cd0-a682-def4-4019-a54267f3241b",
+          "sample_count": 198,
+          "utilization_percent": {
+            "count": 198,
+            "mean": 92.86868686868686,
+            "p50": 96.0,
+            "p95": 100.0,
+            "min": 0.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 198,
+            "mean": 590.6029797979799,
+            "p50": 600.985,
+            "p95": 630.6274999999999,
+            "min": 255.03,
+            "max": 642.8
+          },
+          "peak_memory_mib": 178054.0
+        },
+        "7": {
+          "uuid": "GPU-d1160a28-0f0c-a6e5-496b-b8cf55e941e7",
+          "sample_count": 198,
+          "utilization_percent": {
+            "count": 198,
+            "mean": 92.94949494949495,
+            "p50": 96.0,
+            "p95": 100.0,
+            "min": 0.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 198,
+            "mean": 569.9111111111112,
+            "p50": 580.89,
+            "p95": 607.433,
+            "min": 245.09,
+            "max": 626.3
+          },
+          "peak_memory_mib": 177364.0
+        }
+      },
+      "variant": "default",
+      "run_name": "resident-p3-d1",
+      "config": {
+        "mode": "resident",
+        "model": "/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V4-Flash",
+        "model_layers": 43,
+        "input_tokens": 32768,
+        "output_tokens": 160,
+        "prompt_sha256": "28000cb6de0614b6a863b26f8aaf8f90824c232677d777ef94ad0bd98be6a8fc",
+        "prompt_kind": "Synthetic identical repeated astronomy paragraph plus fixed question",
+        "context_config": {
+          "tensor_parallel_size": 2,
+          "moe_expert_parallel_size": 2,
+          "moe_config": {
+            "backend": "TRTLLM"
+          },
+          "disable_overlap_scheduler": false,
+          "enable_chunked_prefill": true,
+          "cuda_graph_config": {
+            "batch_sizes": [
+              1
+            ],
+            "enable_padding": true
+          },
+          "enable_autotuner": false,
+          "enable_iter_perf_stats": true,
+          "iter_stats_max_iterations": -1,
+          "max_batch_size": 128,
+          "max_seq_len": 33024,
+          "max_num_tokens": 2048,
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/perf",
+          "kv_cache_config": {
+            "dtype": "nvfp4",
+            "tokens_per_block": 128,
+            "enable_block_reuse": true,
+            "free_gpu_memory_fraction": 0.5,
+            "host_cache_size": 0,
+            "max_util_for_resume": 1.0,
+            "fp8_context_mla_kv_len_cap": 33024
+          },
+          "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 33024,
+            "kv_transfer_timeout_ms": 3600000
+          },
+          "sparse_attention_config": {
+            "algorithm": "deepseek_v4",
+            "compress_ratios": [
+              0,
+              0,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              0
+            ],
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "window_size": 128
+          }
+        },
+        "generation_config": {
+          "tensor_parallel_size": 2,
+          "moe_expert_parallel_size": 2,
+          "moe_config": {
+            "backend": "TRTLLM"
+          },
+          "disable_overlap_scheduler": false,
+          "enable_chunked_prefill": true,
+          "cuda_graph_config": {
+            "batch_sizes": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128,
+              256,
+              512,
+              768,
+              1024
+            ],
+            "enable_padding": true
+          },
+          "enable_autotuner": false,
+          "enable_iter_perf_stats": true,
+          "iter_stats_max_iterations": -1,
+          "max_batch_size": 1024,
+          "max_seq_len": 33024,
+          "max_num_tokens": 2048,
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/perf",
+          "kv_cache_config": {
+            "dtype": "nvfp4",
+            "tokens_per_block": 128,
+            "enable_block_reuse": false,
+            "free_gpu_memory_fraction": 0.95,
+            "host_cache_size": 0,
+            "max_util_for_resume": 1.0,
+            "fp8_context_mla_kv_len_cap": 33024,
+            "avg_seq_len": 32770
+          },
+          "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 33024,
+            "kv_transfer_timeout_ms": 3600000
+          },
+          "sparse_attention_config": {
+            "algorithm": "deepseek_v4",
+            "compress_ratios": [
+              0,
+              0,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              0
+            ],
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "window_size": 128
+          },
+          "enable_attention_dp": true
+        },
+        "disaggregation_config": {
+          "hostname": "localhost",
+          "backend": "pytorch",
+          "context_servers": {
+            "num_instances": 3
+          },
+          "generation_servers": {
+            "num_instances": 1
+          },
+          "schedule_style": "generation_first",
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/perf"
+        },
+        "capacity_gate_installed": false,
+        "physical_generation_gpu_ids": [
+          6,
+          7
+        ],
+        "physical_context_gpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "worker_http_connection_policy": "fresh_connection_per_request",
+        "worker_http_retries_disabled": true,
+        "deterministic_kernel_controls": {
+          "FORCE_DETERMINISTIC": "0",
+          "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1",
+          "FORCE_MOE_KERNEL_DETERMINISTIC": "1",
+          "FORCE_ALL_REDUCE_DETERMINISTIC": "1",
+          "FORCE_TOPK_KERNEL_DETERMINISTIC": "1",
+          "FORCE_MHC_KERNEL_DETERMINISTIC": "1"
+        }
+      }
+    },
+    {
+      "analysis_version": 4,
+      "result_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/001-warm-results.json",
+      "input_tokens": 32768,
+      "mode": "offload",
+      "command": {
+        "concurrency": 1,
+        "requests": 1,
+        "output_tokens": 160,
+        "gate": false,
+        "profile": false,
+        "purpose": "Prefill ratio comparison, same physical generation GPUs 6 and 7"
+      },
+      "requests": 1,
+      "output_tokens": 160,
+      "all_requests_passed": true,
+      "e2e_output_tokens_per_second": 31.568564756159613,
+      "generation_tokens_per_client_wall_second": 31.371261226433617,
+      "decode_worker_tokens_per_second": 55.28244636298936,
+      "scheduled_tokens_per_iteration_window_second": 55.29010676738526,
+      "scheduled_tokens_in_iteration_window": 158,
+      "iteration_start_window_seconds": 2.857654094696045,
+      "iteration_token_coverage_complete": true,
+      "decode_worker_tokens_in_window": 159,
+      "decode_worker_window_seconds": 2.8761389999999665,
+      "decode_iterations": 159,
+      "scheduled_generation_tokens": 159,
+      "expected_generation_tokens": 159,
+      "decode_step_cadence_ms": {
+        "count": 158,
+        "mean": 18.086418320861043,
+        "p50": 18.032550811767578,
+        "p95": 18.4354305267334,
+        "min": 17.635107040405273,
+        "max": 18.65077018737793
+      },
+      "iteration_lifecycle_ms": {
+        "count": 159,
+        "mean": 35.41361910742034,
+        "p50": 35.350799560546875,
+        "p95": 35.77475547790527,
+        "min": 32.98616409301758,
+        "max": 36.23342514038086
+      },
+      "host_step_ms": {
+        "count": 159,
+        "mean": 18.048229457447363,
+        "p50": 17.995834350585938,
+        "p95": 18.38700771331787,
+        "min": 17.740964889526367,
+        "max": 18.523454666137695
+      },
+      "scheduled_decode_count": {
+        "count": 159,
+        "mean": 1,
+        "p50": 1.0,
+        "p95": 1.0,
+        "min": 1,
+        "max": 1
+      },
+      "peak_decode_requests": 1,
+      "request_perf_coverage": {
+        "count": 1,
+        "expected": 1,
+        "complete": true
+      },
+      "generation_request_compute_seconds": {
+        "count": 1,
+        "mean": 2.8761389999999665,
+        "p50": 2.8761389999999665,
+        "p95": 2.8761389999999665,
+        "min": 2.8761389999999665,
+        "max": 2.8761389999999665
+      },
+      "generation_request_mean_token_interval_ms": {
+        "count": 1,
+        "mean": 18.070006329113784,
+        "p50": 18.070006329113784,
+        "p95": 18.070006329113784,
+        "min": 18.070006329113784,
+        "max": 18.070006329113784
+      },
+      "generation_forward_event_ms": {
+        "count": 159,
+        "mean": 17.634760826638658,
+        "p50": 17.61248016357422,
+        "p95": 17.732988357543945,
+        "min": 17.549152374267578,
+        "max": 18.266239166259766
+      },
+      "generation_active_intervals": {
+        "start": 1901.280221,
+        "end": 1904.15636,
+        "seconds": 2.8761389999999665,
+        "mean_active_requests": 1.0,
+        "peak_active_requests": 1,
+        "empty_seconds": 0.0,
+        "active_request_seconds": 2.8761389999999665
+      },
+      "stage_seconds": {
+        "generation_receive_lifecycle": {
+          "count": 1,
+          "mean": 2.1550019999999677,
+          "p50": 2.1550019999999677,
+          "p95": 2.1550019999999677,
+          "min": 2.1550019999999677,
+          "max": 2.1550019999999677
+        },
+        "receive_complete_to_first_scheduled": {
+          "count": 1,
+          "mean": 0.004704999999830761,
+          "p50": 0.004704999999830761,
+          "p95": 0.004704999999830761,
+          "min": 0.004704999999830761,
+          "max": 0.004704999999830761
+        },
+        "generation_first_scheduled_to_last_token": {
+          "count": 1,
+          "mean": 2.889603999999963,
+          "p50": 2.889603999999963,
+          "p95": 2.889603999999963,
+          "min": 2.889603999999963,
+          "max": 2.889603999999963
+        },
+        "context_queue": {
+          "count": 1,
+          "mean": 0.06115200000022014,
+          "p50": 0.06115200000022014,
+          "p95": 0.06115200000022014,
+          "min": 0.06115200000022014,
+          "max": 0.06115200000022014
+        },
+        "context_scheduled_to_first_token": {
+          "count": 1,
+          "mean": 1.9533419999997932,
+          "p50": 1.9533419999997932,
+          "p95": 1.9533419999997932,
+          "min": 1.9533419999997932,
+          "max": 1.9533419999997932
+        },
+        "context_ready_to_receive_complete": {
+          "count": 1,
+          "mean": 0.14572649999990972,
+          "p50": 0.14572649999990972,
+          "p95": 0.14572649999990972,
+          "min": 0.14572649999990972,
+          "max": 0.14572649999990972
+        }
+      },
+      "context_batch_histogram": {
+        "1": 16
+      },
+      "context_peak_queue": 0,
+      "generation_tokens_per_forward_to_last_token_window_second": 55.28244636298936,
+      "throughput_definition": "Complete per-request generation steps / elapsed first forward start to last token completion",
+      "arrival_requests_per_second": 0.34768834190559345,
+      "prefill_workers": 3,
+      "generation_workers": 1,
+      "generation_gpus": [
+        6,
+        7
+      ],
+      "trial": "001-warm",
+      "native_transfer": {
+        "send_request_count": 1,
+        "receive_request_count": 1,
+        "expected_completed_requests": 1,
+        "total_send_payload_bytes": 109924352,
+        "send_payload_bytes_per_request": {
+          "count": 1,
+          "mean": 109924352,
+          "p50": 109924352.0,
+          "p95": 109924352.0,
+          "p99": 109924352.0,
+          "min": 109924352,
+          "max": 109924352
+        },
+        "send_transfer_phase_ms": {
+          "count": 1,
+          "mean": 133.493,
+          "p50": 133.493,
+          "p95": 133.493,
+          "p99": 133.493,
+          "min": 133.493,
+          "max": 133.493
+        },
+        "send_prepare_phase_ms": {
+          "count": 1,
+          "mean": 2.852,
+          "p50": 2.852,
+          "p95": 2.852,
+          "p99": 2.852,
+          "min": 2.852,
+          "max": 2.852
+        },
+        "send_queue_phase_ms": {
+          "count": 1,
+          "mean": 0.208,
+          "p50": 0.208,
+          "p95": 0.208,
+          "p99": 0.208,
+          "min": 0.208,
+          "max": 0.208
+        },
+        "segments_per_request": {
+          "count": 1,
+          "mean": 1284,
+          "p50": 1284.0,
+          "p95": 1284.0,
+          "p99": 1284.0,
+          "min": 1284,
+          "max": 1284
+        },
+        "receive_lifecycle_ms": {
+          "count": 1,
+          "mean": 2155.002,
+          "p50": 2155.002,
+          "p95": 2155.002,
+          "p99": 2155.002,
+          "min": 2155.002,
+          "max": 2155.002
+        },
+        "send_phase_payload_mib_per_second": {
+          "count": 1,
+          "mean": 785.2998378192115,
+          "p50": 785.2998378192115,
+          "p95": 785.2998378192115,
+          "p99": 785.2998378192115,
+          "min": 785.2998378192115,
+          "max": 785.2998378192115
+        },
+        "definition": "Native NIXL send-task elapsed transfer phase, excluding its preparation and queue phases. For a request with multiple source ranks, bytes are summed and phase times take the maximum. Receive lifecycle includes waiting for context. Rates are task measurements, not hardware link bandwidth."
+      },
+      "started_at_utc": "2026-10-19T05:28:27.529017+00:00",
+      "completed_at_utc": "2026-10-19T05:28:32.597351+00:00",
+      "client_seconds": 5.068333046999896,
+      "latency_seconds": {
+        "count": 1,
+        "mean": 5.064619462999872,
+        "p50": 5.064619462999872,
+        "p95": 5.064619462999872,
+        "p99": 5.064619462999872,
+        "min": 5.064619462999872,
+        "max": 5.064619462999872
+      },
+      "ttft_seconds": {
+        "count": 1,
+        "mean": 2.188110267999946,
+        "p50": 2.188110267999946,
+        "p95": 2.188110267999946,
+        "p99": 2.188110267999946,
+        "min": 2.188110267999946,
+        "max": 2.188110267999946
+      },
+      "tpot_seconds": {
+        "count": 1,
+        "mean": 0.018091252798741672,
+        "p50": 0.018091252798741672,
+        "p95": 0.018091252798741672,
+        "p99": 0.018091252798741672,
+        "min": 0.018091252798741672,
+        "max": 0.018091252798741672
+      },
+      "metrics": {
+        "peak_concurrent_decode": 1,
+        "iterations_at_peak": 159,
+        "peak_decode_per_rank": {
+          "0": 1,
+          "1": 0
+        },
+        "decode_concurrency_histogram": {
+          "0": 122,
+          "1": 159
+        },
+        "gpu_memory_bytes": {
+          "context_servers:0": 139368202240,
+          "generation_servers:0": 189112647680,
+          "generation_servers:1": 189112647680
+        },
+        "max_paused_requests_per_rank": 0,
+        "max_queued_requests": 0,
+        "generation_kv_stat_peaks": {
+          "rank0:allocNewBlocks": 528,
+          "rank0:allocTotalBlocks": 528,
+          "rank0:cacheHitRate": 0.0,
+          "rank0:freeNumBlocks": 240134,
+          "rank0:maxNumBlocks": 240137,
+          "rank0:missedBlocks": 516,
+          "rank0:reusedBlocks": 0.0,
+          "rank0:tokensPerBlock": 128,
+          "rank0:usedNumBlocks": 265,
+          "rank1:allocNewBlocks": 528,
+          "rank1:allocTotalBlocks": 528,
+          "rank1:cacheHitRate": 0.0,
+          "rank1:freeNumBlocks": 240134,
+          "rank1:maxNumBlocks": 240137,
+          "rank1:missedBlocks": 516,
+          "rank1:reusedBlocks": 0.0,
+          "rank1:tokensPerBlock": 128,
+          "rank1:usedNumBlocks": 265
+        },
+        "decode_iteration_latency_ms": {
+          "count": 159,
+          "mean": 35.41361910742034,
+          "p50": 35.350799560546875,
+          "p95": 35.77475547790527,
+          "p99": 35.89380741119385,
+          "min": 32.98616409301758,
+          "max": 36.23342514038086
+        },
+        "context_schedule_histogram": [
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 0,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 2048,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 4096,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 6144,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 8192,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 10240,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 12288,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 14336,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 16384,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 18432,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 20480,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 22528,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 24576,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 26624,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 28672,
+            "iterations": 1
+          },
+          {
+            "requests": 1,
+            "tokens": 2048,
+            "kv_tokens": 30720,
+            "iterations": 1
+          }
+        ]
+      },
+      "context_gpu_forward_ms": {
+        "count": 15,
+        "mean": 120.50184783935546,
+        "p50": 119.44793701171875,
+        "p95": 124.90305557250976,
+        "min": 118.8082275390625,
+        "max": 130.47605895996094
+      },
+      "context_worker_request_counts": {
+        "perf_metrics-context-umb-b200-260-93943-20261019T052725Z.jsonl": 1
+      },
+      "gpu_telemetry": {
+        "0": {
+          "uuid": "GPU-e1ea2e95-d0c3-0482-48f8-acd57d98f58d",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 19.8,
+            "p50": 0.0,
+            "p95": 56.39999999999999,
+            "min": 0.0,
+            "max": 61.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 360.848,
+            "p50": 316.4,
+            "p95": 519.564,
+            "min": 243.58,
+            "max": 532.5
+          },
+          "peak_memory_mib": 132912.0
+        },
+        "1": {
+          "uuid": "GPU-93f15d5a-41c6-80a8-9fde-3ee3959474d1",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 29.8,
+            "p50": 0.0,
+            "p95": 80.19999999999999,
+            "min": 0.0,
+            "max": 84.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 361.408,
+            "p50": 310.27,
+            "p95": 528.014,
+            "min": 244.45,
+            "max": 544.23
+          },
+          "peak_memory_mib": 132220.0
+        },
+        "2": {
+          "uuid": "GPU-700aa2d2-90a4-d38f-57db-cac888db7523",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 249.112,
+            "p50": 249.13,
+            "p95": 249.16199999999998,
+            "min": 249.04,
+            "max": 249.17
+          },
+          "peak_memory_mib": 132868.0
+        },
+        "3": {
+          "uuid": "GPU-4834715f-9590-552c-3265-8660001654a3",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 245.522,
+            "p50": 245.52,
+            "p95": 245.61,
+            "min": 245.43,
+            "max": 245.62
+          },
+          "peak_memory_mib": 132176.0
+        },
+        "4": {
+          "uuid": "GPU-bfea489f-647b-5c3d-570c-882674218cae",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 244.46,
+            "p50": 244.48,
+            "p95": 244.506,
+            "min": 244.37,
+            "max": 244.51
+          },
+          "peak_memory_mib": 132932.0
+        },
+        "5": {
+          "uuid": "GPU-94e57c2c-c708-f3a6-1343-3f8acb363c12",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 243.626,
+            "p50": 243.65,
+            "p95": 243.696,
+            "min": 243.55,
+            "max": 243.7
+          },
+          "peak_memory_mib": 132240.0
+        },
+        "6": {
+          "uuid": "GPU-46fe2cd0-a682-def4-4019-a54267f3241b",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 91.2,
+            "p50": 91.0,
+            "p95": 91.8,
+            "min": 91.0,
+            "max": 92.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 338.46,
+            "p50": 346.67,
+            "p95": 360.604,
+            "min": 278.98,
+            "max": 360.8
+          },
+          "peak_memory_mib": 180352.0
+        },
+        "7": {
+          "uuid": "GPU-d1160a28-0f0c-a6e5-496b-b8cf55e941e7",
+          "sample_count": 5,
+          "utilization_percent": {
+            "count": 5,
+            "mean": 91.4,
+            "p50": 92.0,
+            "p95": 92.8,
+            "min": 90.0,
+            "max": 93.0
+          },
+          "power_watts": {
+            "count": 5,
+            "mean": 327.45,
+            "p50": 337.85,
+            "p95": 348.37,
+            "min": 266.09,
+            "max": 348.7
+          },
+          "peak_memory_mib": 179662.0
+        }
+      },
+      "variant": "default",
+      "run_name": "offload-p3-d1",
+      "config": {
+        "mode": "offload",
+        "model": "/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V4-Flash",
+        "model_layers": 43,
+        "input_tokens": 32768,
+        "output_tokens": 160,
+        "prompt_sha256": "28000cb6de0614b6a863b26f8aaf8f90824c232677d777ef94ad0bd98be6a8fc",
+        "prompt_kind": "Synthetic identical repeated astronomy paragraph plus fixed question",
+        "context_config": {
+          "tensor_parallel_size": 2,
+          "moe_expert_parallel_size": 2,
+          "moe_config": {
+            "backend": "TRTLLM"
+          },
+          "disable_overlap_scheduler": false,
+          "enable_chunked_prefill": true,
+          "cuda_graph_config": {
+            "batch_sizes": [
+              1
+            ],
+            "enable_padding": true
+          },
+          "enable_autotuner": false,
+          "enable_iter_perf_stats": true,
+          "iter_stats_max_iterations": -1,
+          "max_batch_size": 128,
+          "max_seq_len": 33024,
+          "max_num_tokens": 2048,
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/perf",
+          "kv_cache_config": {
+            "dtype": "nvfp4",
+            "tokens_per_block": 128,
+            "enable_block_reuse": true,
+            "free_gpu_memory_fraction": 0.5,
+            "host_cache_size": 0,
+            "max_util_for_resume": 1.0,
+            "fp8_context_mla_kv_len_cap": 33024
+          },
+          "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 33024,
+            "kv_transfer_timeout_ms": 3600000
+          },
+          "sparse_attention_config": {
+            "algorithm": "deepseek_v4",
+            "compress_ratios": [
+              0,
+              0,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              0
+            ],
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "window_size": 128
+          }
+        },
+        "generation_config": {
+          "tensor_parallel_size": 2,
+          "moe_expert_parallel_size": 2,
+          "moe_config": {
+            "backend": "TRTLLM"
+          },
+          "disable_overlap_scheduler": false,
+          "enable_chunked_prefill": true,
+          "cuda_graph_config": {
+            "batch_sizes": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128,
+              256,
+              512,
+              768,
+              896
+            ],
+            "enable_padding": true
+          },
+          "enable_autotuner": false,
+          "enable_iter_perf_stats": true,
+          "iter_stats_max_iterations": -1,
+          "max_batch_size": 896,
+          "max_seq_len": 33024,
+          "max_num_tokens": 2048,
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/perf",
+          "kv_cache_config": {
+            "dtype": "nvfp4",
+            "tokens_per_block": 128,
+            "enable_block_reuse": false,
+            "free_gpu_memory_fraction": 0.9,
+            "host_cache_size": 0,
+            "max_util_for_resume": 1.0,
+            "fp8_context_mla_kv_len_cap": 33024,
+            "avg_seq_len": 32770
+          },
+          "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 33024,
+            "kv_transfer_timeout_ms": 3600000
+          },
+          "sparse_attention_config": {
+            "algorithm": "deepseek_v4",
+            "compress_ratios": [
+              0,
+              0,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              0
+            ],
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "window_size": 128,
+            "enable_kv_cache_offload": true,
+            "kv_cache_offload_config": {
+              "gpu_cache_factor": 2.0,
+              "host_history_size": 274877906944
+            }
+          },
+          "enable_attention_dp": true
+        },
+        "disaggregation_config": {
+          "hostname": "localhost",
+          "backend": "pytorch",
+          "context_servers": {
+            "num_instances": 3
+          },
+          "generation_servers": {
+            "num_instances": 1
+          },
+          "schedule_style": "generation_first",
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/perf"
+        },
+        "capacity_gate_installed": false,
+        "physical_generation_gpu_ids": [
+          6,
+          7
+        ],
+        "physical_context_gpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "worker_http_connection_policy": "fresh_connection_per_request",
+        "worker_http_retries_disabled": true,
+        "deterministic_kernel_controls": {
+          "FORCE_DETERMINISTIC": "0",
+          "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1",
+          "FORCE_MOE_KERNEL_DETERMINISTIC": "1",
+          "FORCE_ALL_REDUCE_DETERMINISTIC": "1",
+          "FORCE_TOPK_KERNEL_DETERMINISTIC": "1",
+          "FORCE_MHC_KERNEL_DETERMINISTIC": "1"
+        }
+      }
+    },
+    {
+      "analysis_version": 4,
+      "result_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/100-performance-1-results.json",
+      "input_tokens": 32768,
+      "mode": "offload",
+      "command": {
+        "concurrency": 1696,
+        "requests": 4096,
+        "output_tokens": 160,
+        "gate": false,
+        "profile": false,
+        "purpose": "Prefill ratio comparison, same physical generation GPUs 6 and 7"
+      },
+      "requests": 4096,
+      "output_tokens": 160,
+      "all_requests_passed": true,
+      "e2e_output_tokens_per_second": 3298.8311918613626,
+      "generation_tokens_per_client_wall_second": 3278.2134969122294,
+      "decode_worker_tokens_per_second": 3415.980664638043,
+      "scheduled_tokens_per_iteration_window_second": 3416.2957595050057,
+      "scheduled_tokens_in_iteration_window": 651263,
+      "iteration_start_window_seconds": 190.63425588607788,
+      "iteration_token_coverage_complete": true,
+      "decode_worker_tokens_in_window": 651264,
+      "decode_worker_window_seconds": 190.65213299999982,
+      "decode_iterations": 6823,
+      "scheduled_generation_tokens": 651264,
+      "expected_generation_tokens": 651264,
+      "decode_step_cadence_ms": {
+        "count": 6822,
+        "mean": 27.944042199659613,
+        "p50": 28.186917304992676,
+        "p95": 31.09992742538452,
+        "min": 12.847185134887695,
+        "max": 55.1300048828125
+      },
+      "iteration_lifecycle_ms": {
+        "count": 6823,
+        "mean": 53.784007954838586,
+        "p50": 53.88307571411133,
+        "p95": 58.59389305114746,
+        "min": 32.36222267150879,
+        "max": 75.5927562713623
+      },
+      "host_step_ms": {
+        "count": 6823,
+        "mean": 27.88895884864267,
+        "p50": 28.2747745513916,
+        "p95": 30.804729461669922,
+        "min": 14.369964599609375,
+        "max": 48.84028434753418
+      },
+      "scheduled_decode_count": {
+        "count": 6823,
+        "mean": 95.45126777077532,
+        "p50": 98.0,
+        "p95": 103.0,
+        "min": 1,
+        "max": 107
+      },
+      "peak_decode_requests": 107,
+      "request_perf_coverage": {
+        "count": 4096,
+        "expected": 4096,
+        "complete": true
+      },
+      "generation_request_compute_seconds": {
+        "count": 4096,
+        "mean": 4.471429556640629,
+        "p50": 4.4706339999999045,
+        "p95": 4.662587750000114,
+        "min": 3.5961169999995946,
+        "max": 4.731536999999889
+      },
+      "generation_request_mean_token_interval_ms": {
+        "count": 4096,
+        "mean": 28.097241141403796,
+        "p50": 28.092212025316996,
+        "p95": 29.29292246835506,
+        "min": 22.568506329112616,
+        "max": 29.754189873418152
+      },
+      "generation_forward_event_ms": {
+        "count": 13634,
+        "mean": 27.00649019117944,
+        "p50": 27.652640342712402,
+        "p95": 28.453269290924073,
+        "min": 17.657344818115234,
+        "max": 45.93667221069336
+      },
+      "generation_active_intervals": {
+        "start": 1971.098761,
+        "end": 2161.750894,
+        "seconds": 190.65213299999982,
+        "mean_active_requests": 96.06488621871343,
+        "peak_active_requests": 107,
+        "empty_seconds": 0.0,
+        "active_request_seconds": 18314.975464000003
+      },
+      "stage_seconds": {
+        "generation_receive_lifecycle": {
+          "count": 4096,
+          "mean": 57.84662932397456,
+          "p50": 72.3758399999997,
+          "p95": 73.68133499999965,
+          "min": 0.5075170000000071,
+          "max": 77.59346899999991
+        },
+        "receive_complete_to_first_scheduled": {
+          "count": 4096,
+          "mean": 0.01949847656250292,
+          "p50": 0.019544499999938125,
+          "p95": 0.03965374999984306,
+          "min": 0.0009930000001077133,
+          "max": 0.059025000000019645
+        },
+        "generation_first_scheduled_to_last_token": {
+          "count": 4096,
+          "mean": 4.484942467285151,
+          "p50": 4.482800999999881,
+          "p95": 4.674480500000186,
+          "min": 3.615733999999975,
+          "max": 4.750135000000228
+        },
+        "context_queue": {
+          "count": 4096,
+          "mean": 58.458432400390656,
+          "p50": 72.10864800000013,
+          "p95": 73.40042649999998,
+          "min": 0.011334000000033484,
+          "max": 77.01496800000041
+        },
+        "context_scheduled_to_first_token": {
+          "count": 4096,
+          "mean": 0.2573601379394526,
+          "p50": 0.25695599999994556,
+          "p95": 0.26271175000016456,
+          "min": 0.12245100000018283,
+          "max": 0.43778400000019246
+        },
+        "context_ready_to_receive_complete": {
+          "count": 4096,
+          "mean": 0.13798997277808694,
+          "p50": 0.1346699999996872,
+          "p95": 0.14902524999956768,
+          "min": 0.05629349999981059,
+          "max": 0.4648099999999431
+        }
+      },
+      "context_batch_histogram": {
+        "1": 4096
+      },
+      "context_peak_queue": 103,
+      "generation_tokens_per_forward_to_last_token_window_second": 3415.980664638043,
+      "throughput_definition": "Complete per-request generation steps / elapsed first forward start to last token completion",
+      "arrival_requests_per_second": 21.484155123509705,
+      "prefill_workers": 3,
+      "generation_workers": 1,
+      "generation_gpus": [
+        6,
+        7
+      ],
+      "trial": "100-performance-1",
+      "native_transfer": {
+        "send_request_count": 4096,
+        "receive_request_count": 4096,
+        "expected_completed_requests": 4096,
+        "total_send_payload_bytes": 450250145792,
+        "send_payload_bytes_per_request": {
+          "count": 4096,
+          "mean": 109924352,
+          "p50": 109924352.0,
+          "p95": 109924352.0,
+          "p99": 109924352.0,
+          "min": 109924352,
+          "max": 109924352
+        },
+        "send_transfer_phase_ms": {
+          "count": 4096,
+          "mean": 134.34559399414061,
+          "p50": 133.465,
+          "p95": 140.37425000000002,
+          "p99": 145.2757,
+          "min": 113.89,
+          "max": 391.434
+        },
+        "send_prepare_phase_ms": {
+          "count": 4096,
+          "mean": 0.25225244140625,
+          "p50": 0.25,
+          "p95": 0.277,
+          "p99": 0.30010000000000037,
+          "min": 0.228,
+          "max": 0.671
+        },
+        "send_queue_phase_ms": {
+          "count": 4096,
+          "mean": 3.13163720703125,
+          "p50": 0.179,
+          "p95": 7.968249999999999,
+          "p99": 98.32495000000067,
+          "min": 0.061,
+          "max": 346.485
+        },
+        "segments_per_request": {
+          "count": 4096,
+          "mean": 1284,
+          "p50": 1284.0,
+          "p95": 1284.0,
+          "p99": 1284.0,
+          "min": 1284,
+          "max": 1284
+        },
+        "receive_lifecycle_ms": {
+          "count": 4096,
+          "mean": 57846.62932397461,
+          "p50": 72375.84,
+          "p95": 73681.33499999999,
+          "p99": 73813.2446,
+          "min": 507.517,
+          "max": 77593.469
+        },
+        "send_phase_payload_mib_per_second": {
+          "count": 4096,
+          "mean": 781.73808718574,
+          "p50": 785.4645882706379,
+          "p95": 809.7482379429646,
+          "p99": 817.860353697847,
+          "min": 267.81534371056165,
+          "max": 920.4673917815436
+        },
+        "definition": "Native NIXL send-task elapsed transfer phase, excluding its preparation and queue phases. For a request with multiple source ranks, bytes are summed and phase times take the maximum. Receive lifecycle includes waiting for context. Rates are task measurements, not hardware link bandwidth."
+      },
+      "started_at_utc": "2026-10-19T05:29:31.535676+00:00",
+      "completed_at_utc": "2026-10-19T05:32:50.199983+00:00",
+      "client_seconds": 198.66430316799983,
+      "latency_seconds": {
+        "count": 4096,
+        "mean": 66.79612042991381,
+        "p50": 77.06246728999997,
+        "p95": 81.05802700099991,
+        "p99": 88.47514782670001,
+        "min": 14.201547136999807,
+        "max": 91.0527091959998
+      },
+      "ttft_seconds": {
+        "count": 4096,
+        "mean": 62.4245392321836,
+        "p50": 72.65761448150022,
+        "p95": 76.5360938105,
+        "p99": 84.06384197235003,
+        "min": 9.567329039000015,
+        "max": 86.5523968489997
+      },
+      "tpot_seconds": {
+        "count": 4096,
+        "mean": 0.02749422136937246,
+        "p50": 0.028070975022012376,
+        "p95": 0.029302602257861146,
+        "p99": 0.02960921515188721,
+        "min": 6.061679245672539e-06,
+        "max": 0.03353922080503184
+      },
+      "metrics": {
+        "peak_concurrent_decode": 107,
+        "iterations_at_peak": 1,
+        "peak_decode_per_rank": {
+          "0": 60,
+          "1": 56
+        },
+        "decode_concurrency_histogram": {
+          "0": 29,
+          "1": 6,
+          "2": 6,
+          "3": 9,
+          "4": 5,
+          "6": 15,
+          "7": 1,
+          "8": 5,
+          "9": 8,
+          "10": 3,
+          "11": 2,
+          "12": 8,
+          "13": 5,
+          "14": 2,
+          "15": 8,
+          "16": 2,
+          "17": 1,
+          "18": 9,
+          "19": 3,
+          "20": 1,
+          "21": 7,
+          "22": 1,
+          "23": 3,
+          "24": 6,
+          "25": 2,
+          "26": 3,
+          "27": 5,
+          "28": 1,
+          "29": 4,
+          "30": 5,
+          "31": 2,
+          "32": 3,
+          "33": 4,
+          "34": 3,
+          "35": 2,
+          "36": 5,
+          "37": 4,
+          "38": 2,
+          "39": 4,
+          "40": 2,
+          "41": 3,
+          "42": 5,
+          "43": 3,
+          "44": 2,
+          "45": 4,
+          "46": 3,
+          "47": 2,
+          "48": 5,
+          "49": 4,
+          "50": 1,
+          "51": 4,
+          "52": 3,
+          "53": 1,
+          "54": 7,
+          "55": 2,
+          "56": 1,
+          "57": 7,
+          "58": 2,
+          "59": 2,
+          "60": 7,
+          "61": 1,
+          "62": 2,
+          "63": 7,
+          "64": 1,
+          "65": 2,
+          "66": 6,
+          "67": 2,
+          "68": 2,
+          "69": 4,
+          "70": 3,
+          "71": 3,
+          "72": 4,
+          "73": 3,
+          "74": 3,
+          "75": 6,
+          "76": 6,
+          "77": 5,
+          "78": 3,
+          "79": 8,
+          "80": 3,
+          "81": 1,
+          "82": 9,
+          "83": 4,
+          "84": 5,
+          "85": 4,
+          "86": 4,
+          "87": 2,
+          "88": 2,
+          "89": 7,
+          "90": 4,
+          "91": 2,
+          "92": 7,
+          "93": 43,
+          "94": 184,
+          "95": 536,
+          "96": 1244,
+          "97": 854,
+          "98": 715,
+          "99": 1160,
+          "100": 520,
+          "101": 363,
+          "102": 299,
+          "103": 230,
+          "104": 213,
+          "105": 86,
+          "106": 15,
+          "107": 1
+        },
+        "gpu_memory_bytes": {
+          "context_servers:0": 139460542464,
+          "generation_servers:0": 189112647680,
+          "generation_servers:1": 189112647680
+        },
+        "max_paused_requests_per_rank": 0,
+        "max_queued_requests": 17,
+        "generation_kv_stat_peaks": {
+          "rank0:allocNewBlocks": 559416,
+          "rank0:allocTotalBlocks": 559416,
+          "rank0:cacheHitRate": 0.0,
+          "rank0:freeNumBlocks": 240134,
+          "rank0:maxNumBlocks": 240137,
+          "rank0:missedBlocks": 546702,
+          "rank0:reusedBlocks": 0.0,
+          "rank0:tokensPerBlock": 128,
+          "rank0:usedNumBlocks": 218918,
+          "rank1:allocNewBlocks": 559416,
+          "rank1:allocTotalBlocks": 559416,
+          "rank1:cacheHitRate": 0.0,
+          "rank1:freeNumBlocks": 240134,
+          "rank1:maxNumBlocks": 240137,
+          "rank1:missedBlocks": 546702,
+          "rank1:reusedBlocks": 0.0,
+          "rank1:tokensPerBlock": 128,
+          "rank1:usedNumBlocks": 218918
+        },
+        "decode_iteration_latency_ms": {
+          "count": 13634,
+          "mean": 53.7990839124268,
+          "p50": 53.88689041137695,
+          "p95": 58.59582424163818,
+          "p99": 60.63961982727051,
+          "min": 32.36222267150879,
+          "max": 75.5927562713623
+        },
+        "context_schedule_histogram": [
+          {
+            "requests": 1,
+            "tokens": 1,
+            "kv_tokens": 32767,
+            "iterations": 4096
+          }
+        ]
+      },
+      "context_gpu_forward_ms": {
+        "count": 4096,
+        "mean": 118.13672626204789,
+        "p50": 117.53798294067383,
+        "p95": 121.09860610961914,
+        "min": 113.86217498779297,
+        "max": 212.05760192871094
+      },
+      "context_worker_request_counts": {
+        "perf_metrics-context-umb-b200-260-93943-20261019T052725Z.jsonl": 1366,
+        "perf_metrics-context-umb-b200-260-93944-20261019T052726Z.jsonl": 1365,
+        "perf_metrics-context-umb-b200-260-93948-20261019T052724Z.jsonl": 1365
+      },
+      "gpu_telemetry": {
+        "0": {
+          "uuid": "GPU-e1ea2e95-d0c3-0482-48f8-acd57d98f58d",
+          "sample_count": 199,
+          "utilization_percent": {
+            "count": 199,
+            "mean": 18.236180904522612,
+            "p50": 18.0,
+            "p95": 28.299999999999983,
+            "min": 0.0,
+            "max": 56.0
+          },
+          "power_watts": {
+            "count": 199,
+            "mean": 251.011608040201,
+            "p50": 251.47,
+            "p95": 252.52,
+            "min": 242.79,
+            "max": 252.94
+          },
+          "peak_memory_mib": 132980.0
+        },
+        "1": {
+          "uuid": "GPU-93f15d5a-41c6-80a8-9fde-3ee3959474d1",
+          "sample_count": 199,
+          "utilization_percent": {
+            "count": 199,
+            "mean": 49.879396984924625,
+            "p50": 52.0,
+            "p95": 79.19999999999999,
+            "min": 0.0,
+            "max": 99.0
+          },
+          "power_watts": {
+            "count": 199,
+            "mean": 253.49517587939698,
+            "p50": 254.07,
+            "p95": 255.344,
+            "min": 244.19,
+            "max": 255.99
+          },
+          "peak_memory_mib": 132290.0
+        },
+        "2": {
+          "uuid": "GPU-700aa2d2-90a4-d38f-57db-cac888db7523",
+          "sample_count": 199,
+          "utilization_percent": {
+            "count": 199,
+            "mean": 18.20603015075377,
+            "p50": 18.0,
+            "p95": 31.099999999999994,
+            "min": 0.0,
+            "max": 53.0
+          },
+          "power_watts": {
+            "count": 199,
+            "mean": 257.8994974874372,
+            "p50": 258.37,
+            "p95": 259.28099999999995,
+            "min": 249.7,
+            "max": 259.99
+          },
+          "peak_memory_mib": 133000.0
+        },
+        "3": {
+          "uuid": "GPU-4834715f-9590-552c-3265-8660001654a3",
+          "sample_count": 199,
+          "utilization_percent": {
+            "count": 199,
+            "mean": 52.76381909547739,
+            "p50": 56.0,
+            "p95": 83.1,
+            "min": 0.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 199,
+            "mean": 255.74693467336684,
+            "p50": 256.33,
+            "p95": 257.453,
+            "min": 246.07,
+            "max": 258.22
+          },
+          "peak_memory_mib": 132310.0
+        },
+        "4": {
+          "uuid": "GPU-bfea489f-647b-5c3d-570c-882674218cae",
+          "sample_count": 199,
+          "utilization_percent": {
+            "count": 199,
+            "mean": 15.698492462311558,
+            "p50": 15.0,
+            "p95": 19.0,
+            "min": 0.0,
+            "max": 64.0
+          },
+          "power_watts": {
+            "count": 199,
+            "mean": 252.2486432160804,
+            "p50": 252.72,
+            "p95": 253.61200000000002,
+            "min": 244.17,
+            "max": 253.96
+          },
+          "peak_memory_mib": 133000.0
+        },
+        "5": {
+          "uuid": "GPU-94e57c2c-c708-f3a6-1343-3f8acb363c12",
+          "sample_count": 199,
+          "utilization_percent": {
+            "count": 199,
+            "mean": 64.77386934673366,
+            "p50": 70.0,
+            "p95": 93.0,
+            "min": 0.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 199,
+            "mean": 253.4843718592965,
+            "p50": 254.22,
+            "p95": 255.127,
+            "min": 243.22,
+            "max": 256.36
+          },
+          "peak_memory_mib": 132310.0
+        },
+        "6": {
+          "uuid": "GPU-46fe2cd0-a682-def4-4019-a54267f3241b",
+          "sample_count": 199,
+          "utilization_percent": {
+            "count": 199,
+            "mean": 88.75879396984925,
+            "p50": 93.0,
+            "p95": 98.0,
+            "min": 0.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 199,
+            "mean": 559.3527135678391,
+            "p50": 572.64,
+            "p95": 595.1899999999999,
+            "min": 254.1,
+            "max": 611.16
+          },
+          "peak_memory_mib": 180352.0
+        },
+        "7": {
+          "uuid": "GPU-d1160a28-0f0c-a6e5-496b-b8cf55e941e7",
+          "sample_count": 199,
+          "utilization_percent": {
+            "count": 199,
+            "mean": 88.96482412060301,
+            "p50": 93.0,
+            "p95": 98.0,
+            "min": 0.0,
+            "max": 100.0
+          },
+          "power_watts": {
+            "count": 199,
+            "mean": 538.9893969849246,
+            "p50": 551.77,
+            "p95": 572.624,
+            "min": 244.56,
+            "max": 582.15
+          },
+          "peak_memory_mib": 179662.0
+        }
+      },
+      "variant": "default",
+      "run_name": "offload-p3-d1",
+      "config": {
+        "mode": "offload",
+        "model": "/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V4-Flash",
+        "model_layers": 43,
+        "input_tokens": 32768,
+        "output_tokens": 160,
+        "prompt_sha256": "28000cb6de0614b6a863b26f8aaf8f90824c232677d777ef94ad0bd98be6a8fc",
+        "prompt_kind": "Synthetic identical repeated astronomy paragraph plus fixed question",
+        "context_config": {
+          "tensor_parallel_size": 2,
+          "moe_expert_parallel_size": 2,
+          "moe_config": {
+            "backend": "TRTLLM"
+          },
+          "disable_overlap_scheduler": false,
+          "enable_chunked_prefill": true,
+          "cuda_graph_config": {
+            "batch_sizes": [
+              1
+            ],
+            "enable_padding": true
+          },
+          "enable_autotuner": false,
+          "enable_iter_perf_stats": true,
+          "iter_stats_max_iterations": -1,
+          "max_batch_size": 128,
+          "max_seq_len": 33024,
+          "max_num_tokens": 2048,
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/perf",
+          "kv_cache_config": {
+            "dtype": "nvfp4",
+            "tokens_per_block": 128,
+            "enable_block_reuse": true,
+            "free_gpu_memory_fraction": 0.5,
+            "host_cache_size": 0,
+            "max_util_for_resume": 1.0,
+            "fp8_context_mla_kv_len_cap": 33024
+          },
+          "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 33024,
+            "kv_transfer_timeout_ms": 3600000
+          },
+          "sparse_attention_config": {
+            "algorithm": "deepseek_v4",
+            "compress_ratios": [
+              0,
+              0,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              0
+            ],
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "window_size": 128
+          }
+        },
+        "generation_config": {
+          "tensor_parallel_size": 2,
+          "moe_expert_parallel_size": 2,
+          "moe_config": {
+            "backend": "TRTLLM"
+          },
+          "disable_overlap_scheduler": false,
+          "enable_chunked_prefill": true,
+          "cuda_graph_config": {
+            "batch_sizes": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128,
+              256,
+              512,
+              768,
+              896
+            ],
+            "enable_padding": true
+          },
+          "enable_autotuner": false,
+          "enable_iter_perf_stats": true,
+          "iter_stats_max_iterations": -1,
+          "max_batch_size": 896,
+          "max_seq_len": 33024,
+          "max_num_tokens": 2048,
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/perf",
+          "kv_cache_config": {
+            "dtype": "nvfp4",
+            "tokens_per_block": 128,
+            "enable_block_reuse": false,
+            "free_gpu_memory_fraction": 0.9,
+            "host_cache_size": 0,
+            "max_util_for_resume": 1.0,
+            "fp8_context_mla_kv_len_cap": 33024,
+            "avg_seq_len": 32770
+          },
+          "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 33024,
+            "kv_transfer_timeout_ms": 3600000
+          },
+          "sparse_attention_config": {
+            "algorithm": "deepseek_v4",
+            "compress_ratios": [
+              0,
+              0,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              128,
+              4,
+              0
+            ],
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "window_size": 128,
+            "enable_kv_cache_offload": true,
+            "kv_cache_offload_config": {
+              "gpu_cache_factor": 2.0,
+              "host_history_size": 274877906944
+            }
+          },
+          "enable_attention_dp": true
+        },
+        "disaggregation_config": {
+          "hostname": "localhost",
+          "backend": "pytorch",
+          "context_servers": {
+            "num_instances": 3
+          },
+          "generation_servers": {
+            "num_instances": 1
+          },
+          "schedule_style": "generation_first",
+          "return_perf_metrics": true,
+          "perf_metrics_output_dir": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/perf"
+        },
+        "capacity_gate_installed": false,
+        "physical_generation_gpu_ids": [
+          6,
+          7
+        ],
+        "physical_context_gpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "worker_http_connection_policy": "fresh_connection_per_request",
+        "worker_http_retries_disabled": true,
+        "deterministic_kernel_controls": {
+          "FORCE_DETERMINISTIC": "0",
+          "FORCE_ATTENTION_KERNEL_DETERMINISTIC": "1",
+          "FORCE_MOE_KERNEL_DETERMINISTIC": "1",
+          "FORCE_ALL_REDUCE_DETERMINISTIC": "1",
+          "FORCE_TOPK_KERNEL_DETERMINISTIC": "1",
+          "FORCE_MHC_KERNEL_DETERMINISTIC": "1"
+        }
+      }
+    }
+  ],
+  "parity": [
+    {
+      "trial": "000-cold",
+      "left": "resident-p3-d1",
+      "right": "offload-p3-d1",
+      "left_completed": 1,
+      "right_completed": 1,
+      "identical_token_multisets": true,
+      "identical_output_set": true,
+      "exactly_matched_request_pairs": 1,
+      "exactly_matched_output_tokens_per_mode": 160,
+      "left_unique_outputs": 1,
+      "right_unique_outputs": 1
+    },
+    {
+      "trial": "001-warm",
+      "left": "resident-p3-d1",
+      "right": "offload-p3-d1",
+      "left_completed": 1,
+      "right_completed": 1,
+      "identical_token_multisets": true,
+      "identical_output_set": true,
+      "exactly_matched_request_pairs": 1,
+      "exactly_matched_output_tokens_per_mode": 160,
+      "left_unique_outputs": 1,
+      "right_unique_outputs": 1
+    },
+    {
+      "trial": "100-performance-1",
+      "left": "resident-p3-d1",
+      "right": "offload-p3-d1",
+      "left_completed": 4096,
+      "right_completed": 4096,
+      "identical_token_multisets": false,
+      "identical_output_set": true,
+      "exactly_matched_request_pairs": 4082,
+      "exactly_matched_output_tokens_per_mode": 653120,
+      "left_unique_outputs": 13,
+      "right_unique_outputs": 13
+    }
+  ]
+}

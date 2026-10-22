@@ -1,0 +1,528 @@
+[
+  {
+    "rank": 0,
+    "fields": {
+      "sparse_arena_bytes": {
+        "equal": true,
+        "serving": 6597287168,
+        "matched": 6597287168
+      },
+      "host_history_pool_bytes": {
+        "equal": true,
+        "serving": 51480261504,
+        "matched": 51480261504
+      },
+      "gpu_pool_quota_bytes": {
+        "equal": true,
+        "serving": 87879057408,
+        "matched": 87879057408
+      },
+      "gpu_pool_payload_bytes_per_request": {
+        "equal": true,
+        "serving": 95080132,
+        "matched": 95080132
+      },
+      "physical_pools": {
+        "equal": true,
+        "serving": [
+          {
+            "group": 0,
+            "memory_type": "DRAM",
+            "slot_bytes": 193536,
+            "num_slots": 236443,
+            "payload_bytes": 45760232448
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 45696,
+            "num_slots": 236443,
+            "payload_bytes": 10804499328
+          },
+          {
+            "group": 0,
+            "memory_type": "DRAM",
+            "slot_bytes": 24192,
+            "num_slots": 236443,
+            "payload_bytes": 5720029056
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 5760,
+            "num_slots": 236443,
+            "payload_bytes": 1361911680
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 720,
+            "num_slots": 236443,
+            "payload_bytes": 170238960
+          },
+          {
+            "group": 1,
+            "memory_type": "VRAM",
+            "slot_bytes": 10485760,
+            "num_slots": 1846,
+            "payload_bytes": 19356712960
+          },
+          {
+            "group": 1,
+            "memory_type": "VRAM",
+            "slot_bytes": 2818048,
+            "num_slots": 1846,
+            "payload_bytes": 5202116608
+          },
+          {
+            "group": 2,
+            "memory_type": "VRAM",
+            "slot_bytes": 22020096,
+            "num_slots": 1848,
+            "payload_bytes": 40693137408
+          },
+          {
+            "group": 2,
+            "memory_type": "VRAM",
+            "slot_bytes": 5505024,
+            "num_slots": 1848,
+            "payload_bytes": 10173284352
+          }
+        ],
+        "matched": [
+          {
+            "group": 0,
+            "memory_type": "DRAM",
+            "slot_bytes": 193536,
+            "num_slots": 236443,
+            "payload_bytes": 45760232448
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 45696,
+            "num_slots": 236443,
+            "payload_bytes": 10804499328
+          },
+          {
+            "group": 0,
+            "memory_type": "DRAM",
+            "slot_bytes": 24192,
+            "num_slots": 236443,
+            "payload_bytes": 5720029056
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 5760,
+            "num_slots": 236443,
+            "payload_bytes": 1361911680
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 720,
+            "num_slots": 236443,
+            "payload_bytes": 170238960
+          },
+          {
+            "group": 1,
+            "memory_type": "VRAM",
+            "slot_bytes": 10485760,
+            "num_slots": 1846,
+            "payload_bytes": 19356712960
+          },
+          {
+            "group": 1,
+            "memory_type": "VRAM",
+            "slot_bytes": 2818048,
+            "num_slots": 1846,
+            "payload_bytes": 5202116608
+          },
+          {
+            "group": 2,
+            "memory_type": "VRAM",
+            "slot_bytes": 22020096,
+            "num_slots": 1848,
+            "payload_bytes": 40693137408
+          },
+          {
+            "group": 2,
+            "memory_type": "VRAM",
+            "slot_bytes": 5505024,
+            "num_slots": 1848,
+            "payload_bytes": 10173284352
+          }
+        ]
+      },
+      "sparse_arena_shapes": {
+        "equal": true,
+        "serving": [
+          {
+            "num_layers": 21,
+            "cells_per_buffer": 33,
+            "units_per_cell": 32,
+            "cell_bytes": [
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152
+            ]
+          }
+        ],
+        "matched": [
+          {
+            "num_layers": 21,
+            "cells_per_buffer": 33,
+            "units_per_cell": 32,
+            "cell_bytes": [
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152
+            ]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "rank": 1,
+    "fields": {
+      "sparse_arena_bytes": {
+        "equal": true,
+        "serving": 6597287168,
+        "matched": 6597287168
+      },
+      "host_history_pool_bytes": {
+        "equal": true,
+        "serving": 51480261504,
+        "matched": 51480261504
+      },
+      "gpu_pool_quota_bytes": {
+        "equal": true,
+        "serving": 87879057408,
+        "matched": 87879057408
+      },
+      "gpu_pool_payload_bytes_per_request": {
+        "equal": true,
+        "serving": 95080132,
+        "matched": 95080132
+      },
+      "physical_pools": {
+        "equal": true,
+        "serving": [
+          {
+            "group": 0,
+            "memory_type": "DRAM",
+            "slot_bytes": 193536,
+            "num_slots": 236443,
+            "payload_bytes": 45760232448
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 45696,
+            "num_slots": 236443,
+            "payload_bytes": 10804499328
+          },
+          {
+            "group": 0,
+            "memory_type": "DRAM",
+            "slot_bytes": 24192,
+            "num_slots": 236443,
+            "payload_bytes": 5720029056
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 5760,
+            "num_slots": 236443,
+            "payload_bytes": 1361911680
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 720,
+            "num_slots": 236443,
+            "payload_bytes": 170238960
+          },
+          {
+            "group": 1,
+            "memory_type": "VRAM",
+            "slot_bytes": 10485760,
+            "num_slots": 1846,
+            "payload_bytes": 19356712960
+          },
+          {
+            "group": 1,
+            "memory_type": "VRAM",
+            "slot_bytes": 2818048,
+            "num_slots": 1846,
+            "payload_bytes": 5202116608
+          },
+          {
+            "group": 2,
+            "memory_type": "VRAM",
+            "slot_bytes": 22020096,
+            "num_slots": 1848,
+            "payload_bytes": 40693137408
+          },
+          {
+            "group": 2,
+            "memory_type": "VRAM",
+            "slot_bytes": 5505024,
+            "num_slots": 1848,
+            "payload_bytes": 10173284352
+          }
+        ],
+        "matched": [
+          {
+            "group": 0,
+            "memory_type": "DRAM",
+            "slot_bytes": 193536,
+            "num_slots": 236443,
+            "payload_bytes": 45760232448
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 45696,
+            "num_slots": 236443,
+            "payload_bytes": 10804499328
+          },
+          {
+            "group": 0,
+            "memory_type": "DRAM",
+            "slot_bytes": 24192,
+            "num_slots": 236443,
+            "payload_bytes": 5720029056
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 5760,
+            "num_slots": 236443,
+            "payload_bytes": 1361911680
+          },
+          {
+            "group": 0,
+            "memory_type": "VRAM",
+            "slot_bytes": 720,
+            "num_slots": 236443,
+            "payload_bytes": 170238960
+          },
+          {
+            "group": 1,
+            "memory_type": "VRAM",
+            "slot_bytes": 10485760,
+            "num_slots": 1846,
+            "payload_bytes": 19356712960
+          },
+          {
+            "group": 1,
+            "memory_type": "VRAM",
+            "slot_bytes": 2818048,
+            "num_slots": 1846,
+            "payload_bytes": 5202116608
+          },
+          {
+            "group": 2,
+            "memory_type": "VRAM",
+            "slot_bytes": 22020096,
+            "num_slots": 1848,
+            "payload_bytes": 40693137408
+          },
+          {
+            "group": 2,
+            "memory_type": "VRAM",
+            "slot_bytes": 5505024,
+            "num_slots": 1848,
+            "payload_bytes": 10173284352
+          }
+        ]
+      },
+      "sparse_arena_shapes": {
+        "equal": true,
+        "serving": [
+          {
+            "num_layers": 21,
+            "cells_per_buffer": 33,
+            "units_per_cell": 32,
+            "cell_bytes": [
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152
+            ]
+          }
+        ],
+        "matched": [
+          {
+            "num_layers": 21,
+            "cells_per_buffer": 33,
+            "units_per_cell": 32,
+            "cell_bytes": [
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152,
+              9216,
+              1152
+            ]
+          }
+        ]
+      }
+    }
+  }
+]

@@ -3,6 +3,14 @@
 
 # Reproduce DeepSeek V4 Flash sparse KV offload at 32K
 
+The runnable package is checked in under `reproduce-32k-p3d1/`, and the
+reference results are under `evidence/`. No archive extraction is needed.
+Starting from branch `feat/kvcm2-sparse-32k-repro`, apply the package's
+`patches/0001-preserve-sparse-residency.patch` with `git am`, then apply
+`patches/0002-host-memory-sizing.patch` with `git apply` in a separate source
+checkout before building. Run `reproduce-32k-p3d1/reproduce_32k.sh` from the
+prepared container as described below.
+
 This package reproduces the latest **post-residency-fix, unprofiled 32,768 input / 160 output token** comparison. The primary experiment uses **3 prefill workers and 1 decode worker**. A separate matched-batch experiment checks token parity while controlling decoder occupancy. The scripts do not run Nsight Systems or search for new capacity limits.
 
 The original run and full report are retained at `build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/final-report.json` and in the [benchmark report](https://chatgpt.com/space/page_bec74a2e48208191ade22eaebdb248de).
@@ -16,14 +24,15 @@ The original run and full report are retained at `build/sparse-disagg-e2e-artifa
 
 The existing shared checkout is `build/deepseek-v4-sparse-disagg-e2e`, branch `experiment/deepseek-v4-sparse-disagg-e2e`, at **`f4c197fdea4baad546df0e6bba4065ce04e52213`**. The residency fix is committed locally; two host-memory-sizing files remain modified and were also part of the tested source. Keep those modifications for exact reproduction.
 
-For an independent checkout, the package includes both source patches. Starting from the lowsfer fork:
+For an independent checkout from this branch, apply both source patches in a
+separate worktree. Set `assets` to this directory's absolute path:
 
 ```bash
-git fetch https://github.com/lowsfer/TensorRT-LLM.git kvcm2-sparse-attention-api
-git switch -c reproduce-sparse-32k 046f8c84d92a5492d7df908ad71f046cc7cd97ce
-git am /absolute/package/patches/0001-preserve-sparse-residency.patch
-git apply /absolute/package/patches/0002-host-memory-sizing.patch
-git submodule update --init --recursive
+assets=/absolute/path/to/examples/disaggregated/sparse_kv_offload_repro
+git worktree add --detach /absolute/source-checkout feat/kvcm2-sparse-32k-repro
+git -C /absolute/source-checkout am "$assets/reproduce-32k-p3d1/patches/0001-preserve-sparse-residency.patch"
+git -C /absolute/source-checkout apply "$assets/reproduce-32k-p3d1/patches/0002-host-memory-sizing.patch"
+git -C /absolute/source-checkout submodule update --init --recursive
 ```
 
 Build/install this checkout with the repository's source-build procedure before running. Rebuild native `bindings` and `th_common`, including their `tensorrt_llm` dependency; copying Python changes onto old native binaries is insufficient. `reference/binary-manifest.json` records the original built-library hashes. The original measurements preceded the latest documentation-only upstream commit; the replayed fix preserves the tested executable code.
@@ -67,9 +76,10 @@ Inside a prepared container with all eight GPUs available, use a **new output di
 ```bash
 export E2E_REPO=/absolute/built/TensorRT-LLM
 export LLM_MODELS_ROOT=/absolute/model-root
+export REPRO_ASSETS=/absolute/path/to/examples/disaggregated/sparse_kv_offload_repro
 # Optional: extra Python dependency directories, separated by colons.
 # export REPRO_EXTRA_PYTHONPATH=/absolute/python-deps:/absolute/test-deps
-bash /absolute/package/reproduce_32k.sh serving /absolute/results/32k-serving-01
+bash "$REPRO_ASSETS/reproduce-32k-p3d1/reproduce_32k.sh" serving /absolute/results/32k-serving-01
 ```
 
 The wrapper copies the measured harness into the output directory, records source/runtime provenance, samples GPU telemetry, runs resident then offload, and runs the offline analyses. It refuses to overwrite an existing output directory. It never allocates GPUs itself.
@@ -97,7 +107,7 @@ For matched parity controls, use a separate four-GPU allocation/container and fr
 
 ```bash
 # In the four-GPU container; CUDA_VISIBLE_DEVICES lists your four allocated devices.
-bash /absolute/package/reproduce_32k.sh matched /absolute/results/32k-matched-01
+bash "$REPRO_ASSETS/reproduce-32k-p3d1/reproduce_32k.sh" matched /absolute/results/32k-matched-01
 ```
 
 This runs one prefill worker and one decoder. After cold/warm requests, it gates decode until all KV has arrived for batches **1, 96, 144 and 1,204** in both modes. Offload additionally runs **1,696 twice**. A 512-request ungated churn trial at concurrency 128 occurs between the 96 and 144 controls. The packaged controller automates that step in both modes; the original resident churn trial was manually enqueued. Each gated run requires both rank barriers to report the target count. Verify the recorded scheduled counts also remain at the target for all 159 decode iterations before calling a result a matched-batch comparison. These controls do not measure normal serving latency.

@@ -1,0 +1,718 @@
+{
+  "scope": "32K sparse GPU residency fix and completed validation",
+  "excluded": "Raw server logs, environment dumps, model weights and large raw GPU/per-request performance logs",
+  "files": [
+    {
+      "file": "analyze_decode.py",
+      "bytes": 12689,
+      "sha256": "de43b6d21fa094d0c5200cb70376b58a124de1cd41e7e0623223b2e94bd9c6cf",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_decode.py",
+      "source_bytes": 12689,
+      "source_sha256": "de43b6d21fa094d0c5200cb70376b58a124de1cd41e7e0623223b2e94bd9c6cf"
+    },
+    {
+      "file": "analyze_fix.py",
+      "bytes": 5268,
+      "sha256": "16265f9bf28a9cf70e67cc6de500d2a28f3fb252072ca17c04d9b2d78f9f2143",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_fix.py",
+      "source_bytes": 5268,
+      "source_sha256": "16265f9bf28a9cf70e67cc6de500d2a28f3fb252072ca17c04d9b2d78f9f2143"
+    },
+    {
+      "file": "analyze_prefill_feed.py",
+      "bytes": 3274,
+      "sha256": "ba23885f13bfd03a069939922ea9adf70e07999f9e80c0515d9301e06e2fbf1d",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_prefill_feed.py",
+      "source_bytes": 3274,
+      "source_sha256": "ba23885f13bfd03a069939922ea9adf70e07999f9e80c0515d9301e06e2fbf1d"
+    },
+    {
+      "file": "analyze_ratios.py",
+      "bytes": 8179,
+      "sha256": "2cc52830487561f2b4fa8b4876aa591befffb4c1b45b679f5c60ac34a1638ebd",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_ratios.py",
+      "source_bytes": 8179,
+      "source_sha256": "2cc52830487561f2b4fa8b4876aa591befffb4c1b45b679f5c60ac34a1638ebd"
+    },
+    {
+      "file": "analyze_trials.py",
+      "bytes": 12240,
+      "sha256": "e4abad15b2a885e2d5628680d48e35ff231181d7263ab7a965c329a5a8ec5e29",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_trials.py",
+      "source_bytes": 12240,
+      "source_sha256": "e4abad15b2a885e2d5628680d48e35ff231181d7263ab7a965c329a5a8ec5e29"
+    },
+    {
+      "file": "asynchronous-parity-detail.json",
+      "bytes": 397,
+      "sha256": "24a613395d922f1cb6fc4964decd1cc7fd3b4ad8905f0f40d82b66c884b93bf0",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/asynchronous-parity-detail.json",
+      "source_bytes": 397,
+      "source_sha256": "24a613395d922f1cb6fc4964decd1cc7fd3b4ad8905f0f40d82b66c884b93bf0"
+    },
+    {
+      "file": "benchmark_server.py",
+      "bytes": 22972,
+      "sha256": "6f33e61172ec001f16001c651a509a5f7d110a5d389e3aa7c980f83f627d47d5",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/benchmark_server.py",
+      "source_bytes": 22972,
+      "source_sha256": "6f33e61172ec001f16001c651a509a5f7d110a5d389e3aa7c980f83f627d47d5"
+    },
+    {
+      "file": "binary-manifest.json",
+      "bytes": 1274,
+      "sha256": "b2185715778f206ad74c944eab1d107d4ae29fc7af8ab7886b99f919ae682950",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/binary-manifest.json",
+      "source_bytes": 1274,
+      "source_sha256": "b2185715778f206ad74c944eab1d107d4ae29fc7af8ab7886b99f919ae682950"
+    },
+    {
+      "file": "build_final_report.py",
+      "bytes": 10014,
+      "sha256": "f3da94cf05634acf2d05f8ce5b2b3766f803ffdf1074a34cbf99812d8b8db132",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/build_final_report.py",
+      "source_bytes": 10014,
+      "source_sha256": "f3da94cf05634acf2d05f8ce5b2b3766f803ffdf1074a34cbf99812d8b8db132"
+    },
+    {
+      "file": "build_fix_visualization.py",
+      "bytes": 7579,
+      "sha256": "c4124172f3d19f867d1a4801e99809c4725dc0d2bcbf92b22658b8c3d9ae7626",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/build_fix_visualization.py",
+      "source_bytes": 7579,
+      "source_sha256": "c4124172f3d19f867d1a4801e99809c4725dc0d2bcbf92b22658b8c3d9ae7626"
+    },
+    {
+      "file": "cases/offload-p3-d1/000-cold-client-evidence.json",
+      "bytes": 3714,
+      "sha256": "d873b5a2673701d734675d739aa549064c9686b862ee9f44753ea634d64bb7b2",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/000-cold-results.json",
+      "source_bytes": 40617,
+      "source_sha256": "22d632f2fb97b6806ebbb485505e09b8d83f04fb1bfccfa69eb10a8a47080ea4"
+    },
+    {
+      "file": "cases/offload-p3-d1/001-warm-client-evidence.json",
+      "bytes": 3711,
+      "sha256": "4a1dd6be399619fea1e7d060a75a7ecb29c653f4ba8db2b030a771447be4d868",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/001-warm-results.json",
+      "source_bytes": 40592,
+      "source_sha256": "4d1eef5e1581b5e69a435e9fe40ebfd01e82041374675d207f569ebd56a659e0"
+    },
+    {
+      "file": "cases/offload-p3-d1/002-warm-load-client-evidence.json",
+      "bytes": 129744,
+      "sha256": "04cad7770a18f2b97c8cdf9f2e4553d11b9c935b15c58cc5a32bcb22070b79d2",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/002-warm-load-results.json",
+      "source_bytes": 4003993,
+      "source_sha256": "a02138774f88ad309556fcdb3ea89bc1a1be984a360a98978d39df7fc9c09e47"
+    },
+    {
+      "file": "cases/offload-p3-d1/100-performance-1-client-evidence.json",
+      "bytes": 3655987,
+      "sha256": "8d46f383bd0b3b6f7f6974fc3d1d2edc853acd38879006327d46b2924ad924a2",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/100-performance-1-results.json",
+      "source_bytes": 126262186,
+      "source_sha256": "e8d32dd76da35411d11c3c6879fda11b35a38f2132f6d04da95d2c61412c68a3"
+    },
+    {
+      "file": "cases/offload-p3-d1/config.json",
+      "bytes": 5476,
+      "sha256": "473184d4c7c7efd8ac7278c5c369526519a643417081dcbe9b485c54427ee75f",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/config.json",
+      "source_bytes": 5476,
+      "source_sha256": "473184d4c7c7efd8ac7278c5c369526519a643417081dcbe9b485c54427ee75f"
+    },
+    {
+      "file": "cases/offload-p3-d1/finished.json",
+      "bytes": 147,
+      "sha256": "94e41a7b39aaa6415c4ca602a197441af93b9b95b9b1704fc742116df8358bd0",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/finished.json",
+      "source_bytes": 147,
+      "source_sha256": "94e41a7b39aaa6415c4ca602a197441af93b9b95b9b1704fc742116df8358bd0"
+    },
+    {
+      "file": "cases/offload-p3-d1/memory-allocation-rank0.json",
+      "bytes": 2629,
+      "sha256": "25aa39877fbc94ab5b7195eb8736d6b68fdf1343b79ffa19b7dc268d51462da9",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/memory-allocation-rank0.json",
+      "source_bytes": 2629,
+      "source_sha256": "25aa39877fbc94ab5b7195eb8736d6b68fdf1343b79ffa19b7dc268d51462da9"
+    },
+    {
+      "file": "cases/offload-p3-d1/memory-allocation-rank1.json",
+      "bytes": 2629,
+      "sha256": "b3e4b78dd1ccbb275a551555af313d79ca335a7180c061207ec8acacef3d32fa",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/memory-allocation-rank1.json",
+      "source_bytes": 2629,
+      "source_sha256": "b3e4b78dd1ccbb275a551555af313d79ca335a7180c061207ec8acacef3d32fa"
+    },
+    {
+      "file": "cases/offload-p3-d1/ready.json",
+      "bytes": 1260,
+      "sha256": "07ff34ca8dc4891d1133c8be75075b4c726e8812d2ea1901e3265b99198c7673",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/ready.json",
+      "source_bytes": 1260,
+      "source_sha256": "07ff34ca8dc4891d1133c8be75075b4c726e8812d2ea1901e3265b99198c7673"
+    },
+    {
+      "file": "cases/offload-p3-d1/sparse-counters-rank0.json",
+      "bytes": 208,
+      "sha256": "f5b5033641a413a479d4f4e806f5dac4b36ec33db7de7a6ca68fde0e470abb81",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/sparse-counters-rank0.json",
+      "source_bytes": 208,
+      "source_sha256": "f5b5033641a413a479d4f4e806f5dac4b36ec33db7de7a6ca68fde0e470abb81"
+    },
+    {
+      "file": "cases/offload-p3-d1/sparse-counters-rank1.json",
+      "bytes": 208,
+      "sha256": "12dd6e5098248dd0a3b876f5288a6e777e006b647e7e03d1ed41910b470078d7",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/offload-p3-d1/sparse-counters-rank1.json",
+      "source_bytes": 208,
+      "source_sha256": "12dd6e5098248dd0a3b876f5288a6e777e006b647e7e03d1ed41910b470078d7"
+    },
+    {
+      "file": "cases/resident-p3-d1/000-cold-client-evidence.json",
+      "bytes": 3708,
+      "sha256": "884606c9d7d3b25c6007af66dce0aa4f3c53111b2fe31c5173c141d7fc6d0936",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/000-cold-results.json",
+      "source_bytes": 40601,
+      "source_sha256": "c851e68523c2a10411156efb5af0d9f7d9cb1c91938443f6c3253f2e60ad344e"
+    },
+    {
+      "file": "cases/resident-p3-d1/001-warm-client-evidence.json",
+      "bytes": 3712,
+      "sha256": "ebb04d8e83bc0ccf6306a8475997e97240594501a6ed9ea0d49d92a537255ce6",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/001-warm-results.json",
+      "source_bytes": 40620,
+      "source_sha256": "a8b3a79e8c6e965e839b91ed123fb115fc2688b38984555e81fbb7d27d583a70"
+    },
+    {
+      "file": "cases/resident-p3-d1/002-warm-load-client-evidence.json",
+      "bytes": 130283,
+      "sha256": "d9edd76e08474ac077a66936c2fc69ca0eef52dccea44409eaca4f8a453ac265",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/002-warm-load-results.json",
+      "source_bytes": 3987396,
+      "source_sha256": "7fb8df4755a419b19522dad0152b20ce8cfe9836ff62678f6922b160540de4fd"
+    },
+    {
+      "file": "cases/resident-p3-d1/100-performance-1-client-evidence.json",
+      "bytes": 3659587,
+      "sha256": "faf44edc968b1097b16aa49928147c95b0b4bfd594cba4edf24e6e0cb3cd7738",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/100-performance-1-results.json",
+      "source_bytes": 126198694,
+      "source_sha256": "99226a72ef59fa05c4e43834ec7343a5cd5c78afdd238afef807dd73b91163c6"
+    },
+    {
+      "file": "cases/resident-p3-d1/config.json",
+      "bytes": 5325,
+      "sha256": "65ab36b6c0ca12c144bfbe413ac33489047869fb63e96716f531739f44521640",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/config.json",
+      "source_bytes": 5325,
+      "source_sha256": "65ab36b6c0ca12c144bfbe413ac33489047869fb63e96716f531739f44521640"
+    },
+    {
+      "file": "cases/resident-p3-d1/finished.json",
+      "bytes": 148,
+      "sha256": "894d035bb529a24691a2fc5dd0e7868854f9384e1e099498f024fc4676c52663",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/finished.json",
+      "source_bytes": 148,
+      "source_sha256": "894d035bb529a24691a2fc5dd0e7868854f9384e1e099498f024fc4676c52663"
+    },
+    {
+      "file": "cases/resident-p3-d1/memory-allocation-rank0.json",
+      "bytes": 1863,
+      "sha256": "2c164fe181720016835b477a85c0a54d6a973d6f87a04cd0b85b21decfb526dc",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/memory-allocation-rank0.json",
+      "source_bytes": 1863,
+      "source_sha256": "2c164fe181720016835b477a85c0a54d6a973d6f87a04cd0b85b21decfb526dc"
+    },
+    {
+      "file": "cases/resident-p3-d1/memory-allocation-rank1.json",
+      "bytes": 1863,
+      "sha256": "497c54c19d08462275dd793f535e333a9718a45d723c58215789169e904b1b2b",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/memory-allocation-rank1.json",
+      "source_bytes": 1863,
+      "source_sha256": "497c54c19d08462275dd793f535e333a9718a45d723c58215789169e904b1b2b"
+    },
+    {
+      "file": "cases/resident-p3-d1/ready.json",
+      "bytes": 1260,
+      "sha256": "be0476aa5b34498787d0a2df453a36c665bdf01a97843896c51c9928d6c8178c",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cases/resident-p3-d1/ready.json",
+      "source_bytes": 1260,
+      "source_sha256": "be0476aa5b34498787d0a2df453a36c665bdf01a97843896c51c9928d6c8178c"
+    },
+    {
+      "file": "cleanup.json",
+      "bytes": 486,
+      "sha256": "7dd1387fb72f43d7032914253fab6a41dd24321681839d79373b1484fc481dec",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/cleanup.json",
+      "source_bytes": 486,
+      "source_sha256": "7dd1387fb72f43d7032914253fab6a41dd24321681839d79373b1484fc481dec"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/000-cold-client-evidence.json",
+      "bytes": 3766,
+      "sha256": "9426fe3b889b93230a7d4290e10d75bccda72f5012e422ebd799ddd55e2cf503",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/000-cold-results.json",
+      "source_bytes": 40672,
+      "source_sha256": "e410587732ba2c0045ba03a522346cfe49bb5a40200d434a1479b06636f9332a"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/001-warm-client-evidence.json",
+      "bytes": 3779,
+      "sha256": "105adf4aa0acd3a58dd095c6840b39e2088a65725adbccd2bf51a7f9448a294a",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/001-warm-results.json",
+      "source_bytes": 36581,
+      "source_sha256": "97a54bf8aa801aeacc7bbdb53750f69bf64225c793e74b2189b9d054a0bedd13"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/100-c1-client-evidence.json",
+      "bytes": 4048,
+      "sha256": "9790a1eb764c76418c8ef66e0a67cfd3c8c3cbfa552b9e3c6df184925b62f23e",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/100-c1-results.json",
+      "source_bytes": 37051,
+      "source_sha256": "2511beceed80453a0336e4ede8798365e09743c9b6b43ae67e5c5246e346df8f"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/101-c96-client-evidence.json",
+      "bytes": 88942,
+      "sha256": "d504d5f9d66e77cdb1c42cbc3565fd58923bb874a567e6fc9ba5b1bbba87bbbf",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/101-c96-results.json",
+      "source_bytes": 2990822,
+      "source_sha256": "2575fe5f17ab18ad2f295a4a00f30d9936f9add09f8ca468225914da58fef92b"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/102-c144-client-evidence.json",
+      "bytes": 139461,
+      "sha256": "b7f322f464139f42407b628150d1315ffc6153ff8a565a8df5e1e2f36f856782",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/102-c144-results.json",
+      "source_bytes": 4486193,
+      "source_sha256": "d98c46a3bc1c622d50fa1a0def725e7be357f0da7cf8b2497de5fcc0673e36a1"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/103-c1204-client-evidence.json",
+      "bytes": 1151042,
+      "sha256": "492722dc6c2c63d3955e088a23fefdf5f17cb9185635ce1e7fcbae589b236082",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/103-c1204-results.json",
+      "source_bytes": 37485681,
+      "source_sha256": "870464ec01010991106ef3063af5351d4afb03e7f8f9474565aa260f73dc79fd"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/104-c1696-client-evidence.json",
+      "bytes": 1620529,
+      "sha256": "ad862f5f237739fbc5f0dd62752faf1583d0a7d9f2941b6d67a9aaa0f3c95818",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/104-c1696-results.json",
+      "source_bytes": 52810786,
+      "source_sha256": "1b23d6f63a7cf98947d505e4e0993cf3a11938a4d898e304cf05191c0646ce7a"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/105-c1696-repeat-client-evidence.json",
+      "bytes": 1620538,
+      "sha256": "1f9104256411957973a4a0d1b6bda8bed54bbc947d34da0446dc570694aa42a4",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/105-c1696-repeat-results.json",
+      "source_bytes": 52809546,
+      "source_sha256": "0dcefa2859ab3ff6330c0e918fdf6ca944d0d5eb5b77e735cfdda843c3267679"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/200-churn-client-evidence.json",
+      "bytes": 461741,
+      "sha256": "a9d91bcbecccde611f9e5ffc6d79ee611180f6c20c5123938661121157438379",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/200-churn-results.json",
+      "source_bytes": 15891664,
+      "source_sha256": "6e5234e04eb945b21fcbd2c3ebe80c2867f4e503104145ec9214f6e2196c4eb7"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/config.json",
+      "bytes": 5513,
+      "sha256": "0afb9e3bf9a549fab128c8dd195ebf51f36b9042db83f41056febe103fed3d4a",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/config.json",
+      "source_bytes": 5513,
+      "source_sha256": "0afb9e3bf9a549fab128c8dd195ebf51f36b9042db83f41056febe103fed3d4a"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/finished.json",
+      "bytes": 97,
+      "sha256": "d9562bb4b513ed4e768b1b0f8d9a692da95a8cf2e10624411e6ce8d4dfb3a478",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/finished.json",
+      "source_bytes": 97,
+      "source_sha256": "d9562bb4b513ed4e768b1b0f8d9a692da95a8cf2e10624411e6ce8d4dfb3a478"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/memory-allocation-rank0.json",
+      "bytes": 2631,
+      "sha256": "49e7e6b7c4412239d484141e31b6ed9679bb3c523f8567036a2728911e93f80d",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/memory-allocation-rank0.json",
+      "source_bytes": 2631,
+      "source_sha256": "49e7e6b7c4412239d484141e31b6ed9679bb3c523f8567036a2728911e93f80d"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/memory-allocation-rank1.json",
+      "bytes": 2631,
+      "sha256": "8167246bd2e4e90d359c5e4da7a81711bdc2bfad73c8f568f59b6ae9f13207f5",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/memory-allocation-rank1.json",
+      "source_bytes": 2631,
+      "source_sha256": "8167246bd2e4e90d359c5e4da7a81711bdc2bfad73c8f568f59b6ae9f13207f5"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/ready.json",
+      "bytes": 868,
+      "sha256": "285984c70cdb4a53290b5530b943b9a8980ac4844c53500efd057dcb63c3e4ce",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/ready.json",
+      "source_bytes": 868,
+      "source_sha256": "285984c70cdb4a53290b5530b943b9a8980ac4844c53500efd057dcb63c3e4ce"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/sparse-counters-rank0.json",
+      "bytes": 210,
+      "sha256": "0e0a637e69cfc779310789c4b190dfb44c48a29bd9e884c11f3fa92f396704d2",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/sparse-counters-rank0.json",
+      "source_bytes": 210,
+      "source_sha256": "0e0a637e69cfc779310789c4b190dfb44c48a29bd9e884c11f3fa92f396704d2"
+    },
+    {
+      "file": "fallback-p1/cases/offload-matched-p1-d1/sparse-counters-rank1.json",
+      "bytes": 209,
+      "sha256": "40062d6c97d3243cfbaedc1f0a5cbc8326fa8445876f0d4c8bbc987ce37c2183",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/offload-matched-p1-d1/sparse-counters-rank1.json",
+      "source_bytes": 209,
+      "source_sha256": "40062d6c97d3243cfbaedc1f0a5cbc8326fa8445876f0d4c8bbc987ce37c2183"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/000-cold-client-evidence.json",
+      "bytes": 3772,
+      "sha256": "8babb510721b6e216d8d11d6f2b1f789d557f765988548791b73fdb69b0784cf",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/000-cold-results.json",
+      "source_bytes": 40680,
+      "source_sha256": "7241e632d5342badab31cc636d90ab934cc16beb8b16f191a0d37670a1de0e1f"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/001-warm-client-evidence.json",
+      "bytes": 3782,
+      "sha256": "8ca0267dfbea9abd19cdc6591a7fe39dd9ea0a3d6d6bbe5e466150725f2a84ce",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/001-warm-results.json",
+      "source_bytes": 36597,
+      "source_sha256": "5074f72676c021391e41384d04b23c1b4aa48455ae5a0ed3ae55b39438ca1a8f"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/100-c1-client-evidence.json",
+      "bytes": 4041,
+      "sha256": "4f32fda5495a7792e54c9a27a093d600c9470b2046cc7b656831dac439a71b5d",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/100-c1-results.json",
+      "source_bytes": 37045,
+      "source_sha256": "6db7479a1bf1b3312886c62927748be9e34c32b60482fbfe99fd616fe580602f"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/101-c96-client-evidence.json",
+      "bytes": 88924,
+      "sha256": "423b4e6d08b8c9612a623f6ed391b8788f64b740f1cb0d88d25aa9a1fe69fa98",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/101-c96-results.json",
+      "source_bytes": 2975647,
+      "source_sha256": "7238ae54f31c77c6151ab58eba7220d71b33053728f731f427771a6561809a5f"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/102-c144-client-evidence.json",
+      "bytes": 139454,
+      "sha256": "2a1587abdf9f75f384d948538b6f1f60bc9c762b221c699ae95f93fc555e82ab",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/102-c144-results.json",
+      "source_bytes": 4463707,
+      "source_sha256": "c247550e495773c1af96890350258232c3854cf176d018eb9df803be8ec9f121"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/103-c1204-client-evidence.json",
+      "bytes": 1150993,
+      "sha256": "c4524eaa26dfe02477fdb8c0abb3e7f40e50a8cd20c66854447e07f6691abb3a",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/103-c1204-results.json",
+      "source_bytes": 37297217,
+      "source_sha256": "b4d29b3b82a2a2ac668776d161fde7449e15eda683714e31cf3436d175b0a010"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/200-churn-client-evidence.json",
+      "bytes": 463441,
+      "sha256": "76009e08e0fcbadaf0b06183649ced1b5e95ae036613dbecae6637562d109ac8",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/200-churn-results.json",
+      "source_bytes": 15835570,
+      "source_sha256": "5734e6ecc641526e4f0df8cb75caaec2d5f0095a7866ae32b90e88cf860aae5e"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/config.json",
+      "bytes": 5362,
+      "sha256": "74c7195f6d58f4ed4fd2f6fa68bfffd8ebeeda3155642ab796143e6dd4cd470f",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/config.json",
+      "source_bytes": 5362,
+      "source_sha256": "74c7195f6d58f4ed4fd2f6fa68bfffd8ebeeda3155642ab796143e6dd4cd470f"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/finished.json",
+      "bytes": 98,
+      "sha256": "e13d501505860743ea37f715bfede039f09c4d55b767aac290b9b38fb97abc3d",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/finished.json",
+      "source_bytes": 98,
+      "source_sha256": "e13d501505860743ea37f715bfede039f09c4d55b767aac290b9b38fb97abc3d"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/memory-allocation-rank0.json",
+      "bytes": 1865,
+      "sha256": "c967029f6cde69c8c4d512de39ec21cfe8e758011931e8870ac73ae2f1481169",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/memory-allocation-rank0.json",
+      "source_bytes": 1865,
+      "source_sha256": "c967029f6cde69c8c4d512de39ec21cfe8e758011931e8870ac73ae2f1481169"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/memory-allocation-rank1.json",
+      "bytes": 1865,
+      "sha256": "c4ebcd4861d99b28198325f6d3063fbe05f63295dd304282e36c03fc5f16c5f9",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/memory-allocation-rank1.json",
+      "source_bytes": 1865,
+      "source_sha256": "c4ebcd4861d99b28198325f6d3063fbe05f63295dd304282e36c03fc5f16c5f9"
+    },
+    {
+      "file": "fallback-p1/cases/resident-matched-p1-d1/ready.json",
+      "bytes": 867,
+      "sha256": "a9723065f76417f890ca0868d8423a8a072176b3d0363d69768143f2ef87924d",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-p1/cases/resident-matched-p1-d1/ready.json",
+      "source_bytes": 867,
+      "source_sha256": "a9723065f76417f890ca0868d8423a8a072176b3d0363d69768143f2ef87924d"
+    },
+    {
+      "file": "fallback-validation-status.json",
+      "bytes": 185,
+      "sha256": "42307131a0dd3a8398d482ac8b1cd948f2dfed1f57ec5cd39187fbbe7c07d247",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fallback-validation-status.json",
+      "source_bytes": 185,
+      "source_sha256": "42307131a0dd3a8398d482ac8b1cd948f2dfed1f57ec5cd39187fbbe7c07d247"
+    },
+    {
+      "file": "final-report.json",
+      "bytes": 578664,
+      "sha256": "70ff035ce32e47f303c73b634902ed34082fc9b18624693f048d285a0db84185",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/final-report.json",
+      "source_bytes": 578664,
+      "source_sha256": "70ff035ce32e47f303c73b634902ed34082fc9b18624693f048d285a0db84185"
+    },
+    {
+      "file": "fix-analysis.json",
+      "bytes": 413332,
+      "sha256": "4e870afca4a7f94bcd72dcfe841c9e2d1fb97fcfc6bf781fd540f009a1481035",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fix-analysis.json",
+      "source_bytes": 413332,
+      "source_sha256": "4e870afca4a7f94bcd72dcfe841c9e2d1fb97fcfc6bf781fd540f009a1481035"
+    },
+    {
+      "file": "fix-comparison.html",
+      "bytes": 6892,
+      "sha256": "c9d0084bc20f48923778d59d5c82ad7a509532ae5c8ec990c1bf8c9c507d5b6a",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fix-comparison.html",
+      "source_bytes": 6892,
+      "source_sha256": "c9d0084bc20f48923778d59d5c82ad7a509532ae5c8ec990c1bf8c9c507d5b6a"
+    },
+    {
+      "file": "fix-only.patch",
+      "bytes": 31267,
+      "sha256": "ba32f377cf5c8572303b52524f4a4a97c86be43c7b8065853759391ceeb37220",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fix-only.patch",
+      "source_bytes": 31267,
+      "source_sha256": "ba32f377cf5c8572303b52524f4a4a97c86be43c7b8065853759391ceeb37220"
+    },
+    {
+      "file": "fix-patch-summary.json",
+      "bytes": 258,
+      "sha256": "3efc07caefc6a9da0bc41429af7752448c1acf0282c60da6bc12b07afbe5824c",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fix-patch-summary.json",
+      "source_bytes": 258,
+      "source_sha256": "3efc07caefc6a9da0bc41429af7752448c1acf0282c60da6bc12b07afbe5824c"
+    },
+    {
+      "file": "fix-visualization-data.json",
+      "bytes": 1462,
+      "sha256": "ad7cd428b700c4305c344d3f56b2825d2dd1472e8d3f35ffb038881bdbdc6ada",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/fix-visualization-data.json",
+      "source_bytes": 1462,
+      "source_sha256": "ad7cd428b700c4305c344d3f56b2825d2dd1472e8d3f35ffb038881bdbdc6ada"
+    },
+    {
+      "file": "local-after.patch",
+      "bytes": 43398,
+      "sha256": "010feabc3f2c555143db6eeef58d4f6eb2151425203047d649f17c79a7bd0af9",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/local-after.patch",
+      "source_bytes": 43398,
+      "source_sha256": "010feabc3f2c555143db6eeef58d4f6eb2151425203047d649f17c79a7bd0af9"
+    },
+    {
+      "file": "local-before.patch",
+      "bytes": 13373,
+      "sha256": "258fc1e9273f73d23b09fdf1111b3b542af479a9c8d978144b60086fefd5a222",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/local-before.patch",
+      "source_bytes": 13373,
+      "source_sha256": "258fc1e9273f73d23b09fdf1111b3b542af479a9c8d978144b60086fefd5a222"
+    },
+    {
+      "file": "matched-decode-metrics.csv",
+      "bytes": 874,
+      "sha256": "d1869792c8742881c325978e87dc25c53a41a62deeb4c5ec33f0ef9824f6f0f7",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/matched-decode-metrics.csv",
+      "source_bytes": 874,
+      "source_sha256": "d1869792c8742881c325978e87dc25c53a41a62deeb4c5ec33f0ef9824f6f0f7"
+    },
+    {
+      "file": "native-ColdPage.xml",
+      "bytes": 5115,
+      "sha256": "2d5154b2a965348e54e59b59daef4cb8c1622fe8f035c40b335c18f403aeb26d",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/native-ColdPage.xml",
+      "source_bytes": 5115,
+      "source_sha256": "2d5154b2a965348e54e59b59daef4cb8c1622fe8f035c40b335c18f403aeb26d"
+    },
+    {
+      "file": "native-ColdPageCopy.xml",
+      "bytes": 175,
+      "sha256": "9a7106045eade5bbdb980d3e6ca067e578465699eb57e4322f70163e6d02995e",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/native-ColdPageCopy.xml",
+      "source_bytes": 175,
+      "source_sha256": "9a7106045eade5bbdb980d3e6ca067e578465699eb57e4322f70163e6d02995e"
+    },
+    {
+      "file": "native-Concurrency.xml",
+      "bytes": 1624,
+      "sha256": "e9e761044aa4a767c795b7bd35fd28f2bf823a5fd0502e2cf71df4d19b33af3d",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/native-Concurrency.xml",
+      "source_bytes": 1624,
+      "source_sha256": "e9e761044aa4a767c795b7bd35fd28f2bf823a5fd0502e2cf71df4d19b33af3d"
+    },
+    {
+      "file": "native-Config.xml",
+      "bytes": 2180,
+      "sha256": "8965306ddf49912f9aa799ea53591e642694101d6fd3b6221b7605c3e0bb58ef",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/native-Config.xml",
+      "source_bytes": 2180,
+      "source_sha256": "8965306ddf49912f9aa799ea53591e642694101d6fd3b6221b7605c3e0bb58ef"
+    },
+    {
+      "file": "native-DigestPool.xml",
+      "bytes": 2386,
+      "sha256": "788c24028172de424bf1748fbd1189685afedd0e0a289124d636437642dda212",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/native-DigestPool.xml",
+      "source_bytes": 2386,
+      "source_sha256": "788c24028172de424bf1748fbd1189685afedd0e0a289124d636437642dda212"
+    },
+    {
+      "file": "native-HostMem.xml",
+      "bytes": 3548,
+      "sha256": "0d5330bf1dfb2fc402409dc2a2d7102ad48bc5701569e06780e5bb1f8c9dfff3",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/native-HostMem.xml",
+      "source_bytes": 3548,
+      "source_sha256": "0d5330bf1dfb2fc402409dc2a2d7102ad48bc5701569e06780e5bb1f8c9dfff3"
+    },
+    {
+      "file": "native-Stats.xml",
+      "bytes": 4726,
+      "sha256": "a61041e08a145b7c2813810d8ebe87b3a51fd189b4088458d04869143a08fbee",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/native-Stats.xml",
+      "source_bytes": 4726,
+      "source_sha256": "a61041e08a145b7c2813810d8ebe87b3a51fd189b4088458d04869143a08fbee"
+    },
+    {
+      "file": "native-TypedIndex.xml",
+      "bytes": 4097,
+      "sha256": "082de50323399acb49b4a0ae9f899227de18ed200e583933866b917eb783d978",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/native-TypedIndex.xml",
+      "source_bytes": 4097,
+      "source_sha256": "082de50323399acb49b4a0ae9f899227de18ed200e583933866b917eb783d978"
+    },
+    {
+      "file": "offload-metadata.xml",
+      "bytes": 8999,
+      "sha256": "7c3f9583704c35c13687b7edd8da3b30ef0988d6ae36c5208771c2857b20a770",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/offload-metadata.xml",
+      "source_bytes": 8999,
+      "source_sha256": "7c3f9583704c35c13687b7edd8da3b30ef0988d6ae36c5208771c2857b20a770"
+    },
+    {
+      "file": "package_evidence.py",
+      "bytes": 4184,
+      "sha256": "4f0d1c8e978da70d46e7825555d5a17ffd2041f6e199950ef80001e25cd08692",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/package_evidence.py",
+      "source_bytes": 4184,
+      "source_sha256": "4f0d1c8e978da70d46e7825555d5a17ffd2041f6e199950ef80001e25cd08692"
+    },
+    {
+      "file": "pool-geometry-comparison.json",
+      "bytes": 12461,
+      "sha256": "4fa8cd55ef2caefa35cc56f96329f5b618f2b7c178bf66ba55a63fab5db39ac6",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/pool-geometry-comparison.json",
+      "source_bytes": 12461,
+      "source_sha256": "4fa8cd55ef2caefa35cc56f96329f5b618f2b7c178bf66ba55a63fab5db39ac6"
+    },
+    {
+      "file": "prefill-feed.json",
+      "bytes": 5755,
+      "sha256": "a912edcfd2ebd483097b4d0e8e421b5de8057a49a68daa2ac0ddbbde77310717",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/prefill-feed.json",
+      "source_bytes": 5755,
+      "source_sha256": "a912edcfd2ebd483097b4d0e8e421b5de8057a49a68daa2ac0ddbbde77310717"
+    },
+    {
+      "file": "preview-validation.json",
+      "bytes": 362,
+      "sha256": "f8ff97fb9069414422375cbe773cad9062db35951fababe2c6eb60854831322f",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/preview-validation.json",
+      "source_bytes": 362,
+      "source_sha256": "f8ff97fb9069414422375cbe773cad9062db35951fababe2c6eb60854831322f"
+    },
+    {
+      "file": "ratio-analysis.json",
+      "bytes": 98759,
+      "sha256": "b52fb7deb26e7ff90daa31ea0c134ff28e4162bbb5c36729f8dc3fb5abc488c3",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/ratio-analysis.json",
+      "source_bytes": 98759,
+      "source_sha256": "b52fb7deb26e7ff90daa31ea0c134ff28e4162bbb5c36729f8dc3fb5abc488c3"
+    },
+    {
+      "file": "ratio-metrics.csv",
+      "bytes": 1121,
+      "sha256": "aeed439a0bbcec4e2107258d724e3fcf8a125ff00dde6946976d648040343df4",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/ratio-metrics.csv",
+      "source_bytes": 1121,
+      "source_sha256": "aeed439a0bbcec4e2107258d724e3fcf8a125ff00dde6946976d648040343df4"
+    },
+    {
+      "file": "regressions.xml",
+      "bytes": 153859,
+      "sha256": "49d8475eaaa9d2f0e92f384efdaf6ae70fe79930435e37cd72b565294c78ca74",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/regressions.xml",
+      "source_bytes": 153859,
+      "source_sha256": "49d8475eaaa9d2f0e92f384efdaf6ae70fe79930435e37cd72b565294c78ca74"
+    },
+    {
+      "file": "run_matched_cases.py",
+      "bytes": 4161,
+      "sha256": "2ea3e4ae01b510f83449690b1ef8f6cac7b6dcb7df550e05989688207a13629e",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/run_matched_cases.py",
+      "source_bytes": 4161,
+      "source_sha256": "2ea3e4ae01b510f83449690b1ef8f6cac7b6dcb7df550e05989688207a13629e"
+    },
+    {
+      "file": "run_ratios.py",
+      "bytes": 4225,
+      "sha256": "990eaed4d474f1b8ff208d011b91af627f15108fe679ba8bb4ec1d6fb9675fa1",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/run_ratios.py",
+      "source_bytes": 4225,
+      "source_sha256": "990eaed4d474f1b8ff208d011b91af627f15108fe679ba8bb4ec1d6fb9675fa1"
+    },
+    {
+      "file": "serving-pool-geometry-comparison.json",
+      "bytes": 12489,
+      "sha256": "0cc73ddfc129cb5c5ce17e810106627c085173f19dccb2233d30349bc6b1f121",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/serving-pool-geometry-comparison.json",
+      "source_bytes": 12489,
+      "source_sha256": "0cc73ddfc129cb5c5ce17e810106627c085173f19dccb2233d30349bc6b1f121"
+    },
+    {
+      "file": "test-summary.json",
+      "bytes": 2084,
+      "sha256": "4fff213b96518a23a7a62c1716b40d86c519ca02e1f4cfac4754b3d632e932af",
+      "source_file": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/test-summary.json",
+      "source_bytes": 2084,
+      "source_sha256": "4fff213b96518a23a7a62c1716b40d86c519ca02e1f4cfac4754b3d632e932af"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "serve_url": "http://localhost:34111",
+  "startup_seconds": 221.03903916900003,
+  "cluster_info": {
+    "is_ready": true,
+    "server_lists": {
+      "context": [
+        "localhost:46479",
+        "localhost:39255",
+        "localhost:37923"
+      ],
+      "generation": [
+        "localhost:38237"
+      ]
+    },
+    "current_workers": {
+      "context_servers": [
+        {
+          "worker_id": "CONTEXT-localhost:46479-1792387644031-93948-535",
+          "host": "localhost",
+          "port": 46479,
+          "role": 0
+        },
+        {
+          "worker_id": "CONTEXT-localhost:39255-1792387645590-93943-611",
+          "host": "localhost",
+          "port": 39255,
+          "role": 0
+        },
+        {
+          "worker_id": "CONTEXT-localhost:37923-1792387646044-93944-877",
+          "host": "localhost",
+          "port": 37923,
+          "role": 0
+        }
+      ],
+      "generation_servers": [
+        {
+          "worker_id": "GENERATION-localhost:38237-1792387648213-93953-991",
+          "host": "localhost",
+          "port": 38237,
+          "role": 1
+        }
+      ]
+    },
+    "minimal_instances": {
+      "context_servers": 3,
+      "generation_servers": 1
+    }
+  },
+  "local_clock": "2026-10-18T22:27:29.765281-07:00"
+}
