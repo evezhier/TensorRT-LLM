@@ -34,6 +34,26 @@ python3 scripts/build_wheel.py --use_ccache -a "100-real" --skip_building_wheel 
 pip install -e .
 ```
 
+To run the build and dependency installation in a Slurm job, submit the
+companion script with the checkout path, an Enroot SquashFS path or existing
+container name, GPU product, and CPU architecture:
+
+```bash
+sbatch --gres=gpu:gb300:1 --constraint=aarch64 \
+    examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/build_trtllm.sbatch \
+    /absolute/path/to/checked-out/TensorRT-LLM \
+    /absolute/path/to/compatible-container.sqsh gb300 aarch64
+```
+
+Use your cluster's GPU type and CPU feature names for `--gres` and
+`--constraint`. The script requests 64 CPUs, 256 GiB RAM, and four hours. In
+the container it runs `python scripts/build_wheel.py --cuda_architectures
+"native" -D FAST_BUILD=ON --use_ccache`, then `pip3 install -e .`, then
+`pip install -r requirements-dev.txt`. The checkout and SquashFS must be
+visible on the allocated node. The container root is writable for the Python
+installs; installs into a temporary image container are local to that Slurm
+job. Build artifacts written into the checkout persist.
+
 Rebuild native `bindings` and `th_common`, including their `tensorrt_llm`
 dependency. `reference/binary-manifest.json` records the original built-library
 hashes. The original measurements preceded the latest documentation-only
