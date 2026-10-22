@@ -69,6 +69,8 @@ constexpr int32_t kFreeOrdinal = kBadBlockOrdinal.value();
 constexpr uint8_t kClassHit = 0;
 constexpr uint8_t kClassFetched = 1;
 constexpr uint8_t kClassUntouched = 2;
+// Untouched in-flight entries are pinned; a hit is protected by its recency class.
+constexpr uint8_t kPinned = 4;
 
 using BlockScan = cub::BlockScan<int32_t, kThreads>;
 
@@ -87,6 +89,7 @@ struct SmemLayout
     size_t cls = 0;
     size_t scratch = 0;
     size_t order = 0;
+    size_t lru = 0;
     size_t missIdx = 0;
     size_t missOrd = 0;
     size_t total = 0;
@@ -107,6 +110,8 @@ __host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entr
     layout.scratch = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(entries));
     layout.order = offset;
+    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(entries));
+    layout.lru = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(entries));
     layout.missIdx = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
@@ -154,36 +159,54 @@ __device__ inline uint32_t slotOf(int32_t key, uint32_t mask) noexcept
     return (static_cast<uint32_t>(key) * 0x9E3779B1U) & mask;
 }
 
-//! Exclusive sum of a per-position flag over [0, n), single CTA, result in `flags`.
+//! Exclusive sum of zero-or-one flags over [0, n), single CTA, result in `flags`.
+//! Each warp scans a contiguous range before the ranges exchange their totals.
 //! Returns the total. `flags` is shared memory; the scan is in place.
-__device__ int32_t blockExclusiveSum(int32_t* flags, int32_t n, typename BlockScan::TempStorage& temp)
+__device__ int32_t blockExclusiveSum(int32_t* flags, int32_t n)
 {
-    __shared__ int32_t carry;
-    if (threadIdx.x == 0)
+    constexpr int32_t kWarps = kThreads / kWarpSize;
+    __shared__ int32_t warpTotals[kWarps];
+    int32_t const lane = static_cast<int32_t>(threadIdx.x % kWarpSize);
+    int32_t const warp = static_cast<int32_t>(threadIdx.x / kWarpSize);
+    int32_t const tiles = (n + kThreads - 1) / kThreads;
+    int32_t const begin = warp * tiles * kWarpSize;
+    uint32_t const precedingLanes = (1U << lane) - 1U;
+    int32_t carry = 0;
+    for (int32_t tile = 0; tile < tiles; ++tile)
     {
-        carry = 0;
+        int32_t const idx = begin + tile * kWarpSize + lane;
+        uint32_t const votes = __ballot_sync(0xffffffffU, idx < n && flags[idx] != 0);
+        if (idx < n)
+        {
+            flags[idx] = carry + __popc(votes & precedingLanes);
+        }
+        carry += __popc(votes);
+    }
+    if (lane == 0)
+    {
+        warpTotals[warp] = carry;
     }
     __syncthreads();
 
-    for (int32_t base = 0; base < n; base += kThreads)
+    int32_t offset = 0;
+    int32_t total = 0;
+#pragma unroll
+    for (int32_t w = 0; w < kWarps; ++w)
     {
-        int32_t const idx = base + static_cast<int32_t>(threadIdx.x);
-        int32_t const value = idx < n ? flags[idx] : 0;
-        int32_t scanned = 0;
-        int32_t aggregate = 0;
-        BlockScan(temp).ExclusiveSum(value, scanned, aggregate);
+        int32_t const count = warpTotals[w];
+        offset += w < warp ? count : 0;
+        total += count;
+    }
+    for (int32_t tile = 0; tile < tiles; ++tile)
+    {
+        int32_t const idx = begin + tile * kWarpSize + lane;
         if (idx < n)
         {
-            flags[idx] = carry + scanned;
+            flags[idx] += offset;
         }
-        __syncthreads();
-        if (threadIdx.x == 0)
-        {
-            carry += aggregate;
-        }
-        __syncthreads();
     }
-    return carry;
+    __syncthreads();
+    return total;
 }
 
 //! Reserve one in-flight unit without building a selection probe index.
@@ -264,7 +287,7 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
     }
 }
 
-//! One CTA per layer.
+//! One CTA per request row of the resolved layer.
 //!
 //! Shared memory is carved by hand because the probe index is sized at launch; see
 //! SmemLayout for the regions and their alignment.
@@ -302,6 +325,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     auto* cls = reinterpret_cast<uint8_t*>(smem + layout.cls);
     auto* scratch = reinterpret_cast<int32_t*>(smem + layout.scratch);
     auto* order = reinterpret_cast<int32_t*>(smem + layout.order);
+    auto* previousLru = reinterpret_cast<int32_t*>(smem + layout.lru);
     auto* missIdx = reinterpret_cast<int32_t*>(smem + layout.missIdx);
     auto* missOrd = reinterpret_cast<int32_t*>(smem + layout.missOrd);
 
@@ -330,41 +354,54 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < tableSize; i += kThreads)
     {
         keys[i] = kEmptyKey;
-    }
-    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < entries; i += kThreads)
-    {
-        cls[i] = kClassUntouched;
+        vals[i] = kNoSparseSlot;
     }
     __syncthreads();
 
-    // Build the probe index over the resident set. Ordinals are unique within a layer, so
-    // threads contend only on table-position collisions.
-    //
-    // Above the dependency wait deliberately: this reads the layer's own residency table and
-    // writes only shared memory, and nothing that runs before a resolve touches that table --
-    // a previous layer's resolve owns a different slice of it, and the copy and index kernels
-    // between them write cells and indices. So the whole index build is work a block can
-    // finish while the kernel it waits on is still draining.
+    // The selection may be produced by the preceding grid. Only shared-memory
+    // initialization is independent of that producer.
+    gridDependencyWait();
+
+    // Index the required ordinals, then match the resident set against that index.
+    // The index size follows the selection width rather than the cache capacity.
+    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < required; i += kThreads)
+    {
+        int32_t const ord = i < inFlight ? historyUnits + i : selected[i - inFlight];
+        if (ord < 0)
+        {
+            continue;
+        }
+        uint32_t pos = slotOf(ord, mask);
+        int32_t key = atomicCAS(&keys[pos], kEmptyKey, ord);
+        while (key != kEmptyKey && key != ord)
+        {
+            pos = (pos + 1U) & mask;
+            key = atomicCAS(&keys[pos], kEmptyKey, ord);
+        }
+    }
+    __syncthreads();
+
     for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
     {
         int32_t const ord = residentOrdinal[s];
+        cls[s] = kClassUntouched | (ord >= historyUnits ? kPinned : 0);
+        previousLru[s] = lruOrder[s];
         if (ord == kFreeOrdinal)
         {
             continue;
         }
         uint32_t pos = slotOf(ord, mask);
-        while (atomicCAS(&keys[pos], kEmptyKey, ord) != kEmptyKey)
+        int32_t key = keys[pos];
+        while (key != kEmptyKey && key != ord)
         {
             pos = (pos + 1U) & mask;
+            key = keys[pos];
         }
-        vals[pos] = s;
+        if (key == ord)
+        {
+            vals[pos] = s;
+        }
     }
-
-    // The selection is the caller's, produced by whatever chose the units this step wants,
-    // so this is as far as a block gets without it. Every global write stays below the wait
-    // too: a block that has not yet waited may still be running beside a grid that could
-    // read what it would overwrite.
-    gridDependencyWait();
 
     // Slots past the in-flight span say "no unit in flight", so a consumer can read this
     // array without also being told how many units there are.
@@ -398,7 +435,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             pos = (pos + 1U) & mask;
             key = keys[pos];
         }
-        if (key == ord)
+        if (key == ord && vals[pos] != kNoSparseSlot)
         {
             int32_t const slot = vals[pos];
             (i < inFlight ? inFlightSlot[i] : outSlot[i - inFlight]) = slot;
@@ -453,16 +490,13 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     // that are not holding in-flight data.
     for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
     {
-        int32_t const slot = lruOrder[p];
-        int32_t const ord = residentOrdinal[slot];
-        bool const free = ord == kFreeOrdinal;
-        bool const pinned = !free && ord >= historyUnits;
-        scratch[p] = (free || (cls[slot] == kClassUntouched && !pinned)) ? 1 : 0;
+        int32_t const slot = previousLru[p];
+        scratch[p] = cls[slot] == kClassUntouched ? 1 : 0;
     }
     __syncthreads();
 
     // Victims come from the tail, least recently used first, so rank from the tail.
-    int32_t const totalEvictable = blockExclusiveSum(scratch, entries, temp);
+    int32_t const totalEvictable = blockExclusiveSum(scratch, entries);
     // The reservation covers a full selection plus every in-flight unit, and the in-flight
     // ones are resolved first, so there is always a cell for each remaining miss.
     KVCM2_SPARSE_REQUIRE(totalEvictable >= numMiss);
@@ -470,11 +504,8 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
 
     for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
     {
-        int32_t const slot = lruOrder[p];
-        int32_t const ord = residentOrdinal[slot];
-        bool const free = ord == kFreeOrdinal;
-        bool const pinned = !free && ord >= historyUnits;
-        bool const evictable = free || (cls[slot] == kClassUntouched && !pinned);
+        int32_t const slot = previousLru[p];
+        bool const evictable = cls[slot] == kClassUntouched;
         if (!evictable)
         {
             continue;
@@ -504,43 +535,73 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     }
     __syncthreads();
 
-    // The work list and the slots are final here; the recency rebuild below is this
-    // kernel's own bookkeeping, which nothing downstream reads. Releasing now hands the
-    // copy the whole rebuild as overlap.
+    // The work list and slots are final. The copy can perform its independent setup
+    // while this block rebuilds recency, then wait before consuming the work list.
     gridDependencyRelease();
 
     // Rebuild recency: hits, then units fetched this step, then everything untouched, each
-    // group keeping its previous relative order.
-    int32_t base[3];
+    // group keeping its previous relative order. Each warp ranks all three classes
+    // within a contiguous range; class totals give the offsets between ranges.
+    constexpr int32_t kWarps = kThreads / kWarpSize;
+    __shared__ int32_t classTotals[3][kWarps];
+    int32_t const lane = static_cast<int32_t>(threadIdx.x % kWarpSize);
+    int32_t const warp = static_cast<int32_t>(threadIdx.x / kWarpSize);
+    int32_t const tiles = (entries + kThreads - 1) / kThreads;
+    int32_t const begin = warp * tiles * kWarpSize;
+    uint32_t const precedingLanes = (1U << lane) - 1U;
+    int32_t carry[3] = {};
+    for (int32_t tile = 0; tile < tiles; ++tile)
+    {
+        int32_t const p = begin + tile * kWarpSize + lane;
+        uint8_t const c = p < entries ? cls[previousLru[p]] & ~kPinned : 3;
+#pragma unroll
+        for (uint8_t group = 0; group < 3; ++group)
+        {
+            uint32_t const votes = __ballot_sync(0xffffffffU, c == group);
+            if (c == group)
+            {
+                order[p] = carry[group] + __popc(votes & precedingLanes);
+            }
+            carry[group] += __popc(votes);
+        }
+    }
+    if (lane == 0)
+    {
+#pragma unroll
+        for (uint8_t c = 0; c < 3; ++c)
+        {
+            classTotals[c][warp] = carry[c];
+        }
+    }
+    __syncthreads();
+
+    int32_t offsets[3] = {};
+    int32_t base = 0;
+#pragma unroll
     for (uint8_t c = 0; c < 3; ++c)
     {
-        for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
+        int32_t count = 0;
+        int32_t before = 0;
+#pragma unroll
+        for (int32_t w = 0; w < kWarps; ++w)
         {
-            scratch[p] = cls[lruOrder[p]] == c ? 1 : 0;
+            int32_t const total = classTotals[c][w];
+            before += w < warp ? total : 0;
+            count += total;
         }
-        __syncthreads();
-        int32_t const total = blockExclusiveSum(scratch, entries, temp);
-        base[c] = total;
-        for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
-        {
-            if (cls[lruOrder[p]] == c)
-            {
-                // Offset by the preceding classes once their totals are known, below.
-                order[p] = scratch[p];
-            }
-        }
-        __syncthreads();
+        offsets[c] = base + before;
+        base += count;
     }
-
-    int32_t const hitBase = 0;
-    int32_t const fetchedBase = base[0];
-    int32_t const untouchedBase = base[0] + base[1];
-    for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
+    for (int32_t tile = 0; tile < tiles; ++tile)
     {
-        int32_t const slot = lruOrder[p];
-        uint8_t const c = cls[slot];
-        int32_t const offset = c == kClassHit ? hitBase : (c == kClassFetched ? fetchedBase : untouchedBase);
-        scratch[offset + order[p]] = slot;
+        int32_t const p = begin + tile * kWarpSize + lane;
+        if (p < entries)
+        {
+            int32_t const slot = previousLru[p];
+            uint8_t const c = cls[slot] & ~kPinned;
+            int32_t const offset = c == kClassHit ? offsets[0] : (c == kClassFetched ? offsets[1] : offsets[2]);
+            scratch[offset + order[p]] = slot;
+        }
     }
     __syncthreads();
 
@@ -954,7 +1015,8 @@ int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept
 
 size_t sparseResolveSharedBytes(int32_t entriesPerLayer, int32_t selectionWidth, int32_t maxInFlightUnits)
 {
-    return smemLayout(nextPow2(2 * entriesPerLayer), entriesPerLayer, maxInFlightUnits + selectionWidth).total;
+    int32_t const required = maxInFlightUnits + selectionWidth;
+    return smemLayout(nextPow2(2 * required), entriesPerLayer, required).total;
 }
 
 int32_t sparseResolveMaxEntries(int32_t selectionWidth, int32_t maxInFlightUnits, CUdevice device)
@@ -1023,7 +1085,7 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     }
 
     // entriesPerLayer belongs to the layer group, so one size and one grid serve every row.
-    int32_t const tableSize = nextPow2(2 * args.entriesPerLayer);
+    int32_t const tableSize = nextPow2(2 * (args.maxInFlightUnits + args.selectionWidth));
     size_t const shared = sparseResolveSharedBytes(args.entriesPerLayer, args.selectionWidth, args.maxInFlightUnits);
 
     CUdevice device = 0;

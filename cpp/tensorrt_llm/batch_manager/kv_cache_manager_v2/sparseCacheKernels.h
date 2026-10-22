@@ -186,8 +186,8 @@ struct SparseResolveArgs
 };
 
 //! Shared memory one CTA needs for `entriesPerLayer` entries and `selectionWidth` selections.
-//! Grows as next_pow2(2 * entriesPerLayer) for the probe index, so it is the quantity that
-//! bounds how large a cache a single launch can serve.
+//! The probe index grows as next_pow2(2 * (selectionWidth + maxInFlightUnits));
+//! per-entry recency and eviction scratch grow linearly with entriesPerLayer.
 [[nodiscard]] size_t sparseResolveSharedBytes(
     int32_t entriesPerLayer, int32_t selectionWidth, int32_t maxInFlightUnits);
 

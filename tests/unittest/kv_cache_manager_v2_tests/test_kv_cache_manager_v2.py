@@ -1701,6 +1701,113 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.out_slot[0], 0)
         self.assertEqual(result.resident_ordinal[2 + result.out_slot[2]], 42)
 
+    def test_large_caches_preserve_victims_and_recency_order(self):
+        """Hits, fetched victims, and untouched entries retain their relative order."""
+        for entries in (31, 32, 33, 255, 256, 257, 2048, 4096, 4224, 8192):
+            with self.subTest(entries=entries):
+                rng = random.Random(entries)
+                history = 100000
+                in_flight = 4
+                resident = list(range(entries - in_flight)) + list(
+                    range(history, history + in_flight)
+                )
+                resident[: entries // 8] = self._free(entries // 8)
+                rng.shuffle(resident)
+                lru = list(range(entries))
+                rng.shuffle(lru)
+                count = min(entries // 4, 512)
+                hits = rng.sample(
+                    [ordinal for ordinal in resident if 0 <= ordinal < history], count
+                )
+                misses = list(range(50000, 50000 + count))
+                selected = hits + misses + [-1] * 7
+                rng.shuffle(selected)
+                hit_slots = {
+                    slot
+                    for slot, ordinal in enumerate(resident)
+                    if ordinal in hits or history <= ordinal < history + in_flight
+                }
+                eligible = [slot for slot in lru if slot not in hit_slots]
+                victims = set(eligible[-count:])
+                expected_lru = (
+                    [slot for slot in lru if slot in hit_slots]
+                    + [slot for slot in lru if slot in victims]
+                    + [slot for slot in lru if slot not in hit_slots | victims]
+                )
+                try:
+                    result = self._resolve(
+                        resident,
+                        selected,
+                        lru=lru,
+                        history_units=history,
+                        capacity_units=history + in_flight,
+                        max_in_flight_units=in_flight,
+                    )
+                except ValueError as error:
+                    if "above this device's limit" in str(error):
+                        raise unittest.SkipTest(str(error)) from error
+                    raise
+                self.assertEqual(result.miss_count, [count])
+                self.assertEqual(result.lru_order, expected_lru)
+                fetched_slots = set()
+                for ordinal, slot in zip(selected, result.out_slot):
+                    if ordinal < 0:
+                        self.assertEqual(slot, -1)
+                    else:
+                        self.assertEqual(result.resident_ordinal[slot], ordinal)
+                        if ordinal in misses:
+                            fetched_slots.add(slot)
+                self.assertEqual(fetched_slots, victims)
+                for slot, ordinal in enumerate(resident):
+                    if slot not in victims:
+                        self.assertEqual(result.resident_ordinal[slot], ordinal)
+                self.assertEqual(
+                    result.in_flight_slot,
+                    [resident.index(history + i) for i in range(in_flight)],
+                )
+
+    def test_colliding_selections_preserve_slots_and_recency(self) -> None:
+        """Sparse ordinals and padding preserve the same eviction and stable-order contract."""
+        for entries in (63, 257, 2080):
+            with self.subTest(entries=entries):
+                history = 1 << 28
+                resident = [i * 2048 for i in range(entries - 2)] + [history, history + 1]
+                lru = list(range(entries))
+                random.Random(entries).shuffle(lru)
+                count = min(entries // 4, 32)
+                hits = resident[:count]
+                misses = [(entries + i) * 2048 for i in range(count)]
+                selected = [-1, *misses, -1, *reversed(hits), -1]
+                hit_slots = set(range(count)) | {entries - 2, entries - 1}
+                eligible = [slot for slot in lru if slot not in hit_slots]
+                victims = set(eligible[-count:])
+                expected_lru = (
+                    [slot for slot in lru if slot in hit_slots]
+                    + [slot for slot in lru if slot in victims]
+                    + [slot for slot in lru if slot not in hit_slots | victims]
+                )
+                result = self._resolve(
+                    resident,
+                    selected,
+                    lru=lru,
+                    history_units=history,
+                    capacity_units=history + 2,
+                    max_in_flight_units=4,
+                )
+                self.assertEqual(result.lru_order, expected_lru)
+                self.assertEqual(result.miss_count, [count])
+                self.assertEqual(result.miss_total, [count])
+                self.assertEqual(result.in_flight_slot, [entries - 2, entries - 1, -1, -1])
+                for ordinal, slot in zip(selected, result.out_slot):
+                    if ordinal < 0:
+                        self.assertEqual(slot, -1)
+                    else:
+                        self.assertEqual(result.resident_ordinal[slot], ordinal)
+                        if ordinal in hits:
+                            self.assertEqual(slot, resident.index(ordinal))
+                for slot in set(range(entries)) - victims:
+                    self.assertEqual(result.resident_ordinal[slot], resident[slot])
+
 
 class TestSparseUnitCopy(unittest.TestCase):
     """Moving a unit between its cold page and its cache cell, in both directions."""
