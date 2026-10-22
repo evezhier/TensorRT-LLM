@@ -1,0 +1,766 @@
+From f4c197fdea4baad546df0e6bba4065ce04e52213 Mon Sep 17 00:00:00 2001
+From: Guiju Zhang <7135567+cascade812@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:52:42 -0700
+Subject: [PATCH] fix: preserve sparse KV cache residency across decode steps
+
+Keep continuing requests attached to the native Batch and reorder their
+page-index bindings and flush watermarks without releasing sparse arena
+leases. Snapshot legacy host page tables and detach only departing requests.
+
+Order sparse writeback after forward and retain the flush watermark until
+history advances. Cover request lifecycle changes, row permutations and
+cached KV data with NVFP4 scales in regression tests.
+
+Validated with 911 Python tests, 67 C++ tests and full-model 32K/160 runs.
+Controlled token parity passes; asynchronous serving parity remains limited.
+
+Signed-off-by: Guiju Zhang <7135567+cascade812@users.noreply.github.com>
+---
+ .../kv_cache_manager_v2/batch.cpp             |  58 ++++++
+ .../batch_manager/kv_cache_manager_v2/batch.h |   7 +
+ .../batch_manager/kvCacheManagerV2.cpp        |   4 +
+ .../sparse/deepseek_v4/cache_manager.py       |  84 ++++++---
+ .../kv_cache/kv_cache_manager_v2.py           |   4 +-
+ .../runtime/kv_cache_manager_v2/__init__.pyi  |   8 +
+ .../test_deepseek_v4_cache_manager.py         | 166 +++++++++++++++++-
+ .../test_kv_cache_manager_v2.py               | 141 +++++++++++++++
+ 8 files changed, 443 insertions(+), 29 deletions(-)
+
+diff --git a/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.cpp b/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.cpp
+index 1e79c11821..03291dce86 100644
+--- a/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.cpp
++++ b/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.cpp
+@@ -1113,6 +1113,64 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
+     return leaving;
+ }
+ 
++void Batch::reorder(std::vector<KvCache*> const& kvCaches)
++{
++    if (kvCaches.size() != static_cast<size_t>(numKvCaches()))
++    {
++        throw std::invalid_argument("Batch::reorder requires every current member exactly once");
++    }
++    std::vector<bool> seen(mRows.size(), false);
++    for (auto const* cache : kvCaches)
++    {
++        if (cache == nullptr || cache->mBatch != this)
++        {
++            throw std::invalid_argument("Batch::reorder requires members of this Batch");
++        }
++        auto const row = static_cast<size_t>(cache->mBatchRow);
++        if (seen[row])
++        {
++            throw std::invalid_argument("Batch::reorder requires unique members");
++        }
++        seen[row] = true;
++    }
++
++    waitPublished();
++    for (size_t row = 0; row < kvCaches.size(); ++row)
++    {
++        int const oldRow = kvCaches[row]->mBatchRow;
++        int const newRow = static_cast<int>(row);
++        if (oldRow == newRow)
++        {
++            continue;
++        }
++        for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
++        {
++            auto* const oldIndices = _stagingRow(lg, oldRow);
++            auto* const newIndices = _stagingRow(lg, newRow);
++            std::swap_ranges(oldIndices, oldIndices + mMaxBlocksPerSeq, newIndices);
++        }
++        std::swap(mRows[static_cast<size_t>(oldRow)], mRows[row]);
++        std::swap(mFlushedHistory[static_cast<size_t>(oldRow)], mFlushedHistory[row]);
++        for (int const movedRow : {oldRow, newRow})
++        {
++            auto const& cache = mRows[static_cast<size_t>(movedRow)];
++            if (cache != nullptr)
++            {
++                cache->mBatchRow = movedRow;
++                for (LayerGroupId lg{0}; lg < mNumLayerGroups; ++lg)
++                {
++                    // The row's contents have already moved. Rebind its sole writer
++                    // without copying from the old row or ending cache membership.
++                    cache->mBasePageIndices[kDefaultBeamIndex][lg]
++                        = Span<int>{_stagingRow(lg, movedRow), mMaxBlocksPerSeq};
++                }
++            }
++            _seedRowWatermarks(
++                movedRow, cache == nullptr ? 0 : cache->historyLength(), cache == nullptr ? 0 : cache->capacity());
++        }
++    }
++}
++
+ void Batch::_detach(KvCache& kvCache) noexcept
+ {
+     if (kvCache.mBatch != this || kvCache.mBatchRow < 0)
+diff --git a/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.h b/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.h
+index a04e2386d4..fe7dd03efb 100644
+--- a/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.h
++++ b/cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.h
+@@ -274,6 +274,13 @@ public:
+     //! a caller sweeping rows should not have to ask twice about each one.
+     std::shared_ptr<KvCache> removeKvCache(int row);
+ 
++    //! Pack all current members into the supplied order without releasing their arena leases.
++    //!
++    //! Every member must occur exactly once. Page-index bindings and flush watermarks move
++    //! with the members; device tables retain their addresses and change on the next publish.
++    //! Waits for the previous staging upload before changing any host row.
++    void reorder(std::vector<KvCache*> const& kvCaches);
++
+     //! Resize every member, then publish once.
+     //!
+     //! The sanctioned way to advance a batched step, and the reason it exists: it waits on
+diff --git a/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.cpp b/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.cpp
+index abadd15615..af5f316152 100644
+--- a/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.cpp
++++ b/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.cpp
+@@ -2532,6 +2532,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
+             "remove_row", [](kv::Batch& self, int row) { return self.removeKvCache(row); }, nb::arg("row"),
+             "The same, by the row add_kv_cache returned. None when nothing is seated there, so a "
+             "caller sweeping rows need not ask twice about each one.")
++        .def("reorder", &kv::Batch::reorder, nb::arg("kv_caches"), nb::call_guard<nb::gil_scoped_release>(),
++            "Pack every current member into the supplied order without releasing its sparse cache lease. "
++            "Requires every member exactly once. Waits for the previous staging upload; publish() "
++            "makes the new row order visible on the device.")
+         .def(
+             "index_mode",
+             [](kv::Batch const& self, int layerGroupId) { return self.indexMode(kv::LayerGroupId{layerGroupId}); },
+diff --git a/tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py b/tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py
+index 1731d894a8..4d2c7cd9fe 100644
+--- a/tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py
++++ b/tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py
+@@ -1808,7 +1808,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+         )
+ 
+     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
+-        self._release_sparse_batch()
++        self._sparse_batch_prepared = False
++        if self._sparse_batch is not None:
++            self._sparse_batch.wait_published()
+         if self._enable_kv_cache_offload and any(
+             not (request.is_first_context_chunk and request.is_last_context_chunk)
+             for request in scheduled_batch.context_requests
+@@ -1848,10 +1850,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+     def _prepare_sparse_batch(self, request_ids: list[int]) -> None:
+         """Publish scheduled caches in model input order before a forward.
+ 
+-        The allocation persists across steps and CUDA graph profiles. Membership lasts
+-        until the post-forward resource update: Batch temporarily owns every member's
+-        host page-index buffers, including the dense SWA and indexer groups. Returning
+-        those buffers before scheduler mutations keeps the legacy tables up to date.
++        Continuing requests keep their Batch membership and sparse GPU residency across
++        steps. Members write their page indices into Batch staging; the legacy SWA and
++        indexer tables receive a snapshot after scheduling and row reordering.
+         """
+         if not self._enable_kv_cache_offload or not any(
+             self._compress_ratios[layer] == DEEPSEEK_V4_SPARSE_RATIO for layer in self.pp_layers
+@@ -1896,9 +1897,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+             )
+         batch = self._sparse_batch
+         try:
++            batch.wait_published()
++            self._release_sparse_batch(
++                request_id for request_id in self._sparse_batch_members if request_id not in caches
++            )
+             for request_id, cache in caches.items():
+-                batch.add_kv_cache(cache)
+-                self._sparse_batch_members[request_id] = cache
++                if request_id not in self._sparse_batch_members:
++                    batch.add_kv_cache(cache)
++                    self._sparse_batch_members[request_id] = cache
++            batch.reorder(list(caches.values()))
++            self._sparse_batch_members = caches
++            self._refresh_sparse_page_index_bufs()
+             stream = torch.cuda.current_stream(self._stream.device)
+             # Reusing the device mirror follows the previous forward. Publish on
+             # the cache stream so metadata preparation can also join it there.
+@@ -1929,13 +1938,36 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+             raise ValueError("Attention request order does not match the published sparse Batch")
+         return self._sparse_batch
+ 
+-    def _release_sparse_batch(self) -> None:
+-        """Return host page-index ownership before updating or releasing request caches."""
+-        self._sparse_batch_prepared = False
++    def _refresh_sparse_page_index_bufs(self) -> None:
++        """Snapshot Batch-owned indices for the legacy SWA and indexer consumers."""
++        if not self._sparse_batch_members:
++            return
++        assert self._sparse_batch is not None
++        indices = torch.tensor(
++            [
++                self.index_mapper.get_index(request_id) * self.max_beam_width
++                for request_id in self._sparse_batch_members
++            ],
++            dtype=torch.long,
++            device="cpu",
++        )
++        for pool_id in range(self.num_pools):
++            table = torch.from_dlpack(self._sparse_batch.coalesced_page_table(pool_id))
++            self.host_kv_cache_block_offsets[pool_id, :, 0, :].index_copy_(
++                0, indices, table[: len(self._sparse_batch_members)]
++            )
++
++    def _release_sparse_batch(self, request_ids: Iterable[int] | None = None) -> None:
++        """Detach departing requests while retaining other members' GPU cache leases."""
+         if self._sparse_batch is None:
+             return
+         self._sparse_batch.wait_published()
+-        for request_id, cache in list(self._sparse_batch_members.items()):
++        request_ids = list(self._sparse_batch_members if request_ids is None else request_ids)
++        for request_id in request_ids:
++            cache = self._sparse_batch_members.get(request_id)
++            if cache is None:
++                continue
++            self._sparse_batch_prepared = False
+             self._sparse_batch.remove_kv_cache(cache)
+             del self._sparse_batch_members[request_id]
+             # Removal restores the cache's internal indices. Rebind the runtime's
+@@ -1943,17 +1975,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+             self._set_page_index_bufs(request_id, cache)
+ 
+     def suspend_request(self, req: llm_request.LlmRequest) -> None:
+-        self._release_sparse_batch()
++        self._release_sparse_batch([req.py_request_id])
+         self._order_sparse_history_update([req])
+         super().suspend_request(req)
+ 
+     def free_resources(self, request: llm_request.LlmRequest, pin_on_release: bool = False) -> None:
+-        self._release_sparse_batch()
++        self._release_sparse_batch([request.py_request_id])
+         self._order_sparse_history_update([request])
+         super().free_resources(request, pin_on_release)
+ 
+     def release_index_slot(self, request_id: int) -> None:
+-        self._release_sparse_batch()
++        self._release_sparse_batch([request_id])
+         super().release_index_slot(request_id)
+ 
+     def shutdown(self) -> None:
+@@ -1977,8 +2009,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+         """Order writeback after all model producers and attention readers.
+ 
+         The executor orders its calling stream after model forward.
+-        Join it onto the cache stream before resize writes back completed units
+-        or recycles pages. prepare_sparse_batch() supplies the reverse dependency
++        Join it onto the cache stream before flushing completed units or resizing
++        request caches. prepare_sparse_batch() supplies the reverse dependency
+         for the next forward.
+         """
+         if not self._enable_kv_cache_offload:
+@@ -1997,7 +2029,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+             self._stream.wait_stream(torch.cuda.current_stream(self._stream.device))
+ 
+     def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
+-        self._release_sparse_batch()
++        self._release_sparse_batch(
++            request.py_request_id for request in scheduled_batch.context_requests
++        )
+         self._order_sparse_history_update(scheduled_batch.context_requests)
+         super().update_context_resources(scheduled_batch)
+ 
+@@ -2012,11 +2046,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+         nothing.
+         """
+         if self._enable_kv_cache_offload:
++            if self._sparse_batch is not None:
++                self._sparse_batch.wait_published()
+             cache = self.kv_cache_map.get(req.py_request_id)
+             if cache is not None and cache.is_active and cache.capacity > cache.history_length:
+                 return True
+         return super().try_allocate_generation(req)
+ 
++    def revert_allocate_generation(self, req: llm_request.LlmRequest) -> None:
++        if self._sparse_batch is not None:
++            self._sparse_batch.wait_published()
++        super().revert_allocate_generation(req)
++
+     def update_forward_resources(
+         self, scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+     ) -> None:
+@@ -2030,12 +2071,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+         if not self._enable_kv_cache_offload or not scheduled_batch.generation_requests:
+             return
+         wait_for_input_copy()
+-        # Before the batch is released and before any history moves: the write-back reads
++        self._order_sparse_history_update(scheduled_batch.generation_requests)
++        # Before any history moves: the write-back reads
+         # the converted indices the Batch published, so it has to run while the members are
+         # still seated. A row that is not advancing repeats its own history, which asks for
+         # nothing.
+         batch = self._sparse_batch
+         if batch is not None:
++            batch.wait_published()
+             histories = [0] * batch.max_batch_size
+             for cache in self._sparse_batch_members.values():
+                 row = batch.row_of(cache)
+@@ -2050,8 +2093,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+                     histories[row] = cache.history_length + 1
+             batch.flush_sparse_units(histories)
+ 
+-        self._release_sparse_batch()
+-        self._order_sparse_history_update(scheduled_batch.generation_requests)
++        # The flush watermark belongs to the attached Batch row. Keep membership
++        # until resize has checked it and advanced the request's history.
+         for request in scheduled_batch.generation_requests:
+             request_id = request.py_request_id
+             cache = self.kv_cache_map.get(request_id)
+@@ -2066,6 +2109,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
+                     f"to {history_length} tokens after model forward"
+                 )
+             self._allocated_draft_lens.pop(request_id, None)
++        self._sparse_batch_prepared = False
+ 
+     def update_resources(
+         self,
+diff --git a/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py b/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
+index 4b5f8cd84a..ec6787bb31 100644
+--- a/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
++++ b/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
+@@ -3932,8 +3932,8 @@ class KVCacheManagerV2(BaseResourceManager):
+         if kv_cache.batch_row >= 0:
+             # A member's page indices belong to its Batch row; binding a second buffer
+             # would take the writes with it and strand that row at whatever it held when
+-            # the cache joined. When the Batch borrows this tensor the row is the one this
+-            # method would have bound, so nothing is lost by leaving it alone.
++            # the cache joined. Adapters that need separate host tables must snapshot
++            # the Batch's rows before those tables are consumed.
+             return
+         index = self.index_mapper.get_index(request_id)
+         for beam_idx in range(int(kv_cache.beam_width)):
+diff --git a/tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi b/tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi
+index cbf871a4d2..0a9b5f829b 100644
+--- a/tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi
++++ b/tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi
+@@ -954,6 +954,14 @@ class Batch:
+         about each one.
+         """
+ 
++    def reorder(self, kv_caches: list[_KVCache]) -> None:
++        """Pack every current member into this order without releasing its GPU cache lease.
++
++        Requires every member exactly once. Moves page-index bindings and flush watermarks
++        with the members, after waiting for the previous staging upload. Call ``publish``
++        before device consumers use the new order; device buffer addresses stay unchanged.
++        """
++
+     @property
+     def num_index_tables(self) -> int: ...
+     def index_table(self, table_id: int) -> list[IndexTableRequest]:
+diff --git a/tests/unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py b/tests/unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py
+index bb42a7fea5..5d5e069f01 100644
+--- a/tests/unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py
++++ b/tests/unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py
+@@ -799,6 +799,8 @@ class _SchedulingBatch:
+         self.snapshots = []
+         self.upload_pending = False
+         self.flushes = []
++        self.joins = []
++        self.leaves = []
+ 
+     def row_of(self, cache):
+         return self.rows.index(cache) if cache in self.rows else -1
+@@ -818,6 +820,7 @@ class _SchedulingBatch:
+         row = self.rows.index(None)
+         self.rows[row] = cache
+         cache.page_index_owner = "batch"
++        self.joins.append(cache.id)
+         return row
+ 
+     def remove_kv_cache(self, cache):
+@@ -825,6 +828,25 @@ class _SchedulingBatch:
+         assert cache.page_index_owner == "batch"
+         self.rows[self.rows.index(cache)] = None
+         cache.page_index_owner = "cache"
++        self.leaves.append(cache.id)
++
++    def reorder(self, caches: list[_HistoryCache]) -> None:
++        assert not self.upload_pending
++        assert {cache.id for cache in caches} == {
++            cache.id for cache in self.rows if cache is not None
++        }
++        self.rows[:] = list(caches) + [None] * (self.max_batch_size - len(caches))
++
++    def coalesced_page_table(self, pool_id: int) -> torch.Tensor:
++        return torch.tensor(
++            [
++                list(cache.pages) + [BAD_PAGE_INDEX] * (self.max_blocks_per_seq - len(cache.pages))
++                if cache is not None
++                else [BAD_PAGE_INDEX] * self.max_blocks_per_seq
++                for cache in self.rows
++            ],
++            dtype=torch.int32,
++        )
+ 
+     def publish(self):
+         assert not self.upload_pending
+@@ -855,6 +877,10 @@ def sparse_scheduling_case():
+     request.is_first_context_chunk = request.is_last_context_chunk = True
+     other_request = SimpleNamespace(py_request_id=10, is_disagg_generation_init_state=False)
+     scheduled = SimpleNamespace(context_requests=[], generation_requests=[request, other_request])
++    manager.num_pools = 2
++    manager.index_mapper = Mock()
++    manager.index_mapper.get_index.side_effect = {20: 3, 10: 1}.__getitem__
++    manager.host_kv_cache_block_offsets = torch.full((2, 4, 1, 6), -99, dtype=torch.int32)
+ 
+     def restore(request_id, request_cache):
+         assert request_cache.page_index_owner == "cache"
+@@ -908,7 +934,56 @@ def test_sparse_batch_publishes_schedule_and_reuses_allocation(sparse_scheduling
+         [(layer_id, DeepseekV4AttentionType.COMPRESS.role)]
+         for layer_id in sorted(manager.impl.sparse)
+     ]
+-    assert case.restore_buffers.call_count == 2
++    case.restore_buffers.assert_not_called()
++    assert batch.joins == [20, 10]
++    assert not batch.leaves
++
++
++@pytest.mark.cpu_only
++@pytest.mark.parametrize("max_beam_width", [1, 2])
++def test_sparse_batch_retains_continuing_members_and_refreshes_legacy_tables(
++    sparse_scheduling_case: SimpleNamespace, max_beam_width: int
++) -> None:
++    case = sparse_scheduling_case
++    manager = case.manager
++    manager.max_beam_width = max_beam_width
++    manager.host_kv_cache_block_offsets = torch.full(
++        (2, 4 * max_beam_width, 1, 6), -99, dtype=torch.int32
++    )
++    manager.prepare_resources(case.scheduled)
++    batch = manager.get_sparse_batch([20, 10])
++    case.cache.pages = [4, 8, 9]
++    case.scheduled.generation_requests.reverse()
++    manager.prepare_resources(case.scheduled)
++
++    assert batch.joins == [20, 10]
++    assert not batch.leaves
++    assert manager.get_sparse_batch([10, 20]) is batch
++    for pool_id in range(manager.num_pools):
++        assert manager.host_kv_cache_block_offsets[pool_id, 3 * max_beam_width, 0].tolist() == [
++            4,
++            8,
++            9,
++            -1,
++            -1,
++            -1,
++        ]
++        assert manager.host_kv_cache_block_offsets[pool_id, max_beam_width, 0].tolist() == [
++            0,
++            7,
++            8,
++            -1,
++            -1,
++            -1,
++        ]
++
++    case.scheduled.generation_requests = [case.request]
++    manager.prepare_resources(case.scheduled)
++    assert manager.get_sparse_batch([20]) is batch
++    assert batch.joins == [20, 10]
++    assert batch.leaves == [10]
++    assert batch.rows == [case.cache, None, None, None]
++    assert case.cache.page_index_owner == "batch"
+ 
+ 
+ @pytest.mark.cpu_only
+@@ -1030,6 +1105,36 @@ def test_sparse_batch_ignores_disagg_gen_init_preparation(sparse_scheduling_case
+         case.manager.get_sparse_batch([])
+ 
+ 
++@pytest.mark.cpu_only
++def test_disagg_gen_init_retains_continuing_sparse_cache_leases(
++    sparse_scheduling_case: SimpleNamespace,
++) -> None:
++    case = sparse_scheduling_case
++    case.manager.prepare_resources(case.scheduled)
++    batch = case.manager.get_sparse_batch([20, 10])
++    case.manager.prepare_resources(
++        SimpleNamespace(context_requests=[_gen_init_request(100)], generation_requests=[])
++    )
++    assert [cache.id for cache in batch.rows if cache is not None] == [20, 10]
++    assert not batch.leaves
++    case.manager.prepare_resources(case.scheduled)
++    assert case.manager.get_sparse_batch([20, 10]) is batch
++    assert batch.joins == [20, 10]
++
++
++@pytest.mark.cpu_only
++def test_releasing_unseated_request_preserves_the_published_batch(
++    sparse_scheduling_case: SimpleNamespace,
++) -> None:
++    case = sparse_scheduling_case
++    case.manager.prepare_resources(case.scheduled)
++    batch = case.manager.get_sparse_batch([20, 10])
++    with patch.object(KVCacheManagerV2, "free_resources"):
++        case.manager.free_resources(_gen_init_request(100))
++    assert case.manager.get_sparse_batch([20, 10]) is batch
++    assert not batch.leaves
++
++
+ @pytest.mark.cpu_only
+ def test_sparse_batch_publishes_only_requests_that_run_a_forward(sparse_scheduling_case):
+     case = sparse_scheduling_case
+@@ -1085,11 +1190,19 @@ def test_sparse_batch_detaches_before_cache_lifecycle_mutations(sparse_schedulin
+     batch = manager.get_sparse_batch([20, 10])
+ 
+     def mutate(*args):
+-        assert batch.rows == [None] * 4
+-        assert all(cache.page_index_owner == "runtime" for cache in manager.kv_cache_map.values())
++        if operation == "shutdown":
++            assert batch.rows == [None] * 4
++            assert all(
++                cache.page_index_owner == "runtime" for cache in manager.kv_cache_map.values()
++            )
++        else:
++            assert batch.rows == [None, manager.kv_cache_map[10], None, None]
++            assert case.cache.page_index_owner == "runtime"
++            assert manager.kv_cache_map[10].page_index_owner == "batch"
+ 
+     with patch.object(KVCacheManagerV2, operation, side_effect=mutate) as parent:
+         if operation.startswith("update_"):
++            case.scheduled.context_requests = [case.request]
+             getattr(manager, operation)(case.scheduled)
+         elif operation == "release_index_slot":
+             manager.release_index_slot(20)
+@@ -1122,7 +1235,7 @@ def test_sparse_batch_publishes_updated_history_on_next_step(sparse_scheduling_c
+         manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
+         manager.update_resources(case.scheduled)
+     assert cache.history_length == cache.capacity == 8
+-    assert cache.page_index_owner == "runtime"
++    assert cache.page_index_owner == ("runtime" if context else "batch")
+     assert not batch.upload_pending
+ 
+     # Scheduling reserves the next input token after the completed history update.
+@@ -1150,7 +1263,7 @@ def test_sparse_overlap_history_advances_before_delayed_samples(
+     # Forward N produces KV before the executor consumes sampling result N.
+     manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
+     assert cache.history_length == history_length + 1
+-    assert cache.page_index_owner == "runtime"
++    assert cache.page_index_owner == "batch"
+ 
+     assert cache.resize(history_length + 2, None)
+     manager.prepare_resources(case.scheduled)
+@@ -1196,7 +1309,7 @@ def test_sparse_history_does_not_advance_without_forward(
+ 
+ @pytest.mark.cpu_only
+ @pytest.mark.parametrize("copy_fails", [False, True])
+-def test_sparse_forward_waits_for_input_copy_before_detaching(
++def test_sparse_forward_waits_for_input_copy_before_history_update(
+     sparse_scheduling_case: SimpleNamespace, copy_fails: bool
+ ) -> None:
+     case = sparse_scheduling_case
+@@ -1223,10 +1336,49 @@ def test_sparse_forward_waits_for_input_copy_before_detaching(
+     else:
+         manager.update_forward_resources(case.scheduled, wait_for_input_copy=wait)
+         assert cache.history_length == 8
+-        assert cache.page_index_owner == "runtime"
++        assert cache.page_index_owner == "batch"
+     wait.assert_called_once_with()
+ 
+ 
++@pytest.mark.cpu_only
++@pytest.mark.parametrize("history_length", [3, 127])
++def test_sparse_forward_keeps_flush_proof_attached_until_history_advances(
++    sparse_scheduling_case: SimpleNamespace, history_length: int
++) -> None:
++    case = sparse_scheduling_case
++    manager, cache, request = case.manager, case.cache, case.request
++    case.scheduled.generation_requests = [request]
++    cache.history_length, cache.capacity = history_length, history_length + 1
++    manager.prepare_resources(case.scheduled)
++    batch = manager.get_sparse_batch([20])
++    manager._stream.wait_stream.reset_mock()
++    flush = batch.flush_sparse_units
++    resize = cache.resize
++
++    def flush_after_forward(histories):
++        manager._stream.wait_stream.assert_called_once_with(case.current_stream.return_value)
++        flush(histories)
++
++    def advance_attached(capacity, history):
++        row = batch.row_of(cache)
++        assert row >= 0, "The native flush watermark belongs to the attached Batch row"
++        assert batch.flushes[-1][row] >= history
++        assert not batch.upload_pending, "History mutation must not race the staged table upload"
++        return resize(capacity, history)
++
++    with (
++        patch.object(batch, "flush_sparse_units", side_effect=flush_after_forward),
++        patch.object(cache, "resize", side_effect=advance_attached),
++    ):
++        manager.update_forward_resources(case.scheduled, wait_for_input_copy=Mock())
++
++    assert cache.history_length == history_length + 1
++    assert cache.page_index_owner == "batch"
++    assert batch.row_of(cache) == 0
++    assert batch.joins == [20]
++    assert not batch.leaves
++
++
+ @pytest.mark.cpu_only
+ def test_sparse_forward_requires_reserved_input_capacity() -> None:
+     manager, cache, request, batch = _history_case()
+diff --git a/tests/unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py b/tests/unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py
+index 085e7f81b8..3e5b1420a1 100755
+--- a/tests/unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py
++++ b/tests/unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py
+@@ -3276,6 +3276,75 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
+                 cache.close()
+             manager.shutdown()
+ 
++    def test_reordering_retains_cached_data_and_scales(self) -> None:
++        ctypes, cudart, torch = self._deps()
++        manager = self._manager()
++        caches = []
++        batch = None
++        roles = (("key", self.DATA), ("key_scale", self.SCALE))
++        try:
++            with TemporaryCudaStream([]) as stream:
++                handle = cast(CudaStream, stream.handle)
++                batch = Batch(
++                    manager,
++                    handle,
++                    max_batch_size=2,
++                    max_blocks_per_seq=4,
++                    index_tables=manager.sparse_index_table_requests(),
++                )
++                lg = manager.get_layer_group_id(0)
++                patterns = []
++                for request in range(2):
++                    cache = manager.create_kv_cache()
++                    caches.append(cache)
++                    self.assertTrue(cache.resume(handle))
++                    self.assertTrue(cache.resize(2 * self.TPB, 2 * self.TPB))
++                    page = int(cache.get_base_page_indices(lg)[0])
++                    values = []
++                    for buffer, (role, size) in enumerate(roles):
++                        pattern = self._pattern(size, 7 + 11 * request + 3 * buffer)
++                        values.append(pattern)
++                        pool = int(manager.get_mem_pool_base_address(LayerId(0), role))
++                        stride = manager.get_page_stride(LayerId(0), role)
++                        ctypes.memmove(pool + page * stride, pattern, size)
++                    patterns.append(values)
++                    batch.add_kv_cache(cache)
++                batch.publish()
++                selected = torch.tensor([[0, -1], [0, -1]], dtype=torch.int32, device="cuda")
++                out = torch.empty((2, 2, self.SELECTED), dtype=torch.int32, device="cuda")
++                buffers = [BufferId(0, role) for role, _ in roles]
++                manager.fetch_sparse_pages(batch, buffers, selected, out, handle)
++                torch.cuda.synchronize()
++                original_indices = out.cpu().clone()
++                self.assertEqual(batch.peek_hit_miss_counter(), (0, 2))
++
++                batch.reorder(caches[::-1])
++                batch.publish()
++                manager.fetch_sparse_pages(batch, buffers, selected, out, handle)
++                torch.cuda.synchronize()
++                self.assertEqual(batch.peek_hit_miss_counter(), (2, 2))
++                self.assertTrue(torch.equal(out.cpu(), original_indices.flip(0)))
++                for row in range(2):
++                    for buffer, (role, size) in enumerate(roles):
++                        arena = int(manager.get_sparse_cache_base_address(LayerId(0), role))
++                        index = int(out[row, buffer, 0])
++                        got = bytearray(size)
++                        sink = (ctypes.c_ubyte * size).from_buffer(got)
++                        (err,) = cudart.cudaMemcpy(
++                            ctypes.addressof(sink),
++                            arena + index * size,
++                            size,
++                            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
++                        )
++                        self.assertEqual(int(err), 0)
++                        self.assertEqual(bytes(got), patterns[1 - row][buffer])
++        finally:
++            for cache in caches:
++                if batch is not None and batch.row_of(cache) >= 0:
++                    batch.remove_kv_cache(cache)
++                cache.close()
++            manager.shutdown()
++
+ 
+ class TestSparseFlush(unittest.TestCase):
+     """Writing a unit back to its host page once the watermark passes it."""
+@@ -3610,6 +3679,78 @@ class TestBatch(unittest.TestCase):
+         finally:
+             manager.shutdown()
+ 
++    def test_reorder_preserves_bindings_watermarks_and_device_addresses(self) -> None:
++        import torch
++
++        manager = self._manager()
++        caches = []
++        batch = None
++        try:
++            with TemporaryCudaStream([]) as stream:
++                handle = cast(CudaStream, stream.handle)
++                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
++                lg = manager.get_layer_group_id(0)
++                table = torch.from_dlpack(batch.gpu_coalesced_page_table(lg))
++                address = table.data_ptr()
++                for history in (17, 31, 63):
++                    cache = manager.create_kv_cache()
++                    caches.append(cache)
++                    self.assertTrue(cache.resume(handle))
++                    self.assertTrue(cache.resize(128, history))
++                    batch.add_kv_cache(cache)
++                batch.flush_sparse_units([17, 31, 63])
++                batch.publish()
++                order = [caches[2], caches[0], caches[1]]
++                batch.reorder(order)
++                self.assertEqual([batch.row_of(cache) for cache in order], [0, 1, 2])
++                self.assertEqual([batch.flushed_history(row) for row in range(3)], [63, 17, 31])
++
++                # Growth must update the new row, and removing a member must clear it.
++                self.assertTrue(caches[2].resize(257))
++                batch.remove_kv_cache(caches[0])
++                order = [caches[1], caches[2]]
++                batch.reorder(order)
++                batch.publish()
++                torch.cuda.synchronize()
++                self.assertEqual(table.data_ptr(), address)
++                for row, cache in enumerate(order):
++                    self.assertEqual(table[row].tolist(), list(cache.get_base_page_indices(lg)))
++                self.assertTrue(bool((table[2] == BAD_PAGE_INDEX).all()))
++                self.assertEqual(torch.from_dlpack(batch.history_lengths()).tolist(), [31, 63, 0])
++                self.assertEqual(torch.from_dlpack(batch.capacities()).tolist(), [128, 257, 0])
++                self.assertEqual([batch.flushed_history(row) for row in range(2)], [31, 63])
++        finally:
++            for cache in caches:
++                if batch is not None and batch.row_of(cache) >= 0:
++                    batch.remove_kv_cache(cache)
++                cache.close()
++            manager.shutdown()
++
++    def test_reorder_rejects_invalid_members_without_changing_rows(self) -> None:
++        manager = self._manager()
++        caches = []
++        batch = None
++        try:
++            with TemporaryCudaStream([]) as stream:
++                handle = cast(CudaStream, stream.handle)
++                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
++                for _ in range(3):
++                    cache = manager.create_kv_cache()
++                    caches.append(cache)
++                    self.assertTrue(cache.resume(handle))
++                batch.add_kv_cache(caches[0], 2)
++                batch.add_kv_cache(caches[1], 1)
++                for invalid in ([caches[0]], [caches[1], caches[1]], [caches[1], caches[2]]):
++                    with self.assertRaises(ValueError):
++                        batch.reorder(invalid)
++                    self.assertEqual([batch.row_of(cache) for cache in caches], [2, 1, -1])
++        finally:
++            for cache in caches:
++                if batch is not None and batch.row_of(cache) >= 0:
++                    batch.remove_kv_cache(cache)
++                cache.close()
++            manager.shutdown()
++
+     def test_the_batch_keeps_a_seated_member_alive(self):
+         """A caller may keep only the Batch: seating is what holds the cache up.
+ 
+-- 
+2.43.0
+

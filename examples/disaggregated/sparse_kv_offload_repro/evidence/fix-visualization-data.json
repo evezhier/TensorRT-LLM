@@ -1,0 +1,63 @@
+{
+  "rows": [
+    {
+      "mode": "resident",
+      "concurrency": 1,
+      "tps": 63.35021703685803,
+      "gpu_ms": 15.721152305603027,
+      "cadence_ms": 15.80953598022461
+    },
+    {
+      "mode": "offload",
+      "concurrency": 1,
+      "tps": 55.56765132730125,
+      "gpu_ms": 17.551584243774414,
+      "cadence_ms": 17.962932586669922
+    },
+    {
+      "mode": "resident",
+      "concurrency": 96,
+      "tps": 4524.89070082772,
+      "gpu_ms": 21.092000007629395,
+      "cadence_ms": 21.17753028869629
+    },
+    {
+      "mode": "offload",
+      "concurrency": 96,
+      "tps": 4180.78233340389,
+      "gpu_ms": 22.743712425231934,
+      "cadence_ms": 22.899985313415527
+    },
+    {
+      "mode": "resident",
+      "concurrency": 144,
+      "tps": 5728.128133042619,
+      "gpu_ms": 23.19223976135254,
+      "cadence_ms": 23.25737476348877
+    },
+    {
+      "mode": "offload",
+      "concurrency": 144,
+      "tps": 5560.454228200683,
+      "gpu_ms": 25.56889533996582,
+      "cadence_ms": 25.794148445129395
+    },
+    {
+      "mode": "resident",
+      "concurrency": 1204,
+      "tps": 22544.95921751168,
+      "gpu_ms": 41.85452842712402,
+      "cadence_ms": 45.31455039978027
+    },
+    {
+      "mode": "offload",
+      "concurrency": 1204,
+      "tps": 17131.2641673628,
+      "gpu_ms": 63.60307312011719,
+      "cadence_ms": 63.32993507385254
+    }
+  ],
+  "hits": 7894231474,
+  "misses": 1250110209,
+  "hit_rate_percent": 86.32913934828085
+}

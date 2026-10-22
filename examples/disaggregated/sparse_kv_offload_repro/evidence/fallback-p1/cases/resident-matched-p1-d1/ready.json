@@ -1,0 +1,38 @@
+{
+  "serve_url": "http://localhost:40445",
+  "startup_seconds": 278.0304692589998,
+  "cluster_info": {
+    "is_ready": true,
+    "server_lists": {
+      "context": [
+        "localhost:41417"
+      ],
+      "generation": [
+        "localhost:38571"
+      ]
+    },
+    "current_workers": {
+      "context_servers": [
+        {
+          "worker_id": "CONTEXT-localhost:41417-1792384459089-1469072-794",
+          "host": "localhost",
+          "port": 41417,
+          "role": 0
+        }
+      ],
+      "generation_servers": [
+        {
+          "worker_id": "GENERATION-localhost:38571-1792384500884-1469074-443",
+          "host": "localhost",
+          "port": 38571,
+          "role": 1
+        }
+      ]
+    },
+    "minimal_instances": {
+      "context_servers": 1,
+      "generation_servers": 1
+    }
+  },
+  "local_clock": "2026-10-18T21:35:05.802250-07:00"
+}

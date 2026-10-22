@@ -1,0 +1,6 @@
+{
+  "files": 8,
+  "sha256": "ba32f377cf5c8572303b52524f4a4a97c86be43c7b8065853759391ceeb37220",
+  "bytes": 31267,
+  "description": "Only residency-fix changes relative to saved local-before.patch; excludes pre-existing host sizing and flush-order changes"
+}

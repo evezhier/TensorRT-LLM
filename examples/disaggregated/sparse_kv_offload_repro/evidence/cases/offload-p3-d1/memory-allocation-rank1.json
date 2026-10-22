@@ -1,0 +1,133 @@
+{
+  "rank": 1,
+  "pid": 98791,
+  "input_tokens": 32768,
+  "tokens_per_block": 128,
+  "max_batch_size": 896,
+  "max_admissible_sequences": 1792,
+  "gpu_pool_quota_bytes": 87879057408,
+  "sparse_arena_bytes": 6597287168,
+  "sparse_batch_buffer_bytes": 495423584,
+  "sparse_batch_staging_bytes": 3493888,
+  "host_history_budget_bytes": 274874413056,
+  "host_history_pool_bytes": 51480261504,
+  "host_history_capacity_blocks": 236441,
+  "host_history_bytes_per_block": 217728,
+  "gpu_pool_payload_bytes_per_request": 95080132,
+  "sparse_arena_shapes": [
+    {
+      "num_layers": 21,
+      "cells_per_buffer": 33,
+      "units_per_cell": 32,
+      "cell_bytes": [
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152,
+        9216,
+        1152
+      ]
+    }
+  ],
+  "physical_pools": [
+    {
+      "group": 0,
+      "memory_type": "DRAM",
+      "slot_bytes": 193536,
+      "num_slots": 236443,
+      "payload_bytes": 45760232448
+    },
+    {
+      "group": 0,
+      "memory_type": "VRAM",
+      "slot_bytes": 45696,
+      "num_slots": 236443,
+      "payload_bytes": 10804499328
+    },
+    {
+      "group": 0,
+      "memory_type": "DRAM",
+      "slot_bytes": 24192,
+      "num_slots": 236443,
+      "payload_bytes": 5720029056
+    },
+    {
+      "group": 0,
+      "memory_type": "VRAM",
+      "slot_bytes": 5760,
+      "num_slots": 236443,
+      "payload_bytes": 1361911680
+    },
+    {
+      "group": 0,
+      "memory_type": "VRAM",
+      "slot_bytes": 720,
+      "num_slots": 236443,
+      "payload_bytes": 170238960
+    },
+    {
+      "group": 1,
+      "memory_type": "VRAM",
+      "slot_bytes": 10485760,
+      "num_slots": 1846,
+      "payload_bytes": 19356712960
+    },
+    {
+      "group": 1,
+      "memory_type": "VRAM",
+      "slot_bytes": 2818048,
+      "num_slots": 1846,
+      "payload_bytes": 5202116608
+    },
+    {
+      "group": 2,
+      "memory_type": "VRAM",
+      "slot_bytes": 22020096,
+      "num_slots": 1848,
+      "payload_bytes": 40693137408
+    },
+    {
+      "group": 2,
+      "memory_type": "VRAM",
+      "slot_bytes": 5505024,
+      "num_slots": 1848,
+      "payload_bytes": 10173284352
+    }
+  ]
+}

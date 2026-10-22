@@ -1,0 +1,167 @@
+[
+  {
+    "path": "LICENSE",
+    "bytes": 40678,
+    "sha256": "a56e691155bb532ea212f701d3ecacb2db549fa64757f9bad3e06bc9177f46ea"
+  },
+  {
+    "path": "README.md",
+    "bytes": 13337,
+    "sha256": "4c99d05a6663156decc37c46532d03be5929e29c8e14c191f186d71e0e109407"
+  },
+  {
+    "path": "harness/analyze_decode.py",
+    "bytes": 12689,
+    "sha256": "de43b6d21fa094d0c5200cb70376b58a124de1cd41e7e0623223b2e94bd9c6cf"
+  },
+  {
+    "path": "harness/analyze_fix.py",
+    "bytes": 5268,
+    "sha256": "16265f9bf28a9cf70e67cc6de500d2a28f3fb252072ca17c04d9b2d78f9f2143"
+  },
+  {
+    "path": "harness/analyze_prefill_feed.py",
+    "bytes": 3274,
+    "sha256": "ba23885f13bfd03a069939922ea9adf70e07999f9e80c0515d9301e06e2fbf1d"
+  },
+  {
+    "path": "harness/analyze_ratios.py",
+    "bytes": 8179,
+    "sha256": "2cc52830487561f2b4fa8b4876aa591befffb4c1b45b679f5c60ac34a1638ebd"
+  },
+  {
+    "path": "harness/analyze_trials.py",
+    "bytes": 12240,
+    "sha256": "e4abad15b2a885e2d5628680d48e35ff231181d7263ab7a965c329a5a8ec5e29"
+  },
+  {
+    "path": "harness/benchmark_server.py",
+    "bytes": 22972,
+    "sha256": "6f33e61172ec001f16001c651a509a5f7d110a5d389e3aa7c980f83f627d47d5"
+  },
+  {
+    "path": "harness/bin/trtllm-serve",
+    "bytes": 206,
+    "sha256": "d2df7955842e6d9c984b92222aa41e20eb6960d96ee0143b392289a3002e0f27"
+  },
+  {
+    "path": "harness/diagnostics/http_connection_policy.py",
+    "bytes": 1598,
+    "sha256": "1e93a5971dbfaf04f614b6ee33bb0cd7dc6ba6cdb8fe1d836ff6f3f3e8990465"
+  },
+  {
+    "path": "harness/diagnostics/memory_metrics.py",
+    "bytes": 4767,
+    "sha256": "fa9767eb7211c59d84a8dc714061a3232dc93974858e89bbbaa5e6d7389318c2"
+  },
+  {
+    "path": "harness/diagnostics/parity_gate.py",
+    "bytes": 3783,
+    "sha256": "f2e6cb464b60f52af92221c538dd7f71af133085e8694f4ecb6ba5e851d70c25"
+  },
+  {
+    "path": "harness/diagnostics/sitecustomize.py",
+    "bytes": 2520,
+    "sha256": "924d10667ac222f22b69a008a1d17e019dda5a6125e16da3744b2347dac7e905"
+  },
+  {
+    "path": "harness/env.sh",
+    "bytes": 1385,
+    "sha256": "0e5c5e17d2b4c83c5c3db2abc033990e6e0eea72a7c04622a0b4f2fa189e83c1"
+  },
+  {
+    "path": "harness/launch.sh",
+    "bytes": 190,
+    "sha256": "e4f5487ff6e4703b9bcbc96fb5e35a215fdd40103788476cba76f4bf44388826"
+  },
+  {
+    "path": "harness/matched/benchmark_server.py",
+    "bytes": 23306,
+    "sha256": "face605dbf946a534315f5f948a8115934ce111d5924808511b19331d821ab57"
+  },
+  {
+    "path": "harness/matched/run_matched_cases.py",
+    "bytes": 4250,
+    "sha256": "1239533d0e3c0d21c9538eb068d6ea4021f2367dddd3a847dab8b44b297d66a3"
+  },
+  {
+    "path": "harness/metrics_collection.py",
+    "bytes": 6161,
+    "sha256": "ff8601c1a81cfad5c5a552fe6d2ccdb2004d816f23c2f9ea1aef61ac75b20e40"
+  },
+  {
+    "path": "harness/preflight.py",
+    "bytes": 2769,
+    "sha256": "2b6a751714081b6adb82da5be2822ebb2fde741f11f8b0234afec796ad4c826e"
+  },
+  {
+    "path": "harness/run_mode.sh",
+    "bytes": 327,
+    "sha256": "0851a17a2f14d7b7ecbf5b6a9a76f29c7bad9fcfb875a4db50fa77d8da78254e"
+  },
+  {
+    "path": "harness/run_ratios.py",
+    "bytes": 4225,
+    "sha256": "990eaed4d474f1b8ff208d011b91af627f15108fe679ba8bb4ec1d6fb9675fa1"
+  },
+  {
+    "path": "patches/0001-preserve-sparse-residency.patch",
+    "bytes": 37297,
+    "sha256": "741a36cc90980b0b5728612d26680344dfb402c7b3139895e2f6ff68db93a9c3"
+  },
+  {
+    "path": "patches/0002-host-memory-sizing.patch",
+    "bytes": 7871,
+    "sha256": "76d5ca2c6abaef4462622200b69b1051bb4d8c3a18038fa9653130c479a68daf"
+  },
+  {
+    "path": "reference/binary-manifest.json",
+    "bytes": 1274,
+    "sha256": "b2185715778f206ad74c944eab1d107d4ae29fc7af8ab7886b99f919ae682950"
+  },
+  {
+    "path": "reference/handoff-validation.json",
+    "bytes": 854,
+    "sha256": "3dac1639cf7b48782bf42c7a7ded1e2010da6109f7e1e8a64aea5394c39648dc"
+  },
+  {
+    "path": "reference/offload-config.json",
+    "bytes": 5476,
+    "sha256": "473184d4c7c7efd8ac7278c5c369526519a643417081dcbe9b485c54427ee75f"
+  },
+  {
+    "path": "reference/prefill-feed.json",
+    "bytes": 5755,
+    "sha256": "a912edcfd2ebd483097b4d0e8e421b5de8057a49a68daa2ac0ddbbde77310717"
+  },
+  {
+    "path": "reference/provenance.json",
+    "bytes": 3051,
+    "sha256": "b1459aa37b8588b30a6c761d9a802434a0bee33900b6d1ef6c8f7c76f5597c75"
+  },
+  {
+    "path": "reference/ratio-metrics.csv",
+    "bytes": 1121,
+    "sha256": "aeed439a0bbcec4e2107258d724e3fcf8a125ff00dde6946976d648040343df4"
+  },
+  {
+    "path": "reference/resident-config.json",
+    "bytes": 5325,
+    "sha256": "65ab36b6c0ca12c144bfbe413ac33489047869fb63e96716f531739f44521640"
+  },
+  {
+    "path": "reference/test-summary.json",
+    "bytes": 2084,
+    "sha256": "4fff213b96518a23a7a62c1716b40d86c519ca02e1f4cfac4754b3d632e932af"
+  },
+  {
+    "path": "reproduce_32k.sh",
+    "bytes": 2398,
+    "sha256": "9d2bba355f40bfbc5c8c7824d646fc37d252bad25f17e07e2176a8c7f93f0476"
+  },
+  {
+    "path": "run_slurm.sh",
+    "bytes": 801,
+    "sha256": "e5ef46d3acc94c6bdc550df22edd9c110164f0b8a55e4f2472ceb5ad7c2a8390"
+  }
+]

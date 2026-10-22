@@ -1,0 +1,25 @@
+{
+  "created_at_utc": "2026-10-19T04:29:56.671113+00:00",
+  "head": "c7f1fc7960e7588afb6b8944bedac2f3e287d48b",
+  "branch": "experiment/deepseek-v4-sparse-disagg-e2e",
+  "libraries": [
+    {
+      "path": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/deepseek-v4-sparse-disagg-e2e/tensorrt_llm/bindings.cpython-312-x86_64-linux-gnu.so",
+      "bytes": 4990224,
+      "sha256": "c332c64504874d311c24d40cb7a3c03f50a49b2076928af895c599f40d16e727"
+    },
+    {
+      "path": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/deepseek-v4-sparse-disagg-e2e/tensorrt_llm/libs/libtensorrt_llm.so",
+      "bytes": 1473553552,
+      "sha256": "bfd0a748b1d17e5c81e3fcde59ef2e76df9fafdc1a8b32db900224cae1965361"
+    },
+    {
+      "path": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/deepseek-v4-sparse-disagg-e2e/tensorrt_llm/libs/libth_common.so",
+      "bytes": 135866472,
+      "sha256": "5cfc8927258f31cd9bb4557a057830924aabd0d02396ceb28ff7dffee5924f93"
+    }
+  ],
+  "patch_sha256_at_regression_run": "82e697ae5f9a3bd6bce9bcce47a3067a3785395a94719d833accbf219e7f5c14",
+  "local_patch_sha256": "010feabc3f2c555143db6eeef58d4f6eb2151425203047d649f17c79a7bd0af9",
+  "post_test_source_change": "Comment clarification in _set_page_index_bufs only; executable code unchanged"
+}

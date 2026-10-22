@@ -1,0 +1,6 @@
+{
+  "mode": "resident",
+  "prefill_workers": 1,
+  "generation_workers": 1,
+  "profiling": false
+}
