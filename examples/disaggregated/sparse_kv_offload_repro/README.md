@@ -106,10 +106,10 @@ execute the batch script from its spool directory.
 Set `MOUNTS` if extra Python dependencies or caches live elsewhere.
 
 For a wheel built from this repro branch, set `WHEEL` to its absolute path
-when submitting the same job. The launcher installs it and the integration
-harness's `openai` dependency in the benchmark container before running the
-harness, and `preflight.json` records its path
-and SHA-256. The image must already contain the wheel's runtime dependencies.
+when submitting the same job. The launcher installs `requirements-dev.txt`
+and then the wheel in the benchmark container before running the harness.
+`preflight.json` records the wheel path and SHA-256. The container needs
+access to the package indexes used by the requirements.
 
 If you already have an eight-GPU Slurm allocation with the CPU/RAM resources
 above, use the lower-level wrapper from this checkout:

@@ -138,12 +138,11 @@ sbatch --export=ALL --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
     examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
 ```
 
-The launcher installs the wheel and the integration harness's `openai` dependency
-in a writable container immediately before the benchmark. Wheel mode imports
-TensorRT-LLM from that installation while the integration-test harness still
-comes from the checkout. The wheel path
-and SHA-256 are recorded in `preflight.json`. The image must already contain
-the wheel's runtime dependencies.
+The launcher installs `requirements-dev.txt`, then the wheel in a writable
+container immediately before the benchmark. Wheel mode imports TensorRT-LLM
+from that installation while the integration-test harness still comes from
+the checkout. The wheel path and SHA-256 are recorded in `preflight.json`.
+The container needs access to the package indexes used by the requirements.
 
 If you already have an eight-GPU Slurm allocation with the CPU/RAM resources
 above, use the lower-level wrapper from this checkout:
