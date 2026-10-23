@@ -1602,10 +1602,13 @@ class KVCacheManagerV2(BaseResourceManager):
         # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
         # capacity lets the next batch of active requests acquire slots without
         # waiting for the previous batch's transfers to finish. With the overlap
-        # scheduler on (non-PP), a retiring request holds its lease one extra
-        # iteration and needs the same coefficient.
+        # scheduler on (non-PP), a retiring request holds its index slot one extra
+        # iteration and needs the same coefficient. Sparse cache leases do not
+        # follow this count: only requests seated in the attention Batch hold one.
         max_num_sequences = max_batch_size * mapping.pp_size
-        needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
+        needs_extra_index_slots = is_disagg or (
+            not disable_overlap_scheduler and not mapping.has_pp()
+        )
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
         # Both diagnostics below are off unless their environment variable is
         # set; with neither set nothing here changes any allocation, any page
@@ -1624,7 +1627,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
-        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
+        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_index_slots else 1)
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
@@ -5552,7 +5555,6 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = solve_sparse_offload_capacity(
             num_tokens=num_tokens,
             max_batch_size=self.max_batch_size,
-            max_admissible_sequences=self.max_admissible_sequences,
             # The device quota counts only device-backed pools.
             gpu_pool_bytes=self.impl.get_quota(GPU_LEVEL),
             host_pool_bytes=self._get_host_backed_pool_bytes(),

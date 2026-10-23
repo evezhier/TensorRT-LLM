@@ -4086,7 +4086,6 @@ def test_offload_capacity_report_names_the_binding_limit() -> None:
     manager.max_seq_len = 1 << 17
     manager.mapping = Mapping()
     manager.kv_cache_manager_py_config = _v4_flash_offload_config(manager)
-    manager.max_admissible_sequences = 512
     # Half of a 100 GiB share of host memory, the automatic budget on a node of
     # four ranks with 400 GiB available.
     manager._host_history_budget = 50 << 30
