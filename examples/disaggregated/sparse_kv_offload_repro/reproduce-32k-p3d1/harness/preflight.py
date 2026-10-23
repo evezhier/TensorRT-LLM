@@ -14,7 +14,11 @@ from pathlib import Path
 def git_provenance(repo: Path, output: Path) -> tuple[str | None, str | None]:
     try:
         git_root = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], cwd=repo, text=True, capture_output=True, check=False
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
         )
     except FileNotFoundError:
         return None, None
@@ -51,6 +55,14 @@ def main() -> None:
         raise RuntimeError("TensorRT-LLM was imported from a different checkout")
     if not hasattr(Batch, "reorder"):
         raise RuntimeError("Rebuild the native bindings: Batch.reorder is missing")
+    host_staging_mb = int(os.environ.get("TRTLLM_NIXL_HOST_STAGING_MB", "0"))
+    if host_staging_mb > 0:
+        from tensorrt_llm._torch.disaggregation.native import transfer
+
+        if not hasattr(transfer, "_HostStagePool"):
+            raise RuntimeError(
+                "Installed TensorRT-LLM lacks sender-side host staging; rebuild the wheel"
+            )
     if not callable(launch_disaggregated_llm):
         raise RuntimeError("Disaggregated integration-test launcher is unavailable")
     wheel_sha256 = None
@@ -83,6 +95,7 @@ def main() -> None:
         "cuda": torch.version.cuda,
         "gpus": [torch.cuda.get_device_name(index) for index in range(expected_gpus)],
         "batch_reorder_available": True,
+        "nixl_host_staging_mb": host_staging_mb,
     }
     (output / "preflight.json").write_text(json.dumps(info, indent=2) + "\n")
     print("Runtime and model preflight passed")

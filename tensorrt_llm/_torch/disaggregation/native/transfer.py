@@ -24,7 +24,7 @@ import time
 import weakref
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
@@ -228,6 +228,58 @@ class WriteMeta:
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
     transfer_groups: tuple[_TransferGroup, ...] = ()
+
+
+@dataclass
+class _HostStageSlot:
+    buffer: torch.Tensor
+    registration: RegMemoryDescs
+    in_use: bool = False
+
+
+class _HostStagePool:
+    """Reuse registered pinned memory for GPU-to-host KV sends."""
+
+    def __init__(self, agent: BaseTransferAgent, capacity_bytes: int) -> None:
+        self._agent = agent
+        self._capacity_bytes = capacity_bytes
+        self._allocated_bytes = 0
+        self._slots: list[_HostStageSlot] = []
+        self._lock = threading.Lock()
+
+    def acquire(self, size: int) -> _HostStageSlot | None:
+        with self._lock:
+            for slot in self._slots:
+                if not slot.in_use and slot.buffer.numel() >= size:
+                    slot.in_use = True
+                    return slot
+            if self._allocated_bytes + size > self._capacity_bytes:
+                return None
+            buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+            registration = RegMemoryDescs(
+                "DRAM",
+                [(buffer.data_ptr(), size, 0, f"host_stage_{id(self)}_{len(self._slots)}")],
+            )
+            self._agent.register_memory(registration)
+            slot = _HostStageSlot(buffer, registration, True)
+            self._slots.append(slot)
+            self._allocated_bytes += size
+            return slot
+
+    def release(self, slot: _HostStageSlot) -> None:
+        with self._lock:
+            if not slot.in_use:
+                raise RuntimeError("Host staging slot released twice")
+            slot.in_use = False
+
+    def close(self) -> None:
+        with self._lock:
+            if any(slot.in_use for slot in self._slots):
+                raise RuntimeError("Host staging memory is still in use")
+            for slot in self._slots:
+                self._agent.deregister_memory(slot.registration)
+            self._slots.clear()
+            self._allocated_bytes = 0
 
 
 class MessageType:
@@ -722,6 +774,7 @@ class _PendingSettlement:
     write_meta: WriteMeta
     initial_report: Optional[list[bytes]]
     send_slot_id: Optional[int] = None
+    host_stage_slot: Optional[_HostStageSlot] = None
     backend_done: bool = False
     report_error_logged: bool = False
 
@@ -981,6 +1034,14 @@ class Sender(SenderBase):
         self._agent = agent
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
+        host_staging_mb = int(os.environ.get("TRTLLM_NIXL_HOST_STAGING_MB", "0"))
+        if host_staging_mb < 0:
+            raise ValueError("TRTLLM_NIXL_HOST_STAGING_MB must be nonnegative")
+        self._host_staging = (
+            _HostStagePool(agent, host_staging_mb << 20) if host_staging_mb else None
+        )
+        if self._host_staging is not None:
+            logger.info(f"NIXL sender host staging enabled with {host_staging_mb} MiB per rank")
         self._retirement_watchdog = retirement_watchdog
         # Generation-first metadata can arrive while prefill is still queued.
         # Keep it for at least the configured transfer timeout.
@@ -1352,12 +1413,13 @@ class Sender(SenderBase):
         write_meta: WriteMeta,
         initial_report: list[bytes],
         send_slot_id: Optional[int] = None,
+        host_stage_slot: Optional[_HostStageSlot] = None,
     ) -> None:
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         key = (write_meta.task, write_meta.peer_rank)
         if key in self._pending_settlements[thread_idx]:
             return
-        pending = _PendingSettlement(write_meta, initial_report, send_slot_id)
+        pending = _PendingSettlement(write_meta, initial_report, send_slot_id, host_stage_slot)
         self._pending_settlements[thread_idx][key] = pending
         try:
             self._get_result_dealer(write_meta.peer_endpoint).send(initial_report)
@@ -1383,6 +1445,9 @@ class Sender(SenderBase):
                 if pending.send_slot_id is not None:
                     self._bounce.release_send(pending.send_slot_id)
                     pending.send_slot_id = None
+                if pending.host_stage_slot is not None:
+                    self._host_staging.release(pending.host_stage_slot)
+                    pending.host_stage_slot = None
                 if meta.meta_type == WriteMetaType.AUX:
                     message = _make_aux_result_msg(
                         self._instance_rank, meta.unique_rid, AgentResult.FAILED_QUIESCED
@@ -1460,6 +1525,63 @@ class Sender(SenderBase):
             )
         return requests[0] if len(requests) == 1 else _TransferRequestGroup(tuple(requests))
 
+    def _stage_host_destinations(
+        self, write_meta: WriteMeta
+    ) -> tuple[WriteMeta, _HostStageSlot | None]:
+        pool = getattr(self, "_host_staging", None)
+        if pool is None:
+            return write_meta, None
+        groups = [
+            group
+            for group in write_meta.transfer_groups
+            if group.src_memory_type == "VRAM" and group.dst_memory_type == "DRAM"
+        ]
+        if not groups:
+            return write_meta, None
+        total = sum(int(write_meta.sizes[group.start : group.stop].sum()) for group in groups)
+        slot = pool.acquire(total)
+        if slot is None:
+            logger.warning_once(
+                f"Host staging has no free space for {total} bytes; using direct GPU-to-host NIXL",
+                key="host-staging-full",
+            )
+            return write_meta, None
+
+        source_ptrs = write_meta.src_ptrs.copy()
+        stream = torch.cuda.current_stream(self._device_id).cuda_stream
+        offset = 0
+        try:
+            for group in groups:
+                for index in range(group.start, group.stop):
+                    size = int(write_meta.sizes[index])
+                    destination = slot.buffer.data_ptr() + offset
+                    CUASSERT(
+                        cudart.cudaMemcpyAsync(
+                            destination,
+                            int(write_meta.src_ptrs[index]),
+                            size,
+                            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                            stream,
+                        )
+                    )
+                    source_ptrs[index] = destination
+                    offset += size
+            CUASSERT(cudart.cudaStreamSynchronize(stream))
+        except Exception:
+            # Earlier copies may already be queued; keep the buffer leased if synchronization fails.
+            try:
+                CUASSERT(cudart.cudaStreamSynchronize(stream))
+            except Exception:
+                pass
+            else:
+                pool.release(slot)
+            raise
+        staged_groups = tuple(
+            replace(group, src_memory_type="DRAM") if group in groups else group
+            for group in write_meta.transfer_groups
+        )
+        return replace(write_meta, src_ptrs=source_ptrs, transfer_groups=staged_groups), slot
+
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
         assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
@@ -1522,15 +1644,27 @@ class Sender(SenderBase):
 
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
+        host_stage_slot = None
         submitted_and_completed = False
         if write_meta.src_ptrs.size > 0:
+            stage_timed = getattr(self, "_host_staging", None) is not None and any(
+                group.src_memory_type == "VRAM" and group.dst_memory_type == "DRAM"
+                for group in write_meta.transfer_groups
+            )
+            if timer and stage_timed:
+                timer.record_transfer_start(write_meta.peer_rank)
             try:
+                request_meta, host_stage_slot = self._stage_host_destinations(write_meta)
                 request, send_slot_id = build_send_request(
                     self._bounce,
-                    write_meta,
-                    lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
+                    request_meta,
+                    lambda: Sender._make_agent_request(request_meta, device_id=self._device_id),
                 )
             except Exception as e:
+                if host_stage_slot is not None:
+                    self._host_staging.release(host_stage_slot)
+                if timer and stage_timed:
+                    timer.record_transfer_end(write_meta.peer_rank)
                 # Don't let a gather fault escape: without a result the receiver would hang and its
                 # region leak. Tell the receiver it failed and fail the local task instead.
                 logger.error(
@@ -1550,7 +1684,7 @@ class Sender(SenderBase):
                     )
                 )
                 return
-            if timer:
+            if timer and not stage_timed:
                 timer.record_transfer_start(write_meta.peer_rank)
             transfer_finished = False
             try:
@@ -1586,6 +1720,13 @@ class Sender(SenderBase):
             finally:
                 if send_slot_id is not None and (not owned or transfer_finished):
                     self._bounce.release_send(send_slot_id)
+                if host_stage_slot is not None and transfer_finished:
+                    self._host_staging.release(host_stage_slot)
+                elif host_stage_slot is not None and not owned:
+                    logger.error(
+                        "NIXL completion is unproven; retaining sender host staging memory "
+                        f"for request {write_meta.unique_rid}"
+                    )
         elif owned:
             task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
         if timer:
@@ -1620,7 +1761,7 @@ class Sender(SenderBase):
             tail=tail,
         )
         if agent_result == AgentResult.IN_DOUBT:
-            self._retain_in_doubt_transfer(write_meta, result_msg, send_slot_id)
+            self._retain_in_doubt_transfer(write_meta, result_msg, send_slot_id, host_stage_slot)
             return
         self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
 
@@ -2397,6 +2538,12 @@ class Sender(SenderBase):
             q.put(None)
         for t in self._worker_threads:
             t.join(timeout=5)
+
+        host_staging = getattr(self, "_host_staging", None)
+        if host_staging is not None:
+            if any(t.is_alive() for t in self._worker_threads):
+                raise RuntimeError("Sender workers still access host staging memory")
+            host_staging.close()
 
         # Snapshot under lock as defense in depth.
         with self._loaded_remote_agents_lock:
