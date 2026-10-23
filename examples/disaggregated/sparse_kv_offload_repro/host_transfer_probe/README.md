@@ -110,3 +110,24 @@ host case, then the 1,284-entry host sender aborted inside UCX with
 `gdr_unpin_buffer failed. ret:22` followed by `mem type pack failed`. It
 produced no result for that case. The production serving run used one NIXL
 thread, and the default probe matrix now matches it.
+
+## Sender-side host staging result
+
+Job `2584773` ran GPU 0 to GPU 6 on a B200 node (`prenyx0230`) with the same
+wheel, `UCX_TLS=^ib`, and one NIXL thread. All four cases completed with every
+byte verified. Medians use eight samples after two warmups.
+
+| Mode | Entries | NIXL p50, ms | CUDA copy p50, ms | Sum p50, ms |
+| --- | ---: | ---: | ---: | ---: |
+| Direct GPU to host | 1 | 224.887 | 0 | 224.887 |
+| Sender host staging | 1 | 15.475 | 2.020 | 17.491 |
+| Direct GPU to host | 1,284 | 232.858 | 0 | 232.858 |
+| Sender host staging | 1,284 | 12.640 | 2.014 | 14.654 |
+
+For 1,284 entries, sender-side staging reduced the measured copy-plus-send
+median by about 15.9 times relative to direct GPU-to-host NIXL on this node.
+UCX selected `zero-copy | cma/memory` for host-to-host writes, while the direct
+GPU-to-host write used `software emulation | sysv/memory`. The contiguous
+sender-staged case was slower than its fragmented counterpart; the probe does
+not establish why. These are synthetic transport measurements on B200, not
+an end-to-end serving result or a GB300 measurement of sender-side staging.
