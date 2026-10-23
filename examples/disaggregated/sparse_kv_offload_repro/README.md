@@ -17,7 +17,7 @@ in the [benchmark report](https://chatgpt.com/space/page_bec74a2e48208191ade22ea
 
 - Serving comparison: one exclusive **8 × NVIDIA B200** node, **160 allocated CPUs and 1,024 GiB host RAM**. Three TP2/EP2 prefill workers use GPUs 0–1, 2–3 and 4–5. One TP2/EP2 decoder uses GPUs 6–7, with attention DP enabled across its two ranks. Run both modes sequentially on the same node.
 - Matched controls: **4 × B200**, 96 CPUs and 768 GiB host RAM were used. One TP2 prefill worker and one TP2 decoder; this is a separate experiment.
-- Full **43-layer DeepSeek V4 Flash** weights in `$REPRO_MODEL_DIR`; a working source build with native libraries and Python bindings from the same source. The preflight checks that `Batch.reorder` is available and that Python imports the selected checkout. If `REPRO_MODEL_DIR` is unset, the scripts use `$LLM_MODELS_ROOT/DeepSeek-V4-Flash`.
+- Full **43-layer DeepSeek V4 Flash** weights in `$REPRO_MODEL_DIR`; a working runtime with native libraries and Python bindings. The preflight checks that `Batch.reorder` is available and that Python imports the selected checkout in source mode or the installed package in wheel mode. If `REPRO_MODEL_DIR` is unset, the scripts use `$LLM_MODELS_ROOT/DeepSeek-V4-Flash`.
 - Original container: `trtllm_pytorch-26.08-py3-x86_64-ubuntu24.04-skip-tritondevel-202609210610-19345.sqsh`, Python 3.12, SM100 build. The integration-test Python dependencies must be installed; the harness imports `tests/integration/defs/accuracy/test_disaggregated_serving.py`. Weights, container, native binaries and dependency directories are not bundled.
 
 The original measured checkout was `build/deepseek-v4-sparse-disagg-e2e`, branch
@@ -139,7 +139,7 @@ This runs one prefill worker and one decoder. After cold/warm requests, it gates
 
 | Output | Purpose |
 | --- | --- |
-| `preflight.json`, `source-working-tree.patch` | Checkout, runtime versions, model config hash and local changes |
+| `preflight.json`, optional `source-working-tree.patch` | Runtime versions, wheel and model hashes; source revision and local changes when Git metadata is available |
 | `cases/*/config.json`, `prompt-tokens.json` | Exact resolved configuration and input token vector |
 | `cases/*/*-results.json` | All output token IDs, client latency/TTFT, completions and command |
 | `cases/*/*-perf.json`, `*-metrics.json` | Worker timing and iteration records |

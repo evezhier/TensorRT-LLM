@@ -11,6 +11,24 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
+def git_provenance(repo: Path, output: Path) -> tuple[str | None, str | None]:
+    try:
+        git_root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=repo, text=True, capture_output=True, check=False
+        )
+    except FileNotFoundError:
+        return None, None
+    if git_root.returncode != 0 or Path(git_root.stdout.strip()).resolve() != repo:
+        return None, None
+
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    working_tree = subprocess.check_output(["git", "status", "--short"], cwd=repo, text=True)
+    (output / "source-working-tree.patch").write_bytes(
+        subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=repo)
+    )
+    return head, working_tree
+
+
 def main() -> None:
     import torch
     from defs.accuracy.test_disaggregated_serving import launch_disaggregated_llm
@@ -49,6 +67,7 @@ def main() -> None:
             packages[name] = version(name)
         except PackageNotFoundError:
             packages[name] = None
+    head, working_tree = git_provenance(repo, output)
     info = {
         "variant": variant,
         "repo": str(repo),
@@ -56,10 +75,8 @@ def main() -> None:
         "wheel_path": wheel_path,
         "wheel_sha256": wheel_sha256,
         "model_dir": str(config_path.parent.resolve()),
-        "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
-        "working_tree": subprocess.check_output(
-            ["git", "status", "--short"], cwd=repo, text=True
-        ),
+        "head": head,
+        "working_tree": working_tree,
         "model_config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
         "python": sys.version,
         "packages": packages,
@@ -68,9 +85,6 @@ def main() -> None:
         "batch_reorder_available": True,
     }
     (output / "preflight.json").write_text(json.dumps(info, indent=2) + "\n")
-    (output / "source-working-tree.patch").write_bytes(
-        subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=repo)
-    )
     print("Runtime and model preflight passed")
 
 

@@ -10,7 +10,7 @@ if [[ -z "${REPRO_MODEL_DIR:-}" && -z "${LLM_MODELS_ROOT:-}" ]]; then
     exit 2
 fi
 repro_package=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-export E2E_REPO="${E2E_REPO:-$(git -C "$repro_package" rev-parse --show-toplevel)}"
+export E2E_REPO="${E2E_REPO:-$(realpath -- "$repro_package/../../../..")}"
 case "${1:-}" in
     serving|matched)
         ;;

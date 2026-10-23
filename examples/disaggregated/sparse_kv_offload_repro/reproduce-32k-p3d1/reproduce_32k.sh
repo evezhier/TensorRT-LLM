@@ -10,7 +10,7 @@ if [[ $# != 2 || "$1" != "serving" && "$1" != "matched" ]]; then
     exit 2
 fi
 repro_package=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-export E2E_REPO="${E2E_REPO:-$(git -C "$repro_package" rev-parse --show-toplevel)}"
+export E2E_REPO="${E2E_REPO:-$(realpath -- "$repro_package/../../../..")}"
 if [[ -z "${REPRO_MODEL_DIR:-}" ]]; then
     : "${LLM_MODELS_ROOT:?Set REPRO_MODEL_DIR to the checkpoint folder or LLM_MODELS_ROOT to its parent}"
     REPRO_MODEL_DIR="$LLM_MODELS_ROOT/DeepSeek-V4-Flash"
