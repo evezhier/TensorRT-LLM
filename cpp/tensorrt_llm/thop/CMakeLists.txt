@@ -166,7 +166,7 @@ add_library(
   $<TARGET_OBJECTS:th_common_decoding>)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
-  th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
+  th_common PRIVATE tinygemm2_src ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
 
 if(BUILD_DEEP_GEMM)
