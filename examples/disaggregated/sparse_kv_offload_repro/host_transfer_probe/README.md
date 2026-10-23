@@ -84,11 +84,12 @@ the 1,284-entry case is much slower than contiguous with the same bytes,
 descriptor fragmentation deserves attention. Compare `staged` total time
 with `host` NIXL time before changing the full transport.
 
-## Initial GB300 result
+## Initial B200 result
 
-Job `2584536` ran GPU 0 to GPU 6 on `prenyx0210` with `UCX_TLS=^ib` and the
-wheel used for the 32K serving run. Each completed case verified every byte;
-the table uses eight measured samples after two warmups with one NIXL thread.
+Job `2584536` ran GPU 0 to GPU 6 on a B200 node (`prenyx0210`) with
+`UCX_TLS=^ib` and the wheel used for the 32K serving run. Each completed case
+verified every byte. The table uses eight measured samples after two warmups
+with one NIXL thread.
 
 | Destination | Entries | NIXL p50, ms | Local copy p50, ms | Sum p50, ms |
 | --- | ---: | ---: | ---: | ---: |
