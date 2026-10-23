@@ -11,52 +11,52 @@
 set -euo pipefail
 
 : "${SLURM_JOB_ID:?Submit this script with sbatch}"
-: "${E2E_REPO:?Set E2E_REPO to the absolute path of the benchmark checkout}"
-: "${REPRO_IMAGE:?Set REPRO_IMAGE to the compatible container image}"
-: "${REPRO_OUTPUT_ROOT:?Set REPRO_OUTPUT_ROOT to a persistent results directory}"
+: "${REPO:?Set REPO to the absolute path of the benchmark checkout}"
+: "${IMAGE:?Set IMAGE to the compatible container image}"
+: "${OUTPUT_ROOT:?Set OUTPUT_ROOT to a persistent results directory}"
 
-E2E_REPO=$(realpath -- "$E2E_REPO")
-export E2E_REPO
-repro_package="$E2E_REPO/examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1"
+REPO=$(realpath -- "$REPO")
+export REPO
+repro_package="$REPO/examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1"
 if [[ ! -f "$repro_package/run_slurm.sh" ]]; then
-    echo "Repro scripts not found under E2E_REPO: $E2E_REPO" >&2
+    echo "Repro scripts not found under REPO: $REPO" >&2
     exit 2
 fi
-if [[ -z "${REPRO_MODEL_DIR:-}" ]]; then
-    : "${LLM_MODELS_ROOT:?Set REPRO_MODEL_DIR to the checkpoint folder or LLM_MODELS_ROOT to its parent}"
-    REPRO_MODEL_DIR="$LLM_MODELS_ROOT/DeepSeek-V4-Flash"
+if [[ -z "${MODEL_DIR:-}" ]]; then
+    : "${LLM_MODELS_ROOT:?Set MODEL_DIR to the checkpoint folder or LLM_MODELS_ROOT to its parent}"
+    MODEL_DIR="$LLM_MODELS_ROOT/DeepSeek-V4-Flash"
 fi
-REPRO_MODEL_DIR=$(realpath -- "$REPRO_MODEL_DIR")
-LLM_MODELS_ROOT=$(dirname -- "$REPRO_MODEL_DIR")
-REPRO_OUTPUT_ROOT=$(realpath -m -- "$REPRO_OUTPUT_ROOT")
-export REPRO_MODEL_DIR LLM_MODELS_ROOT REPRO_OUTPUT_ROOT
+MODEL_DIR=$(realpath -- "$MODEL_DIR")
+LLM_MODELS_ROOT=$(dirname -- "$MODEL_DIR")
+OUTPUT_ROOT=$(realpath -m -- "$OUTPUT_ROOT")
+export MODEL_DIR LLM_MODELS_ROOT OUTPUT_ROOT
 
-if [[ ! -f "$REPRO_MODEL_DIR/config.json" ]]; then
-    echo "config.json is missing in checkpoint folder $REPRO_MODEL_DIR" >&2
+if [[ ! -f "$MODEL_DIR/config.json" ]]; then
+    echo "config.json is missing in checkpoint folder $MODEL_DIR" >&2
     exit 2
 fi
 
-if [[ -n "${REPRO_WHEEL:-}" ]]; then
-    REPRO_WHEEL=$(realpath -- "$REPRO_WHEEL")
-    if [[ ! -f "$REPRO_WHEEL" ]]; then
-        echo "Prebuilt wheel not found: $REPRO_WHEEL" >&2
+if [[ -n "${WHEEL:-}" ]]; then
+    WHEEL=$(realpath -- "$WHEEL")
+    if [[ ! -f "$WHEEL" ]]; then
+        echo "Prebuilt wheel not found: $WHEEL" >&2
         exit 2
     fi
-    export REPRO_WHEEL
+    export WHEEL
 fi
 
-mkdir -p -- "$REPRO_OUTPUT_ROOT"
-export REPRO_MOUNTS="${REPRO_MOUNTS:-$E2E_REPO:$E2E_REPO,$LLM_MODELS_ROOT:$LLM_MODELS_ROOT,$REPRO_OUTPUT_ROOT:$REPRO_OUTPUT_ROOT}"
-if [[ -n "${REPRO_WHEEL:-}" ]]; then
-    case "$REPRO_WHEEL" in
-        "$E2E_REPO"/*|"$LLM_MODELS_ROOT"/*|"$REPRO_OUTPUT_ROOT"/*) ;;
+mkdir -p -- "$OUTPUT_ROOT"
+export MOUNTS="${MOUNTS:-$REPO:$REPO,$LLM_MODELS_ROOT:$LLM_MODELS_ROOT,$OUTPUT_ROOT:$OUTPUT_ROOT}"
+if [[ -n "${WHEEL:-}" ]]; then
+    case "$WHEEL" in
+        "$REPO"/*|"$LLM_MODELS_ROOT"/*|"$OUTPUT_ROOT"/*) ;;
         *)
-            wheel_parent=$(dirname -- "$REPRO_WHEEL")
-            REPRO_MOUNTS+=",$wheel_parent:$wheel_parent"
+            wheel_parent=$(dirname -- "$WHEEL")
+            MOUNTS+=",$wheel_parent:$wheel_parent"
             ;;
     esac
 fi
-export REPRO_JOB_ID="$SLURM_JOB_ID"
-export REPRO_CPUS="${SLURM_CPUS_PER_TASK:-160}"
+export JOB_ID="$SLURM_JOB_ID"
+export CPUS="${SLURM_CPUS_PER_TASK:-160}"
 
-bash "$repro_package/run_slurm.sh" serving "$REPRO_OUTPUT_ROOT/32k-serving-$SLURM_JOB_ID"
+bash "$repro_package/run_slurm.sh" serving "$OUTPUT_ROOT/32k-serving-$SLURM_JOB_ID"
