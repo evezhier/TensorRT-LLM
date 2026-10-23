@@ -19,7 +19,18 @@ case "${1:-}" in
         exit 2
         ;;
 esac
-exec srun --jobid="$REPRO_JOB_ID" --ntasks=1 --cpus-per-task="${REPRO_CPUS:-160}" \
-    --container-image="$REPRO_IMAGE" --container-mounts="$REPRO_MOUNTS" \
-    --container-workdir="$E2E_REPO" \
-    bash "$repro_package/reproduce_32k.sh" "$@"
+srun_args=(
+    --jobid="$REPRO_JOB_ID" --ntasks=1 --cpus-per-task="${REPRO_CPUS:-160}"
+    --container-image="$REPRO_IMAGE" --container-mounts="$REPRO_MOUNTS"
+    --container-workdir="$E2E_REPO"
+)
+if [[ -n "${REPRO_WHEEL:-}" ]]; then
+    if [[ ! -f "$REPRO_WHEEL" ]]; then
+        echo "Prebuilt wheel not found: $REPRO_WHEEL" >&2
+        exit 2
+    fi
+    exec srun "${srun_args[@]}" --container-writable --container-remap-root \
+        bash -c 'set -e; python3 -m pip install --force-reinstall --no-deps "$REPRO_WHEEL"; exec bash "$@"' \
+        _ "$repro_package/reproduce_32k.sh" "$@"
+fi
+exec srun "${srun_args[@]}" bash "$repro_package/reproduce_32k.sh" "$@"

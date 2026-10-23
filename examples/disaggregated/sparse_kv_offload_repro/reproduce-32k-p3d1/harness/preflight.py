@@ -24,12 +24,21 @@ def main() -> None:
     expected_gpus = 8 if variant == "serving" else 4
     if torch.cuda.device_count() != expected_gpus:
         raise RuntimeError(f"{variant} requires exactly {expected_gpus} visible GPUs")
-    if Path(tensorrt_llm.__file__).resolve().parent != repo / "tensorrt_llm":
+    package_dir = Path(tensorrt_llm.__file__).resolve().parent
+    wheel_path = os.environ.get("REPRO_WHEEL")
+    if wheel_path:
+        if package_dir == repo / "tensorrt_llm":
+            raise RuntimeError("Wheel mode imported TensorRT-LLM from the source checkout")
+    elif package_dir != repo / "tensorrt_llm":
         raise RuntimeError("TensorRT-LLM was imported from a different checkout")
     if not hasattr(Batch, "reorder"):
         raise RuntimeError("Rebuild the native bindings: Batch.reorder is missing")
     if not callable(launch_disaggregated_llm):
         raise RuntimeError("Disaggregated integration-test launcher is unavailable")
+    wheel_sha256 = None
+    if wheel_path:
+        with Path(wheel_path).open("rb") as wheel_file:
+            wheel_sha256 = hashlib.file_digest(wheel_file, "sha256").hexdigest()
     config_path = Path(os.environ["REPRO_MODEL_DIR"]) / "config.json"
     config = json.loads(config_path.read_text())
     if config["num_hidden_layers"] != 43 or config["max_position_embeddings"] < 33024:
@@ -43,6 +52,9 @@ def main() -> None:
     info = {
         "variant": variant,
         "repo": str(repo),
+        "package_dir": str(package_dir),
+        "wheel_path": wheel_path,
+        "wheel_sha256": wheel_sha256,
         "model_dir": str(config_path.parent.resolve()),
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
         "working_tree": subprocess.check_output(

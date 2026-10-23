@@ -122,6 +122,24 @@ of RAM, then writes to `32k-serving-JOB_ID` under `REPRO_OUTPUT_ROOT`. It mounts
 the checkout, checkpoint parent and results parent at the same paths in the container.
 Set `REPRO_MOUNTS` if extra Python dependencies or caches live elsewhere.
 
+If a wheel built from this repro branch is available, set `REPRO_WHEEL` to its
+absolute path when submitting the same job:
+
+```bash
+REPRO_WHEEL=/absolute/path/to/tensorrt_llm-1.4.0rc0-cp312-cp312-linux_x86_64.whl \
+REPRO_MODEL_DIR=/absolute/path/to/checkpoint-folder \
+REPRO_IMAGE=/absolute/compatible-container.sqsh \
+REPRO_OUTPUT_ROOT=/absolute/results-parent \
+sbatch --export=ALL --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
+    examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
+```
+
+The launcher installs the wheel in a writable container immediately before
+the benchmark. Wheel mode imports TensorRT-LLM from that installation while
+the integration-test harness still comes from the checkout. The wheel path
+and SHA-256 are recorded in `preflight.json`. The image must already contain
+the wheel's runtime dependencies.
+
 If you already have an eight-GPU Slurm allocation with the CPU/RAM resources
 above, use the lower-level wrapper from this checkout:
 
