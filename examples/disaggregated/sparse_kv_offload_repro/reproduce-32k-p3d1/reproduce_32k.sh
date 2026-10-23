@@ -6,12 +6,18 @@ set -euo pipefail
 if [[ $# != 2 || "$1" != "serving" && "$1" != "matched" ]]; then
     echo "Usage: bash reproduce_32k.sh {serving|matched} /absolute/fresh-output-directory"
     echo "Run inside a prepared container with 8 GPUs (serving) or 4 GPUs (matched)."
-    echo "Required environment: LLM_MODELS_ROOT. E2E_REPO defaults to this checkout. See README.md."
+    echo "Required environment: REPRO_MODEL_DIR or LLM_MODELS_ROOT. E2E_REPO defaults to this checkout."
     exit 2
 fi
 repro_package=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export E2E_REPO="${E2E_REPO:-$(git -C "$repro_package" rev-parse --show-toplevel)}"
-: "${LLM_MODELS_ROOT:?Set LLM_MODELS_ROOT to the directory containing DeepSeek-V4-Flash}"
+if [[ -z "${REPRO_MODEL_DIR:-}" ]]; then
+    : "${LLM_MODELS_ROOT:?Set REPRO_MODEL_DIR to the checkpoint folder or LLM_MODELS_ROOT to its parent}"
+    REPRO_MODEL_DIR="$LLM_MODELS_ROOT/DeepSeek-V4-Flash"
+fi
+REPRO_MODEL_DIR=$(realpath -- "$REPRO_MODEL_DIR")
+LLM_MODELS_ROOT=$(dirname -- "$REPRO_MODEL_DIR")
+export REPRO_MODEL_DIR LLM_MODELS_ROOT
 repro_variant=$1
 export REPRO_OUTPUT
 REPRO_OUTPUT=$(realpath -m -- "$2")

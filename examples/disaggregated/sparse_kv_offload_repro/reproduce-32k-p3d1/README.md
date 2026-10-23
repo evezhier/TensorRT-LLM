@@ -17,7 +17,7 @@ and in the [benchmark report](https://chatgpt.com/space/page_bec74a2e48208191ade
 
 - Serving comparison: one exclusive **8 × NVIDIA B200** node, **160 allocated CPUs and 1,024 GiB host RAM**. Three TP2/EP2 prefill workers use GPUs 0–1, 2–3 and 4–5. One TP2/EP2 decoder uses GPUs 6–7, with attention DP enabled across its two ranks. Run both modes sequentially on the same node.
 - Matched controls: **4 × B200**, 96 CPUs and 768 GiB host RAM were used. One TP2 prefill worker and one TP2 decoder; this is a separate experiment.
-- Full **43-layer DeepSeek V4 Flash** weights at `$LLM_MODELS_ROOT/DeepSeek-V4-Flash`; a working source build with native libraries and Python bindings from the same source. The preflight checks that `Batch.reorder` is available and that Python imports the selected checkout.
+- Full **43-layer DeepSeek V4 Flash** weights in `$REPRO_MODEL_DIR`; a working source build with native libraries and Python bindings from the same source. The preflight checks that `Batch.reorder` is available and that Python imports the selected checkout. If `REPRO_MODEL_DIR` is unset, the scripts use `$LLM_MODELS_ROOT/DeepSeek-V4-Flash`.
 - Original container: `trtllm_pytorch-26.08-py3-x86_64-ubuntu24.04-skip-tritondevel-202609210610-19345.sqsh`, Python 3.12, SM100 build. The integration-test Python dependencies must be installed; the harness imports `tests/integration/defs/accuracy/test_disaggregated_serving.py`. Weights, container, native binaries and dependency directories are not bundled.
 
 The original measured checkout was `build/deepseek-v4-sparse-disagg-e2e`, branch
@@ -96,7 +96,7 @@ This gives **4,226 requests per mode**, 8,452 across both modes. Warmups are exc
 Inside a prepared container with all eight GPUs available, use a **new output directory**:
 
 ```bash
-export LLM_MODELS_ROOT=/absolute/model-root
+export REPRO_MODEL_DIR=/absolute/path/to/checkpoint-folder
 cd /absolute/path/to/checked-out/TensorRT-LLM
 # Optional: extra Python dependency directories, separated by colons.
 # export REPRO_EXTRA_PYTHONPATH=/absolute/python-deps:/absolute/test-deps
@@ -110,7 +110,7 @@ To allocate the original one-node serving topology with `sbatch`, build this
 checkout first and submit from the repository root:
 
 ```bash
-export LLM_MODELS_ROOT=/absolute/model-root
+export REPRO_MODEL_DIR=/absolute/path/to/checkpoint-folder
 export REPRO_IMAGE=/absolute/compatible-container.sqsh
 export REPRO_OUTPUT_ROOT=/absolute/results-parent
 sbatch --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
@@ -119,16 +119,16 @@ sbatch --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
 
 The script requests one exclusive node with eight GPUs, 160 CPUs and 1,024 GiB
 of RAM, then writes to `32k-serving-JOB_ID` under `REPRO_OUTPUT_ROOT`. It mounts
-the checkout, model root and results parent at the same paths in the container.
+the checkout, checkpoint parent and results parent at the same paths in the container.
 Set `REPRO_MOUNTS` if extra Python dependencies or caches live elsewhere.
 
 If you already have an eight-GPU Slurm allocation with the CPU/RAM resources
 above, use the lower-level wrapper from this checkout:
 
 ```bash
-export LLM_MODELS_ROOT=/absolute/model-root
+export REPRO_MODEL_DIR=/absolute/path/to/checkpoint-folder
 export REPRO_IMAGE=/absolute/compatible-container.sqsh
-export REPRO_MOUNTS=/absolute/repo-parent:/absolute/repo-parent,/absolute/model-root:/absolute/model-root,/absolute/results-parent:/absolute/results-parent
+export REPRO_MOUNTS=/absolute/repo-parent:/absolute/repo-parent,/absolute/path/to:/absolute/path/to,/absolute/results-parent:/absolute/results-parent
 export REPRO_JOB_ID=YOUR_NEW_JOB_ID
 export REPRO_CPUS=160
 bash examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_slurm.sh \

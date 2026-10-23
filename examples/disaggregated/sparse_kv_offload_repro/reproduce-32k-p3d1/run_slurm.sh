@@ -5,7 +5,10 @@ set -euo pipefail
 : "${REPRO_JOB_ID:?Set REPRO_JOB_ID to your current allocation}"
 : "${REPRO_IMAGE:?Set REPRO_IMAGE to the compatible container image}"
 : "${REPRO_MOUNTS:?Set REPRO_MOUNTS to the comma-separated container mounts}"
-: "${LLM_MODELS_ROOT:?Set LLM_MODELS_ROOT}"
+if [[ -z "${REPRO_MODEL_DIR:-}" && -z "${LLM_MODELS_ROOT:-}" ]]; then
+    echo "Set REPRO_MODEL_DIR to the checkpoint folder or LLM_MODELS_ROOT to its parent" >&2
+    exit 2
+fi
 repro_package=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export E2E_REPO="${E2E_REPO:-$(git -C "$repro_package" rev-parse --show-toplevel)}"
 case "${1:-}" in

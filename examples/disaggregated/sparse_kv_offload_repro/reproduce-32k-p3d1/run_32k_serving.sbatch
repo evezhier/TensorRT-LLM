@@ -13,18 +13,22 @@ set -euo pipefail
 
 : "${SLURM_JOB_ID:?Submit this script with sbatch}"
 : "${REPRO_IMAGE:?Set REPRO_IMAGE to the compatible container image}"
-: "${LLM_MODELS_ROOT:?Set LLM_MODELS_ROOT to the model root}"
 : "${REPRO_OUTPUT_ROOT:?Set REPRO_OUTPUT_ROOT to a persistent results directory}"
 
 repro_package=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export E2E_REPO
 E2E_REPO=$(git -C "$repro_package" rev-parse --show-toplevel)
-LLM_MODELS_ROOT=$(realpath -- "$LLM_MODELS_ROOT")
+if [[ -z "${REPRO_MODEL_DIR:-}" ]]; then
+    : "${LLM_MODELS_ROOT:?Set REPRO_MODEL_DIR to the checkpoint folder or LLM_MODELS_ROOT to its parent}"
+    REPRO_MODEL_DIR="$LLM_MODELS_ROOT/DeepSeek-V4-Flash"
+fi
+REPRO_MODEL_DIR=$(realpath -- "$REPRO_MODEL_DIR")
+LLM_MODELS_ROOT=$(dirname -- "$REPRO_MODEL_DIR")
 REPRO_OUTPUT_ROOT=$(realpath -m -- "$REPRO_OUTPUT_ROOT")
-export LLM_MODELS_ROOT REPRO_OUTPUT_ROOT
+export REPRO_MODEL_DIR LLM_MODELS_ROOT REPRO_OUTPUT_ROOT
 
-if [[ ! -f "$LLM_MODELS_ROOT/DeepSeek-V4-Flash/config.json" ]]; then
-    echo "DeepSeek-V4-Flash/config.json is missing under $LLM_MODELS_ROOT" >&2
+if [[ ! -f "$REPRO_MODEL_DIR/config.json" ]]; then
+    echo "config.json is missing in checkpoint folder $REPRO_MODEL_DIR" >&2
     exit 2
 fi
 
