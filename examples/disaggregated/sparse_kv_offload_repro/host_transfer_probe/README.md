@@ -12,16 +12,19 @@ uses anonymous `mmap` plus `cudaHostRegister(PORTABLE | MAPPED)`, matching the
 KVCM host pool's allocation style. Every payload byte is checked after each
 transfer, outside the timed interval.
 
-| Mode | NIXL write | Local step after NIXL |
+| Mode | NIXL write | Local CUDA step |
 | --- | --- | --- |
 | `gpu` | GPU to GPU | None |
 | `host` | GPU to CUDA-registered host memory | None |
 | `staged` | GPU to GPU | CUDA device-to-host copies into registered host memory |
+| `sender_staged` | CUDA-registered host memory to host memory | CUDA device-to-host copy on sender before NIXL |
 
 Each mode runs with one contiguous descriptor and with 1,284 descriptors
 separated by 4 KiB gaps in the destination allocation. Both layouts carry the
 same logical bytes. The staged case copies each descriptor to its matching
-host position. It reports the NIXL phase, local copy phase, and their sum;
+host position. The sender-staged case copies the contiguous GPU source into a
+pinned sender host buffer before submitting the same descriptors to NIXL.
+Both staged cases report the NIXL phase, local copy phase, and their sum;
 the sum excludes control messages and is an optimistic estimate of an
 integrated staged transport. This probe does not run model serving or exercise
 KVCM page ownership. The model run mixes GPU and host destinations, while each
@@ -51,7 +54,9 @@ serving topology. The job requests one exclusive node. It installs
 `requirements-dev.txt` and the wheel in one writable Pyxis container step.
 
 The default matrix uses one NIXL thread, matching the production serving
-run. Set `THREADS_LIST="1 8"` to compare eight threads as an additional
+run. It includes all four modes. Set `MODES="sender_staged"` to run only the
+new sender-side route, or `MODES="host sender_staged"` for a direct comparison.
+Set `THREADS_LIST="1 8"` to compare eight threads as an additional
 diagnostic. A failed case is recorded in `failures.tsv`; completed cases
 still appear in `summary.csv`. The production serving test sets `UCX_TLS=^ib`
 inside its worker launcher; this probe uses the same default. Set `UCX_TLS` explicitly
@@ -67,6 +72,11 @@ The job writes `OUTPUT_ROOT/host-transfer-JOB_ID/`:
 - `p*.json`: every sample, including warmups and verification status.
 - `failures.tsv`: case and exit code for any native abort or verification failure.
 - `gpu-topology.txt` and `job.log`: node topology and job setup.
+
+The sender-staged case needs host scratch on the sender and no receiver GPU
+landing buffer. Its total excludes control messages, KVCM page ownership,
+and overlap with concurrent serving work. The local copy and NIXL send are
+timed separately, then summed for each sample.
 
 If contiguous GPU-to-host remains slow, inspect its UCX protocol in the
 sender log. A slow contiguous write points to the physical host path. If
