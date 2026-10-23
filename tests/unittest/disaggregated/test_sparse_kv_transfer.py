@@ -235,6 +235,65 @@ def test_transfer_groups_keep_the_same_byte_ranges(offload: bool) -> None:
     )
 
 
+def test_host_stage_pool_reuses_registered_pinned_memory(monkeypatch) -> None:
+    buffer = SimpleNamespace(numel=lambda: 60, data_ptr=lambda: 0xA00000)
+    allocate = Mock(return_value=buffer)
+    monkeypatch.setattr(transfer_mod.torch, "empty", allocate)
+    agent = Mock()
+    pool = transfer_mod._HostStagePool(agent, 100)
+
+    slot = pool.acquire(60)
+    assert slot is not None
+    assert pool.acquire(60) is None
+    pool.release(slot)
+    assert pool.acquire(60) is slot
+    allocate.assert_called_once_with(60, dtype=transfer_mod.torch.uint8, pin_memory=True)
+    agent.register_memory.assert_called_once()
+    pool.release(slot)
+    pool.close()
+    agent.deregister_memory.assert_called_once_with(slot.registration)
+
+
+def test_gpu_to_host_staging_changes_only_host_bound_sources(monkeypatch) -> None:
+    sender, meta = _sender_and_meta(
+        build_page_table_from_manager(_manager(False)),
+        build_page_table_from_manager(_manager(True)),
+    )
+    sender._device_id = 3
+    slot = transfer_mod._HostStageSlot(SimpleNamespace(data_ptr=lambda: 0xA00000), Mock(), True)
+    sender._host_staging = Mock(acquire=Mock(return_value=slot))
+    monkeypatch.setattr(
+        transfer_mod.torch.cuda, "current_stream", lambda _device: SimpleNamespace(cuda_stream=7)
+    )
+    success = (transfer_mod.cudart.cudaError_t.cudaSuccess,)
+    copy = Mock(return_value=success)
+    synchronize = Mock(return_value=success)
+    monkeypatch.setattr(transfer_mod.cudart, "cudaMemcpyAsync", copy)
+    monkeypatch.setattr(transfer_mod.cudart, "cudaStreamSynchronize", synchronize)
+
+    staged, leased = sender._stage_host_destinations(meta)
+    assert leased is slot
+    assert int(staged.sizes.sum()) == int(meta.sizes.sum())
+    assert staged.dst_ptrs is meta.dst_ptrs
+    assert {(g.src_memory_type, g.dst_memory_type) for g in staged.transfer_groups} == {
+        ("DRAM", "DRAM"),
+        ("VRAM", "VRAM"),
+    }
+    requests = sender._make_agent_request(staged, 3).requests
+    assert {(r.src_descs.type, r.dst_descs.type) for r in requests} == {
+        (MemoryType.DRAM, MemoryType.DRAM),
+        (MemoryType.VRAM, MemoryType.VRAM),
+    }
+    assert {(g.src_memory_type, g.dst_memory_type) for g in meta.transfer_groups} == {
+        ("VRAM", "DRAM"),
+        ("VRAM", "VRAM"),
+    }
+    assert copy.call_count == sum(
+        g.stop - g.start for g in meta.transfer_groups if g.dst_memory_type == "DRAM"
+    )
+    synchronize.assert_called_once_with(7)
+
+
 @pytest.mark.parametrize("outcome", ["success", "wait_failure", "submission_failure"])
 def test_grouped_submission_retains_every_handle_until_settled(outcome: str) -> None:
     sender, meta = _sender_and_meta(
@@ -273,7 +332,10 @@ def test_grouped_submission_retains_every_handle_until_settled(outcome: str) -> 
 
 
 @pytest.mark.parametrize("enforce_ownership", [False, True])
-def test_one_logical_completion_after_all_grouped_writes(enforce_ownership: bool) -> None:
+@pytest.mark.parametrize("host_stage", [False, True])
+def test_one_logical_completion_after_all_grouped_writes(
+    enforce_ownership: bool, host_stage: bool
+) -> None:
     sender, meta = _sender_and_meta(
         build_page_table_from_manager(_manager(False)),
         build_page_table_from_manager(_manager(True)),
@@ -288,6 +350,10 @@ def test_one_logical_completion_after_all_grouped_writes(enforce_ownership: bool
     sender._device_id = 3
     sender._instance_rank = 0
     sender._bounce = Mock()
+    stage_slot = object() if host_stage else None
+    if stage_slot is not None:
+        sender._host_staging = Mock()
+        sender._stage_host_destinations = Mock(return_value=(meta, stage_slot))
     dealer = Mock()
     sender._get_result_dealer = Mock(return_value=dealer)
 
@@ -308,6 +374,8 @@ def test_one_logical_completion_after_all_grouped_writes(enforce_ownership: bool
     assert task.is_done
     dealer.send.assert_called_once()
     sender._bounce.build_request.assert_not_called()
+    if stage_slot is not None:
+        sender._host_staging.release.assert_called_once_with(stage_slot)
 
 
 @pytest.mark.parametrize("first_completes", [False, True])

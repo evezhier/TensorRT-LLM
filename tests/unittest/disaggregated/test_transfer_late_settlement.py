@@ -219,8 +219,9 @@ def test_settlement_does_not_clear_local_completion_or_publication() -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("auxiliary", [False, True])
 @pytest.mark.parametrize("poll_early", [False, True])
+@pytest.mark.parametrize("host_stage", [False, True])
 def test_sender_late_done_reports_physical_failure_only(
-    monkeypatch: pytest.MonkeyPatch, auxiliary: bool, poll_early: bool
+    monkeypatch: pytest.MonkeyPatch, auxiliary: bool, poll_early: bool, host_stage: bool
 ) -> None:
     sender = _sender()
     task = (
@@ -262,6 +263,10 @@ def test_sender_late_done_reports_physical_failure_only(
         is_last_slice=False,
         meta_type=transfer_mod.WriteMetaType.AUX if auxiliary else transfer_mod.WriteMetaType.KV,
     )
+    stage_slot = object() if host_stage and not auxiliary else None
+    if stage_slot is not None:
+        sender._host_staging = Mock()
+        sender._stage_host_destinations = Mock(return_value=(meta, stage_slot))
     assert task.begin_physical_operation(7)
     if auxiliary:
         sender._deliver_aux_to_agent(meta)
@@ -274,6 +279,8 @@ def test_sender_late_done_reports_physical_failure_only(
     assert not task.resources_drained
     sender._poll_in_doubt_transfers(0)
     assert dealer.send.call_count == 1
+    if stage_slot is not None:
+        sender._host_staging.release.assert_not_called()
     status.is_completed.return_value = True
     sender._poll_in_doubt_transfers(0)
     sender._poll_in_doubt_transfers(0)
@@ -286,6 +293,8 @@ def test_sender_late_done_reports_physical_failure_only(
     assert sender._ownership_poisoned is not None
     assert not sender._pending_settlements[0]
     assert dealer.send.call_count == 2
+    if stage_slot is not None:
+        sender._host_staging.release.assert_called_once_with(stage_slot)
     messages = [call.args[0] for call in dealer.send.call_args_list]
     if auxiliary:
         assert [message[-1].decode() for message in messages] == ["IN_DOUBT", "FAILED_QUIESCED"]
