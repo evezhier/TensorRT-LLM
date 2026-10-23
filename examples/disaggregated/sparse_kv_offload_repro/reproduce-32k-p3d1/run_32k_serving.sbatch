@@ -4,7 +4,7 @@
 #SBATCH --job-name=dsv4-sparse-32k
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=8
+#SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=160
 #SBATCH --mem=1024G
 #SBATCH --time=04:00:00
