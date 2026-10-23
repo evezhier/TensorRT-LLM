@@ -26,7 +26,7 @@ export UCX_TLS="${UCX_TLS:-^ib}"
 export UCX_MM_ERROR_HANDLING="${UCX_MM_ERROR_HANDLING:-y}"
 export UCX_PROTO_INFO=y
 GPU_PAIRS="${GPU_PAIRS:-0:6}"
-THREADS_LIST="${THREADS_LIST:-1 8}"
+THREADS_LIST="${THREADS_LIST:-1}"
 SEGMENTS_LIST="${SEGMENTS_LIST:-1 1284}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-109924352}"
 GAP_BYTES="${GAP_BYTES:-4096}"
@@ -55,6 +55,8 @@ if os.environ.get("WHEEL") and source.is_relative_to(repo):
 PY
 nvidia-smi -L
 nvidia-smi topo -m > "$OUTPUT/gpu-topology.txt"
+printf 'case\trole\texit_code\n' > "$OUTPUT/failures.tsv"
+failures=0
 
 for pair in $GPU_PAIRS; do
     sender_gpu=${pair%%:*}
@@ -99,11 +101,16 @@ for pair in $GPU_PAIRS; do
                     kill "$receiver_pid" 2>/dev/null || true
                     wait "$receiver_pid" 2>/dev/null || true
                     echo "Sender failed for $tag (exit $sender_rc); inspect its logs" >&2
-                    exit "$sender_rc"
+                    printf '%s\tsender\t%s\n' "$tag" "$sender_rc" >> "$OUTPUT/failures.tsv"
+                    failures=$((failures + 1))
+                    continue
                 fi
-                if ! wait "$receiver_pid"; then
-                    echo "Receiver failed for $tag; inspect its logs" >&2
-                    exit 1
+                receiver_rc=0
+                wait "$receiver_pid" || receiver_rc=$?
+                if (( receiver_rc != 0 )); then
+                    echo "Receiver failed for $tag (exit $receiver_rc); inspect its logs" >&2
+                    printf '%s\treceiver\t%s\n' "$tag" "$receiver_rc" >> "$OUTPUT/failures.tsv"
+                    failures=$((failures + 1))
                 fi
             done
         done
@@ -112,3 +119,7 @@ done
 
 python3 "$here/summarize.py" "$OUTPUT"
 echo "Results: $OUTPUT/summary.csv"
+if (( failures > 0 )); then
+    echo "$failures probe cases failed; inspect $OUTPUT/failures.tsv and the per-case logs" >&2
+    exit 1
+fi
