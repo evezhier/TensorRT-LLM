@@ -73,3 +73,30 @@ sender log. A slow contiguous write points to the physical host path. If
 the 1,284-entry case is much slower than contiguous with the same bytes,
 descriptor fragmentation deserves attention. Compare `staged` total time
 with `host` NIXL time before changing the full transport.
+
+## Initial GB300 result
+
+Job `2584536` ran GPU 0 to GPU 6 on `prenyx0210` with `UCX_TLS=^ib` and the
+wheel used for the 32K serving run. Each completed case verified every byte;
+the table uses eight measured samples after two warmups with one NIXL thread.
+
+| Destination | Entries | NIXL p50, ms | Local copy p50, ms | Sum p50, ms |
+| --- | ---: | ---: | ---: | ---: |
+| GPU | 1 | 0.187 | 0 | 0.187 |
+| GPU | 1,284 | 5.349 | 0 | 5.349 |
+| Host | 1 | 220.727 | 0 | 220.727 |
+| Host | 1,284 | 230.277 | 0 | 230.277 |
+| Staged GPU then host | 1 | 0.162 | 2.016 | 2.178 |
+| Staged GPU then host | 1,284 | 4.979 | 6.412 | 11.394 |
+
+UCX selected `software emulation | sysv/memory` for GPU-to-host writes and
+`zero-copy | cuda_ipc/cuda` for GPU-to-GPU writes. The host route is slow even
+with one descriptor; fragmentation adds about 10 ms to the direct host case.
+The staged sum is a measured lower bound for a future integrated path, since
+it excludes control and KVCM page-lifetime work.
+
+The optional eight-thread sweep completed the GPU cases and the contiguous
+host case, then the 1,284-entry host sender aborted inside UCX with
+`gdr_unpin_buffer failed. ret:22` followed by `mem type pack failed`. It
+produced no result for that case. The production serving run used one NIXL
+thread, and the default probe matrix now matches it.
