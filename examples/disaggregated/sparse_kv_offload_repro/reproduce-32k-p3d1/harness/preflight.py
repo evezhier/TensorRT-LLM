@@ -30,7 +30,7 @@ def main() -> None:
         raise RuntimeError("Rebuild the native bindings: Batch.reorder is missing")
     if not callable(launch_disaggregated_llm):
         raise RuntimeError("Disaggregated integration-test launcher is unavailable")
-    config_path = Path(os.environ["LLM_MODELS_ROOT"]) / "DeepSeek-V4-Flash/config.json"
+    config_path = Path(os.environ["REPRO_MODEL_DIR"]) / "config.json"
     config = json.loads(config_path.read_text())
     if config["num_hidden_layers"] != 43 or config["max_position_embeddings"] < 33024:
         raise RuntimeError("Expected the full 43-layer DeepSeek V4 Flash checkpoint")
@@ -43,6 +43,7 @@ def main() -> None:
     info = {
         "variant": variant,
         "repo": str(repo),
+        "model_dir": str(config_path.parent.resolve()),
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
         "working_tree": subprocess.check_output(
             ["git", "status", "--short"], cwd=repo, text=True

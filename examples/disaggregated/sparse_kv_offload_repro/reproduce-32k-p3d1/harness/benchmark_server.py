@@ -185,7 +185,7 @@ def main() -> None:
     commands.mkdir(exist_ok=True)
     perf_directory = args.output / "perf"
     perf_directory.mkdir(exist_ok=True)
-    model = Path(os.environ["LLM_MODELS_ROOT"]) / "DeepSeek-V4-Flash"
+    model = Path(os.environ["REPRO_MODEL_DIR"])
     checkpoint = json.loads((model / "config.json").read_text())
     assert checkpoint["num_hidden_layers"] == 43
     assert args.input_tokens + args.output_tokens <= checkpoint["max_position_embeddings"]
