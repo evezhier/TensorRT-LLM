@@ -117,7 +117,7 @@ sbatch --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
     examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
 ```
 
-The script requests one exclusive node with eight GPUs, 160 CPUs and 1,024 GiB
+The script requests one exclusive node, assumed to have eight GPUs, 160 CPUs and 1,024 GiB
 of RAM, then writes to `32k-serving-JOB_ID` under `REPRO_OUTPUT_ROOT`. It mounts
 the checkout, checkpoint parent and results parent at the same paths in the container.
 Set `REPRO_MOUNTS` if extra Python dependencies or caches live elsewhere.
