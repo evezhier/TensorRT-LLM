@@ -36,14 +36,14 @@ def main() -> None:
     import tensorrt_llm
     from tensorrt_llm.runtime.kv_cache_manager_v2 import Batch
 
-    repo = Path(os.environ["E2E_REPO"]).resolve()
-    output = Path(os.environ["REPRO_OUTPUT"])
+    repo = Path(os.environ["REPO"]).resolve()
+    output = Path(os.environ["OUTPUT"])
     variant = sys.argv[1]
     expected_gpus = 8 if variant == "serving" else 4
     if torch.cuda.device_count() != expected_gpus:
         raise RuntimeError(f"{variant} requires exactly {expected_gpus} visible GPUs")
     package_dir = Path(tensorrt_llm.__file__).resolve().parent
-    wheel_path = os.environ.get("REPRO_WHEEL")
+    wheel_path = os.environ.get("WHEEL")
     if wheel_path:
         if package_dir == repo / "tensorrt_llm":
             raise RuntimeError("Wheel mode imported TensorRT-LLM from the source checkout")
@@ -57,7 +57,7 @@ def main() -> None:
     if wheel_path:
         with Path(wheel_path).open("rb") as wheel_file:
             wheel_sha256 = hashlib.file_digest(wheel_file, "sha256").hexdigest()
-    config_path = Path(os.environ["REPRO_MODEL_DIR"]) / "config.json"
+    config_path = Path(os.environ["MODEL_DIR"]) / "config.json"
     config = json.loads(config_path.read_text())
     if config["num_hidden_layers"] != 43 or config["max_position_embeddings"] < 33024:
         raise RuntimeError("Expected the full 43-layer DeepSeek V4 Flash checkpoint")

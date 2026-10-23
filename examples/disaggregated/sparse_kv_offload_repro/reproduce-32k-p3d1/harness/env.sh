@@ -2,23 +2,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
-: "${E2E_REPO:?Set E2E_REPO}"
+: "${REPO:?Set REPO}"
 : "${LLM_MODELS_ROOT:?Set LLM_MODELS_ROOT}"
-: "${REPRO_OUTPUT:?Set REPRO_OUTPUT}"
-if [[ -n "${REPRO_WHEEL:-}" ]]; then
-    export PYTHONPATH="$E2E_REPO/tests/integration:$E2E_REPO/tests${REPRO_EXTRA_PYTHONPATH:+:$REPRO_EXTRA_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
+: "${OUTPUT:?Set OUTPUT}"
+if [[ -n "${WHEEL:-}" ]]; then
+    export PYTHONPATH="$REPO/tests/integration:$REPO/tests${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
 else
-    export PYTHONPATH="$E2E_REPO:$E2E_REPO/tests/integration:$E2E_REPO/tests${REPRO_EXTRA_PYTHONPATH:+:$REPRO_EXTRA_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH="$REPO:$REPO/tests/integration:$REPO/tests${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
 fi
-export PATH="$REPRO_OUTPUT/bin${PYTHONUSERBASE:+:$PYTHONUSERBASE/bin}:$PATH"
+export PATH="$OUTPUT/bin${PYTHONUSERBASE:+:$PYTHONUSERBASE/bin}:$PATH"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 export TMPDIR=/tmp
-export REPRO_CACHE_DIR="${REPRO_CACHE_DIR:-$REPRO_OUTPUT/cache}"
-export XDG_CACHE_HOME="$REPRO_CACHE_DIR"
-export TRITON_CACHE_DIR="$REPRO_CACHE_DIR/triton"
-export DG_JIT_CACHE_DIR="$REPRO_CACHE_DIR/deepgemm"
-export CUDA_CACHE_PATH="$REPRO_CACHE_DIR/cuda"
+export CACHE_DIR="${CACHE_DIR:-$OUTPUT/cache}"
+export XDG_CACHE_HOME="$CACHE_DIR"
+export TRITON_CACHE_DIR="$CACHE_DIR/triton"
+export DG_JIT_CACHE_DIR="$CACHE_DIR/deepgemm"
+export CUDA_CACHE_PATH="$CACHE_DIR/cuda"
 mkdir -p -- "$TRITON_CACHE_DIR" "$DG_JIT_CACHE_DIR" "$CUDA_CACHE_PATH"
 export UCX_TLS='^ib,gdr_copy'
 export TRTLLM_NIXL_NUM_THREADS=1
@@ -32,5 +32,5 @@ export FORCE_MHC_KERNEL_DETERMINISTIC=1
 export PRTE_MCA_plm='^slurm'
 export PRTE_MCA_ras='^slurm'
 export TLLM_METRICS_ALL_RANKS=1
-export SWEEP_OUT="$REPRO_OUTPUT"
-cd -- "$E2E_REPO"
+export SWEEP_OUT="$OUTPUT"
+cd -- "$REPO"
