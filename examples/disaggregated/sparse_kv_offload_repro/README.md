@@ -102,6 +102,11 @@ of RAM, then writes to `32k-serving-JOB_ID` under `REPRO_OUTPUT_ROOT`. It mounts
 the checkout, checkpoint parent and results parent at the same paths in the container.
 Set `REPRO_MOUNTS` if extra Python dependencies or caches live elsewhere.
 
+For a wheel built from this repro branch, set `REPRO_WHEEL` to its absolute path
+when submitting the same job. The launcher installs it in the benchmark
+container before running the harness, and `preflight.json` records its path
+and SHA-256. The image must already contain the wheel's runtime dependencies.
+
 If you already have an eight-GPU Slurm allocation with the CPU/RAM resources
 above, use the lower-level wrapper from this checkout:
 

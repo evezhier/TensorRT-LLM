@@ -31,8 +31,26 @@ if [[ ! -f "$REPRO_MODEL_DIR/config.json" ]]; then
     exit 2
 fi
 
+if [[ -n "${REPRO_WHEEL:-}" ]]; then
+    REPRO_WHEEL=$(realpath -- "$REPRO_WHEEL")
+    if [[ ! -f "$REPRO_WHEEL" ]]; then
+        echo "Prebuilt wheel not found: $REPRO_WHEEL" >&2
+        exit 2
+    fi
+    export REPRO_WHEEL
+fi
+
 mkdir -p -- "$REPRO_OUTPUT_ROOT"
 export REPRO_MOUNTS="${REPRO_MOUNTS:-$E2E_REPO:$E2E_REPO,$LLM_MODELS_ROOT:$LLM_MODELS_ROOT,$REPRO_OUTPUT_ROOT:$REPRO_OUTPUT_ROOT}"
+if [[ -n "${REPRO_WHEEL:-}" ]]; then
+    case "$REPRO_WHEEL" in
+        "$E2E_REPO"/*|"$LLM_MODELS_ROOT"/*|"$REPRO_OUTPUT_ROOT"/*) ;;
+        *)
+            wheel_parent=$(dirname -- "$REPRO_WHEEL")
+            REPRO_MOUNTS+=",$wheel_parent:$wheel_parent"
+            ;;
+    esac
+fi
 export REPRO_JOB_ID="$SLURM_JOB_ID"
 export REPRO_CPUS="${SLURM_CPUS_PER_TASK:-160}"
 
