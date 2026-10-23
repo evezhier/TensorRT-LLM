@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Measure same-node NIXL writes to GPU and CUDA-registered host memory."""
+"""Measure same-node NIXL writes and CUDA staging for GPU and host memory."""
 
 import argparse
 import json
@@ -117,7 +117,26 @@ def _run_sender(args: argparse.Namespace, socket: zmq.Socket) -> None:
     expected = _pattern(args.payload_bytes)
     source = torch.from_numpy(expected).to("cuda")
     torch.cuda.synchronize()
-    registration = RegMemoryDescs("VRAM", [(source.data_ptr(), args.payload_bytes, 0, name)])
+    host_mapping = None
+    host_array = None
+    host_ptr = None
+    source_kind = "VRAM"
+    source_ptr = source.data_ptr()
+    if args.mode == "sender_staged":
+        host_mapping = mmap.mmap(
+            -1, args.payload_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+        )
+        host_array = np.frombuffer(host_mapping, dtype=np.uint8)
+        host_ptr = int(host_array.ctypes.data)
+        _cuda_check(
+            cudart.cudaHostRegister(
+                host_ptr, args.payload_bytes, HOST_REGISTER_PORTABLE | HOST_REGISTER_MAPPED
+            ),
+            "cudaHostRegister",
+        )
+        source_kind = "DRAM"
+        source_ptr = host_ptr
+    registration = RegMemoryDescs(source_kind, [(source_ptr, args.payload_bytes, 0, name)])
     agent.register_memory(registration)
     published = False
     try:
@@ -128,15 +147,31 @@ def _run_sender(args: argparse.Namespace, socket: zmq.Socket) -> None:
         source_offsets, destination_offsets, sizes, _ = _layout(
             args.payload_bytes, args.segments, args.gap_bytes
         )
-        source_ptrs = source_offsets + source.data_ptr()
+        source_ptrs = source_offsets + source_ptr
         destination_ptrs = destination_offsets + remote["ptr"]
         for index in range(args.warmup + args.samples):
             socket.send_pyobj({"ready": index})
             if socket.recv_pyobj() != {"ready": index}:
                 raise RuntimeError("Receiver did not prepare its destination")
+            copy_seconds = 0.0
+            if args.mode == "sender_staged":
+                stream = torch.cuda.current_stream().cuda_stream
+                copy_start = time.perf_counter()
+                _cuda_check(
+                    cudart.cudaMemcpyAsync(
+                        host_ptr,
+                        source.data_ptr(),
+                        args.payload_bytes,
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                        stream,
+                    ),
+                    "cudaMemcpyAsync",
+                )
+                _cuda_check(cudart.cudaStreamSynchronize(stream), "cudaStreamSynchronize")
+                copy_seconds = time.perf_counter() - copy_start
             request = TransferRequest(
                 TransferOp.WRITE,
-                _memory_desc("VRAM", source_ptrs, sizes),
+                _memory_desc(source_kind, source_ptrs, sizes),
                 _memory_desc(remote["kind"], destination_ptrs, sizes),
                 remote["name"],
                 None,
@@ -147,7 +182,13 @@ def _run_sender(args: argparse.Namespace, socket: zmq.Socket) -> None:
             elapsed = time.perf_counter() - start
             if not completed or not status.is_completed():
                 raise RuntimeError(f"NIXL completion unproven: {status.last_status_str()}")
-            socket.send_pyobj({"sample": index, "transfer_seconds": elapsed})
+            socket.send_pyobj(
+                {
+                    "sample": index,
+                    "transfer_seconds": elapsed,
+                    "local_copy_seconds": copy_seconds,
+                }
+            )
             reply = socket.recv_pyobj()
             if reply != {"verified": index}:
                 raise RuntimeError(f"Receiver did not verify sample {index}: {reply!r}")
@@ -162,6 +203,10 @@ def _run_sender(args: argparse.Namespace, socket: zmq.Socket) -> None:
         raise
     agent.deregister_memory(registration)
     agent.shutdown()
+    if host_ptr is not None:
+        _cuda_check(cudart.cudaHostUnregister(host_ptr), "cudaHostUnregister")
+        del host_array
+        host_mapping.close()
 
 
 def _run_receiver(args: argparse.Namespace, socket: zmq.Socket) -> None:
@@ -174,7 +219,7 @@ def _run_receiver(args: argparse.Namespace, socket: zmq.Socket) -> None:
     host_array = None
     host_ptr = None
     gpu = None
-    if args.mode in ("host", "staged"):
+    if args.mode in ("host", "staged", "sender_staged"):
         host_mapping = mmap.mmap(-1, span, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         host_array = np.frombuffer(host_mapping, dtype=np.uint8)
         host_ptr = int(host_array.ctypes.data)
@@ -184,7 +229,7 @@ def _run_receiver(args: argparse.Namespace, socket: zmq.Socket) -> None:
         )
     if args.mode in ("gpu", "staged"):
         gpu = torch.empty(span, dtype=torch.uint8, device="cuda")
-    kind = "DRAM" if args.mode == "host" else "VRAM"
+    kind = "DRAM" if args.mode in ("host", "sender_staged") else "VRAM"
     target = host_ptr if kind == "DRAM" else gpu.data_ptr()
     agent = _make_agent(name)
     registration = RegMemoryDescs(kind, [(target, span, 0, name)])
@@ -215,7 +260,7 @@ def _run_receiver(args: argparse.Namespace, socket: zmq.Socket) -> None:
             result = socket.recv_pyobj()
             if result.get("sample") != index:
                 raise RuntimeError("Sender completion sequence mismatch")
-            copy_seconds = 0.0
+            copy_seconds = result["local_copy_seconds"]
             if args.mode == "staged":
                 stream = torch.cuda.current_stream().cuda_stream
                 start = time.perf_counter()
@@ -289,7 +334,7 @@ def _run_receiver(args: argparse.Namespace, socket: zmq.Socket) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("sender", "receiver"), required=True)
-    parser.add_argument("--mode", choices=("gpu", "host", "staged"), required=True)
+    parser.add_argument("--mode", choices=("gpu", "host", "staged", "sender_staged"), required=True)
     parser.add_argument("--payload-bytes", type=int, default=109924352)
     parser.add_argument("--segments", type=int, default=1284)
     parser.add_argument("--gap-bytes", type=int, default=4096)

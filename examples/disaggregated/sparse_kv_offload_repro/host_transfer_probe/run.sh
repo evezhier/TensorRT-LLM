@@ -27,6 +27,7 @@ export UCX_MM_ERROR_HANDLING="${UCX_MM_ERROR_HANDLING:-y}"
 export UCX_PROTO_INFO=y
 GPU_PAIRS="${GPU_PAIRS:-0:6}"
 THREADS_LIST="${THREADS_LIST:-1}"
+MODES="${MODES:-gpu host staged sender_staged}"
 SEGMENTS_LIST="${SEGMENTS_LIST:-1 1284}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-109924352}"
 GAP_BYTES="${GAP_BYTES:-4096}"
@@ -37,6 +38,7 @@ TIMEOUT_MS="${TIMEOUT_MS:-30000}"
 echo "Output: $OUTPUT"
 echo "Host: $(hostname), job: ${SLURM_JOB_ID:-local}"
 echo "UCX_TLS=$UCX_TLS, GPU_PAIRS=$GPU_PAIRS, THREADS_LIST=$THREADS_LIST"
+echo "MODES=$MODES"
 echo "PAYLOAD_BYTES=$PAYLOAD_BYTES, SEGMENTS_LIST=$SEGMENTS_LIST, GAP_BYTES=$GAP_BYTES"
 if [[ -n "${WHEEL:-}" ]]; then
     sha256sum -- "$WHEEL"
@@ -70,7 +72,11 @@ for pair in $GPU_PAIRS; do
             echo "THREADS_LIST contains an invalid thread count: $threads" >&2
             exit 2
         fi
-        for mode in gpu host staged; do
+        for mode in $MODES; do
+            case "$mode" in
+                gpu|host|staged|sender_staged) ;;
+                *) echo "MODES contains an invalid mode: $mode" >&2; exit 2 ;;
+            esac
             for segments in $SEGMENTS_LIST; do
                 if [[ ! "$segments" =~ ^[1-9][0-9]*$ ]]; then
                     echo "SEGMENTS_LIST contains an invalid count: $segments" >&2
