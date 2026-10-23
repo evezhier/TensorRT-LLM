@@ -11,12 +11,17 @@
 set -euo pipefail
 
 : "${SLURM_JOB_ID:?Submit this script with sbatch}"
+: "${E2E_REPO:?Set E2E_REPO to the absolute path of the benchmark checkout}"
 : "${REPRO_IMAGE:?Set REPRO_IMAGE to the compatible container image}"
 : "${REPRO_OUTPUT_ROOT:?Set REPRO_OUTPUT_ROOT to a persistent results directory}"
 
-repro_package=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+E2E_REPO=$(realpath -- "$E2E_REPO")
 export E2E_REPO
-E2E_REPO=$(realpath -- "$repro_package/../../../..")
+repro_package="$E2E_REPO/examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1"
+if [[ ! -f "$repro_package/run_slurm.sh" ]]; then
+    echo "Repro scripts not found under E2E_REPO: $E2E_REPO" >&2
+    exit 2
+fi
 if [[ -z "${REPRO_MODEL_DIR:-}" ]]; then
     : "${LLM_MODELS_ROOT:?Set REPRO_MODEL_DIR to the checkpoint folder or LLM_MODELS_ROOT to its parent}"
     REPRO_MODEL_DIR="$LLM_MODELS_ROOT/DeepSeek-V4-Flash"
