@@ -34,7 +34,7 @@ if [[ "$repro_variant" == "matched" ]]; then
     export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 fi
 source "$OUTPUT/env.sh"
-python3 "$OUTPUT/preflight.py" "$repro_variant" > "$OUTPUT/preflight.log" 2>&1
+python3 "$OUTPUT/preflight.py" "$repro_variant" 2>&1 | tee "$OUTPUT/preflight.log"
 nvidia-smi --query-gpu=timestamp,index,uuid,utilization.gpu,memory.used,power.draw \
     --format=csv -l 1 > "$OUTPUT/gpu-telemetry.csv" &
 repro_telemetry_pid=$!
