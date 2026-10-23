@@ -30,7 +30,7 @@ if [[ -n "${WHEEL:-}" ]]; then
         exit 2
     fi
     exec srun "${srun_args[@]}" --container-writable --container-remap-root \
-        bash -c 'set -e; python3 -m pip install --force-reinstall --no-deps "$WHEEL"; exec bash "$@"' \
+        bash -c 'set -e; python3 -m pip install --force-reinstall --no-deps "$WHEEL"; python3 -m pip install openai; exec bash "$@"' \
         _ "$repro_package/reproduce_32k.sh" "$@"
 fi
 exec srun "${srun_args[@]}" bash "$repro_package/reproduce_32k.sh" "$@"
