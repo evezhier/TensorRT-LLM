@@ -50,10 +50,11 @@ sbatch --export=ALL -A ACCOUNT -p PARTITION -t 02:00:00 \
 serving topology. The job requests one exclusive node. It installs
 `requirements-dev.txt` and the wheel in one writable Pyxis container step.
 
-The default matrix uses `THREADS_LIST="1 8"` to compare the production
-one-thread NIXL setting with eight threads. Set `THREADS_LIST="1"` for the
-smallest run. The production serving test sets `UCX_TLS=^ib` inside its
-worker launcher; this probe uses the same default. Set `UCX_TLS` explicitly
+The default matrix uses one NIXL thread, matching the production serving
+run. Set `THREADS_LIST="1 8"` to compare eight threads as an additional
+diagnostic. A failed case is recorded in `failures.tsv`; completed cases
+still appear in `summary.csv`. The production serving test sets `UCX_TLS=^ib`
+inside its worker launcher; this probe uses the same default. Set `UCX_TLS` explicitly
 to run a different protocol selection. `UCX_PROTO_INFO=y` is always enabled.
 
 ## Results
@@ -64,6 +65,7 @@ The job writes `OUTPUT_ROOT/host-transfer-JOB_ID/`:
   for each byte-verified case.
 - `p*.sender.log` and `p*.receiver.log`: errors and UCX protocol selection.
 - `p*.json`: every sample, including warmups and verification status.
+- `failures.tsv`: case and exit code for any native abort or verification failure.
 - `gpu-topology.txt` and `job.log`: node topology and job setup.
 
 If contiguous GPU-to-host remains slow, inspect its UCX protocol in the
