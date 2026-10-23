@@ -111,15 +111,18 @@ checkout first and submit from the repository root:
 
 ```bash
 export REPRO_MODEL_DIR=/absolute/path/to/checkpoint-folder
+export E2E_REPO=/absolute/path/to/checked-out/TensorRT-LLM
 export REPRO_IMAGE=/absolute/compatible-container.sqsh
 export REPRO_OUTPUT_ROOT=/absolute/results-parent
-sbatch --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
+sbatch --export=ALL --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
     examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
 ```
 
 The script requests one exclusive node, assumed to have eight GPUs, 160 CPUs and 1,024 GiB
 of RAM, then writes to `32k-serving-JOB_ID` under `REPRO_OUTPUT_ROOT`. It mounts
 the checkout, checkpoint parent and results parent at the same paths in the container.
+`E2E_REPO` must point to the checkout visible on the compute node; Slurm may
+execute the batch script from its spool directory.
 Set `REPRO_MOUNTS` if extra Python dependencies or caches live elsewhere.
 
 If a wheel built from this repro branch is available, set `REPRO_WHEEL` to its
@@ -127,6 +130,7 @@ absolute path when submitting the same job:
 
 ```bash
 REPRO_WHEEL=/absolute/path/to/tensorrt_llm-1.4.0rc0-cp312-cp312-linux_x86_64.whl \
+E2E_REPO=/absolute/path/to/checked-out/TensorRT-LLM \
 REPRO_MODEL_DIR=/absolute/path/to/checkpoint-folder \
 REPRO_IMAGE=/absolute/compatible-container.sqsh \
 REPRO_OUTPUT_ROOT=/absolute/results-parent \
