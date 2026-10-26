@@ -55,10 +55,12 @@ def main() -> None:
         raise RuntimeError("TensorRT-LLM was imported from a different checkout")
     if not hasattr(Batch, "reorder"):
         raise RuntimeError("Rebuild the native bindings: Batch.reorder is missing")
-    host_staging_mb = int(os.environ.get("TRTLLM_NIXL_HOST_STAGING_MB", "0"))
-    if host_staging_mb > 0:
-        from tensorrt_llm._torch.disaggregation.native import transfer
+    from tensorrt_llm._torch.disaggregation.native import transfer
 
+    if not hasattr(transfer, "_host_staging_mb"):
+        raise RuntimeError("Installed TensorRT-LLM lacks automatic sender host staging; rebuild the wheel")
+    host_staging_mb = transfer._host_staging_mb(0)
+    if host_staging_mb > 0:
         if not hasattr(transfer, "_HostStagePool"):
             raise RuntimeError(
                 "Installed TensorRT-LLM lacks sender-side host staging; rebuild the wheel"
@@ -95,6 +97,7 @@ def main() -> None:
         "cuda": torch.version.cuda,
         "gpus": [torch.cuda.get_device_name(index) for index in range(expected_gpus)],
         "batch_reorder_available": True,
+        "nixl_host_staging_override_mb": os.environ.get("TRTLLM_NIXL_HOST_STAGING_MB"),
         "nixl_host_staging_mb": host_staging_mb,
     }
     (output / "preflight.json").write_text(json.dumps(info, indent=2) + "\n")

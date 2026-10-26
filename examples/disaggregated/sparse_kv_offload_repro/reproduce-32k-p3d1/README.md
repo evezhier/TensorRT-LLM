@@ -147,17 +147,22 @@ The container needs access to the package indexes used by the requirements.
 ### Sender-side host staging experiment
 
 The native NIXL sender can copy GPU-backed KV fragments into a reusable pinned
-host buffer before writing to the decoder's host KV pool. This path is opt-in:
-set `TRTLLM_NIXL_HOST_STAGING_MB=256` when submitting the serving job. The
-limit is per prefill rank; if the buffer is full or a transfer exceeds it, the
-sender uses the direct path. Only GPU-to-host KV fragments use this buffer.
-The sender retains leased memory through uncertain NIXL completion.
+host buffer before writing to the decoder's host KV pool. It defaults to
+256 MiB per prefill rank on non-Grace systems. On Arm hosts with Hopper,
+Blackwell, or Blackwell Ultra GPUs, staging defaults to off, using the same
+host-architecture and GPU-generation proxy used elsewhere in the codebase for
+Grace systems. Set `TRTLLM_NIXL_HOST_STAGING_MB=0` to force direct transfer or
+set a positive MiB value to force staging on any system. If the buffer is full
+or a transfer exceeds it, the sender uses the direct path. Only GPU-to-host KV
+fragments use this buffer. The sender retains leased memory through uncertain
+NIXL completion.
 
 Build a **new wheel from this checkout** before the run. The wheel used for
-job `2584221` does not contain host staging. The preflight records the setting
-and rejects an installed wheel that lacks the implementation. For a controlled
-comparison, run once with the setting absent (direct transfer), then again
-with it set to `256`, using the same wheel, model, and B200 node type:
+job `2584221` does not contain host staging. The preflight records the override
+and effective setting, and rejects an installed wheel that lacks the
+implementation. For a controlled comparison, run once with
+`TRTLLM_NIXL_HOST_STAGING_MB=0` and again with it set to `256`, using the same
+wheel, model, and B200 node type:
 
 ```bash
 TRTLLM_NIXL_HOST_STAGING_MB=256 WHEEL=/absolute/path/to/new-wheel.whl \

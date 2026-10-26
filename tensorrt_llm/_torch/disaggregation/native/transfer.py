@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import os
+import platform
 import queue
 import struct
 import threading
@@ -98,6 +99,24 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
+
+_DEFAULT_HOST_STAGING_MB = 256
+_GRACE_GPU_SM_VERSIONS = {(9, 0), (10, 0), (10, 3)}
+
+
+def _host_staging_mb(device_id: int) -> int:
+    configured = os.environ.get("TRTLLM_NIXL_HOST_STAGING_MB")
+    if configured is not None:
+        size_mb = int(configured)
+        if size_mb < 0:
+            raise ValueError("TRTLLM_NIXL_HOST_STAGING_MB must be nonnegative")
+        return size_mb
+
+    if platform.machine().lower() == "aarch64":
+        properties = torch.cuda.get_device_properties(device_id)
+        if (properties.major, properties.minor) in _GRACE_GPU_SM_VERSIONS:
+            return 0
+    return _DEFAULT_HOST_STAGING_MB
 
 # Keep standalone TxSession waits responsive to cancellation even when callers
 # do not configure a sender-future wait slice.
@@ -1034,9 +1053,7 @@ class Sender(SenderBase):
         self._agent = agent
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
-        host_staging_mb = int(os.environ.get("TRTLLM_NIXL_HOST_STAGING_MB", "0"))
-        if host_staging_mb < 0:
-            raise ValueError("TRTLLM_NIXL_HOST_STAGING_MB must be nonnegative")
+        host_staging_mb = _host_staging_mb(self._device_id)
         self._host_staging = (
             _HostStagePool(agent, host_staging_mb << 20) if host_staging_mb else None
         )
@@ -1579,6 +1596,11 @@ class Sender(SenderBase):
         staged_groups = tuple(
             replace(group, src_memory_type="DRAM") if group in groups else group
             for group in write_meta.transfer_groups
+        )
+        logger.warning_once(
+            "NIXL GPU-to-host KV transfer is using pinned-host staging: "
+            "GPU-to-CPU copy followed by host-to-host transfer",
+            key="host-staging-active",
         )
         return replace(write_meta, src_ptrs=source_ptrs, transfer_groups=staged_groups), slot
 

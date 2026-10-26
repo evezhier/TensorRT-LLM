@@ -254,6 +254,47 @@ def test_host_stage_pool_reuses_registered_pinned_memory(monkeypatch) -> None:
     agent.deregister_memory.assert_called_once_with(slot.registration)
 
 
+@pytest.mark.parametrize(
+    "cpu_arch,sm_version,expected_mb",
+    [
+        ("x86_64", (10, 0), 256),
+        ("x86_64", (10, 3), 256),
+        ("aarch64", (9, 0), 0),
+        ("aarch64", (10, 0), 0),
+        ("aarch64", (10, 3), 0),
+        ("aarch64", (8, 0), 256),
+    ],
+)
+def test_host_staging_default_follows_host_and_gpu_architecture(
+    monkeypatch, cpu_arch: str, sm_version: tuple[int, int], expected_mb: int
+) -> None:
+    monkeypatch.delenv("TRTLLM_NIXL_HOST_STAGING_MB", raising=False)
+    monkeypatch.setattr(transfer_mod.platform, "machine", lambda: cpu_arch)
+    get_properties = Mock(return_value=SimpleNamespace(major=sm_version[0], minor=sm_version[1]))
+    monkeypatch.setattr(transfer_mod.torch.cuda, "get_device_properties", get_properties)
+
+    assert transfer_mod._host_staging_mb(3) == expected_mb
+    assert get_properties.call_count == int(cpu_arch == "aarch64")
+
+
+@pytest.mark.parametrize("configured,expected_mb", [("0", 0), ("512", 512)])
+def test_host_staging_override_skips_architecture_detection(
+    monkeypatch, configured: str, expected_mb: int
+) -> None:
+    monkeypatch.setenv("TRTLLM_NIXL_HOST_STAGING_MB", configured)
+    get_properties = Mock(side_effect=AssertionError("device inspection should be skipped"))
+    monkeypatch.setattr(transfer_mod.torch.cuda, "get_device_properties", get_properties)
+
+    assert transfer_mod._host_staging_mb(3) == expected_mb
+    get_properties.assert_not_called()
+
+
+def test_host_staging_rejects_negative_override(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_NIXL_HOST_STAGING_MB", "-1")
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        transfer_mod._host_staging_mb(3)
+
+
 def test_gpu_to_host_staging_changes_only_host_bound_sources(monkeypatch) -> None:
     sender, meta = _sender_and_meta(
         build_page_table_from_manager(_manager(False)),
@@ -270,6 +311,8 @@ def test_gpu_to_host_staging_changes_only_host_bound_sources(monkeypatch) -> Non
     synchronize = Mock(return_value=success)
     monkeypatch.setattr(transfer_mod.cudart, "cudaMemcpyAsync", copy)
     monkeypatch.setattr(transfer_mod.cudart, "cudaStreamSynchronize", synchronize)
+    warning_once = Mock()
+    monkeypatch.setattr(transfer_mod.logger, "warning_once", warning_once)
 
     staged, leased = sender._stage_host_destinations(meta)
     assert leased is slot
@@ -292,6 +335,8 @@ def test_gpu_to_host_staging_changes_only_host_bound_sources(monkeypatch) -> Non
         g.stop - g.start for g in meta.transfer_groups if g.dst_memory_type == "DRAM"
     )
     synchronize.assert_called_once_with(7)
+    warning_once.assert_called_once()
+    assert warning_once.call_args.kwargs["key"] == "host-staging-active"
 
 
 @pytest.mark.parametrize("outcome", ["success", "wait_failure", "submission_failure"])
