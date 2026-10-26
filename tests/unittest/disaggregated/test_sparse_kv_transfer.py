@@ -259,9 +259,11 @@ def test_host_stage_pool_reuses_registered_pinned_memory(monkeypatch) -> None:
     [
         ("x86_64", (10, 0), 256),
         ("x86_64", (10, 3), 256),
+        ("x86_64", (10, 7), 256),
         ("aarch64", (9, 0), 0),
         ("aarch64", (10, 0), 0),
         ("aarch64", (10, 3), 0),
+        ("aarch64", (10, 7), 0),
         ("aarch64", (8, 0), 256),
     ],
 )

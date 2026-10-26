@@ -148,10 +148,11 @@ The container needs access to the package indexes used by the requirements.
 
 The native NIXL sender can copy GPU-backed KV fragments into a reusable pinned
 host buffer before writing to the decoder's host KV pool. It defaults to
-256 MiB per prefill rank on non-Grace systems. On Arm hosts with Hopper,
-Blackwell, or Blackwell Ultra GPUs, staging defaults to off, using the same
-host-architecture and GPU-generation proxy used elsewhere in the codebase for
-Grace systems. Set `TRTLLM_NIXL_HOST_STAGING_MB=0` to force direct transfer or
+256 MiB per prefill rank on systems outside the known CPU-GPU superchip combinations.
+On Arm hosts with Hopper, Blackwell, Blackwell Ultra, or Rubin GPUs, staging
+defaults to off. This host-architecture and GPU-generation check is a proxy for
+Grace Hopper, Grace Blackwell, and Vera Rubin systems; it does not inspect the
+interconnect. Set `TRTLLM_NIXL_HOST_STAGING_MB=0` to force direct transfer or
 set a positive MiB value to force staging on any system. If the buffer is full
 or a transfer exceeds it, the sender uses the direct path. Only GPU-to-host KV
 fragments use this buffer. The sender retains leased memory through uncertain

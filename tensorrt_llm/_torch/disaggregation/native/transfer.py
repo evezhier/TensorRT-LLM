@@ -101,7 +101,7 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
 _DEFAULT_HOST_STAGING_MB = 256
-_GRACE_GPU_SM_VERSIONS = {(9, 0), (10, 0), (10, 3)}
+_SUPERCHIP_GPU_SM_VERSIONS = {(9, 0), (10, 0), (10, 3), (10, 7)}
 
 
 def _host_staging_mb(device_id: int) -> int:
@@ -114,7 +114,7 @@ def _host_staging_mb(device_id: int) -> int:
 
     if platform.machine().lower() == "aarch64":
         properties = torch.cuda.get_device_properties(device_id)
-        if (properties.major, properties.minor) in _GRACE_GPU_SM_VERSIONS:
+        if (properties.major, properties.minor) in _SUPERCHIP_GPU_SM_VERSIONS:
             return 0
     return _DEFAULT_HOST_STAGING_MB
 
