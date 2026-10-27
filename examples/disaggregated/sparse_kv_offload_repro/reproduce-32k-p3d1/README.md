@@ -118,8 +118,9 @@ sbatch --export=ALL --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
     examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
 ```
 
-The script requests one exclusive node, assumed to have eight GPUs, 160 CPUs and 1,024 GiB
-of RAM, then writes to `32k-serving-JOB_ID` under `OUTPUT_ROOT`. It mounts
+The script requests 64 CPUs and 1,024 GiB of RAM on one exclusive node; the
+serving layout assumes eight GPUs. It writes to `32k-serving-JOB_ID` under
+`OUTPUT_ROOT` and mounts
 the checkout, checkpoint parent and results parent at the same paths in the container.
 `REPO` must point to the checkout visible on the compute node; Slurm may
 execute the batch script from its spool directory.
@@ -187,7 +188,7 @@ export MODEL_DIR=/absolute/path/to/checkpoint-folder
 export IMAGE=/absolute/compatible-container.sqsh
 export MOUNTS=/absolute/repo-parent:/absolute/repo-parent,/absolute/path/to:/absolute/path/to,/absolute/results-parent:/absolute/results-parent
 export JOB_ID=YOUR_NEW_JOB_ID
-export CPUS=160
+export CPUS=64
 bash examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_slurm.sh \
     serving /absolute/results-parent/32k-serving-01
 ```

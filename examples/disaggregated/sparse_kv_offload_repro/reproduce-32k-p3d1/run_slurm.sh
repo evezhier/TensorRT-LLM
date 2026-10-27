@@ -20,7 +20,7 @@ case "${1:-}" in
         ;;
 esac
 srun_args=(
-    --jobid="$JOB_ID" --ntasks=1 --cpus-per-task="${CPUS:-160}"
+    --jobid="$JOB_ID" --ntasks=1 --cpus-per-task="${CPUS:-64}"
     --container-image="$IMAGE" --container-mounts="$MOUNTS"
     --container-workdir="$REPO"
 )
