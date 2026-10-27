@@ -31,45 +31,60 @@ KVCM page ownership. The model run mixes GPU and host destinations, while each
 probe case routes its full payload to one destination type. The 4 KiB gaps are
 synthetic, so matching the model run's 136 ms exactly is not expected.
 
-## Submit on the eight-GPU node
+## Run a UCX sweep on GB300
 
-The branch changes only probe assets, so the wheel used for job `2584221`
-(SHA-256 `2ee661b7e862e003dc8bfcee4bb6290e3231a573d429caa4cd0d45446f76832b`)
-can be reused. From the checkout root, submit with paths visible on the
-compute node:
+Use an Arm-compatible image and TensorRT-LLM wheel from this checkout. A
+four-GPU GB300 node defaults to sender GPU 0 and receiver GPU 2; set
+`REQUIRE_GB300=1` to reject a node without an Arm host and SM 103 GPUs. This
+check is a platform proxy; inspect `gpu-topology.txt` for the actual GPU pair.
+From the checkout root, submit with paths visible on the compute node:
 
 ```bash
 REPO=/absolute/path/to/TensorRT-LLM \
-IMAGE=/absolute/path/to/devel-image.sqsh \
-WHEEL=/absolute/path/to/tensorrt_llm.whl \
+IMAGE=/absolute/path/to/arm-devel-image.sqsh \
+WHEEL=/absolute/path/to/arm-tensorrt_llm.whl \
 OUTPUT_ROOT=/absolute/path/to/results \
-GPU_PAIRS="0:6" \
+REQUIRE_GB300=1 GPU_PAIRS="0:2" \
+UCX_SWEEP="baseline all cuda_ipc_tcp put_zcopy" \
+MODES="gpu host sender_staged" \
 sbatch --export=ALL -A ACCOUNT -p PARTITION -t 02:00:00 \
     examples/disaggregated/sparse_kv_offload_repro/host_transfer_probe/run.sbatch
 ```
 
 `GPU_PAIRS` names sender:receiver GPU indexes as seen inside the container;
-`0:6` follows the first context GPU and the first generation GPU in the 32K
-serving topology. The job requests one exclusive node. It installs
+the default is `0:2` with four visible GPUs or `0:6` with eight. The job
+requests one exclusive node. It installs
 `requirements-dev.txt` and the wheel in one writable Pyxis container step.
+Only the probe scripts changed for the sweep, so an existing compatible wheel
+can be reused.
 
-The default matrix uses one NIXL thread, matching the production serving
-run. It includes all four modes. Set `MODES="sender_staged"` to run only the
-new sender-side route, or `MODES="host sender_staged"` for a direct comparison.
+The default sweep repeats the same byte-verified cases with four UCX settings:
+`baseline` keeps the caller's `UCX_TLS` or defaults to `^ib`, matching the
+32K serving run; `all` sets `UCX_TLS=all`; `cuda_ipc_tcp` allows
+`cuda_ipc,cuda_copy,sm,self,tcp`; and `put_zcopy` combines `UCX_TLS=all`,
+`UCX_RNDV_SCHEME=put_zcopy`, and `UCX_CUDA_IPC_ENABLE_MNNVL=n`. Set
+`UCX_SWEEP=baseline` to run one setting. Each setting starts fresh sender and
+receiver processes, so UCX reads its environment again. `UCX_PROTO_INFO=y`
+records protocol selection in each sender log; it can be overridden.
+
+The default matrix uses one NIXL thread, matching the production serving run.
+It includes all four modes. Set `MODES="host sender_staged"` to compare direct
+GPU-to-host transfer with sender staging, or include `gpu` for a GPU baseline.
 Set `THREADS_LIST="1 8"` to compare eight threads as an additional
 diagnostic. A failed case is recorded in `failures.tsv`; completed cases
-still appear in `summary.csv`. The production serving test sets `UCX_TLS=^ib`
-inside its worker launcher; this probe uses the same default. Set `UCX_TLS` explicitly
-to run a different protocol selection. `UCX_PROTO_INFO=y` is always enabled.
+still appear in `summary.csv`. The original eight-GPU B200 run can use
+`GPU_PAIRS=0:6` and omit `REQUIRE_GB300`.
 
 ## Results
 
 The job writes `OUTPUT_ROOT/host-transfer-JOB_ID/`:
 
-- `summary.csv` and `summary.json`: transfer, local-copy, and summed p50/p95
-  for each byte-verified case.
-- `p*.sender.log` and `p*.receiver.log`: errors and UCX protocol selection.
-- `p*.json`: every sample, including warmups and verification status.
+- `summary.csv` and `summary.json`: the UCX setting, transfer, local-copy, and
+  summed p50/p95 for each byte-verified case, plus speedup against the matching
+  `baseline` case when it completed.
+- `<setting>/p*.sender.log` and `<setting>/p*.receiver.log`: errors and UCX
+  protocol selection for that setting.
+- `<setting>/p*.json`: every sample, including warmups and verification status.
 - `failures.tsv`: case and exit code for any native abort or verification failure.
 - `gpu-topology.txt` and `job.log`: node topology and job setup.
 
@@ -77,6 +92,11 @@ The sender-staged case needs host scratch on the sender and no receiver GPU
 landing buffer. Its total excludes control messages, KVCM page ownership,
 and overlap with concurrent serving work. The local copy and NIXL send are
 timed separately, then summed for each sample.
+
+Compare rows with the same GPU pair, mode, descriptor count, and payload across
+settings. Inspect the corresponding sender logs to see which UCX protocol was
+selected. A faster synthetic transfer still needs confirmation with the full
+32K serving run's NIXL send phase and completed-request throughput.
 
 If contiguous GPU-to-host remains slow, inspect its UCX protocol in the
 sender log. A slow contiguous write points to the physical host path. If
