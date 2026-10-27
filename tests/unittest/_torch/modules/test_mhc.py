@@ -22,6 +22,46 @@ BENCH_ITERS = 200
 timing_stats = defaultdict(dict)
 
 
+@skip_pre_blackwell
+@pytest.mark.parametrize("num_tokens", [1, 129])
+@pytest.mark.parametrize("force_fma", [False, True])
+@pytest.mark.parametrize(
+    "deterministic_env", ["FORCE_DETERMINISTIC", "FORCE_MHC_KERNEL_DETERMINISTIC"]
+)
+def test_mhc_deterministic_mode_repeats_with_cached_tactic(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int, force_fma: bool, deterministic_env: str
+) -> None:
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_MHC_KERNEL_DETERMINISTIC", raising=False)
+    monkeypatch.setenv(deterministic_env, "1")
+    if force_fma:
+        monkeypatch.setattr(mhc_cuda, "_fused_hc_mma_supported", lambda: False)
+    runner = mhc_cuda.MhcFusedHcRunner(4, 4096, 1e-6, 1e-6, 1e-6, 2.0, 20)
+    generator = torch.Generator(device="cuda").manual_seed(0)
+
+    def random_tensor(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        return torch.randn(shape, generator=generator, dtype=dtype, device="cuda")
+
+    inputs = [
+        random_tensor(num_tokens, 4096, dtype=torch.bfloat16),
+        random_tensor(num_tokens, 4, 4096, dtype=torch.bfloat16),
+        random_tensor(num_tokens, 4).sigmoid(),
+        random_tensor(num_tokens, 4, 4).softmax(-1),
+        random_tensor(24, 16384) * 0.01,
+        torch.ones(3, device="cuda"),
+        torch.zeros(24, device="cuda"),
+    ]
+    assert len(runner.get_valid_tactics(inputs, None)) == 1
+    reference = runner(inputs)
+    for _ in range(20):
+        actual = runner(inputs, tactic=("fused_half_mma", 0, 16, 0, 1))
+        for expected, value in zip(reference, actual):
+            assert torch.isfinite(value).all()
+            assert torch.equal(value, expected)
+
+
 def _mhc_fused_hc_mma_available() -> bool:
     try:
         from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_mma_supported

@@ -1231,6 +1231,12 @@ class ModelConfig(Generic[TConfig]):
                         use_gvr_emission = sparse_attention_config.use_gvr_emission
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
+                        offload_kwargs = {
+                            'enable_kv_cache_offload':
+                            sparse_attention_config.enable_kv_cache_offload,
+                            'kv_cache_offload_config':
+                            sparse_attention_config.kv_cache_offload_config,
+                        }
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -1246,6 +1252,7 @@ class ModelConfig(Generic[TConfig]):
                         use_gvr_emission = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
+                        offload_kwargs = {}
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -1264,7 +1271,8 @@ class ModelConfig(Generic[TConfig]):
                             use_gvr_emission=use_gvr_emission,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
-                            index_share_for_mtp_iteration)
+                            index_share_for_mtp_iteration,
+                            **offload_kwargs)
                 elif pretrained_config.architectures[
                         0] in _DEEPSEEK_V41_ARCHITECTURES:
                     sparse_config = kwargs.get('sparse_attention_config')
@@ -1361,13 +1369,16 @@ class ModelConfig(Generic[TConfig]):
                             compress_ratios = list(compress_ratios) + [1] * (
                                 total_layers - len(compress_ratios))
 
-                    indexer_k_dtype = indexer_config.pop('indexer_k_dtype')
+                    resolved_sparse_config = (
+                        sparse_attention_config.model_dump()
+                        if sparse_attention_config is not None else {})
+                    resolved_sparse_config.update(
+                        compress_ratios=compress_ratios,
+                        window_size=window_size,
+                        **indexer_config)
                     kwargs[
                         'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
-                            compress_ratios=compress_ratios,
-                            window_size=window_size,
-                            indexer_k_dtype=indexer_k_dtype,
-                            **indexer_config)
+                            **resolved_sparse_config)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

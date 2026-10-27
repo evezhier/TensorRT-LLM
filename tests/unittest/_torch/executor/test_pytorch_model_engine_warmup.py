@@ -26,6 +26,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
+import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs as graphs_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_runner_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
@@ -34,6 +35,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, remove_weights
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
@@ -51,11 +53,15 @@ from tensorrt_llm._torch.speculative.utils import resolve_draft_len, update_draf
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
+    BaseSparseAttentionConfig,
     DecodingBaseConfig,
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
     DraftTargetDecodingConfig,
     MultimodalConfig,
     PARDDecodingConfig,
     PrefillCudaGraphBackend,
+    SparseKvCacheOffloadConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
@@ -1904,6 +1910,15 @@ def test_indexer_q_prewarm_runs_every_fallback_tactic(tp_size: int) -> None:
         owner.dist.tp_allgather.assert_called_once_with(1)
 
 
+class _OffloadingSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Any sparse attention algorithm that offloads KV history to host memory."""
+
+    algorithm: str = "offloading"
+
+    def get_kv_cache_offload_config(self) -> SparseKvCacheOffloadConfig:
+        return SparseKvCacheOffloadConfig()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "case", ["no_indexer", "indexer_without_wq_b", "indexer_of_other_pp_stage"]
@@ -2010,6 +2025,81 @@ def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
     remote_indexer._project_and_quantize_q.assert_not_called()
     assert local_indexer._project_and_quantize_q.call_count == 3
     owner.dist.tp_allgather.assert_called_once_with(1)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (None, False),
+        (DeepSeekSparseAttentionConfig(), False),
+        (DeepSeekV4SparseAttentionConfig(), False),
+        (DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True), True),
+        (_OffloadingSparseAttentionConfig(), True),
+    ],
+    ids=["none", "dsa", "dsv4", "dsv4_offload", "any_offload"],
+)
+def test_only_kv_cache_offload_makes_a_worker_decode_only(config, expected: bool) -> None:
+    assert is_decode_only(config) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_total_draft_tokens", "expected"),
+    [(0, [(1, 1), (13, 13)]), (2, [(3, 1), (39, 13)])],
+)
+def test_generation_warmup_shapes_drop_context_tokens(
+    max_total_draft_tokens: int, expected: list[tuple[int, int]]
+) -> None:
+    warmup = SimpleNamespace(_config=SimpleNamespace(max_total_draft_tokens=max_total_draft_tokens))
+    configs = [(1, 0), (1, 1), (3, 1), (258, 0), (13, 13), (39, 13), (2, 0), (2, 1)]
+
+    assert DecoderWarmup._generation_warmup_shapes(warmup, configs) == expected
+
+
+@pytest.mark.cpu_only
+def test_decode_only_skips_prefill_cuda_graph_capture() -> None:
+    """A decode-only worker never runs a context batch, so prefill graphs are dead weight."""
+    graphs = SimpleNamespace(
+        _config=SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            torch_compile_enabled=True,
+            prefill_cuda_graph_num_tokens=[16],
+        ),
+        sparse_attention_config=_OffloadingSparseAttentionConfig(),
+        _dummy_requests=SimpleNamespace(create_warmup_request=Mock()),
+    )
+
+    DecoderCudaGraphs._capture_prefill_cuda_graphs(graphs, Mock())
+
+    graphs._dummy_requests.create_warmup_request.assert_not_called()
+
+
+@pytest.mark.parametrize("decode_only", [False, True], ids=["default", "decode_only"])
+def test_decode_only_warmup_requests_generation_shapes_only(decode_only: bool) -> None:
+    """Every warmup phase of a decode-only worker builds pure-generation batches."""
+    engine, resource_manager = _build_engine_and_resource_manager()
+    warmup = engine._runner._warmup
+    shapes = []
+
+    def record(resources, num_tokens, num_gen_requests, **kwargs):
+        shapes.append((num_tokens, num_gen_requests))
+        return None  # No batch, so each phase skips its forward.
+
+    with (
+        patch.object(decoder_warmup_module, "is_decode_only", return_value=decode_only),
+        patch.object(graphs_module, "is_decode_only", return_value=decode_only),
+        patch.object(warmup._dummy_requests, "create_warmup_request", side_effect=record),
+        patch.object(engine._runner._graphs, "_capture_generation_cuda_graphs"),
+    ):
+        engine.warmup(resource_manager)
+
+    assert shapes
+    context_shapes = [shape for shape in shapes if shape[0] != shape[1]]
+    if decode_only:
+        assert context_shapes == [], shapes
+    else:
+        assert context_shapes, shapes
 
 
 if __name__ == "__main__":

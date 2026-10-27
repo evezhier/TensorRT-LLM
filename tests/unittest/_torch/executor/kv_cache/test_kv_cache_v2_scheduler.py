@@ -4919,7 +4919,6 @@ class TestPrefixAwareSkip:
 def test_connector_credit_admits_another_request(chunked: bool) -> None:
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker
 

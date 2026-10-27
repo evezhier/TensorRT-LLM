@@ -1309,6 +1309,13 @@
           "title": "Enable Heuristic Topk",
           "type": "boolean"
         },
+        "enable_kv_cache_offload": {
+          "default": false,
+          "description": "Offload the sparse attention KV history to host memory with KV cache manager v2. Each decode step fetches the units the indexer selects into a per-request GPU cache; the indexer cache remains on GPU. Only a decode-only worker, such as the generation worker of a disaggregated deployment, can offload.",
+          "status": "prototype",
+          "title": "Enable Kv Cache Offload",
+          "type": "boolean"
+        },
         "gvr_deterministic_topk": {
           "default": false,
           "description": "Make the self-sampling GVR Top-K deterministic: the selected index set is {score > tau} plus the smallest indices among the ties at tau, and the output order is a fixed function of the input (decode and prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect with enable_heuristic_topk=True and use_self_sampling_topk=True; ignored otherwise.",
@@ -1397,6 +1404,11 @@
           "title": "Indexer Rope Interleave",
           "type": "boolean"
         },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "Memory sizing for KV cache offload. Applies only with enable_kv_cache_offload.",
+          "status": "prototype"
+        },
         "q_split_threshold": {
           "default": 8192,
           "description": "If number of packed tokens in prefill chunk exceeds this threshold,             q tokens will be evenly distributed across ranks for indexer computation.             If negative, q split will always be disabled.",
@@ -1476,7 +1488,7 @@
         },
         "enable_kv_cache_offload": {
           "default": false,
-          "description": "Offload ratio-4 compressed attention KV history to host memory with KV cache manager v2. The indexer and sliding-window caches remain on GPU. This feature is under development and currently cannot be enabled for inference.",
+          "description": "Offload ratio-4 compressed attention KV history to host memory with KV cache manager v2. The indexer and sliding-window caches remain on GPU. Only a decode-only worker, such as the generation worker of a disaggregated deployment, can offload.",
           "status": "prototype",
           "title": "Enable Kv Cache Offload",
           "type": "boolean"
@@ -1568,6 +1580,11 @@
           "description": "Whether to use interleaved RoPE layout for the indexer.",
           "title": "Indexer Rope Interleave",
           "type": "boolean"
+        },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "Memory sizing for KV cache offload. Applies only with enable_kv_cache_offload.",
+          "status": "prototype"
         },
         "q_split_threshold": {
           "default": 8192,
@@ -7546,6 +7563,37 @@
         }
       },
       "title": "SleepConfig",
+      "type": "object"
+    },
+    "SparseKvCacheOffloadConfig": {
+      "additionalProperties": false,
+      "description": "Memory sizing for sparse attention KV cache offload.\n\nWith offload, the KV history a sparse attention layer selects from lives in\nhost memory, and each request keeps a GPU cache of the units its selections\nname.",
+      "properties": {
+        "gpu_cache_factor": {
+          "default": 2.0,
+          "description": "Size of each request's GPU cache for offloaded attention history, in selections: the cache holds this many times the units one decode step selects, plus the unit being written, rounded up to whole pages. A larger cache keeps more history on the GPU between decode steps, so fewer units are fetched from host memory, at the cost of GPU memory per request.",
+          "minimum": 1.0,
+          "status": "prototype",
+          "title": "Gpu Cache Factor",
+          "type": "number"
+        },
+        "host_history_size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pinned host memory in bytes, per rank, for offloaded attention history and the staging buffers that publish it to the GPU. History pages share slots with the GPU KV cache pools, so the GPU KV cache quota is lowered when needed to stay within it. It is separate from kv_cache_config.host_cache_size, the host tier that evicted KV cache pages move to, and the two together must fit this rank's share of available host memory and the pinned-memory limit. When unset, it holds max_batch_size requests at kv_cache_config.avg_seq_len, or max_seq_len when that is unset, capped by the host memory automatic sizing may pin.",
+          "status": "prototype",
+          "title": "Host History Size"
+        }
+      },
+      "title": "SparseKvCacheOffloadConfig",
       "type": "object"
     },
     "TelemetryConfig": {
