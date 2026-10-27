@@ -8,7 +8,7 @@ and this harness. Build that checkout and run the harness directly. The source
 patches in `patches/` are retained for provenance; do not apply them again to
 this branch.
 
-This package reproduces the latest **post-residency-fix, unprofiled 32,768 input / 160 output token** comparison. The primary experiment uses **3 prefill workers and 1 decode worker**. A separate matched-batch experiment checks token parity while controlling decoder occupancy. The scripts do not run Nsight Systems or search for new capacity limits.
+This package reproduces the latest **post-residency-fix, unprofiled 32,768 input / 160 output token** comparison. The original experiment uses **3 prefill workers and 1 decode worker** on eight GPUs. Four-GPU serving runs use one prefill worker and one decoder. A separate matched-batch experiment checks token parity while controlling decoder occupancy. The scripts do not run Nsight Systems or search for new capacity limits.
 
 The original run's full report is included at `../evidence/final-report.json`
 and in the [benchmark report](https://chatgpt.com/space/page_bec74a2e48208191ade22eaebdb248de).
@@ -16,6 +16,7 @@ and in the [benchmark report](https://chatgpt.com/space/page_bec74a2e48208191ade
 ## Hardware and source prerequisites
 
 - Serving comparison: one exclusive **8 × NVIDIA B200** node, **160 allocated CPUs and 1,024 GiB host RAM**. Three TP2/EP2 prefill workers use GPUs 0–1, 2–3 and 4–5. One TP2/EP2 decoder uses GPUs 6–7, with attention DP enabled across its two ranks. Run both modes sequentially on the same node.
+- Four-GPU serving comparison: one **4 × NVIDIA GB300** node. One TP2/EP2 prefill worker uses GPUs 0–1 and one TP2/EP2 decoder uses GPUs 2–3. This is a p1:d1 result; the original p3:d1 throughput and validated capacity limits do not transfer to it.
 - Matched controls: **4 × B200**, 96 CPUs and 768 GiB host RAM were used. One TP2 prefill worker and one TP2 decoder; this is a separate experiment.
 - Full **43-layer DeepSeek V4 Flash** weights in `$MODEL_DIR`; a working runtime with native libraries and Python bindings. The preflight checks that `Batch.reorder` is available and that Python imports the selected checkout in source mode or the installed package in wheel mode. If `MODEL_DIR` is unset, the scripts use `$LLM_MODELS_ROOT/DeepSeek-V4-Flash`.
 - Original container: `trtllm_pytorch-26.08-py3-x86_64-ubuntu24.04-skip-tritondevel-202609210610-19345.sqsh`, Python 3.12, SM100 build. The integration-test Python dependencies must be installed; the harness imports `tests/integration/defs/accuracy/test_disaggregated_serving.py`. Weights, container, native binaries and dependency directories are not bundled.
@@ -79,6 +80,11 @@ Generation is greedy (`temperature=0`, `seed=0`, `ignore_eos=true`, `min_tokens=
 
 Common settings: `max_seq_len=33024`, chunked prefill enabled, prefill `max_num_tokens=2048`, prefill configured max batch 128, prefill GPU fraction 0.5, `fp8_context_mla_kv_len_cap=33024`, CUDA graph padding enabled, overlap scheduling enabled, autotuning disabled. The observed serving prefill batch was 1. NIXL uses the Python transceiver, one NIXL thread, and `UCX_TLS=^ib,gdr_copy` for this single-node experiment. Fresh worker HTTP connections and retries disabled are part of the recipe.
 
+The GB300 variant selects `UCX_TLS=^ib`, matching the faster direct host path
+in the GB300 transfer probe. B200 retains `^ib,gdr_copy`. Set
+`SPARSE_REPRO_UCX_TLS` to override this choice; `preflight.json` records the
+effective value.
+
 `harness/env.sh` preserves the kernel determinism controls: attention, MoE, all-reduce, top-k and MHC controls are 1, while the global `FORCE_DETERMINISTIC` is 0. Batch-dependent output differences must still be measured.
 
 For each mode, start fresh workers and run this sequence without restarting between trials:
@@ -93,7 +99,7 @@ This gives **4,226 requests per mode**, 8,452 across both modes. Warmups are exc
 
 ## Run the scripts
 
-Inside a prepared container with all eight GPUs available, use a **new output directory**:
+Inside a prepared container with four or eight GPUs available, use a **new output directory**:
 
 ```bash
 export MODEL_DIR=/absolute/path/to/checkpoint-folder
@@ -105,6 +111,8 @@ bash examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/reproduce
 ```
 
 The wrapper copies the measured harness into the output directory, records source/runtime provenance, samples GPU telemetry, runs resident then offload, and runs the offline analyses. It refuses to overwrite an existing output directory. It never allocates GPUs itself.
+Four visible GPUs select p1:d1 and eight select p3:d1. Both serving layouts run
+the same 32K prompt and report NIXL send phase, throughput, latency and parity.
 
 To allocate the original one-node serving topology with `sbatch`, build this
 checkout first and submit from the repository root:
@@ -126,6 +134,19 @@ at the same paths in the container.
 execute the batch script from its spool directory.
 Set `MOUNTS` if extra Python dependencies or caches live elsewhere.
 
+For a four-GPU GB300 node, use an Arm-compatible image and wheel built for
+that node, then submit the same script with `--gpus=4`:
+
+```bash
+WHEEL=/absolute/path/to/arm-tensorrt_llm.whl \
+REPO=/absolute/path/to/checked-out/TensorRT-LLM \
+MODEL_DIR=/absolute/path/to/checkpoint-folder \
+IMAGE=/absolute/path/to/arm-compatible-container.sqsh \
+OUTPUT_ROOT=/absolute/results-parent \
+sbatch --export=ALL --gpus=4 --partition=YOUR_GB300_PARTITION --account=YOUR_ACCOUNT \
+    examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
+```
+
 If a wheel built from this repro branch is available, set `WHEEL` to its
 absolute path when submitting the same job:
 
@@ -135,7 +156,7 @@ REPO=/absolute/path/to/checked-out/TensorRT-LLM \
 MODEL_DIR=/absolute/path/to/checkpoint-folder \
 IMAGE=/absolute/compatible-container.sqsh \
 OUTPUT_ROOT=/absolute/results-parent \
-sbatch --export=ALL --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
+sbatch --export=ALL --gpus=8 --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
     examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
 ```
 
@@ -171,7 +192,7 @@ TRTLLM_NIXL_HOST_STAGING_MB=256 WHEEL=/absolute/path/to/new-wheel.whl \
 REPO=/absolute/path/to/checked-out/TensorRT-LLM \
 MODEL_DIR=/absolute/path/to/checkpoint-folder \
 IMAGE=/absolute/compatible-container.sqsh OUTPUT_ROOT=/absolute/results-parent \
-sbatch --export=ALL --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
+sbatch --export=ALL --gpus=8 --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
     examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
 ```
 
@@ -218,7 +239,7 @@ This runs one prefill worker and one decoder. After cold/warm requests, it gates
 | `cases/*/native-transfer/` | NIXL transfer timing CSVs |
 | `cases/offload*/sparse-counters-rank*.json` | Sparse hits/misses written at shutdown |
 | `ratio-metrics.csv`, `ratio-analysis.json` | Primary serving metrics, actual occupancy and parity |
-| `prefill-feed.json` | KV-ready arrival rate from all three prefill workers |
+| `prefill-feed.json` | KV-ready arrival rate from the active prefill workers |
 | `fix-analysis.json` | Per-trial summaries, exact token-multiset comparisons and cache hit rate |
 
 For serving analysis only, rerun `python3 OUTPUT/analyze_ratios.py`, then `python3 OUTPUT/analyze_prefill_feed.py`, then `python3 OUTPUT/analyze_fix.py`. Use the original output directory: raw records retain native-transfer paths. For matched runs, use `analyze_fix.py` alone. Analysis uses standard-library Python; launching workers needs the prepared runtime.

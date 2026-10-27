@@ -5,7 +5,7 @@ set -euo pipefail
 
 if [[ $# != 2 || "$1" != "serving" && "$1" != "matched" ]]; then
     echo "Usage: bash reproduce_32k.sh {serving|matched} /absolute/fresh-output-directory"
-    echo "Run inside a prepared container with 8 GPUs (serving) or 4 GPUs (matched)."
+    echo "Run inside a prepared container with 4 or 8 GPUs (serving) or 4 GPUs (matched)."
     echo "Required environment: MODEL_DIR or LLM_MODELS_ROOT. REPO defaults to this checkout."
     exit 2
 fi

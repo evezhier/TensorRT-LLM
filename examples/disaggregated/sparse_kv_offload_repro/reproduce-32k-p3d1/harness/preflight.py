@@ -43,9 +43,12 @@ def main() -> None:
     repo = Path(os.environ["REPO"]).resolve()
     output = Path(os.environ["OUTPUT"])
     variant = sys.argv[1]
-    expected_gpus = 8 if variant == "serving" else 4
-    if torch.cuda.device_count() != expected_gpus:
-        raise RuntimeError(f"{variant} requires exactly {expected_gpus} visible GPUs")
+    visible_gpus = torch.cuda.device_count()
+    if variant == "serving" and visible_gpus not in (4, 8):
+        raise RuntimeError(f"serving requires exactly 4 or 8 visible GPUs; found {visible_gpus}")
+    if variant == "matched" and visible_gpus != 4:
+        raise RuntimeError(f"matched requires exactly 4 visible GPUs; found {visible_gpus}")
+    prefill_workers = visible_gpus // 2 - 1
     package_dir = Path(tensorrt_llm.__file__).resolve().parent
     wheel_path = os.environ.get("WHEEL")
     if wheel_path:
@@ -84,6 +87,7 @@ def main() -> None:
     head, working_tree = git_provenance(repo, output)
     info = {
         "variant": variant,
+        "prefill_workers": prefill_workers,
         "repo": str(repo),
         "package_dir": str(package_dir),
         "wheel_path": wheel_path,
@@ -95,7 +99,8 @@ def main() -> None:
         "python": sys.version,
         "packages": packages,
         "cuda": torch.version.cuda,
-        "gpus": [torch.cuda.get_device_name(index) for index in range(expected_gpus)],
+        "gpus": [torch.cuda.get_device_name(index) for index in range(visible_gpus)],
+        "ucx_tls": os.environ.get("UCX_TLS"),
         "batch_reorder_available": True,
         "nixl_host_staging_override_mb": os.environ.get("TRTLLM_NIXL_HOST_STAGING_MB"),
         "nixl_host_staging_mb": host_staging_mb,

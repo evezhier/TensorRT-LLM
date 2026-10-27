@@ -180,6 +180,7 @@ def main() -> None:
     parser.add_argument("--context-instances", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--context-kv-length-cap", type=int)
     args = parser.parse_args()
+    generation_gpus = list(range(2 * args.context_instances, 2 * args.context_instances + 2))
     args.output.mkdir(parents=True, exist_ok=True)
     commands = args.output / "commands"
     commands.mkdir(exist_ok=True)
@@ -317,7 +318,7 @@ def main() -> None:
             "generation_config": gen,
             "disaggregation_config": disagg,
             "capacity_gate_installed": args.capacity_gate,
-            "physical_generation_gpu_ids": [6, 7],
+            "physical_generation_gpu_ids": generation_gpus,
             "physical_context_gpu_ids": list(range(2 * args.context_instances)),
             "worker_http_connection_policy": "fresh_connection_per_request",
             "worker_http_retries_disabled": True,
@@ -356,7 +357,10 @@ def main() -> None:
         if "--server_role" in command:
             role = command[command.index("--server_role") + 1]
             if role == "generation":
-                kwargs["env"] = {**kwargs["env"], "CUDA_VISIBLE_DEVICES": "6,7"}
+                kwargs["env"] = {
+                    **kwargs["env"],
+                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, generation_gpus)),
+                }
         return original_popen(command, **kwargs)
 
     disagg_test.popen = pinned_popen

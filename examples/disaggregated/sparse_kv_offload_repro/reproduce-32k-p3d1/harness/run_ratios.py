@@ -16,7 +16,10 @@ def publish(path: Path, value: dict) -> None:
 
 def main() -> None:
     root = Path(__file__).resolve().parent
-    for mode, ratio in (("resident", 3), ("offload", 3)):
+    preflight = json.loads((root / "preflight.json").read_text())
+    ratio = preflight.get("prefill_workers", len(preflight["gpus"]) // 2 - 1)
+    generation_gpus = list(range(2 * ratio, 2 * ratio + 2))
+    for mode in ("resident", "offload"):
         run = root / "cases" / f"{mode}-p{ratio}-d1"
         if (run / "finished.json").exists():
             continue
@@ -56,7 +59,10 @@ def main() -> None:
                     publish(run / "commands" / f"{name}.json", {
                         "concurrency": concurrency, "requests": count, "output_tokens": output_tokens,
                         "gate": False, "profile": False,
-                        "purpose": "Prefill ratio comparison, same physical generation GPUs 6 and 7",
+                        "purpose": (
+                            f"Serving comparison with {ratio} prefill workers "
+                            f"and decode GPUs {generation_gpus}"
+                        ),
                     })
                     result = wait(run / f"{name}-results.json")
                     print(json.dumps({"mode": mode, "prefill_workers": ratio, "trial": name,
@@ -72,7 +78,7 @@ def main() -> None:
                 raise RuntimeError(f"Server cleanup exited {code}")
             wait(run / "stopped.json", 30)
             publish(run / "finished.json", {"mode": mode, "prefill_workers": ratio,
-                                            "generation_workers": 1, "generation_gpus": [6, 7],
+                                            "generation_workers": 1, "generation_gpus": generation_gpus,
                                             "offered_concurrency": maximum})
         print(f"RATIO_COMPLETE {mode} prefill={ratio}", flush=True)
 

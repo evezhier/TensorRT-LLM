@@ -40,6 +40,8 @@ def gpu_summary(run: Path, summary: dict) -> dict:
 
 def main() -> None:
     rows = []
+    preflight = json.loads((ROOT / "preflight.json").read_text())
+    expected_generation_gpus = list(range(len(preflight["gpus"]) - 2, len(preflight["gpus"])))
     for mode in ("resident", "offload"):
         variants = [("default", 1), ("default", 3)]
         if mode == "offload":
@@ -51,6 +53,7 @@ def main() -> None:
                 source = run / f"{trial}-results.json"
                 if not source.exists():
                     continue
+                config = json.loads((run / "config.json").read_text())
                 target = run / f"{trial}-decode-analysis.json"
                 if target.exists() and json.loads(target.read_text()).get("analysis_version") == 4:
                     summary = json.loads(target.read_text())
@@ -64,7 +67,8 @@ def main() -> None:
                     native.pop("_selected_request_ids", None)
                     summary.update({
                         "mode": mode, "prefill_workers": ratio, "generation_workers": 1,
-                        "generation_gpus": [6, 7], "trial": trial, "native_transfer": native,
+                        "generation_gpus": config["physical_generation_gpu_ids"],
+                        "trial": trial, "native_transfer": native,
                         "started_at_utc": result["started_at_utc"],
                         "completed_at_utc": result["completed_at_utc"],
                         "client_seconds": result["seconds"],
@@ -94,8 +98,7 @@ def main() -> None:
                 summary["gpu_telemetry"] = gpu_summary(run, summary)
                 summary["variant"] = variant
                 summary["run_name"] = name
-                config = json.loads((run / "config.json").read_text())
-                assert config["physical_generation_gpu_ids"] == [6, 7]
+                assert config["physical_generation_gpu_ids"] == expected_generation_gpus
                 assert config["physical_context_gpu_ids"] == list(range(2 * ratio))
                 assert config["disaggregation_config"]["context_servers"]["num_instances"] == ratio
                 summary["config"] = config

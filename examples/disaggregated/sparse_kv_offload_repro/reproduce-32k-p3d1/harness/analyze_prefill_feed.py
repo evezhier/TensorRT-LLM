@@ -12,9 +12,11 @@ ROOT = Path(__file__).resolve().parent
 
 
 def main() -> None:
+    preflight = json.loads((ROOT / "preflight.json").read_text())
+    ratio = preflight.get("prefill_workers", len(preflight["gpus"]) // 2 - 1)
     modes = {}
     for mode in ("resident", "offload"):
-        source = ROOT / "cases" / f"{mode}-p3-d1" / "100-performance-1-perf.json"
+        source = ROOT / "cases" / f"{mode}-p{ratio}-d1" / "100-performance-1-perf.json"
         records = json.loads(source.read_text())
         ids = {r["ctx_request_id"] for r in records if "perf_metrics-generation-" in r["source_file"]
                and len(r.get("time_breakdown_metrics", {}).get("step_metrics", [])) == 159}
@@ -24,7 +26,7 @@ def main() -> None:
         by_worker = defaultdict(list)
         for row in contexts:
             by_worker[row["source_file"]].append(row)
-        assert len(by_worker) == 3
+        assert len(by_worker) == ratio
         ready = [r["perf_metrics"]["timing_metrics"]["kv_cache_transfer_start"] for r in contexts]
         start, end = min(ready), max(ready)
         middle_start = start + 0.1 * (end - start)
@@ -51,8 +53,17 @@ def main() -> None:
             "first_to_last_kv_ready_seconds": end - start,
         }
     output = {
-        "scope": "Unprofiled 32K/160 3:1 runs after the residency fix. Context prefix reuse is enabled with repeated synthetic prompts; these are not fresh unique 32K-prefill rates.",
-        "definition": "KV-ready means the context request's kv_cache_transfer_start timestamp, before transfer. Central window is 10% through 90% of the first-to-last KV-ready interval; all three workers use the same window.",
+        "scope": (
+            f"Unprofiled 32K/160 {ratio}:1 runs after the residency fix. "
+            "Context prefix reuse is enabled with repeated synthetic prompts; "
+            "these are not fresh unique 32K-prefill rates."
+        ),
+        "definition": (
+            "KV-ready means the context request's kv_cache_transfer_start "
+            "timestamp, before transfer. Central window is 10% through 90% "
+            "of the first-to-last KV-ready interval; all prefill workers use "
+            "the same window."
+        ),
         "modes": modes,
     }
     (ROOT / "prefill-feed.json").write_text(json.dumps(output, indent=2) + "\n")

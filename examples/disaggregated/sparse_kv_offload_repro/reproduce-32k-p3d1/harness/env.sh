@@ -20,7 +20,14 @@ export TRITON_CACHE_DIR="$CACHE_DIR/triton"
 export DG_JIT_CACHE_DIR="$CACHE_DIR/deepgemm"
 export CUDA_CACHE_PATH="$CACHE_DIR/cuda"
 mkdir -p -- "$TRITON_CACHE_DIR" "$DG_JIT_CACHE_DIR" "$CUDA_CACHE_PATH"
-export UCX_TLS='^ib,gdr_copy'
+gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null) || gpu_names=
+if [[ -n "${SPARSE_REPRO_UCX_TLS:-}" ]]; then
+    export UCX_TLS="$SPARSE_REPRO_UCX_TLS"
+elif [[ "$gpu_names" == *"NVIDIA GB300"* ]]; then
+    export UCX_TLS='^ib'
+else
+    export UCX_TLS='^ib,gdr_copy'
+fi
 export TRTLLM_NIXL_NUM_THREADS=1
 export OMP_NUM_THREADS=8
 export FORCE_DETERMINISTIC=0
