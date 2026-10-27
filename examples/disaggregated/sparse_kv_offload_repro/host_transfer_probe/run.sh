@@ -27,6 +27,10 @@ export UCX_MM_ERROR_HANDLING="${UCX_MM_ERROR_HANDLING:-y}"
 export UCX_PROTO_INFO="${UCX_PROTO_INFO:-y}"
 UCX_SWEEP="${UCX_SWEEP:-baseline all cuda_ipc_tcp put_zcopy}"
 baseline_ucx_tls=$UCX_TLS
+if [[ " $UCX_SWEEP " == *" baseline "* && "$baseline_ucx_tls" == "tcp" ]]; then
+    echo "UCX_TLS=tcp excludes CUDA memory transports required by the probe; set UCX_TLS=^ib or use cuda_copy,cuda_ipc,sm,self,tcp" >&2
+    exit 2
+fi
 baseline_rndv_scheme="${UCX_RNDV_SCHEME:-}"
 baseline_mnnvl="${UCX_CUDA_IPC_ENABLE_MNNVL:-}"
 THREADS_LIST="${THREADS_LIST:-1}"
