@@ -20,10 +20,13 @@ case "${1:-}" in
         ;;
 esac
 srun_args=(
-    --jobid="$JOB_ID" --ntasks=1 --cpus-per-task="${CPUS:-64}"
+    --jobid="$JOB_ID" --ntasks=1
     --container-image="$IMAGE" --container-mounts="$MOUNTS"
     --container-workdir="$REPO"
 )
+if [[ -n "${CPUS:-}" ]]; then
+    srun_args+=(--cpus-per-task="$CPUS")
+fi
 if [[ -n "${WHEEL:-}" ]]; then
     if [[ ! -f "$WHEEL" ]]; then
         echo "Prebuilt wheel not found: $WHEEL" >&2

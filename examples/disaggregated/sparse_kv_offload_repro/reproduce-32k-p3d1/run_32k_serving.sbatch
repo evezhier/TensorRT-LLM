@@ -4,8 +4,6 @@
 #SBATCH --job-name=dsv4-sparse-32k
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=1024G
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
 set -euo pipefail
@@ -57,6 +55,6 @@ if [[ -n "${WHEEL:-}" ]]; then
     esac
 fi
 export JOB_ID="$SLURM_JOB_ID"
-export CPUS="${SLURM_CPUS_PER_TASK:-64}"
+unset CPUS
 
 bash "$repro_package/run_slurm.sh" serving "$OUTPUT_ROOT/32k-serving-$SLURM_JOB_ID"

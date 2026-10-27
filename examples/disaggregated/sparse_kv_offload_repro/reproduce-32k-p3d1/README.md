@@ -114,14 +114,14 @@ export MODEL_DIR=/absolute/path/to/checkpoint-folder
 export REPO=/absolute/path/to/checked-out/TensorRT-LLM
 export IMAGE=/absolute/compatible-container.sqsh
 export OUTPUT_ROOT=/absolute/results-parent
-sbatch --export=ALL --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
+sbatch --export=ALL --gpus=8 --partition=YOUR_B200_PARTITION --account=YOUR_ACCOUNT \
     examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_serving.sbatch
 ```
 
-The script requests 64 CPUs and 1,024 GiB of RAM on one exclusive node; the
-serving layout assumes eight GPUs. It writes to `32k-serving-JOB_ID` under
-`OUTPUT_ROOT` and mounts
-the checkout, checkpoint parent and results parent at the same paths in the container.
+The submission requests eight GPUs on one exclusive node. The script has no
+explicit GPU, CPU or memory count. It writes to `32k-serving-JOB_ID` under
+`OUTPUT_ROOT` and mounts the checkout, checkpoint parent and results parent
+at the same paths in the container.
 `REPO` must point to the checkout visible on the compute node; Slurm may
 execute the batch script from its spool directory.
 Set `MOUNTS` if extra Python dependencies or caches live elsewhere.
@@ -180,15 +180,14 @@ result reports. The send-phase timer includes the CUDA staging copy when this
 path is enabled. A shorter send phase alone does not establish a serving
 improvement; compare completed requests, output parity, and throughput too.
 
-If you already have an eight-GPU Slurm allocation with the CPU/RAM resources
-above, use the lower-level wrapper from this checkout:
+If you already have an eight-GPU Slurm allocation with enough CPU and RAM for
+the model, use the lower-level wrapper from this checkout:
 
 ```bash
 export MODEL_DIR=/absolute/path/to/checkpoint-folder
 export IMAGE=/absolute/compatible-container.sqsh
 export MOUNTS=/absolute/repo-parent:/absolute/repo-parent,/absolute/path/to:/absolute/path/to,/absolute/results-parent:/absolute/results-parent
 export JOB_ID=YOUR_NEW_JOB_ID
-export CPUS=64
 bash examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_slurm.sh \
     serving /absolute/results-parent/32k-serving-01
 ```
