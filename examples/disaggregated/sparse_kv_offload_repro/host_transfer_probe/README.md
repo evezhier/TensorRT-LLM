@@ -45,7 +45,6 @@ IMAGE=/absolute/path/to/arm-devel-image.sqsh \
 WHEEL=/absolute/path/to/arm-tensorrt_llm.whl \
 OUTPUT_ROOT=/absolute/path/to/results \
 REQUIRE_GB300=1 GPU_PAIRS="0:2" \
-UCX_TLS="^ib" \
 UCX_SWEEP="baseline all cuda_ipc_tcp put_zcopy" \
 MODES="gpu host sender_staged" \
 sbatch --export=ALL -A ACCOUNT -p PARTITION -t 02:00:00 \
@@ -60,15 +59,16 @@ Only the probe scripts changed for the sweep, so an existing compatible wheel
 can be reused.
 
 The default sweep repeats the same byte-verified cases with four UCX settings:
-`baseline` keeps the caller's `UCX_TLS` or defaults to `^ib`, matching the
+`baseline` keeps the caller's non-TCP `UCX_TLS` or defaults to `^ib`, matching the
 32K serving run; `all` sets `UCX_TLS=all`; `cuda_ipc_tcp` allows
 `cuda_ipc,cuda_copy,sm,self,tcp`; and `put_zcopy` combines `UCX_TLS=all`,
 `UCX_RNDV_SCHEME=put_zcopy`, and `UCX_CUDA_IPC_ENABLE_MNNVL=n`. Set
 `UCX_SWEEP=baseline` to run one setting. Each setting starts fresh sender and
 receiver processes, so UCX reads its environment again. `UCX_PROTO_INFO=y`
 records protocol selection in each sender log; it can be overridden.
-Set `UCX_TLS` explicitly when submitting from a cluster environment that
-provides `UCX_TLS=tcp`: TCP alone cannot register the probe's GPU memory.
+The probe ignores an inherited `UCX_TLS=tcp`, which some Slurm/Pyxis environments
+inject and which cannot register GPU memory. Set `BASELINE_UCX_TLS` to choose a
+different baseline explicitly; `BASELINE_UCX_TLS=tcp` is rejected.
 
 The default matrix uses one NIXL thread, matching the production serving run.
 It includes all four modes. Set `MODES="host sender_staged"` to compare direct

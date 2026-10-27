@@ -22,13 +22,17 @@ else
     export PYTHONPATH="$REPO${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}"
 fi
 cd -- "$OUTPUT"
-export UCX_TLS="${UCX_TLS:-^ib}"
+if [[ "${UCX_TLS:-}" == "tcp" ]]; then
+    unset UCX_TLS
+    echo "Ignoring inherited UCX_TLS=tcp; the probe requires CUDA memory transports"
+fi
+export UCX_TLS="${BASELINE_UCX_TLS:-${UCX_TLS:-^ib}}"
 export UCX_MM_ERROR_HANDLING="${UCX_MM_ERROR_HANDLING:-y}"
 export UCX_PROTO_INFO="${UCX_PROTO_INFO:-y}"
 UCX_SWEEP="${UCX_SWEEP:-baseline all cuda_ipc_tcp put_zcopy}"
 baseline_ucx_tls=$UCX_TLS
 if [[ " $UCX_SWEEP " == *" baseline "* && "$baseline_ucx_tls" == "tcp" ]]; then
-    echo "UCX_TLS=tcp excludes CUDA memory transports required by the probe; set UCX_TLS=^ib or use cuda_copy,cuda_ipc,sm,self,tcp" >&2
+    echo "BASELINE_UCX_TLS=tcp excludes CUDA memory transports; use ^ib or cuda_copy,cuda_ipc,sm,self,tcp" >&2
     exit 2
 fi
 baseline_rndv_scheme="${UCX_RNDV_SCHEME:-}"
