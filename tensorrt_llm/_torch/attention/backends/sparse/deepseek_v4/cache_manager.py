@@ -20,10 +20,12 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor import llm_request
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _GUARD_PAGE_REQUEST_ID,
     _RESERVED_REQUEST_IDS,
+    CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
     _fill_kv_pages,
@@ -49,8 +51,10 @@ from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     AttentionLayerConfig,
+    Batch,
     BatchDesc,
     BufferConfig,
+    CudaStream,
     DataRole,
     KVCacheDesc,
     LayerId,

@@ -163,7 +163,9 @@ sbatch --export=ALL --gpus=8 --partition=YOUR_B200_PARTITION --account=YOUR_ACCO
 The launcher installs `requirements-dev.txt`, then the wheel in a writable
 container immediately before the benchmark. Wheel mode imports TensorRT-LLM
 from that installation while the integration-test harness still comes from
-the checkout. The wheel path and SHA-256 are recorded in `preflight.json`.
+the checkout. Build the wheel from the current checkout; preflight imports the
+DeepSeek V4 cache manager and checks that its installed source matches the
+checkout. The wheel path and SHA-256 are recorded in `preflight.json`.
 The container needs access to the package indexes used by the requirements.
 
 ### Sender-side host staging experiment

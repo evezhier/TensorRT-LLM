@@ -40,4 +40,8 @@ export PRTE_MCA_plm='^slurm'
 export PRTE_MCA_ras='^slurm'
 export TLLM_METRICS_ALL_RANKS=1
 export SWEEP_OUT="$OUTPUT"
-cd -- "$REPO"
+if [[ -n "${WHEEL:-}" ]]; then
+    cd -- "$OUTPUT"
+else
+    cd -- "$REPO"
+fi

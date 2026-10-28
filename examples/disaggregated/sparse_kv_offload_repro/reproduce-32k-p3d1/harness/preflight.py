@@ -3,6 +3,7 @@
 """Check the built runtime and record reproducible inputs before starting workers."""
 
 import hashlib
+import importlib
 import json
 import os
 import subprocess
@@ -56,6 +57,15 @@ def main() -> None:
             raise RuntimeError("Wheel mode imported TensorRT-LLM from the source checkout")
     elif package_dir != repo / "tensorrt_llm":
         raise RuntimeError("TensorRT-LLM was imported from a different checkout")
+    cache_manager = importlib.import_module(
+        "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager"
+    )
+    if wheel_path:
+        relative_path = Path(
+            "tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py"
+        )
+        if Path(cache_manager.__file__).read_bytes() != (repo / relative_path).read_bytes():
+            raise RuntimeError("Installed wheel has a different DeepSeek V4 cache manager; rebuild it")
     if not hasattr(Batch, "reorder"):
         raise RuntimeError("Rebuild the native bindings: Batch.reorder is missing")
     from tensorrt_llm._torch.disaggregation.native import transfer
