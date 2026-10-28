@@ -1889,7 +1889,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("host_sparse_pool_quota", &kv::KVCacheManagerConfig::hostSparsePoolQuota,
-            "Host bytes the GPU tier's host-backed pools may take, or None for unbounded.\n\n"
+            "Host bytes the GPU tier's host-backed pools may take. None has the storage manager set it "
+            "at construction to 80% of the host memory the host tiers' quotas leave, and keep that value.\n\n"
             "A sparse buffer's pages are host memory, so the device quota does not pay for them and "
             "nothing else bounds them: a slot spans every pool of its group, so their row count "
             "follows from the device-backed pools the quota does size. This is the bound they "

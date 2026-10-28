@@ -105,13 +105,14 @@ PoolGroupIndex LifeCyclePoolGroupMapping::numPoolGroups() const noexcept
 CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
     CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator,
-    HostMemBackingOptions const& options)
+    HostMemBackingOptions const& options, std::optional<size_t> sparseReservation)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
-    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options);
+    storage = createCacheLevelStorage(
+        tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options, sparseReservation);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +125,23 @@ namespace
 bool isGpuAccessibleMemory(CacheTier tier) noexcept
 {
     return tier == CacheTier::GPU_MEM || tier == CacheTier::HOST_MEM;
+}
+
+// The host sparse pool quota an unset configuration gets: 80% of the host memory the host
+// tiers' quotas leave. Host tiers configured past physical memory leave none.
+size_t defaultHostSparsePoolQuota(TypedVec<CacheLevel, CacheTierConfig> const& cacheTiers)
+{
+    size_t hostTierQuota = 0;
+    for (auto const& tier : cacheTiers)
+    {
+        if (cacheTierOf(tier) == CacheTier::HOST_MEM)
+        {
+            hostTierQuota += cacheTierQuota(tier);
+        }
+    }
+    size_t const total = hostTotalMemory();
+    size_t const remaining = total > hostTierQuota ? total - hostTierQuota : 0;
+    return remaining / 5 * 4;
 }
 
 // Compute the slot-to-page-indices scale factors.
@@ -347,12 +365,15 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // A sparse pool's hot pages are host memory. Its bytes are excluded from the GPU quota
     // rather than sized from it: a slot spans every pool of its group, so a sparse pool's
     // row count follows from the group's device-backed pools, which the quota does size.
-    mHostSparsePoolQuota = config.hostSparsePoolQuota;
+    // Those pages still need host memory, so an unset quota is filled in here and kept: it
+    // bounds the slot counts and each sparse pool's address-space reservation alike.
+    mHostSparsePoolQuota = config.hostSparsePoolQuota.has_value() ? *config.hostSparsePoolQuota
+                                                                  : defaultHostSparsePoolQuota(config.cacheTiers);
     // From the descriptors: the level's storage does not exist yet.
     auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
-        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), config.hostSparsePoolQuota));
+        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota));
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{});
+        gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{}, mHostSparsePoolQuota);
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(

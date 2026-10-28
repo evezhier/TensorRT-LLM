@@ -617,7 +617,7 @@ TypedVec<PoolIndex, size_t> PoolGroupBase::slotSize() const
 
 GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
     PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity,
-    HostMemBackingOptions const& hostOptions)
+    HostMemBackingOptions const& hostOptions, std::optional<size_t> sparseReservation)
     : PoolGroupBase(numSlots)
 {
     if (sparsity.empty())
@@ -654,14 +654,20 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
     {
         size_t const sz = slotSizeList.at(p);
         size_t const grain = sparsity[p] ? hostMemSizeGranularity() : physMemSize;
-        size_t vmSize = std::max(roundUp(maxSlots * sz, grain), roundUp(slotCountToSizeT(numSlots) * sz, grain));
+        size_t reserved = maxSlots * sz;
+        if (sparsity[p] && sparseReservation.has_value())
+        {
+            reserved = std::min(reserved, *sparseReservation);
+        }
+        size_t const vmSize = std::max(roundUp(reserved, grain), roundUp(slotCountToSizeT(numSlots) * sz, grain));
         if (sparsity[p])
         {
             // A sparse pool's pages: host memory, device-mapped, so the sparse cache fills
             // from them without a host round trip. The reservation is host address space,
             // not device, but it is as hard a bound: HostMem keeps a fixed base and rejects
-            // a resize past it. Sizing it from maxSlots is what keeps it unreachable, since
-            // the row count those slots imply is the most the device quota can buy.
+            // a resize past it. maxSlots alone would keep it unreachable, but scaled by a
+            // sparse slot it can exceed the address space, so `sparseReservation` caps it
+            // and growth past the cap is refused.
             mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, vmSize, hostOptions));
             continue;
         }
@@ -738,7 +744,7 @@ TypedVec<PoolIndex, Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx
 
 GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
-    HostMemBackingOptions const& hostOptions)
+    HostMemBackingOptions const& hostOptions, std::optional<size_t> sparseReservation)
     : mPhysMemAllocator(physMemAllocator)
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
@@ -754,7 +760,7 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
             sparsity.push_back(slotDesc.isSparse(pool));
         }
         mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
-            slotCountList[pgIdx], sizes, mPhysMemAllocator, std::move(sparsity), hostOptions));
+            slotCountList[pgIdx], sizes, mPhysMemAllocator, std::move(sparsity), hostOptions, sparseReservation));
     }
 }
 
@@ -805,7 +811,8 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator, HostMemBackingOptions const& options)
+    PooledPhysMemAllocator* gpuPhysMemAllocator, HostMemBackingOptions const& options,
+    std::optional<size_t> sparseReservation)
 {
     TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(
@@ -815,7 +822,7 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             if constexpr (std::is_same_v<T, GpuCacheTierConfig>)
             {
                 return std::make_unique<GpuCacheLevelStorage>(
-                    slotDescList, slotCountList, *gpuPhysMemAllocator, options);
+                    slotDescList, slotCountList, *gpuPhysMemAllocator, options, sparseReservation);
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {

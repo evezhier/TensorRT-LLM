@@ -557,8 +557,9 @@ struct KVCacheManagerConfig
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
 
-    // Host memory the GPU tier's host-backed pools may take, in bytes. Unset leaves them
-    // unbounded.
+    // Host memory the GPU tier's host-backed pools may take, in bytes. Unset, the storage
+    // manager sets it at construction to 80% of the host memory the host tiers' quotas leave,
+    // and keeps that value.
     //
     // A sparse buffer's pages are host memory, so the device quota does not size them: a slot
     // spans every pool of its group, so their row count follows from the device-backed pools.

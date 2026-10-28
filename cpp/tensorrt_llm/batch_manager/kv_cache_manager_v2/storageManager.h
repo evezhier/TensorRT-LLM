@@ -101,7 +101,7 @@ public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
-        HostMemBackingOptions const& options = {});
+        HostMemBackingOptions const& options = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
     CacheLevel cacheLevel;
     CacheTier cacheTier;
@@ -517,10 +517,11 @@ private:
     //! Hot-level slot floors, from the batch constraints and scaled by 1/maxUtilForResume.
     TypedVec<PoolGroupIndex, SlotCount> mHotMinSlots;
 
-    //! Host memory the hot level's host-backed pools may take, when the configuration bounds
-    //! it. Kept because a rebalance moves the slot counts those pools follow, so the bound
-    //! has to be reapplied rather than assumed still satisfied.
-    std::optional<size_t> mHostSparsePoolQuota;
+    //! Host memory the hot level's host-backed pools may take: the configured quota, or the
+    //! default construction fills in when it is unset. Kept because a rebalance moves the
+    //! slot counts those pools follow, so the bound has to be reapplied rather than assumed
+    //! still satisfied.
+    size_t mHostSparsePoolQuota = 0;
 
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;

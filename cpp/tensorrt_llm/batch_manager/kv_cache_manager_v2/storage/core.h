@@ -559,9 +559,14 @@ public:
     //!
     //! `hostOptions` backs the sparse pools. One object for the whole level, so every
     //! host-backed pool commits in the same unit.
+    //!
+    //! `sparseReservation`, when given, caps the host address space each sparse pool
+    //! reserves; a pool never reserves less than its initial slots. Unset reserves for the
+    //! most slots device memory could buy, which exceeds the address space once a sparse
+    //! slot is several hundred times the group's device bytes per slot.
     GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
         PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {},
-        HostMemBackingOptions const& hostOptions = {});
+        HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
@@ -900,9 +905,10 @@ class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
     //! Each SlotDesc declares per pool which pools are sparse, and so host-allocated.
+    //! `sparseReservation` is passed to every GpuPoolGroup.
     GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
-        HostMemBackingOptions const& hostOptions = {});
+        HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -960,8 +966,10 @@ private:
 };
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
+// `sparseReservation` applies to a GPU tier only; see GpuPoolGroup.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {});
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {},
+    std::optional<size_t> sparseReservation = std::nullopt);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
