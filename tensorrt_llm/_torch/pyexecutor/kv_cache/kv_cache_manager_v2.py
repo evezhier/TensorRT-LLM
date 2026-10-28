@@ -2241,8 +2241,6 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
         )
-        config = self._build_cache_config(config)
-        config = self._remove_zero_size_buffers(config)
         config = self._add_mixed_precision_layers(config)
         arena_bytes = sparse_arena_bytes(config, self.max_batch_size)
         if arena_bytes > reserved_arena_bytes:

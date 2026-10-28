@@ -1026,7 +1026,8 @@ PoolSpec Batch::poolSpecFor(IndexTableSpec const& spec) const
     {
         // One stride for the spec, because a reader has only one: the entries carry each
         // buffer's offset in pages, which is a count of this stride and of no other.
-        TLLM_CHECK_WITH_INFO(mManager->getPageStride(buffer.layerId, buffer.role) == out.pageStride,
+        TLLM_CHECK_WITH_INFO(
+            static_cast<size_t>(mManager->getPageStride(buffer.layerId, buffer.role)) == out.pageStride,
             "An index table spec spans page strides, so one base cannot address its buffers");
     }
     return out;

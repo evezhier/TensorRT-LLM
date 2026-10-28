@@ -2028,6 +2028,9 @@ def test_sparse_nvfp4_gather_uses_shared_pool_indices(residual_dim, global_scale
         capture = torch.cuda.CUDAGraph()
         with torch.cuda.graph(capture):
             gather()
+        # The gather leaves rows whose index is out of range untouched, so the
+        # replay's expectation of zeros there only holds from a cleared output.
+        out.zero_()
         original_indices.copy_(
             torch.tensor([[10, -1, 1, 4], [2, 11, 5, 0]], dtype=torch.int32, device="cuda")
         )

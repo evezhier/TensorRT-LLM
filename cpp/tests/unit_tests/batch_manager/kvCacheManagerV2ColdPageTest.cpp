@@ -239,14 +239,14 @@ TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
     auto reservations
         = storage.newSlotsForPoolGroup(kHotLevel, hotGroup, storage.getStatistics(kHotLevel, hotGroup).free);
-    EXPECT_FALSE(reader->resume(stream, std::nullopt, std::vector<LifeCycleId>{encoder, peer}));
+    EXPECT_FALSE(reader->resume(stream, std::vector<LifeCycleId>{encoder, peer}));
     EXPECT_FALSE(reader->isActive());
     EXPECT_EQ(reader->numCommittedTokens(), 8);
     for (auto& slot : reservations)
     {
         storage.releaseSlot(encoder, kHotLevel, std::move(slot));
     }
-    ASSERT_TRUE(reader->resume(stream, std::nullopt, std::vector<LifeCycleId>{encoder, peer}));
+    ASSERT_TRUE(reader->resume(stream, std::vector<LifeCycleId>{encoder, peer}));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
     EXPECT_EQ(block->getPage(encoder), encoderPage);
     EXPECT_EQ(block->getPage(peer), peerPage);
@@ -1090,7 +1090,7 @@ TEST(KvCacheManagerV2ColdPageTest, MaxQuotaBelowTheStructuralMinimumIsRejected)
     // Two cold pool groups, from the two distinct sliding windows.
     size_t const kOneUnit = HostMem::sizeGranularity();
 
-    auto makeConfig = [](std::optional<size_t> maxQuota)
+    auto makeConfig = [kOneUnit](std::optional<size_t> maxQuota)
     {
         auto config = makeSplitColdGroupingConfig();
         config.cacheTiers[1] = HostCacheTierConfig{kOneUnit, maxQuota};
@@ -1184,13 +1184,14 @@ TEST(KvCacheManagerV2ColdPageTest, SparseHistoryPassesThroughTheCodec)
     // sitting in a GPU-tier group beside a device-backed pool. Without this the test would
     // pass for a dense life cycle too, and prove nothing.
     PoolGroupIndex const hotPg = storage.getPoolGroupIndex(kHotLevel, lifeCycle);
-    ASSERT_EQ(storage.cacheTier(kHotLevel, hotPg), CacheTier::GPU_MEM);
+    ASSERT_EQ(storage.cacheTier(kHotLevel), CacheTier::GPU_MEM);
     auto const hotPools = storage.slotSize(kHotLevel, hotPg);
     ASSERT_EQ(hotPools.size(), PoolIndex{2}) << "a sparse pool beside a device-backed one";
     int sparsePools = 0;
     for (PoolIndex pool{0}; pool < hotPools.size(); ++pool)
     {
-        sparsePools += storage.isSparsePool(kHotLevel, hotPg, pool) ? 1 : 0;
+        // A pool whose medium differs from its level's tier is the host-backed one.
+        sparsePools += storage.poolMedium(kHotLevel, hotPg, pool) != storage.cacheTier(kHotLevel) ? 1 : 0;
     }
     ASSERT_EQ(sparsePools, 1) << "exactly one of the group's pools holds host-backed pages";
 

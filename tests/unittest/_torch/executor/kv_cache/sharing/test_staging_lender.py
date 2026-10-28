@@ -180,7 +180,7 @@ def sparse_layer(monkeypatch, index):
     here does: the runtime may then lock that layer group's read-only pages in host memory."""
     from dataclasses import replace
 
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
 
     build = KVCacheManagerV2._build_cache_config
@@ -190,9 +190,14 @@ def sparse_layer(monkeypatch, index):
         layer = layers[index]
         layers[index] = AttentionLayerConfig(
             layer_id=layer.layer_id,
+            # An extra index buffer, as a model declaring sparsity does, rather than a
+            # sparse K or V. Sparsity is a property of a pool: a pool group needs a
+            # non-sparse pool to size its slots from, and a layer whose roles straddle
+            # host and device memory cannot be addressed by the attention op. Its page
+            # size differs from K/V's so it forms its own pool instead of coalescing.
             buffers=[
-                BufferConfig(b.role, b.size, b.tokens_per_block_override, is_sparse=True)
-                for b in layer.buffers
+                *(BufferConfig(b.role, b.size, b.tokens_per_block_override) for b in layer.buffers),
+                BufferConfig(Role.INDEX_KEY, layer.buffers[0].size // 2, is_sparse=True),
             ],
             sliding_window_size=layer.sliding_window_size,
             num_sink_tokens=layer.num_sink_tokens,
@@ -219,7 +224,8 @@ def test_a_layer_group_of_sparse_buffers_is_refused(kit, host_tier_manager, monk
     with host_tier_manager(**keywords) as mgr:
         layers = {int(layer.layer_id): layer for layer in mgr.impl.init_config.layers}
         flags = [
-            any(b.is_sparse for b in layers[int(ids[0])].buffers) for ids in mgr.impl.layer_grouping
+            any(b.is_sparse for lid in ids for b in layers[int(lid)].buffers)
+            for ids in mgr.impl.layer_grouping
         ]
         sparse = [lg for lg, flag in enumerate(flags) if flag]
         assert sparse and (0 in sparse) == (case == "first"), (

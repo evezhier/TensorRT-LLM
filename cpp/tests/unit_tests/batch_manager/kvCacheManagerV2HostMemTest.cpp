@@ -409,24 +409,25 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
 TEST(KvCacheManagerV2HostMemTest, DeferredParallelFillKeepsEarlyWrites)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    constexpr size_t kChunk = HostMem::kFillChunkSize;
-    constexpr size_t kSize = 4 * kChunk;
+    // A fill advances the watermark one commit step at a time.
+    size_t const kChunk = HostMemBacking::commitChunkSize();
+    size_t const kSize = 4 * kChunk;
 
     HostMem memory(kSize, kSize, HostMemBackingOptions{}, /*waitForFill=*/false);
     auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
     auto const pattern
-        = [](size_t offset) { return static_cast<unsigned char>((offset / HostMem::kAlignment) * 5 + 3); };
+        = [](size_t offset) { return static_cast<unsigned char>((offset / HostMem::sizeGranularity()) * 5 + 3); };
     for (size_t chunkEnd = kChunk; chunkEnd <= kSize; chunkEnd += kChunk)
     {
         memory.waitUsable(chunkEnd);
-        for (size_t offset = chunkEnd - kChunk; offset < chunkEnd; offset += HostMem::kAlignment)
+        for (size_t offset = chunkEnd - kChunk; offset < chunkEnd; offset += HostMem::sizeGranularity())
         {
             bytes[offset] = pattern(offset);
         }
     }
 
     memory.waitUsable(kSize);
-    for (size_t offset = 0; offset < kSize; offset += HostMem::kAlignment)
+    for (size_t offset = 0; offset < kSize; offset += HostMem::sizeGranularity())
     {
         ASSERT_EQ(bytes[offset], pattern(offset)) << "byte at " << offset << " lost during the fill";
     }
@@ -438,23 +439,23 @@ TEST(KvCacheManagerV2HostMemTest, DeferredParallelFillKeepsEarlyWrites)
 TEST(KvCacheManagerV2HostMemTest, ParallelInitialFillThenGrow)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    constexpr size_t kChunk = HostMem::kFillChunkSize;
-    constexpr size_t kInitial = 2 * kChunk + kChunk / 2;
-    constexpr size_t kGrown = 4 * kChunk + kChunk / 4;
+    size_t const kChunk = HostMemBacking::commitChunkSize();
+    size_t const kInitial = 2 * kChunk + kChunk / 2;
+    size_t const kGrown = 4 * kChunk + kChunk / 4;
 
     HostMem memory(kGrown, kInitial);
     auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
-    for (size_t offset = 0; offset < kInitial; offset += HostMem::kAlignment)
+    for (size_t offset = 0; offset < kInitial; offset += HostMem::sizeGranularity())
     {
-        bytes[offset] = static_cast<unsigned char>((offset / HostMem::kAlignment) * 7 + 1);
+        bytes[offset] = static_cast<unsigned char>((offset / HostMem::sizeGranularity()) * 7 + 1);
     }
 
     memory.resize(kGrown);
-    for (size_t offset = 0; offset < kGrown; offset += HostMem::kAlignment)
+    for (size_t offset = 0; offset < kGrown; offset += HostMem::sizeGranularity())
     {
         if (offset < kInitial)
         {
-            ASSERT_EQ(bytes[offset], static_cast<unsigned char>((offset / HostMem::kAlignment) * 7 + 1))
+            ASSERT_EQ(bytes[offset], static_cast<unsigned char>((offset / HostMem::sizeGranularity()) * 7 + 1))
                 << "byte at " << offset << " lost by the grow";
         }
         else

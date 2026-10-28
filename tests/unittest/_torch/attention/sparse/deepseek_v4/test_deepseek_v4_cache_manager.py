@@ -227,7 +227,9 @@ def test_sparse_offload_descriptors_use_runtime_ids(tokens_per_block):
         assert descriptor.group_id == 13
         assert descriptor.unit_tokens == 4
         assert descriptor.data_buffer_index == 0
-        assert descriptor.arena_row_counts == (6 * 2 * (tokens_per_block // 4),)
+        assert descriptor.arena_row_counts == (
+            manager.max_batch_size * 2 * (tokens_per_block // 4),
+        )
         assert descriptor.arena_base_addresses == (
             manager.impl.get_sparse_cache_base_address(*descriptor.buffer_ids[0]),
         )
@@ -369,10 +371,13 @@ def test_sparse_arena_padding_initialization_covers_all_leases(row_sizes, max_un
         cache.max_cached_units = max_units if layer.layer_id == 19 else 16
         layer.sparse_cache = cache
     rows = (max_units + expansion - 1) // expansion * expansion
-    # Native constraints reserve six leases even though the runtime's batch limit
-    # in this fixture is four. Two model buffers and one padding buffer share each pool.
+    # The Batch owns the arenas and leases one row of them per batch row, so the
+    # fixture's arena is as wide as its batch limit. Two model buffers and one
+    # padding buffer share each pool.
+    leases = manager.max_batch_size
     arenas = [
-        torch.full((6, 3, rows, size), 37, dtype=torch.uint8, device="cuda") for size in row_sizes
+        torch.full((leases, 3, rows, size), 37, dtype=torch.uint8, device="cuda")
+        for size in row_sizes
     ]
     manager.impl.get_sparse_cache_base_address = lambda layer, role: arenas[
         "scale" in role
@@ -383,7 +388,7 @@ def test_sparse_arena_padding_initialization_covers_all_leases(row_sizes, max_un
     assert manager.get_sparse_compress_buffers(4)[0] is data_view
     assert manager.get_sparse_compress_buffers(4)[1] is scale_view
     for view, arena, size in zip((data_view, scale_view), arenas, row_sizes):
-        assert view.shape == (6 * 3 * rows, 1, size)
+        assert view.shape == (leases * 3 * rows, 1, size)
         assert view.is_contiguous() and view.data_ptr() == arena.data_ptr()
         torch.testing.assert_close(view.view(torch.uint8).reshape_as(arena), arena)
     manager._stream.wait_stream(torch.cuda.current_stream())
@@ -428,7 +433,7 @@ def test_sparse_arena_views_use_pool_capacity_and_share_storage(cache_dtype, max
         8192 if "scale" in role else 4096
     )
     descriptors = manager.get_sparse_offload_descriptors()
-    rows = 6 * 3 * ((max_units + 31) // 32 * 32)
+    rows = manager.max_batch_size * 3 * ((max_units + 31) // 32 * 32)
     with (
         patch.object(torch.cuda, "device"),
         patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),

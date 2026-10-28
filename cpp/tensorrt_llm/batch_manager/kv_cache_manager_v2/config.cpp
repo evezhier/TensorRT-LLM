@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <map>
 #include <set>

@@ -185,18 +185,19 @@ TEST_F(HostMemBackingTest, BaseAddressIsStableAcrossCommits)
 //! alone: data written between populate() and commit() survives it.
 TEST_F(HostMemBackingTest, CommitOfPopulatedRangeKeepsContents)
 {
-    MemAddress const base = mBacking->reserve(mTotalSize);
+    MemAddress const base = mBacking->address();
     ASSERT_NE(base, 0U);
 
     mBacking->open(0, mTotalSize);
     mBacking->populate(0, mTotalSize);
     stamp(base, 0, mTotalSize, 3);
-    for (size_t chunk = 0; chunk < kNumChunks; ++chunk)
+    mBacking->setTargetSize(mTotalSize);
+    while (mBacking->committedSize() != mBacking->targetSize())
     {
-        mBacking->commit(chunk * mChunkSize, mChunkSize, /*populated=*/true);
+        mBacking->resizeStep(/*populated=*/true);
     }
     EXPECT_TRUE(verify(base, 0, mTotalSize, 3));
-    for (size_t offset = 0; offset < mTotalSize; offset += kCommitUnit)
+    for (size_t offset = 0; offset < mTotalSize; offset += mBacking->registerUnit())
     {
         unsigned int flags = 0;
         ASSERT_EQ(cudaHostGetFlags(&flags, reinterpret_cast<void*>(base + offset)), cudaSuccess)

@@ -123,7 +123,9 @@ protected:
         params.mMaxSeqLenCacheKv = kCaptureKvLength;
         params.mMaxSeqLenQ = 1;
         params.mMaxSeqLenKv = kCaptureKvLength;
-        params.mAttentionWindowSize = std::numeric_limits<int32_t>::max();
+        // Negative reaches are unbounded, which is what a full-attention decode wants.
+        params.mLeftSlidingWindow = -1;
+        params.mRightSlidingWindow = -1;
         params.mChunkedAttentionSize = std::numeric_limits<int32_t>::max();
         params.mSumOfSeqLensQ = 1;
         params.mSumOfSeqLensKv = kCaptureKvLength;

@@ -3937,6 +3937,8 @@ def _gen_init_manager(host_capacity_blocks: int | None) -> KVCacheManagerV2:
         manager._host_history_reservations = HostHistoryReservations(host_capacity_blocks)
     manager.num_extra_kv_tokens = 0
     manager.tokens_per_block = 128
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
     return manager
 
 
@@ -4944,6 +4946,7 @@ def test_warmup_scan_leaves_host_backed_history_alone(offload: bool) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_offsets = {0: 0, 1: 1}
     manager.layer_to_pool_mapping_dict = {0: 0, 1: 1}
+    manager.layer_specs = None
     manager.get_buffers = lambda layer_idx, kv_layout="NHD": torch.ones(2)
     # Layer 0's KEY pages are offloaded history; layer 1's are device memory.
     manager.kv_cache_manager_py_config = KVCacheManagerConfig(

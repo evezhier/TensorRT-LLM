@@ -754,7 +754,10 @@ class SparseOffloadCacheMixin:
             for buffers in sparse_pool_buffers.values()
             for position, buffer_id in enumerate(buffers)
         }
-        max_leases = max(len(batch.kv_caches) for batch in self.impl.init_config.constraints)
+        # The Batch owns the arenas and sizes them for its rows, so the lease count is
+        # its capacity. A constraint describes a batch the manager must be able to hold,
+        # not the arena's extent.
+        max_leases = self.max_batch_size
         return _SparseArenaLayout(
             pool_indices=pool_indices,
             layer_configs=layer_configs,
@@ -886,7 +889,7 @@ class SparseOffloadCacheMixin:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Sparse arena padding must be initialized before graph capture")
-        max_leases = max(len(batch.kv_caches) for batch in self.impl.init_config.constraints)
+        max_leases = self.max_batch_size
         with torch.cuda.device(self._stream.device), torch.cuda.stream(self._stream):
             for region in regions:
                 convert_to_torch_tensor(

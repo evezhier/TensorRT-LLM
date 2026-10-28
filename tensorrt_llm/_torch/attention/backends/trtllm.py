@@ -2915,7 +2915,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
-        block_offsets = metadata.kv_cache_block_offsets
+        # Left unresolved here: the presentation below swaps in the token-major block
+        # table, and this call addresses its rows. A latent write target brings its own
+        # table, which the presentation does not touch.
+        block_offsets = None
         pool_pointers = metadata.kv_cache_manager.kv_cache_pool_pointers
         pool_mapping = metadata.kv_cache_manager.kv_cache_pool_mapping
         layer_idx = self.get_local_layer_idx(metadata)
@@ -2945,6 +2948,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # from a single scalar seq_len, which only describes a batch where every
         # request contributes the same number of tokens.
         with self.presented_token_major_for(metadata):
+            if block_offsets is None:
+                block_offsets = metadata.kv_cache_block_offsets
             self._mla_rope_generation_impl(
                 metadata, fused_q, q_pe, latent_cache, cu_q_seqlens,
                 cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
