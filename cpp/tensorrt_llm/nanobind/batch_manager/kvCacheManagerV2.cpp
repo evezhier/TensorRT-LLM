@@ -3182,7 +3182,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "peek_hit_miss_counter",
             [](kv::Batch const& self)
             {
-                auto const stats = self.peekHitMissCounter();
+                kv::SparseHitMiss stats;
+                {
+                    // Copies device counters and synchronises, which is not work to hold the
+                    // GIL across; make_tuple below needs it again.
+                    nb::gil_scoped_release rel;
+                    stats = self.peekHitMissCounter();
+                }
                 return nb::make_tuple(stats.hits(), stats.misses);
             },
             "Cumulative (hits, misses) in selection units since the Batch was built or the "
