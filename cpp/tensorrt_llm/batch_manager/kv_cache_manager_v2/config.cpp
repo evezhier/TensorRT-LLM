@@ -238,7 +238,7 @@ void KVCacheManagerConfig::validate() const
                             // which is how a dense one of no size is treated too.
                             if (buf.isSparse && buf.size != 0)
                             {
-                                buf.sparseLayout(unitsPerPage);
+                                static_cast<void>(buf.sparseLayout(unitsPerPage));
                             }
                         }
                     }
