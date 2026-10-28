@@ -220,13 +220,17 @@ SparseArenaView SparseCellArena::view() const noexcept
     return out;
 }
 
-std::vector<int32_t> SparseCellArena::readResidentOrdinals(SparseLeaseIndex slot) const
+std::vector<int32_t> SparseCellArena::peekResidentOrdinals(SparseLeaseIndex slot) const
 {
     CUstream const stream = nullptr;
     if (empty() || slot == kNoSparseLease)
     {
         return {};
     }
+    // A resolve writes this metadata on the Batch's stream, which is non-blocking and so
+    // unordered against the one below. Only a device-wide sync covers it; nothing here
+    // knows which stream last touched the slot.
+    cuCheck(cuCtxSynchronize());
     auto const arena = view();
     std::vector<int32_t> out(arena.numEntries());
     cuCheck(cuMemcpyDtoHAsync(out.data(),

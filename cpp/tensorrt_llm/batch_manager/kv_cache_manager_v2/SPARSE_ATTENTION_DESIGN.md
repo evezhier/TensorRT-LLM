@@ -89,9 +89,11 @@ entry and the selection unit is already a page.
    storage tier. A sparse buffer has no separately managed GPU pages: both the block being
    written and the history a step selects occupy cache cells, drawn from the same lease and
    replaced by the same LRU.
-5. **The host page is authoritative once the watermark passes the block.** A block is
-   flushed to its host page by the `resize()` that raises `history_length` past it, after
-   which its cache entry is evictable. Before that it holds the only copy and is pinned.
+5. **The host page is authoritative once the watermark passes the block.** A block reaches
+   its host page through `Batch::flushSparseUnits()`, which the caller runs before the
+   `resize()` that raises `history_length` past it; `resize()` checks that flush has
+   happened rather than performing it. After it the cache entry is evictable. Before it the
+   entry holds the only copy and is pinned.
 6. **Extraction is pluggable**, because KVCM2 buffers are opaque bytes and a sub-page unit
    cannot be located without layout knowledge.
 
@@ -216,7 +218,8 @@ unflushed  <=>  resident_ordinal >= history_length / unit_tokens
 
 Nothing records this. History is monotonic (`resize()` rejects a decrease), so an ordinal
 that was history stays history and a resident ordinal at or above the watermark cannot be a
-stale fetched copy. The flush at `resize()` covers exactly `[old_history, new_history)`, so
+stale fetched copy. The flush recorded for a `resize()` covers exactly
+`[old_history, new_history)`, so
 the flushed prefix always equals the watermark and there is no second high-water mark to
 keep. A per-entry dirty bitmap would be derived state that can only ever disagree with the
 ordinal it was derived from.
@@ -1036,8 +1039,8 @@ and `Batch::_buildIndexTables` folds the two into **one** table, because their `
 `K` with its scale, `V` with its scale. A scale shared by `K` and `V` together is a pool
 of one buffer, whose `cellsPerLease` differs, so it keeps a slice of its own: `[0, 1, 2]`.
 
-`Batch::sparseOutSlots` is the query, and both `fetchSparsePages` and
-`prepareSparseWriteIndices` follow it. The two have to agree, or a caller would need one
+`Batch::sparseOutSlots` is the query, and `fetchSparsePages`,
+`fetchResolvedPages` and `prepareSparseWriteIndices` all follow it. They have to agree, or a caller would need one
 rule for reading a fetch and another for a write. A run whose slices an earlier one
 already wrote is not launched at all -- the saved work and the saved writes are the point
 -- and the entries of `out` no buffer maps to are left untouched rather than packed out,

@@ -1165,6 +1165,12 @@ BatchRow Batch::addKvCache(KvCache& kvCache, std::optional<BatchRow> requestedRo
     {
         throw LogicError("A KvCache belongs to at most one Batch");
     }
+    if (kvCache.mManager.get() != mManager)
+    {
+        // Rows, arena leases and index tables are all this manager's. A member from another
+        // would be addressed through them and read memory that was never its own.
+        throw LogicError("A KvCache may only join a Batch of the manager that created it");
+    }
     if (kvCache.beamWidth() != BeamIndex{1})
     {
         // Only beam 0 is mirrored below, so a wider request would publish one beam's pages
@@ -1325,6 +1331,15 @@ void Batch::move(BatchRow dstRow, BatchRow srcRow)
         // Swapped rather than copied so the vacated row ends up holding what the empty
         // destination held: every entry kBadPageIndex, which is what a free row must publish.
         std::swap_ranges(from, from + mMaxBlocksPerSeq, to);
+        if (mMaxScratchSlots > 0)
+        {
+            // The scratch slots are a second per-row table the member writes through, and
+            // _stageScratch() publishes them from the row it occupies. They travel with it
+            // for the same reason its page indices do.
+            auto* const scratchFrom = _scratchSlotRow(lc, srcRow);
+            auto* const scratchTo = _scratchSlotRow(lc, dstRow);
+            std::swap_ranges(scratchFrom, scratchFrom + mMaxScratchSlots, scratchTo);
+        }
     }
     std::swap(mRows[dstRow], mRows[srcRow]);
     std::swap(mFlushedHistory[dstRow], mFlushedHistory[srcRow]);
@@ -1339,6 +1354,10 @@ void Batch::move(BatchRow dstRow, BatchRow srcRow)
         // The row's contents have already moved. Rebind its sole writer without copying from
         // the old row or ending membership -- mBatch and the arena lease are untouched.
         kvCache.mBasePageIndices[kDefaultBeamIndex][lc] = Span<int>{_stagingRow(lc, dstRow), mMaxBlocksPerSeq};
+        if (mMaxScratchSlots > 0)
+        {
+            kvCache.setScratchSlotBuf(lc, _scratchSlotRow(lc, dstRow), mMaxScratchSlots);
+        }
     }
     _seedRowWatermarks(dstRow, kvCache.historyLength(), kvCache.capacity());
     _seedRowWatermarks(srcRow, 0, 0);

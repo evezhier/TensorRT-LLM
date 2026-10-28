@@ -129,7 +129,7 @@ std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache c
     {
         return {};
     }
-    return kvCache.mBatch->_sparseArena(id).readResidentOrdinals(kvCache.mBatch->leaseOf(*kvCache.mBatchRow));
+    return kvCache.mBatch->_sparseArena(id).peekResidentOrdinals(kvCache.mBatch->leaseOf(*kvCache.mBatchRow));
 }
 
 std::optional<int> KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool)

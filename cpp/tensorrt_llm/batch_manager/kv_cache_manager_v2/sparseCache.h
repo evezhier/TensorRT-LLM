@@ -189,9 +189,11 @@ public:
     //! The slot is the Batch row's own, and one row's slot serves every life cycle.
     void initialiseLease(SparseLeaseIndex slot, CUstream stream);
 
-    //! Copy a slot's resident ordinals back to the host. Test and debug use only;
-    //! synchronises.
-    [[nodiscard]] std::vector<int32_t> readResidentOrdinals(SparseLeaseIndex slot) const;
+    //! Copy a slot's resident ordinals back to the host, for debugging and introspection
+    //! only. Not on any serving path: it synchronises the device to pick up whatever a
+    //! resolve left on the Batch's stream, which no stream of the caller's orders it
+    //! against, and so reports a moment rather than a state the caller can act on.
+    [[nodiscard]] std::vector<int32_t> peekResidentOrdinals(SparseLeaseIndex slot) const;
 
     //! How a kernel addresses this arena's leases. Constant once constructed, so a launch
     //! carries one of these rather than one descriptor per row.
