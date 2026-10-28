@@ -16,7 +16,7 @@
 from collections import defaultdict
 from dataclasses import replace
 from math import ceil, gcd
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_generation_kv_capacity,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
