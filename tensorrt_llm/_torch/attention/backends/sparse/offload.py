@@ -960,8 +960,11 @@ class SparseOffloadCacheMixin:
     ) -> torch.Tensor:
         """Reserve this layer's in-flight arena rows on the current stream.
 
-        Return int32[B, F] in Batch row and descriptor buffer order; a row without
-        a unit in flight gets -1. A writer addressing requests by input position
+        Return int32[B, F] in Batch row order, with columns assigned by
+        ``Batch.sparse_out_slots`` and cached in ``state.out_slots[layer_idx]``.
+        Buffers with matching arena indices share a column; unused columns are
+        untouched. A used column gets -1 when its row has no unit in flight.
+        A writer addressing requests by input position
         reads request i's entries at Batch row ``state.batch_rows[i]``, for example
         through ``gather_sparse_batch_rows``. The caller must join Batch publication
         before this call. Reservation must finish before either the writer or
@@ -969,9 +972,8 @@ class SparseOffloadCacheMixin:
         protected in-flight row. Both must finish before attention or a history
         update. No KV is fetched here.
 
-        A layer with block scales has its data and scale columns compared once,
-        outside graph capture, after a live row is seen: writers and the NVFP4
-        gather address scales with the data column.
+        Data and scale buffers use the same column when their arena indices coincide;
+        the output-slot mapping follows the arena geometry and requires no device read.
         """
         if (
             not self._enable_kv_cache_offload

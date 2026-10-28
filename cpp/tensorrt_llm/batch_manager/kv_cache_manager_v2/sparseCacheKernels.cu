@@ -1017,6 +1017,17 @@ int32_t sparseResolveSharedLimit()
 
 } // namespace
 
+size_t checkedSparseResolveSharedBytes(int32_t entriesPerSelection, int32_t selectionWidth, int32_t maxInFlightUnits)
+{
+    size_t const shared = sparseResolveSharedBytes(entriesPerSelection, selectionWidth, maxInFlightUnits);
+    int32_t const limit = sparseResolveSharedLimit();
+    TLLM_CHECK_WITH_INFO(shared <= static_cast<size_t>(limit),
+        "Sparse resolve: the cache needs " + std::to_string(shared)
+            + " bytes of shared memory, above this device's limit of " + std::to_string(limit)
+            + "; reduce max_cached_units or num_selected_blocks, or raise the selection unit size");
+    return shared;
+}
+
 void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
 {
     TLLM_CHECK_WITH_INFO(args.arena.numSelections > 0 && args.arena.entriesPerSelection > 0 && args.selectionWidth >= 0
@@ -1055,13 +1066,7 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     // entriesPerSelection belongs to the life cycle, so one size and one grid serve every row.
     int32_t const tableSize = nextPow2(2 * (args.maxInFlightUnits + args.selectionWidth));
     size_t const shared
-        = sparseResolveSharedBytes(args.arena.entriesPerSelection, args.selectionWidth, args.maxInFlightUnits);
-
-    int32_t const limit = sparseResolveSharedLimit();
-    TLLM_CHECK_WITH_INFO(shared <= static_cast<size_t>(limit),
-        "launchSparseResolve: the cache needs " + std::to_string(shared)
-            + " bytes of shared memory, above this device's limit of " + std::to_string(limit)
-            + "; reduce max_cached_units or raise the selection unit size");
+        = checkedSparseResolveSharedBytes(args.arena.entriesPerSelection, args.selectionWidth, args.maxInFlightUnits);
     tensorrt_llm::common::launchWithPdlWhenEnabled("sparseResolve", sparseResolveKernel,
         dim3(static_cast<unsigned>(args.numRows)), dim3(kThreads), shared, reinterpret_cast<cudaStream_t>(stream), args,
         tableSize);

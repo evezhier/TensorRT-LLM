@@ -992,13 +992,17 @@ class TestSparseCacheReservation(unittest.TestCase):
         init_cuda_once()
 
     @staticmethod
-    def _manager(max_cached_units: int) -> KVCacheManager:
+    def _manager(
+        max_cached_units: int, *, num_selected_blocks: int = 2, unit_tokens: int = 128
+    ) -> KVCacheManager:
         # sparse_cache is absent when the fetch path is unconfigured: the buffer still gets
         # sparse storage and locking, it simply has no GPU cache to read through.
         # The cache must exceed the selection, since the surplus is the in-flight headroom.
         sparse_cache = (
             SparseCacheConfig(
-                num_selected_blocks=2, max_cached_units=max_cached_units, unit_tokens=128
+                num_selected_blocks=num_selected_blocks,
+                max_cached_units=max_cached_units,
+                unit_tokens=unit_tokens,
             )
             if max_cached_units > 0
             else None
@@ -1037,6 +1041,45 @@ class TestSparseCacheReservation(unittest.TestCase):
     @staticmethod
     def _free(manager: KVCacheManager) -> int:
         return sum(stats.free for stats in manager.get_storage_statistics())
+
+    def test_batch_rejects_resolve_shared_memory_overflow_before_fetch(self) -> None:
+        for max_cached_units, selection_width in ((1 << 20, 2), (1 << 16, (1 << 16) - 1)):
+            with self.subTest(max_cached_units=max_cached_units, selection_width=selection_width):
+                # Token-sized units keep the arena small while either residency metadata
+                # or the selection's probe table exceeds a device's per-block limit.
+                manager = self._manager(
+                    max_cached_units,
+                    num_selected_blocks=selection_width,
+                    unit_tokens=1,
+                )
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
+                        Batch(
+                            manager,
+                            NULL_STREAM,
+                            max_batch_size=1,
+                            max_blocks_per_seq=4,
+                            index_tables=manager.sparse_index_table_specs(),
+                        )
+                finally:
+                    manager.shutdown()
+
+    def test_batch_accepts_resolve_shared_memory_that_fits(self) -> None:
+        # Three token-sized units round up to a full 128-unit cell.
+        manager = self._manager(max_cached_units=3, unit_tokens=1)
+        batch = None
+        try:
+            batch = Batch(
+                manager,
+                NULL_STREAM,
+                max_batch_size=1,
+                max_blocks_per_seq=4,
+                index_tables=manager.sparse_index_table_specs(),
+            )
+            self.assertEqual(batch.max_batch_size, 1)
+        finally:
+            del batch
+            manager.shutdown()
 
     def _free_delta_across_resume(self, max_cached_units: int) -> int:
         """GPU slots a single resume consumes, for the given cache width."""

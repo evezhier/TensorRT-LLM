@@ -1956,6 +1956,8 @@ void Batch::_buildSparseArenas()
             .cellsPerBuffer = cellsPerBuffer,
             .layerSelection = mManager->_sparseLayerSelection(lcId),
         };
+        (void) checkedSparseResolveSharedBytes(shape.entriesPerSelection, mManager->_sparseCacheSelectionWidth(lcId),
+            mManager->_sparseCacheMaxInFlightUnits(lcId));
 
         // The arena mirrors the hot pool group: one region per pool the life cycle's sparse
         // buffers draw on, sized by that pool's cell and the buffers sharing it.

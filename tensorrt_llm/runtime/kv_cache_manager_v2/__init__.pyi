@@ -286,41 +286,27 @@ class BufferConfig:
     buffers group on ``(size, is_sparse)``, so one layer's buffers may land in both. A group
     holds whichever its buffers grouped into, and reports GPU memory either way. A pool
     group must hold at least one non-sparse pool, since slot counts are sized from device
-    bytes; a wholly sparse layer is refused by the ``KVCacheManager`` constructor.
+    bytes; a wholly sparse pool group is refused by the ``KVCacheManager`` constructor.
+    A wholly sparse layer is allowed when its group also contains dense buffers from
+    another layer.
 
-    All device residency is a per-request lease on the life cycle's cache arena -- a
-    dedicated allocation, not a storage tier. Both the unit being written and the history a
-    step selects are cells in it. ``max_cached_units`` is the whole cache, counting both
-    populations, and the lease follows from it alone. The two never overlap: the selection
-    is below the watermark, everything in flight is above it. Only one unit is ever in
-    flight, because a request contributes one query token per step, so the surplus above the
-    selection width is retention rather than headroom.
+    The layer's :attr:`AttentionLayerConfig.sparse_cache` configures its fetch path,
+    including selection width, cache capacity and unit size. Without it, sparse storage
+    and locking still work, but the buffer has no GPU cache to read through.
 
-    A lease is one contiguous run of buffer-sized cells, so an entry is a
-    ``(buffer, entry index)`` pair resolved to a cell by arithmetic alone -- no page table
-    and no slot indirection. :meth:`KVCacheManager.fetch_sparse_pages` fills the cells a
-    step selects.
+    Device residency is a lease on the life cycle's arena owned by a :class:`Batch`.
+    Each Batch row has one lease, held by its seated request. Both the unit being written
+    and the selected history occupy cells in it. The selection is below the watermark;
+    the single unit in flight is above it and cannot be evicted.
 
-    Two to four times ``num_selected_blocks`` is the usual starting point: a cache only as
-    wide as the selection retains nothing between steps, and retention of units not selected
-    this step is where the hit rate comes from. ``max_cached_units`` must exceed
-    ``num_selected_blocks``, since equality would leave no cell for the unit being written.
+    A lease holds contiguous runs of buffer-sized cells, addressed by arithmetic from
+    the buffer and entry index. :meth:`Batch.fetch_sparse_pages` fills selected units.
+    ``sparse_unit_chunks``, the layer's ``sparse_cache.unit_tokens`` and the buffer's
+    size determine where each unit's bytes are in a densely packed page.
 
-    Both default to zero, meaning the fetch path is not configured for this buffer; sparse
-    storage and locking work without them.
-
-    ``sparse_unit_layout`` tells the manager where a selection unit's bytes are. It is
-    required once ``max_cached_units`` is set, because a cell that cannot be located can be
-    neither filled nor written back.
-
-    A block's data reaches its page by a write-back that leaves the cell cached and
-    merely stops pinning it. A block must be written back before it can be selected, so
-    :meth:`_KVCache.resize` is both the deadline and the only place it happens -- that being
-    the one call through which the watermark ever moves. ``commit()`` is not a separate
-    write-back site: a committed block is already at or below the watermark, and where
-    ``commit()`` advances the watermark it calls :meth:`_KVCache.resize`. A cell is
-    evictable exactly when its unit is below the watermark, which is what protects the block
-    still being written.
+    :meth:`Batch.flush_sparse_units` writes completed units back to their host pages
+    before :meth:`_KVCache.resize` advances history or the request leaves its Batch.
+    The flush leaves the cells cached; advancing history makes them evictable.
 
     Fixed at construction: the storage layout derived from it is built once.
     """
@@ -352,15 +338,18 @@ class BufferConfig:
 class SparseCacheConfig:
     """One layer's sparse fetch path.
 
-    Per layer rather than per buffer because every sparse buffer of a layer shares one
-    resolve, one resident set and one recency order: the metadata is laid out
-    ``[layer][entry]``, and a selection names units for all of them at once. Declaring
-    these per buffer would let two of them disagree with nothing to reconcile it.
+    Every sparse buffer of a layer shares one resolve, one resident set and one recency
+    order. Within each Batch row's lease, metadata is laid out ``[selection][entry]``.
+    Layers with the same ``selection_id`` share that metadata while keeping separate
+    data cells; otherwise each layer has its own selection.
 
     Its presence is what configures the fetch path. A sparse buffer in a layer without it
     still gets sparse storage and locking; it simply has no GPU cache to read through.
 
-    Layers sharing a life cycle must declare the same values -- they share one arena.
+    Layers sharing a life cycle must agree on width, capacity and unit size, since they
+    share one arena; their ``selection_id`` values may differ. Batch construction checks
+    the rounded cache capacity and selection width against the resolve kernel's available
+    shared memory on the current device.
     """
 
     num_selected_blocks: int
@@ -757,14 +746,14 @@ class _KVCache:
 
         **One token**, and read-only, because it is a consequence of the supported shape
         rather than of how wide a cache is. A sparse request contributes exactly one query
-        token per step: :meth:`KVCacheManager.fetch_sparse_pages` resolves one selection
+        token per step: :meth:`Batch.fetch_sparse_pages` resolves one selection
         per request, while an attention kernel indexes its selection per query token, and
         the two agree only at one token each. Prefill and speculative decoding give a
         request several query tokens per step and are out of scope; this bound is the guard
         that keeps them out.
 
         It follows that at most one unit is ever in flight, so essentially all of
-        :attr:`BufferConfig.max_cached_units` is available to the selection rather than
+        :attr:`SparseCacheConfig.max_cached_units` is available to the selection rather than
         being reserved as headroom.
         """
 
@@ -1062,9 +1051,9 @@ class Batch:
 
         Takes the sparse cache arena lease, because membership is what being stepped means:
         a resumed request that is not seated cannot fetch, and a disaggregated one receives
-        its whole history into host pages without touching the cache. The arena is sized
-        from the same ``constraints`` the rows come from, so a free row always has a free
-        lease and this cannot fail for want of one.
+        its whole history into host pages without touching the cache. The arena has one
+        lease per Batch row, so a free row always has a free lease and this cannot fail
+        for want of one.
 
         So seat a request only once it is ready to be stepped: one still receiving its
         disaggregated history, or sitting a step out, costs the arena nothing while it stays
@@ -1322,9 +1311,10 @@ class Batch:
         evict it, and a fetch never copies over it: a unit at or above the watermark has no
         written-back host page, so there is nothing it could be refilled from.
 
+        The Batch's published rows own the arena leases; each seated cache uses its row's
+        lease until it leaves the Batch.
+
         Args:
-            batch: whose watermarks and cache views are published. A row's cache must hold
-                the reservation taken at :meth:`_KVCache.resume`.
             buffers: exactly one layer's sparse buffers, in the cache's order -- the same
                 rule and the same order as :meth:`fetch_sparse_pages`.
             out: int32 ``[batch.max_batch_size, len(buffers)]``. ``out[b][s]`` is the index
@@ -1337,7 +1327,7 @@ class Batch:
                 is ever in flight.
 
                 ``BAD_PAGE_INDEX`` is an ordinary outcome, not an error. A unit is in flight
-                only once it is whole: with ``tokens_per_block_override`` of 4, that is one
+                only once it is whole: with ``SparseCacheConfig.unit_tokens`` of 4, that is one
                 step in four, which is also the only step on which a ratio-4 compressor has
                 produced anything to write. With one token per unit it is every step.
             stream: the CUDA stream to enqueue on.
@@ -1350,8 +1340,8 @@ class Batch:
         Call it after publication and before the model's KV writes, ordering the two
         through the stream. Regenerate the output whenever a watermark or a reservation
         changes, and keep it unmodified until its consumers are done. Complete the writes
-        before advancing history through :meth:`_KVCache.resize`, which is what writes a
-        finished unit back to its host page.
+        before :meth:`flush_sparse_units` writes a finished unit back to its host page,
+        then advance history through :meth:`_KVCache.resize`.
 
         Device-driven and stream-ordered, with static shapes, so a CUDA graph can capture
         it.
@@ -1407,7 +1397,7 @@ class Batch:
         second resolve read the first's admissions as hits, issue no copies, and leave
         the second layer's cells unfilled; it raises rather than doing that.
 
-        ``selected`` holds block ordinals, ``topk`` uniform across requests and ``-1``
+        ``selected`` holds selection-unit ordinals, ``topk`` uniform across requests and ``-1``
         past a request's valid count. The page table and the per-request count of
         eligible blocks come from ``batch``, whose row order ``selected`` and ``out``
         both inherit.
@@ -1422,10 +1412,10 @@ class Batch:
         Each selected unit is looked up in the owning request's cache for that layer.
         A hit is reused in place; a miss is copied from the locked host page into a slot
         taken from the free list, evicting least-recently-used when it is empty.
-        Reservation at :meth:`_KVCache.resume` guarantees room for a full selection
-        width, so a fetch always satisfies its own layer, and within a step a fetch may
-        evict entries of layers already processed but never one a later kernel still
-        needs.
+        The Batch row's lease guarantees room for a full selection and the in-flight
+        unit. Eviction is local to this selection's resident set; it cannot evict another
+        selection's entries. Layers sharing a ``selection_id`` use the split resolve/fetch
+        calls described above and keep their cells in matching slots.
 
         Copies leave the host page authoritative rather than moving it, so evicting a
         fetched cell moves no data. The copies are a snapshot, which is sound only because a

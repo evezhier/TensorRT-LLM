@@ -745,7 +745,6 @@ def solve_sparse_offload_capacity(
     *,
     num_tokens: int,
     max_batch_size: int,
-    max_admissible_sequences: int,
     gpu_pool_bytes: int,
     host_pool_bytes: int,
     host_budget_bytes: int,
@@ -760,10 +759,7 @@ def solve_sparse_offload_capacity(
 
     Args:
         num_tokens: Tokens per request.
-        max_batch_size: The configured batch limit.
-        max_admissible_sequences: Requests that hold a lease at once, excluding
-            padding requests: a batch slot holds two when a retiring or
-            receiving request keeps its lease beside the next one.
+        max_batch_size: The configured batch limit, the rows of the Batch.
         gpu_pool_bytes: Device bytes of the KV pools.
         host_pool_bytes: Host bytes of the host-backed pools the manager allocated.
         host_budget_bytes: Host bytes offloaded history may take.
@@ -772,7 +768,9 @@ def solve_sparse_offload_capacity(
             does not grow with length.
         host_bytes_per_request: Host history bytes one request holds.
         arenas: The arena of each sparse life cycle.
-        num_leases: Leases each arena holds.
+        num_leases: Leases each arena holds. A cache holds a lease only while it
+            is seated in the Batch, so this is ``max_batch_size``; any beyond it
+            are padding.
         batch_buffer_bytes: Device bytes of the buffers sized for
             ``max_batch_size`` rows, reserved apart from ``gpu_pool_bytes``.
     """
@@ -787,15 +785,14 @@ def solve_sparse_offload_capacity(
     }
     # The device budget pays for the pools, the arena and the buffers sized for
     # max_batch_size rows. The arena's shared tables and padding leases are
-    # fixed; every batch slot adds a request's pages, the leases that slot holds
-    # and its rows of those buffers.
-    leases_per_slot = max(1, max_admissible_sequences // max(1, max_batch_size))
-    padding_leases = max(0, num_leases - max_admissible_sequences)
+    # fixed; every batch slot adds a request's pages, the one lease its seated
+    # cache holds and its rows of those buffers.
+    padding_leases = max(0, num_leases - max_batch_size)
     fixed_arena_bytes = sum(arena.arena_bytes(padding_leases) for arena in arenas)
     batch_bytes_per_slot = ceil_div(batch_buffer_bytes, max(1, max_batch_size))
     recommended = min(
         max(0, gpu_pool_bytes + arena_bytes + batch_buffer_bytes - fixed_arena_bytes)
-        // (gpu_bytes_per_request + leases_per_slot * lease_bytes + batch_bytes_per_slot),
+        // (gpu_bytes_per_request + lease_bytes + batch_bytes_per_slot),
         host_budget_bytes // host_bytes_per_request,
     )
     return SparseOffloadCapacity(

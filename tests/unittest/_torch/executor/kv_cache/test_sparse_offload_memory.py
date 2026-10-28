@@ -648,7 +648,6 @@ def _v4_flash_capacity(**overrides):
     kwargs = dict(
         num_tokens=1 << 17,
         max_batch_size=256,
-        max_admissible_sequences=512,
         gpu_pool_bytes=100 << 30,
         # The host pool holds 4,096 blocks: four requests of 128K tokens.
         host_pool_bytes=4096 * V4_FLASH_HOST_BYTES_PER_BLOCK,
@@ -658,7 +657,8 @@ def _v4_flash_capacity(**overrides):
         fixed_gpu_bytes_per_request=81_657_856,
         host_bytes_per_request=1024 * V4_FLASH_HOST_BYTES_PER_BLOCK,
         arenas=[V4_FLASH_ARENA],
-        num_leases=513,
+        # One lease per Batch row.
+        num_leases=256,
         batch_buffer_bytes=V4_FLASH_BATCH_BUFFER_BYTES,
     )
     kwargs.update(overrides)
@@ -673,49 +673,66 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert capacity.limited_by == "host"
     assert capacity.fits == 4
     assert capacity.lease_bytes == 7_362_688
-    assert capacity.arena_bytes == V4_FLASH_ARENA.arena_bytes(513)
+    assert capacity.arena_bytes == V4_FLASH_ARENA.arena_bytes(256)
     # The 50 GiB host budget holds 240 requests of 128K tokens; the GPU budget
-    # would hold more even with two leases per request.
+    # would hold more.
     assert capacity.recommended_max_batch_size == 240
     report = capacity.describe()
     assert "4 by host" in report
     assert "limited by host" in report
-    assert "513 leases" in report
+    assert "256 leases" in report
     assert "offload buffers 157.0MiB for 256 rows" in report
     assert "A max_batch_size of 240 fits" in report
 
 
 @pytest.mark.cpu_only
-def test_capacity_recommendation_charges_every_lease_a_batch_slot_holds() -> None:
+@pytest.mark.parametrize("padding_leases", [0, 1])
+def test_capacity_recommendation_charges_a_batch_slot_one_lease(padding_leases: int) -> None:
+    # A cache holds a lease only while it is seated in the Batch, so each slot
+    # holds one, even on a disaggregated or overlap worker where the index mapper
+    # admits two requests per slot.
     lease_bytes = V4_FLASH_ARENA.lease_bytes
     gpu_bytes_per_request = 81_657_856 + 1024 * 52_176
-    # Ten batch slots, each holding two leases, plus one padding lease.
+    # Ten batch slots of one lease each, plus any padding leases.
     budget = (
-        10 * (gpu_bytes_per_request + 2 * lease_bytes)
-        + V4_FLASH_ARENA.arena_bytes(1)
-        - V4_FLASH_ARENA.arena_bytes(21)
+        10 * (gpu_bytes_per_request + lease_bytes)
+        + V4_FLASH_ARENA.arena_bytes(padding_leases)
+        - V4_FLASH_ARENA.arena_bytes(10 + padding_leases)
     )
     capacity = _v4_flash_capacity(
-        gpu_pool_bytes=budget, host_budget_bytes=1 << 50, num_leases=21, batch_buffer_bytes=0
+        max_batch_size=10,
+        gpu_pool_bytes=budget,
+        host_budget_bytes=1 << 50,
+        num_leases=10 + padding_leases,
+        batch_buffer_bytes=0,
     )
-
     assert capacity.recommended_max_batch_size == 10
+
+    short = _v4_flash_capacity(
+        max_batch_size=10,
+        gpu_pool_bytes=budget - 1,
+        host_budget_bytes=1 << 50,
+        num_leases=10 + padding_leases,
+        batch_buffer_bytes=0,
+    )
+    assert short.recommended_max_batch_size == 9
 
 
 @pytest.mark.cpu_only
 def test_capacity_recommendation_charges_every_batch_slot_its_rows_of_offload_buffers() -> None:
     gpu_bytes_per_request = 81_657_856 + 1024 * 52_176
-    # 1 MiB of offload buffers per row, sized for 256 rows.
-    slot_bytes = gpu_bytes_per_request + 2 * V4_FLASH_ARENA.lease_bytes + (1 << 20)
+    # 1 MiB of offload buffers per row, sized for 16 rows.
+    slot_bytes = gpu_bytes_per_request + V4_FLASH_ARENA.lease_bytes + (1 << 20)
     # Device memory for ten batch slots, the arena's shared tables and the
     # offload buffers, of which the pools get what the rest leaves.
     budget = 10 * slot_bytes + V4_FLASH_ARENA.arena_bytes(0)
-    gpu_pool_bytes = budget - V4_FLASH_ARENA.arena_bytes(21) - (256 << 20)
+    gpu_pool_bytes = budget - V4_FLASH_ARENA.arena_bytes(16) - (16 << 20)
     capacity = _v4_flash_capacity(
+        max_batch_size=16,
         gpu_pool_bytes=gpu_pool_bytes,
         host_budget_bytes=1 << 50,
-        num_leases=21,
-        batch_buffer_bytes=256 << 20,
+        num_leases=16,
+        batch_buffer_bytes=16 << 20,
     )
 
     assert capacity.recommended_max_batch_size == 10

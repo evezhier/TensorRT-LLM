@@ -209,10 +209,10 @@ struct BufferConfig
 // ---------------------------------------------------------------------------
 // SparseCacheConfig — one layer's sparse fetch path.
 //
-// Per layer rather than per buffer because every sparse buffer of a layer shares one
-// resolve, one resident set and one recency order: the metadata is laid out [layer][entry],
-// and a selection names units for all of them at once. Declaring these per buffer would let
-// two of them disagree with nothing to reconcile it.
+// Every sparse buffer of a layer shares one resolve, one resident set and one recency
+// order. Each Batch row's lease holds [selection][entry] metadata: layers sharing a
+// selectionId share this metadata while keeping separate data cells; otherwise each
+// layer has its own selection.
 //
 // Its presence is what configures the fetch path. A sparse buffer in a layer without it
 // still gets sparse storage and locking; it simply has no GPU cache to read through.
