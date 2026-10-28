@@ -198,7 +198,10 @@ void KvCacheManager::_computeSparseCacheShape()
         bool layerCounted = false;
         for (auto const& buf : attn->buffers)
         {
-            if (!buf.isSparse)
+            // A zero-size buffer has no layout and never reaches storage, so the plan below
+            // has no entry for it. Counting it here would size this metadata for a buffer
+            // nothing writes.
+            if (!buf.isSparse || buf.size == 0)
             {
                 continue;
             }
@@ -293,7 +296,9 @@ std::vector<SparseBufferPlan> KvCacheManager::_sparseBufferPlan(LifeCycleId life
         {
             // A sparse buffer in a layer with no sparse_cache has storage and locking but
             // no fetch path, so it contributes no cells and no layout.
-            if (!buf.isSparse || !attn->sparseCache.has_value())
+            // Zero-size as in _computeSparseCacheShape: no layout to derive, and
+            // sparseLayout() rejects one rather than inventing it.
+            if (!buf.isSparse || buf.size == 0 || !attn->sparseCache.has_value())
             {
                 continue;
             }

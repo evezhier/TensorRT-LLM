@@ -376,10 +376,12 @@ public:
     //! before it can be selected, and selectable means below the watermark; resize() refuses
     //! a history this has not covered.
     //!
-    //! Bounded by the capacity each row started from, not by how far history travels: only
-    //! a unit that was in flight has a cell holding its one copy, so a resumed request
-    //! moving history across a whole prompt writes back nothing. A move wider than the
-    //! in-flight headroom is refused, because the per-row flush list is sized for one.
+    //! Bounded by what was in flight, not by how far history travels: only a unit that was
+    //! in flight has a cell holding its one copy, so a resumed request moving history across
+    //! a whole prompt writes back nothing. What is refused is a batch whose rows together
+    //! cross more units than the write-back list can name -- the list is one per layer and
+    //! compacted across rows, sized from `maxTotalInputTokens`, so one prefilling row may
+    //! use the budget several decoding rows leave unspent.
     //!
     //! Reads the index table as of the last publish, which covers the blocks in range for
     //! the same reason -- they were allocated by an earlier step.

@@ -830,6 +830,14 @@ class TestSparseBufferConfig(unittest.TestCase):
             layers=[layer],
         )
         self.assertEqual([b.is_sparse for b in config.layers[0].buffers], [True, False])
+        # Built, not just configured: the pool grouping that has to tolerate the mix runs
+        # during construction, so a config-only check would pass even if storage refused it.
+        manager = KVCacheManager(config)
+        try:
+            self.assertTrue(manager.is_sparse(0, "key"))
+            self.assertFalse(manager.is_sparse(0, "value"))
+        finally:
+            manager.shutdown()
 
 
 class TestSparseTierFlexibility(unittest.TestCase):
@@ -3115,10 +3123,11 @@ class TestIndexTables(unittest.TestCase):
                 batch.publish()
                 batch.wait_published()
         finally:
-            if batch is not None and cache is not None:
+            if batch is not None and cache is not None and batch.row_of(cache) is not None:
                 batch.remove_kv_cache(cache)
             if cache is not None:
                 cache.close()
+            manager.shutdown()
 
     def test_scratch_blocks_match_the_reference_converter(self):
         """The substituting path, against PageIndexConverter given the same scratch range.
@@ -3319,8 +3328,11 @@ class TestIndexTables(unittest.TestCase):
                 self.assertTrue(cache.resize(prompt_len))
                 self.assertTrue(cache.has_scratch_slots, "config produced no scratch")
 
+                # Seating is outside the assertion: the claim is that the batch takes the
+                # member and publish() is what refuses it, which a block covering both
+                # would not tell apart.
+                batch.add_kv_cache(cache)
                 with self.assertRaises(RuntimeError) as caught:
-                    batch.add_kv_cache(cache)
                     batch.publish()
                 self.assertIn("SHARED life cycle", str(caught.exception))
         finally:
@@ -5151,7 +5163,10 @@ class TestBatch(unittest.TestCase):
             manager.shutdown()
 
     def test_move_carries_bindings_and_watermarks_to_the_empty_row(self) -> None:
-        import torch
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to pass device arrays")
 
         manager = self._manager()
         caches = []

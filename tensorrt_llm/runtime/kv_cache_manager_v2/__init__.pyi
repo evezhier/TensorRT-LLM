@@ -704,7 +704,7 @@ class _KVCache:
     def num_blocks(self) -> int: ...
     @property
     def batch_row(self) -> BatchRow | None:
-        """Row this cache occupies in its :class:`Batch`, or ``-1`` when it belongs to none.
+        """Row this cache occupies in its :class:`Batch`, or ``None`` when it belongs to none.
 
         Also the answer to who owns its page index buffers: a member's are the batch's
         rows, so :meth:`set_base_page_index_buf` refuses and ``suspend()`` leaves them
@@ -1157,7 +1157,7 @@ class Batch:
         """
 
     def row_of(self, kv_cache: _KVCache) -> BatchRow | None:
-        """Row of a member, or ``-1``."""
+        """Row of a member, or ``None`` when it is not seated."""
 
     def __getitem__(self, row: BatchRow) -> _KVCache | None:
         """The member seated in ``row``, or ``None`` when that row is free.
