@@ -684,6 +684,13 @@ def _create_py_executor(
             "generation servers; aggregated serving with Helix is not "
             "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
             "development only).")
+    if (is_decode_only(llm_args.sparse_attention_config)
+            and not is_disagg_enabled(cache_transceiver_config)):
+        raise NotImplementedError(
+            "Sparse KV cache offload runs only on disaggregated generation "
+            "servers: it admits one input token per request per step, so it "
+            "cannot serve context requests. Set cache_transceiver_config, or "
+            "disable sparse_attention_config.enable_kv_cache_offload.")
 
     has_spec_drafter = False
     if spec_config is not None:

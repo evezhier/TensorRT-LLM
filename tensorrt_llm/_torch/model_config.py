@@ -1229,6 +1229,7 @@ class ModelConfig(Generic[TConfig]):
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
                         use_gvr_emission = sparse_attention_config.use_gvr_emission
+                        gvr_deterministic_topk = sparse_attention_config.gvr_deterministic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                         offload_kwargs = {
@@ -1250,6 +1251,7 @@ class ModelConfig(Generic[TConfig]):
                         enable_heuristic_topk = False
                         use_self_sampling_topk = True
                         use_gvr_emission = False
+                        gvr_deterministic_topk = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
                         offload_kwargs = {}
@@ -1269,6 +1271,7 @@ class ModelConfig(Generic[TConfig]):
                             enable_heuristic_topk=enable_heuristic_topk,
                             use_self_sampling_topk=use_self_sampling_topk,
                             use_gvr_emission=use_gvr_emission,
+                            gvr_deterministic_topk=gvr_deterministic_topk,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration,

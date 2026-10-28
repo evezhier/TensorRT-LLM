@@ -702,11 +702,14 @@ def test_completed_history_advances_without_reuse_or_capacity_growth(tokens_per_
         assert cache.calls == [(None, tokens_per_block - 1)]
         batch.context_requests, batch.generation_requests = [], [request]
         for completed in range(tokens_per_block, 2 * tokens_per_block + 2):
+            # What scheduling records for the step, as try_allocate_generation does.
             manager._allocated_draft_lens[request.py_request_id] = 0
+            manager._inflight_draft_lens.setdefault(request.py_request_id, []).append(0)
             manager.update_forward_resources(batch, wait_for_input_copy=Mock())
             assert cache.history_length == completed
             assert cache.calls[-1] == (None, completed)
             assert request.py_request_id not in manager._allocated_draft_lens
+            assert request.py_request_id not in manager._inflight_draft_lens
             # Sampling has appended one output token; that token has no KV yet.
             request.max_beam_num_tokens = completed + 1
             manager.update_resources(batch)
@@ -4050,12 +4053,13 @@ def test_offload_scratch_counts_both_attention_metadata_copies() -> None:
     manager = _v4_flash_offload_manager()
     config = _v4_flash_offload_config(manager)
 
-    # A copy holds 64 MiB of FP8 rows dequantized from NVFP4, [256, 512, 512], and
-    # int32 indices: the selections [256, 512], the fetch outputs [256, 2, 512] and
-    # write destinations [256, 2] of the data and scale buffers, the scatter start
-    # positions [256], the Batch row map [256] and the active count.
-    per_copy = 256 * 512 * 512 + 4 * (256 * 512 + 256 * 2 * 512 + 256 * 2 + 256 + 256 + 1)
-    assert per_copy == 68_685_828
+    # A copy holds 64 MiB of FP8 rows dequantized from NVFP4, [256, 512, 512], with a
+    # zeroed tail of one FMHA KV tile (128 rows of 512), and int32 indices: the
+    # selections [256, 512], the fetch outputs [256, 2, 512] and write destinations
+    # [256, 2] of the data and scale buffers, the scatter start positions [256], the
+    # Batch row map [256] and the active count.
+    per_copy = (256 * 512 + 128) * 512 + 4 * (256 * 512 + 256 * 2 * 512 + 256 * 2 + 256 + 256 + 1)
+    assert per_copy == 68_751_364
     # The eager attention metadata holds one, and the CUDA graph metadata share one.
     assert manager.get_sparse_offload_scratch_bytes(config) == 2 * per_copy
 

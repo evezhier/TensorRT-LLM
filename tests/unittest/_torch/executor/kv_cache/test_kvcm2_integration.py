@@ -3250,7 +3250,7 @@ def _index_mapper_capacity_for(
     ):
         manager = KVCacheManagerV2(
             # A quota must be set or __init__ asserts; the value is irrelevant here.
-            KvCacheConfig(max_gpu_total_bytes=16 << 20),
+            KvCacheConfig(max_gpu_total_bytes=16 << 20, enable_block_reuse=False),
             CacheType.SELFKONLY,
             num_layers=1,
             num_kv_heads=1,
@@ -3636,7 +3636,7 @@ def _native_config_with_sparse_arena(
         patch.object(KVCacheManagerV2, "_plan_host_history_budget", plan_host_history_budget),
     ):
         KVCacheManagerV2(
-            kv_cache_config or KvCacheConfig(max_gpu_total_bytes=budget),
+            kv_cache_config or KvCacheConfig(max_gpu_total_bytes=budget, enable_block_reuse=False),
             CacheType.SELFKONLY,
             num_layers=1,
             num_kv_heads=1,
@@ -3690,6 +3690,25 @@ def test_offload_allocations_larger_than_the_budget_are_rejected(
         _device_quota_with_sparse_arena(
             arena_bytes=arena_bytes, budget=16 << 20, batch_buffer_bytes=batch_buffer_bytes
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("max_tokens", [4 * TOKENS_PER_BLOCK, 1 << 30])
+def test_max_tokens_sizes_the_pools_beside_the_offload_allocations(max_tokens: int) -> None:
+    # The arena and buffers come out of the device memory budget. max_tokens sizes the
+    # pools alone, so a pool for a few tokens still fits beside a large arena.
+    def quota(arena_bytes: int, batch_buffer_bytes: int) -> int:
+        return _device_quota_with_sparse_arena(
+            arena_bytes=arena_bytes,
+            budget=16 << 20,
+            batch_buffer_bytes=batch_buffer_bytes,
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=16 << 20, max_tokens=max_tokens, enable_block_reuse=False
+            ),
+        )
+
+    pools = quota(0, 0)
+    assert quota(12 << 20, 1 << 20) == min(pools, (16 << 20) - (13 << 20))
 
 
 @pytest.mark.cpu_only
@@ -3779,7 +3798,10 @@ def test_offload_refuses_to_leave_no_room_for_the_automatic_host_tier(
     config = _native_config_with_sparse_arena(
         **kwargs,
         kv_cache_config=KvCacheConfig(
-            max_gpu_total_bytes=16 << 20, disk_cache_size=16 << 20, disk_cache_path=str(tmp_path)
+            max_gpu_total_bytes=16 << 20,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+            enable_block_reuse=False,
         ),
     )
     assert [type(tier) for tier in config.cache_tiers] == [
@@ -3795,7 +3817,9 @@ def test_offload_warns_when_it_runs_without_a_cold_tier() -> None:
             arena_bytes=0,
             budget=16 << 20,
             sparse_kv_offload_config=SparseKvCacheOffloadConfig(),
-            kv_cache_config=KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=0),
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=16 << 20, host_cache_size=0, enable_block_reuse=False
+            ),
         )
 
     assert [type(tier) for tier in config.cache_tiers] == [GpuCacheTierConfig]
@@ -4198,6 +4222,8 @@ def test_free_resources_releases_host_history() -> None:
     manager._fresh_pages_filled = {}
     manager._disagg_receive_ready = {}
     manager._pending_preemption = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
     manager.kv_cache_map = {}
     manager.impl = Mock()
 
@@ -4272,6 +4298,15 @@ def test_sparse_kv_offload_rejects_speculative_decoding() -> None:
             KvCacheConfig(enable_block_reuse=False),
             Mapping(),
             spec_config=MTPDecodingConfig(max_draft_len=1),
+        )
+
+
+@pytest.mark.cpu_only
+def test_sparse_kv_offload_rejects_block_reuse() -> None:
+    # Reuse is on by default, so the check runs before any pool or arena is sized.
+    with pytest.raises(ValueError, match="does not support block reuse"):
+        KVCacheManagerV2._check_sparse_kv_offload_config(
+            SparseKvCacheOffloadConfig(), KvCacheConfig(), Mapping(), spec_config=None
         )
 
 
@@ -4458,7 +4493,7 @@ def test_offload_hands_its_host_budget_to_the_manager(monkeypatch) -> None:
         patch.object(KVCacheManagerV2, "_reserve_guard_page"),
     ):
         KVCacheManagerV2(
-            KvCacheConfig(max_gpu_total_bytes=64 << 20),
+            KvCacheConfig(max_gpu_total_bytes=64 << 20, enable_block_reuse=False),
             CacheType.SELFKONLY,
             num_layers=1,
             num_kv_heads=1,

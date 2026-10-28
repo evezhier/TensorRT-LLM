@@ -549,10 +549,23 @@ def get_host_memory_limits(mapping: Mapping) -> HostMemoryLimits:
     import resource
 
     local_ranks = max(1, Distributed.get(mapping).local_world_size)
+    # MemAvailable counts the page cache that pinning reclaims. Weights read at startup
+    # fill it, so free pages alone can understate usable memory by hundreds of GiB.
+    mem_available = None
     try:
-        mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
-    except (ValueError, OSError):
-        mem_available = float("inf")
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    mem_available = int(line.split()[1]) * 1024
+                    break
+    except (OSError, IndexError, ValueError):
+        pass
+    if mem_available is None:
+        # Kernels before 3.14 and non-Linux hosts do not publish MemAvailable.
+        try:
+            mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+        except (ValueError, OSError):
+            mem_available = float("inf")
     try:
         soft_limit, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
         memlock_limit = soft_limit if soft_limit != resource.RLIM_INFINITY else float("inf")
@@ -2064,23 +2077,9 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             quota = int(kv_cache_config.max_gpu_total_bytes)
             logger.info(f"max_gpu_total_bytes is provided. New quota is {quota / (1 << 30)}GiB")
-        if kv_cache_config.max_tokens is not None:
-            quota_from_max_tokens = int(
-                math.ceil(
-                    self._get_quota_from_max_tokens(kv_cache_config.max_tokens)
-                    / max_util_for_resume
-                )
-            )
-            quota = min(quota, quota_from_max_tokens)
-            logger.info(
-                f"max_tokens {kv_cache_config.max_tokens} is provided. "
-                f"Allowed quota from max_tokens is {quota_from_max_tokens / (1 << 30)}GiB. "
-                f"New quota is {quota / (1 << 30)}GiB"
-            )
 
-        # Taken from whichever budget bound above, rather than from max_gpu_total_bytes
-        # alone: the arenas and buffers sit beside the pools either way, so a quota that
-        # came from max_tokens has to pay for them too.
+        # The arenas and buffers sit beside the pools, so they come out of the device
+        # memory budget. max_tokens below sizes the pools alone and does not pay for them.
         if reserved_bytes > 0 and quota < sys.maxsize:
             reserved = (
                 f"{reserved_arena_bytes / (1 << 30):.2f}GiB of sparse cache arena for "
@@ -2101,6 +2100,19 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"Reserved {reserved} from the device KV budget. "
                     f"New quota is {quota / (1 << 30)}GiB"
                 )
+        if kv_cache_config.max_tokens is not None:
+            quota_from_max_tokens = int(
+                math.ceil(
+                    self._get_quota_from_max_tokens(kv_cache_config.max_tokens)
+                    / max_util_for_resume
+                )
+            )
+            quota = min(quota, quota_from_max_tokens)
+            logger.info(
+                f"max_tokens {kv_cache_config.max_tokens} is provided. "
+                f"Allowed quota from max_tokens is {quota_from_max_tokens / (1 << 30)}GiB. "
+                f"New quota is {quota / (1 << 30)}GiB"
+            )
 
         assert quota < sys.maxsize, (
             "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
@@ -6595,6 +6607,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Sparse KV cache offload does not support speculative decoding: a sparse cache "
                 "takes one input token per decode step. Remove speculative_config or disable "
                 "sparse_attention_config.enable_kv_cache_offload."
+            )
+        elif kv_cache_config.enable_block_reuse:
+            error = ValueError(
+                "Sparse KV cache offload does not support block reuse: offloaded history lives "
+                "in host-backed pools that reuse cannot share. Set "
+                "kv_cache_config.enable_block_reuse=False."
             )
         elif host_history_size is not None:
             limits = get_host_memory_limits(mapping)

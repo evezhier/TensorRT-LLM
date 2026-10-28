@@ -33,7 +33,12 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
     DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import DeepseekV4AttentionType
-from tensorrt_llm._torch.attention.backends.sparse.offload import _SparseBatchMember
+from tensorrt_llm._torch.attention.backends.sparse.offload import (
+    NVFP4_SCRATCH_TAIL_ROWS,
+    SparseOffloadState,
+    _SparseBatchMember,
+    allocate_sparse_offload_state,
+)
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm.bindings import DataType
@@ -132,6 +137,35 @@ def test_sparse_metadata_uses_native_capacity_and_configured_width():
     assert state.batch_rows.shape == (4,) and (state.batch_rows == -1).all()
     assert state.history_lengths is None and state.batch is None
     assert (state.selected_history_units == -1).all()
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_scratch_keeps_a_zeroed_tail_past_its_rows():
+    """The sparse MLA FMHA can read one KV tile past the last row its indices name."""
+    allocated = {}
+
+    def allocate(name, shape, dtype):
+        if dtype.itemsize == 1:
+            tensor = torch.full(shape, 0x7F, dtype=torch.uint8).view(dtype)
+        else:
+            tensor = torch.empty(shape, dtype=dtype)
+        allocated[name] = tensor
+        return tensor
+
+    layers = {2: SimpleNamespace(buffer_ids=(None, None))}
+    state = allocate_sparse_offload_state(
+        allocate, layers, max_batch_size=4, topk=8, nvfp4_head_dim=512
+    )
+    rows = 4 * 8
+    flat = allocated["nvfp4_scratch"]
+    assert flat.shape == (rows + NVFP4_SCRATCH_TAIL_ROWS, 512)
+    assert state.nvfp4_scratch.shape == (4, 8, 512)
+    assert state.nvfp4_scratch.data_ptr() == flat.data_ptr()
+    assert (flat[:rows].view(torch.uint8) == 0x7F).all()
+    assert (flat[rows:].view(torch.uint8) == 0).all()
+    assert SparseOffloadState.device_bytes(
+        max_batch_size=4, topk=8, buffer_counts={2}, nvfp4_head_dim=512
+    ) == sum(tensor.numel() * tensor.element_size() for tensor in allocated.values())
 
 
 @pytest.mark.cpu_only

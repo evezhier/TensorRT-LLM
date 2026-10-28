@@ -55,6 +55,11 @@ if TYPE_CHECKING:
 # graph metadata, which share theirs through the graph buffer pool.
 SPARSE_OFFLOAD_STATE_COPIES = 2
 
+# The sparse MLA FMHA reads the NVFP4 scratch as its aux KV pool and can read up to
+# one KV tile (128 rows) past the last row its indices name (https://nvbugs/6796296),
+# so the scratch carries a zeroed tail of that many rows.
+NVFP4_SCRATCH_TAIL_ROWS = 128
+
 
 @dataclass(frozen=True, slots=True)
 class SparseOffloadPaddingRegion:
@@ -181,7 +186,8 @@ class SparseOffloadState:
         index_entries += sum(max_batch_size * count * (topk + 1) for count in buffer_counts)
         nvfp4_bytes = 0
         if nvfp4_head_dim is not None:
-            nvfp4_bytes = max_batch_size * topk * nvfp4_head_dim * torch.float8_e4m3fn.itemsize
+            nvfp4_rows = max_batch_size * topk + NVFP4_SCRATCH_TAIL_ROWS
+            nvfp4_bytes = nvfp4_rows * nvfp4_head_dim * torch.float8_e4m3fn.itemsize
         return index_entries * torch.int32.itemsize + nvfp4_bytes
 
 
@@ -209,6 +215,14 @@ def allocate_sparse_offload_state(
         tensor.fill_(value)
         return tensor
 
+    def nvfp4_scratch(head_dim: int) -> torch.Tensor:
+        rows = max_batch_size * topk
+        flat = allocate(
+            "nvfp4_scratch", (rows + NVFP4_SCRATCH_TAIL_ROWS, head_dim), torch.float8_e4m3fn
+        )
+        flat[rows:].zero_()
+        return flat[:rows].view(max_batch_size, topk, head_dim)
+
     buffer_counts = sorted({len(descriptor.buffer_ids) for descriptor in layers.values()})
     return SparseOffloadState(
         layers=layers,
@@ -228,11 +242,7 @@ def allocate_sparse_offload_state(
             for count in buffer_counts
         },
         scatter_start_positions=index_tensor("scatter_start_positions", (max_batch_size,), 0),
-        nvfp4_scratch=(
-            allocate("nvfp4_scratch", (max_batch_size, topk, nvfp4_head_dim), torch.float8_e4m3fn)
-            if nvfp4_head_dim is not None
-            else None
-        ),
+        nvfp4_scratch=nvfp4_scratch(nvfp4_head_dim) if nvfp4_head_dim is not None else None,
     )
 
 
@@ -701,6 +711,12 @@ class SparseOffloadCacheMixin:
                     f"to {history_length} tokens after model forward"
                 )
             self._allocated_draft_lens.pop(request_id, None)
+            # This step's allocation is settled here rather than in update_resources.
+            inflight = self._inflight_draft_lens.get(request_id)
+            if inflight:
+                inflight.pop(0)
+                if not inflight:
+                    del self._inflight_draft_lens[request_id]
         self._sparse_batch_prepared = False
 
     def update_resources(

@@ -2915,14 +2915,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
-        # Left unresolved here: the presentation below swaps in the token-major block
-        # table, and this call addresses its rows. A latent write target brings its own
-        # table, which the presentation does not touch.
-        block_offsets = None
-        pool_pointers = metadata.kv_cache_manager.kv_cache_pool_pointers
-        pool_mapping = metadata.kv_cache_manager.kv_cache_pool_mapping
-        layer_idx = self.get_local_layer_idx(metadata)
-        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
         if latent_write_target is not None:
             if metadata._helix_spec_tokens_valid or kv_norm_weight is not None:
                 raise NotImplementedError(
@@ -2932,11 +2924,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # Each request's one-token page is the target row; the per-token slot
             # 0 addresses it, and -1 skips the token.
             helix_tensor_params.append(latent_write_target.write_slots)
-            block_offsets = latent_write_target.block_offsets
-            pool_pointers = latent_write_target.pool_pointers
-            pool_mapping = latent_write_target.pool_mapping
-            layer_idx = 0
-            tokens_per_block = 1
         elif metadata._helix_spec_tokens_valid:
             # Speculative verify groups: per-token KV write slots (-1 = this
             # rank does not own the token's position). The append kernel then
@@ -2948,16 +2935,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # from a single scalar seq_len, which only describes a batch where every
         # request contributes the same number of tokens.
         with self.presented_token_major_for(metadata):
-            if block_offsets is None:
-                block_offsets = metadata.kv_cache_block_offsets
             self._mla_rope_generation_impl(
-                metadata, fused_q, q_pe, latent_cache, cu_q_seqlens,
-                cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                mla_bmm2_scale, quant_q_buffer, out_scale, helix_tensor_params,
-                kv_norm_weight, kv_norm_eps, precomputed_cu_seqlens,
-                precomputed_fmha_scheduler, kv_only, kv_done_elsewhere,
-                quant_scale_qkv, q_rope_applied, block_offsets, pool_pointers,
-                pool_mapping, layer_idx, tokens_per_block)
+                metadata,
+                fused_q,
+                q_pe,
+                latent_cache,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                quant_q_buffer,
+                out_scale,
+                helix_tensor_params,
+                kv_norm_weight,
+                kv_norm_eps,
+                precomputed_cu_seqlens,
+                precomputed_fmha_scheduler,
+                kv_only,
+                kv_done_elsewhere,
+                quant_scale_qkv,
+                q_rope_applied,
+                latent_write_target=latent_write_target)
 
     @contextlib.contextmanager
     def presented_token_major_for(
@@ -2987,12 +2986,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_done_elsewhere: bool,
         quant_scale_qkv: Optional[torch.Tensor],
         q_rope_applied: bool,
-        block_offsets: torch.Tensor,
-        pool_pointers: torch.Tensor,
-        pool_mapping: torch.Tensor,
-        layer_idx: int,
-        tokens_per_block: int,
+        latent_write_target: Optional[MlaLatentWriteTarget] = None,
     ) -> None:
+        if latent_write_target is None:
+            # Read under the caller's presentation: a ragged verify batch
+            # presents a token-major block table, one row per token.
+            block_offsets = metadata.kv_cache_block_offsets
+            pool_pointers = metadata.kv_cache_manager.kv_cache_pool_pointers
+            pool_mapping = metadata.kv_cache_manager.kv_cache_pool_mapping
+            layer_idx = self.get_local_layer_idx(metadata)
+            tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+        else:
+            block_offsets = latent_write_target.block_offsets
+            pool_pointers = latent_write_target.pool_pointers
+            pool_mapping = latent_write_target.pool_mapping
+            layer_idx = 0
+            tokens_per_block = 1
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
             q_pe,
