@@ -1,0 +1,154 @@
+{
+  "scope": "Unprofiled 32K/160 3:1 runs after the residency fix. Context prefix reuse is enabled with repeated synthetic prompts; these are not fresh unique 32K-prefill rates.",
+  "definition": "KV-ready means the context request's kv_cache_transfer_start timestamp, before transfer. Central window is 10% through 90% of the first-to-last KV-ready interval; all three workers use the same window.",
+  "modes": {
+    "resident": {
+      "requests": 4096,
+      "workers": [
+        {
+          "source_file": "perf_metrics-context-umb-b200-260-82623-20261019T051624Z.jsonl",
+          "requests": 1365,
+          "central_window_ready_requests": 1085,
+          "central_window_ready_requests_per_second": 7.168144336348484,
+          "central_window_inter_ready_ms": {
+            "count": 1084,
+            "mean": 139.4633948339483,
+            "p50": 139.415500000041,
+            "p95": 145.39370000009058,
+            "min": 133.57700000005934,
+            "max": 151.99399999983143
+          },
+          "gpu_forward_ms": {
+            "count": 1365,
+            "mean": 119.30669726696644,
+            "p50": 119.04557037353516,
+            "p95": 123.93790740966797,
+            "min": 114.83837127685547,
+            "max": 179.18038940429688
+          }
+        },
+        {
+          "source_file": "perf_metrics-context-umb-b200-260-82624-20261019T051627Z.jsonl",
+          "requests": 1365,
+          "central_window_ready_requests": 1103,
+          "central_window_ready_requests_per_second": 7.287062859900809,
+          "central_window_inter_ready_ms": {
+            "count": 1102,
+            "mean": 137.21312159709595,
+            "p50": 136.74399999990783,
+            "p95": 140.38249999991876,
+            "min": 134.03299999981755,
+            "max": 146.10199999970064
+          },
+          "gpu_forward_ms": {
+            "count": 1365,
+            "mean": 118.10733246296753,
+            "p50": 117.71878051757812,
+            "p95": 120.72337799072265,
+            "min": 115.03388977050781,
+            "max": 186.8573760986328
+          }
+        },
+        {
+          "source_file": "perf_metrics-context-umb-b200-260-82628-20261019T051625Z.jsonl",
+          "requests": 1366,
+          "central_window_ready_requests": 1103,
+          "central_window_ready_requests_per_second": 7.287062859900809,
+          "central_window_inter_ready_ms": {
+            "count": 1102,
+            "mean": 137.27154990925587,
+            "p50": 137.02650000004724,
+            "p95": 140.92939999991358,
+            "min": 133.0750000001899,
+            "max": 146.24499999990803
+          },
+          "gpu_forward_ms": {
+            "count": 1366,
+            "mean": 117.70993816660578,
+            "p50": 117.1631965637207,
+            "p95": 121.13614273071289,
+            "min": 114.14556884765625,
+            "max": 153.62940979003906
+          }
+        }
+      ],
+      "central_window_seconds": 151.36413959999982,
+      "central_window_ready_requests_per_second": 21.7422700561501,
+      "first_to_last_kv_ready_seconds": 189.20517449999988
+    },
+    "offload": {
+      "requests": 4096,
+      "workers": [
+        {
+          "source_file": "perf_metrics-context-umb-b200-260-93943-20261019T052725Z.jsonl",
+          "requests": 1366,
+          "central_window_ready_requests": 1092,
+          "central_window_ready_requests_per_second": 7.302283062811814,
+          "central_window_inter_ready_ms": {
+            "count": 1091,
+            "mean": 136.8683657195233,
+            "p50": 136.35199999998804,
+            "p95": 140.41849999989608,
+            "min": 132.88299999976516,
+            "max": 239.2530000001898
+          },
+          "gpu_forward_ms": {
+            "count": 1366,
+            "mean": 117.63440424526767,
+            "p50": 117.19580841064453,
+            "p95": 120.76614189147949,
+            "min": 113.86217498779297,
+            "max": 212.05760192871094
+          }
+        },
+        {
+          "source_file": "perf_metrics-context-umb-b200-260-93944-20261019T052726Z.jsonl",
+          "requests": 1365,
+          "central_window_ready_requests": 1089,
+          "central_window_ready_requests_per_second": 7.282221845606287,
+          "central_window_inter_ready_ms": {
+            "count": 1088,
+            "mean": 137.35010386029455,
+            "p50": 136.77850000021863,
+            "p95": 141.3207499999089,
+            "min": 133.92900000008012,
+            "max": 153.18299999989904
+          },
+          "gpu_forward_ms": {
+            "count": 1365,
+            "mean": 118.41419731391655,
+            "p50": 117.44483184814453,
+            "p95": 121.47167205810547,
+            "min": 115.31433868408203,
+            "max": 205.90342712402344
+          }
+        },
+        {
+          "source_file": "perf_metrics-context-umb-b200-260-93948-20261019T052724Z.jsonl",
+          "requests": 1365,
+          "central_window_ready_requests": 1089,
+          "central_window_ready_requests_per_second": 7.282221845606287,
+          "central_window_inter_ready_ms": {
+            "count": 1088,
+            "mean": 137.32337224264705,
+            "p50": 136.91799999980958,
+            "p95": 140.24644999985867,
+            "min": 133.6020000001099,
+            "max": 205.83099999998922
+          },
+          "gpu_forward_ms": {
+            "count": 1365,
+            "mean": 118.36194522843692,
+            "p50": 117.84662628173828,
+            "p95": 121.01392211914063,
+            "min": 114.86131286621094,
+            "max": 178.65274047851562
+          }
+        }
+      ],
+      "central_window_seconds": 149.54227200000037,
+      "central_window_ready_requests_per_second": 21.866726754024388,
+      "first_to_last_kv_ready_seconds": 186.9278400000003
+    }
+  }
+}
