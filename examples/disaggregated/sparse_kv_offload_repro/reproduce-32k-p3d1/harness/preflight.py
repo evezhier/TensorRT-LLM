@@ -57,17 +57,16 @@ def main() -> None:
             raise RuntimeError("Wheel mode imported TensorRT-LLM from the source checkout")
     elif package_dir != repo / "tensorrt_llm":
         raise RuntimeError("TensorRT-LLM was imported from a different checkout")
-    cache_manager = importlib.import_module(
-        "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager"
-    )
     if wheel_path:
-        relative_path = Path(
-            "tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py"
-        )
-        if Path(cache_manager.__file__).read_bytes() != (repo / relative_path).read_bytes():
-            raise RuntimeError(
-                "Installed wheel has a different DeepSeek V4 cache manager; rebuild it"
-            )
+        for module_name in (
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager",
+            "tensorrt_llm._torch.disaggregation.native.transfer",
+            "tensorrt_llm._torch.disaggregation.native.bounce.impl",
+        ):
+            module = importlib.import_module(module_name)
+            relative_path = Path(*module_name.split(".")).with_suffix(".py")
+            if Path(module.__file__).read_bytes() != (repo / relative_path).read_bytes():
+                raise RuntimeError(f"Installed wheel has a different {module_name}; rebuild it")
     if not hasattr(Batch, "move"):
         raise RuntimeError("Rebuild the native bindings: Batch.move is missing")
     if not callable(launch_disaggregated_llm):

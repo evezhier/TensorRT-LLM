@@ -51,7 +51,7 @@ The output directory is `$OUTPUT_ROOT/32k-serving-$SLURM_JOB_ID`. Every run
 requires a fresh output directory. Preflight records the source revision,
 wheel hash, checkpoint hash, GPU names, and effective UCX setting. It imports
 the DeepSeek V4 cache manager, checks `Batch.move`, and requires the installed
-wheel's cache-manager source to match this checkout.
+wheel's cache-manager and KV transfer sources to match this checkout.
 
 On GB300, the harness defaults to `UCX_TLS=^ib`; elsewhere it uses
 `UCX_TLS=^ib,gdr_copy`. Set `SPARSE_REPRO_UCX_TLS` to override this choice.
