@@ -67,6 +67,11 @@ worker logs for `[kv-bounce] coalesced` and
 `[kv-bounce] GPU scatter into CUDA-mapped host pool` to confirm the path taken.
 A transfer that cannot reserve bounce space falls
 back to the direct per-fragment path.
+For TP2 fan-in with unequal layer-group sizes, the receiver reserves one
+full-payload slot per sender and checks each sender's actual byte count before
+submission. The 32K payload is about 110 MB, so one such request uses about
+220 MB of the 256 MiB receive region. More overlapping requests may fall back
+unless the bounce capacity is increased.
 
 ## Read the result
 

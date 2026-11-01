@@ -224,10 +224,26 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
 
 
 # --------------------------------------------------------------------------- #
-# fan-in safety gate — equal total//num_writers split only for uniform writers
+# fan-in topology gate — exclude duplicate or uneven writer sets
 # --------------------------------------------------------------------------- #
+def test_recv_req_carries_bounce_writer_capacity() -> None:
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    req = tfr.RecvReqInfo(
+        sender_req_id=1,
+        instance_name="receiver",
+        instance_rank=0,
+        block_ids_per_layer_groups=[np.array([1, 2], dtype=np.int64)],
+        unique_rid=3,
+        bounce_dst_base=0x100000,
+        bounce_writer_capacity_bytes=4096,
+    )
+    restored = tfr.RecvReqInfo.from_bytes(req.to_bytes())
+    assert restored.bounce_dst_base == 0x100000
+    assert restored.bounce_writer_capacity_bytes == 4096
+
+
 def test_fanin_bounce_safe_gate() -> None:
-    """Restrict multi-writer equal-split bounce to uniform TP-by-head.
+    """Restrict multi-writer bounce to supported TP-by-head topology.
 
     Uneven PP splits and duplicate_head_factor>1 (MLA / duplicate TP heads ->
     some ranks don't send KV yet count in expected_transfers) must fall back to
@@ -391,6 +407,7 @@ def _recv_req(block_counts, rid=1, slice_id=0):
         unique_rid=rid,
         slice_id=slice_id,
         bounce_dst_base=None,
+        bounce_writer_capacity_bytes=None,
     )
 
 
@@ -464,24 +481,47 @@ class TestFanInReserve:
         assert t.writer_base((req.unique_rid, req.slice_id), 0) == 0x100000
         assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 100
 
-    def test_reserve_uneven_fanin_falls_back(self, monkeypatch):
+    def test_reserve_uneven_fanin_uses_full_writer_slots(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[3])
         req = _recv_req([1])  # total = 3, not divisible by 2
-        assert t.reserve(req, num_writers=2) is False
-        assert req.bounce_dst_base is None
+        assert t.reserve(req, num_writers=2) is True
+        assert t._recv_alloc.reserved_sizes == [6]
+        assert req.bounce_writer_capacity_bytes == 3
+        assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 3
 
-    def test_reserve_heterogeneous_fanin_falls_back(self, monkeypatch):
-        # Two groups with different per-block sizes: the equal split would overrun a sub-region, so
-        # fall back (even though the total is divisible).
+    def test_reserve_heterogeneous_fanin_uses_full_writer_slots(self, monkeypatch):
+        # Unequal group sizes use disjoint full-payload slots, even when total divides evenly.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100, 200])
         req = _recv_req([2, 2])  # total = 2*100 + 2*200 = 600
+        assert t.reserve(req, num_writers=2) is True
+        assert t._recv_alloc.reserved_sizes == [1200]
+        assert req.bounce_writer_capacity_bytes == 600
+        assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 600
+
+    def test_heterogeneous_fanin_falls_back_when_reservation_cannot_fit(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 200], capacity=1000)
+        req = _recv_req([2, 2])
         assert t.reserve(req, num_writers=2) is False
         assert req.bounce_dst_base is None
+        assert req.bounce_writer_capacity_bytes is None
+
+    def test_sender_does_not_overrun_writer_slot(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        monkeypatch.setattr(
+            t, "_reserve_and_gather", lambda *args, **kwargs: pytest.fail("gather must not run")
+        )
+        write_meta = SimpleNamespace(
+            sizes=np.array([400, 201], dtype=np.int64), bounce_writer_capacity_bytes=600
+        )
+        assert t.build_request(write_meta) is None
 
     def test_reserve_uniform_multigroup_fanin_ok(self, monkeypatch):
         # Uniform slot bytes across present groups -> even byte split -> bounce allowed.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100, 100])
-        assert t.reserve(_recv_req([2, 2]), num_writers=2) is True
+        req = _recv_req([2, 2])
+        assert t.reserve(req, num_writers=2) is True
+        assert t._recv_alloc.reserved_sizes == [400]
+        assert req.bounce_writer_capacity_bytes == 200
 
     def test_reserve_heterogeneous_single_writer_ok(self, monkeypatch):
         # num_writers==1 has no split, so heterogeneous slot bytes are fine.

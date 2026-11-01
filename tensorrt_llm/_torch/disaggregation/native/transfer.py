@@ -141,6 +141,7 @@ class RecvReqInfo:
     # Context-first receivers send REQUEST_DATA only after the context phase
     # produced the KV cache, so a TxSession must already exist (or have ended).
     context_first: bool = False
+    bounce_writer_capacity_bytes: Optional[int] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -157,6 +158,7 @@ class RecvReqInfo:
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
                 "context_first": self.context_first,
+                "bounce_writer_capacity_bytes": self.bounce_writer_capacity_bytes,
             }
         )
 
@@ -242,6 +244,7 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    bounce_writer_capacity_bytes: Optional[int] = None
     transfer_groups: tuple[_TransferGroup, ...] = ()
 
 
@@ -1646,6 +1649,7 @@ class Sender(SenderBase):
                 if transfer_groups and all(g.src_memory_type == "VRAM" for g in transfer_groups)
                 else None
             ),
+            bounce_writer_capacity_bytes=req_info.bounce_writer_capacity_bytes,
             transfer_groups=tuple(transfer_groups),
         )
 
@@ -2953,8 +2957,8 @@ class Receiver(ReceiverBase):
         peer_ri: RankInfo,
         receiver_page_table: Optional[KVCachePageTable],
     ) -> bool:
-        """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
-        The split assumes every writer contributes the same size, which holds when:
+        """Whether multi-writer bounce can assign disjoint slots for this overlap.
+        A compact split assumes every writer contributes the same size, which holds when:
           * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
             expected_transfers, so the live writers overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
@@ -2962,8 +2966,8 @@ class Receiver(ReceiverBase):
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
             list isn't available (shorter than the fan-in degree), be conservative and fall back.
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
-        the mismatched case, so this only needs the count to split evenly."""
+        Equal layer count means equal bytes only when per-block sizes match. reserve() uses
+        larger writer slots when the receiver's layer-group sizes differ."""
         if overlap.duplicate_head_factor != 1:
             return False
         if overlap.overlap_pp_size > 1:
@@ -3059,7 +3063,9 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
-        # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
+        # TP fan-in splits one reserved region into disjoint writer slots. The
+        # receiver can reserve a full transfer's worth per writer when its
+        # layer-group sizes differ.
         # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
