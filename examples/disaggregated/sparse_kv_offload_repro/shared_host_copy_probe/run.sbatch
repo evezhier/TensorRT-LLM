@@ -35,6 +35,7 @@ export WHEEL probe output
 srun --ntasks=1 --container-image="$IMAGE" --container-mounts="$mounts" \
     --container-workdir="$REPO" --container-writable --container-remap-root \
     bash -c 'set -e
+python3 -m pip install -r "$REPO/requirements-dev.txt"
 python3 -m pip install --force-reinstall --no-deps "$WHEEL"
 exec python3 "$probe" --kvcm --output "$output"'
 echo "Result: $output"
