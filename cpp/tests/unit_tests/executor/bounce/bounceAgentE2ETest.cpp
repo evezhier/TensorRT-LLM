@@ -31,8 +31,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <sys/mman.h>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -197,6 +199,54 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
 
     a->shutdown();
     b->shutdown();
+    freeXferBufs(bufs);
+}
+
+TEST(BounceAgentE2E, SubmitTransferRequestsScattersIntoMappedHostMemory)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeBounceConfig("hostAgentA", 1), skipMsg);
+    auto b = a ? tryMakeAgent(makeBounceConfig("hostAgentB", 1), skipMsg) : nullptr;
+    if (!a || !b)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+    auto bufs = makeXferBufs(/*nDescs=*/40, /*descBytes=*/700, /*seed=*/13);
+    std::size_t const hostBytes = (bufs.total + 4095) & ~std::size_t{4095};
+    void* hostDst = mmap(nullptr, hostBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(hostDst, MAP_FAILED);
+    ASSERT_EQ(cudaHostRegister(hostDst, hostBytes, cudaHostRegisterMapped | cudaHostRegisterPortable), cudaSuccess);
+    std::memset(hostDst, 0, bufs.total);
+    std::vector<kvc::MemoryDesc> hostDescs;
+    hostDescs.reserve(bufs.nDescs);
+    for (std::uint32_t i = 0; i < bufs.nDescs; ++i)
+    {
+        auto const addr = reinterpret_cast<std::uintptr_t>(static_cast<char*>(hostDst) + bufs.off[i]);
+        hostDescs.emplace_back(addr, bufs.descBytes, 0);
+    }
+    kvc::TransferDescs const dst{kvc::MemoryType::kDRAM, std::move(hostDescs)};
+    a->loadRemoteAgent("hostAgentB", b->getLocalAgentDesc());
+    kvc::TransferRequest req{kvc::TransferOp::kWRITE, bufs.srcDescs, dst, "hostAgentB", std::nullopt};
+    auto status = a->submitTransferRequests(req);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(a->getBounceSubmitCount(), 1);
+    auto const* bytes = static_cast<unsigned char const*>(hostDst);
+    for (std::uint32_t i = 0; i < bufs.nDescs; ++i)
+    {
+        for (std::uint32_t j = 0; j < bufs.descBytes; ++j)
+        {
+            ASSERT_EQ(bytes[bufs.off[i] + j], bounce_test::patSeed(bufs.seed, i, j));
+        }
+    }
+    a->shutdown();
+    b->shutdown();
+    EXPECT_EQ(cudaHostUnregister(hostDst), cudaSuccess);
+    EXPECT_EQ(munmap(hostDst, hostBytes), 0);
     freeXferBufs(bufs);
 }
 

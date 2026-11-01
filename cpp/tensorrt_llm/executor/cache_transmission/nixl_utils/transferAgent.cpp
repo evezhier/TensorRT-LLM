@@ -276,7 +276,9 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
     {
         return BounceRejectReason::kNotWrite;
     }
-    if (request.getSrcDescs().getType() != MemoryType::kVRAM || request.getDstDescs().getType() != MemoryType::kVRAM)
+    if (request.getSrcDescs().getType() != MemoryType::kVRAM
+        || (request.getDstDescs().getType() != MemoryType::kVRAM
+            && request.getDstDescs().getType() != MemoryType::kDRAM))
     {
         return BounceRejectReason::kNotVram;
     }

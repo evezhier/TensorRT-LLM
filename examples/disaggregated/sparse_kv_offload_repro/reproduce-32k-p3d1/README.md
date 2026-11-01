@@ -73,6 +73,15 @@ submission. The 32K payload is about 110 MB, so one such request uses about
 220 MB of the 256 MiB receive region. More overlapping requests may fall back
 unless the bounce capacity is increased.
 
+To test the credit-scheduled C++ agent bounce, set
+`SPARSE_REPRO_AGENT_BOUNCE_MB=256` instead. This requires a wheel rebuilt from
+this checkout. The agent gathers GPU fragments into bounded GPU staging,
+transfers each granted chunk GPU to GPU, then scatters into the CUDA-mapped
+host pool. Do not set `SPARSE_REPRO_KV_BOUNCE_MB` in the same run. The C++ agent
+bounce gate is relaxed for this benchmark's roughly 86 KiB descriptors. The C++ agent
+bounce negotiates its wire version with the peer and falls back to standard
+NIXL when the peer has an incompatible version.
+
 ## Read the result
 
 The main comparison is in `ratio-metrics.csv`: select the

@@ -741,19 +741,44 @@ void BounceReceiver::scatterWorkerLoop()
                     auto const bufs = planBufs(ctx, nTotal);
                     std::size_t idx = 0;
                     seen = 0;
-                    for (std::uint32_t i = 0; i < n; ++i)
+                    for (std::uint32_t i = 0; i < n && srcInBounds; ++i)
                     {
                         auto const& e = job.entries[i];
+                        if (e.dstMemoryType > 1)
+                        {
+                            srcInBounds = false;
+                            break;
+                        }
                         for (std::uint32_t p = 0; p < e.count; ++p)
                         {
                             ++seen;
+                            auto dstAddr = e.dstAddr + static_cast<std::uint64_t>(p) * e.dstStride;
+                            if (e.dstMemoryType == 1)
+                            {
+                                void* devicePtr = nullptr;
+                                auto const mapErr
+                                    = cudaHostGetDevicePointer(&devicePtr, reinterpret_cast<void*>(dstAddr), 0);
+                                if (mapErr != cudaSuccess)
+                                {
+                                    TLLM_LOG_WARNING(
+                                        "BounceTransport(%s): host destination mapping failed (%d) "
+                                        "rid=%llu chunk=%u",
+                                        mCtx.selfName.c_str(), static_cast<int>(mapErr),
+                                        static_cast<unsigned long long>(job.rid), job.chunkIdx);
+                                    srcInBounds = false;
+                                    break;
+                                }
+                                dstAddr = reinterpret_cast<std::uintptr_t>(devicePtr);
+                            }
                             appendSplitInto(bufs, idx,
-                                regionBase + e.bounceOffset + static_cast<std::uint64_t>(p) * e.bounceStride,
-                                e.dstAddr + static_cast<std::uint64_t>(p) * e.dstStride, e.pieceSize,
-                                splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
+                                regionBase + e.bounceOffset + static_cast<std::uint64_t>(p) * e.bounceStride, dstAddr,
+                                e.pieceSize, splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
                         }
                     }
-                    launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
+                    if (srcInBounds)
+                    {
+                        launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
+                    }
                 }
                 else if (srcInBounds && nTotal == 0)
                 {
