@@ -1643,7 +1643,7 @@ class Sender(SenderBase):
             is_last_slice=task._chunk.is_last,
             bounce_dst_base=(
                 req_info.bounce_dst_base
-                if all(g.src_memory_type == g.dst_memory_type == "VRAM" for g in transfer_groups)
+                if transfer_groups and all(g.src_memory_type == "VRAM" for g in transfer_groups)
                 else None
             ),
             transfer_groups=tuple(transfer_groups),
@@ -3089,11 +3089,10 @@ class Receiver(ReceiverBase):
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=mamba_dst_slot,
                 )
-        # Bounce gather/scatter operates on device allocations. A mixed-memory
-        # handoff writes directly to the published host and device pools.
-        allow_bounce = allow_bounce and not any(
-            page_table is not None and page_table.has_host_pools
-            for page_table in (self._registrar.self_extractor.page_table, peer_infos.page_table)
+        # Gather requires device sources. The receiver can scatter into its
+        # registered host pools after the coalesced device-to-device write.
+        allow_bounce = allow_bounce and not (
+            peer_infos.page_table is not None and peer_infos.page_table.has_host_pools
         )
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes

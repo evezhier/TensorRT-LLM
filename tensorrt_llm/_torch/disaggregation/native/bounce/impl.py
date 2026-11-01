@@ -69,7 +69,8 @@ class VmmBounceTransport(BounceTransport):
 
     @classmethod
     def from_config(
-        cls, agent, cfg, *, device_id: int, block_bytes_per_group: list[int | None]
+        cls, agent, cfg, *, device_id: int, block_bytes_per_group: list[int | None],
+        host_pool_ranges: list[tuple[int, int]],
     ) -> VmmBounceTransport | None:
         """Build a transport sized from the config and clamped to free memory, or None if not even one
         chunk fits."""
@@ -95,6 +96,7 @@ class VmmBounceTransport(BounceTransport):
             capacity_bytes=capacity_bytes,
             phys_chunk_size=chunk,
             block_bytes_per_group=block_bytes_per_group,
+            host_pool_ranges=host_pool_ranges,
             min_bytes=cfg.min_bytes,
             min_blocks=cfg.min_blocks,
         )
@@ -107,6 +109,7 @@ class VmmBounceTransport(BounceTransport):
         capacity_bytes: int,
         phys_chunk_size: int,
         block_bytes_per_group: list[int | None],
+        host_pool_ranges: list[tuple[int, int]] = (),
         min_bytes: int = DEFAULT_MIN_BYTES,
         min_blocks: int = 96,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
@@ -116,6 +119,8 @@ class VmmBounceTransport(BounceTransport):
         self._device_id = device_id
         # The byte size of one cache block, listed for each attention layer group.
         self._block_bytes_per_group = list(block_bytes_per_group)
+        self._host_pool_ranges = tuple(host_pool_ranges)
+        self._host_device_ptrs: dict[int, int] = {}
         # Size gates below which bounce is skipped: coalescing only pays off once the transfer is
         # large enough to beat the gather+scatter overhead (see config.DEFAULT_MIN_BYTES for the
         # rationale). min_bytes applies to payloads carrying recurrent (mamba/KDA) state;
@@ -484,7 +489,8 @@ class VmmBounceTransport(BounceTransport):
                 # Scatter each writer's fragments from its own source, never one global offset, so a
                 # missing or fallback writer cannot shift where the others are read from.
                 for src_base, dst_ptrs, sizes in descs:
-                    p = Plan(dst_ptrs, dst_ptrs, sizes, int(sizes.sum()))
+                    device_dst_ptrs = self._device_scatter_destinations(dst_ptrs)
+                    p = Plan(device_dst_ptrs, device_dst_ptrs, sizes, int(sizes.sum()))
                     scatter_contiguous(
                         src_base, p.dst_ptrs, p.sizes, p.offsets, stream=self._scatter_stream
                     )
@@ -495,6 +501,26 @@ class VmmBounceTransport(BounceTransport):
                 logger.error(f"[kv-bounce] scatter failed (slot={ctx.slot_id}): {e}")
             # record the outcome and settle; completion fires only after the sync above
             self._apply(ctx.rid_slice, lambda c, ok=ok: c.finish_scatter(ok))
+
+    def _device_scatter_destinations(self, dst_ptrs: np.ndarray) -> np.ndarray:
+        """Resolve registered host destinations to their CUDA device aliases."""
+        if not self._host_pool_ranges:
+            return dst_ptrs
+        resolved = np.asarray(dst_ptrs, dtype=np.int64).copy()
+        for index, address in enumerate(resolved):
+            pointer = int(address)
+            if not any(start <= pointer < end for start, end in self._host_pool_ranges):
+                continue
+            device_pointer = self._host_device_ptrs.get(pointer)
+            if device_pointer is None:
+                device_pointer = int(CUASSERT(cudart.cudaHostGetDevicePointer(pointer, 0))[0])
+                self._host_device_ptrs[pointer] = device_pointer
+                logger.info_once(
+                    "[kv-bounce] GPU scatter into CUDA-mapped host pool",
+                    key="kv-bounce-host-scatter",
+                )
+            resolved[index] = device_pointer
+        return resolved
 
     def close(self) -> None:
         self._stop.set()
@@ -568,7 +594,8 @@ def create_bounce(agent, cfg, *, device_id: int, page_table) -> BounceTransport:
         return NoBounceTransport()
     try:
         transport = VmmBounceTransport.from_config(
-            agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(page_table)
+            agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(page_table),
+            host_pool_ranges=host_pool_ranges(page_table),
         )
         return transport if transport is not None else NoBounceTransport()
     except (
@@ -620,6 +647,20 @@ def decode_result_tail(message):
             int(np.frombuffer(message[4], dtype=np.int64)[0]),
         )
     return None, None, None
+
+
+def host_pool_ranges(page_table: KVCachePageTable) -> list[tuple[int, int]]:
+    """Address ranges of host-backed cache pools in the local page table."""
+    return [
+        (
+            int(pool.base_address),
+            int(pool.base_address) + (int(pool.num_slots) - 1) * int(pool.slot_stride_bytes)
+            + int(pool.slot_bytes),
+        )
+        for group in page_table.pool_groups
+        for pool in group.pools
+        if pool.memory_type == "DRAM" and pool.num_slots > 0
+    ]
 
 
 def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:

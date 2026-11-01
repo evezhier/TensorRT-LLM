@@ -56,6 +56,18 @@ wheel's cache-manager source to match this checkout.
 On GB300, the harness defaults to `UCX_TLS=^ib`; elsewhere it uses
 `UCX_TLS=^ib,gdr_copy`. Set `SPARSE_REPRO_UCX_TLS` to override this choice.
 
+To measure the coalesced GPU transfer followed by a GPU scatter into the
+offloaded KVCM2 host pool, add `SPARSE_REPRO_KV_BOUNCE_MB=256` before `sbatch`.
+This enables the existing Python KV bounce transport on the prefill and
+offload decode workers; the resident comparison keeps its original transport.
+Each worker allocates two GPU bounce regions of this size. The sender gathers
+device fragments, NIXL writes one device region, and the receiver scatters
+into CUDA-registered host pages before declaring transfer complete. Check the
+worker logs for `[kv-bounce] coalesced` and
+`[kv-bounce] GPU scatter into CUDA-mapped host pool` to confirm the path taken.
+A transfer that cannot reserve bounce space falls
+back to the direct per-fragment path.
+
 ## Read the result
 
 The main comparison is in `ratio-metrics.csv`: select the

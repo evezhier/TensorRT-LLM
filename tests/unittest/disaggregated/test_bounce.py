@@ -423,6 +423,38 @@ class TestFanInReserve:
 
         assert btr.block_bytes_per_group(page_table) == [125]
 
+    def test_host_pool_ranges_include_slot_stride(self):
+        page_table = KVCachePageTable(
+            tokens_per_block=128,
+            layer_groups=[],
+            pool_groups=[
+                PhysicalPoolGroup(
+                    pools=[
+                        PhysicalPool(0x100000, 256, 4, 512, "DRAM"),
+                        PhysicalPool(0x200000, 256, 4, 512, "VRAM"),
+                    ]
+                )
+            ],
+        )
+        assert btr.host_pool_ranges(page_table) == [(0x100000, 0x100000 + 3 * 512 + 256)]
+
+    def test_host_pool_scatter_uses_cuda_aliases(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t._host_pool_ranges = ((0x200000, 0x210000),)
+        calls = []
+
+        def get_device_pointer(pointer, flags):
+            calls.append((pointer, flags))
+            return (0, pointer + 0x100000)
+
+        monkeypatch.setattr(btr.cudart, "cudaHostGetDevicePointer", get_device_pointer)
+        addresses = np.array([0x100000, 0x200100, 0x200200], dtype=np.int64)
+        expected = [0x100000, 0x300100, 0x300200]
+        assert t._device_scatter_destinations(addresses).tolist() == expected
+        assert t._device_scatter_destinations(addresses).tolist() == expected
+        assert calls == [(0x200100, 0), (0x200200, 0)]
+        assert addresses.tolist() == [0x100000, 0x200100, 0x200200]
+
     def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])  # total = 2 * 100 = 200
