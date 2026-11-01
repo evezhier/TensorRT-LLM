@@ -165,6 +165,7 @@ def _kvcm_host_pool(payload_bytes: int, segments: int):
         SparseCacheConfig,
     )
 
+    stream = torch.cuda.current_stream().cuda_stream
     tokens_per_block = 128
     tokens = segments * tokens_per_block
     page_bytes = ((payload_bytes + segments - 1) // segments + 255) // 256 * 256
@@ -191,7 +192,6 @@ def _kvcm_host_pool(payload_bytes: int, segments: int):
         if manager.sparse_backing_medium() != CacheTier.HOST_MEM:
             raise RuntimeError("KVCM2 sparse key pool is not host-backed")
         cache = manager.create_kv_cache()
-        stream = torch.cuda.current_stream().cuda_stream
         if not cache.resume(stream) or not cache.resize(tokens, tokens):
             raise RuntimeError("KVCM2 could not allocate the sparse receive pages")
         group = manager.get_layer_group_id(0)
@@ -355,10 +355,15 @@ def main() -> None:
         report["cases"].append(_case(args, segments, gap_bytes, method))
         publish()
     if args.kvcm:
-        with _kvcm_host_pool(args.payload_bytes, args.segments) as pool:
-            report["cases"].append(
-                _case(args, args.segments, args.gap_bytes, "scatter_kernel", pool)
-            )
+        try:
+            with _kvcm_host_pool(args.payload_bytes, args.segments) as pool:
+                report["cases"].append(
+                    _case(args, args.segments, args.gap_bytes, "scatter_kernel", pool)
+                )
+        except Exception as error:
+            report["kvcm_error"] = f"{type(error).__name__}: {error}"
+            publish()
+            raise
         publish()
 
 

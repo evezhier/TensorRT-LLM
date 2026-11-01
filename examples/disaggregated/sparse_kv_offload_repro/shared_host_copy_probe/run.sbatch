@@ -15,6 +15,7 @@ REPO=$(realpath -- "$REPO")
 WHEEL=$(realpath -- "$WHEEL")
 OUTPUT_ROOT=$(realpath -m -- "$OUTPUT_ROOT")
 mkdir -p -- "$OUTPUT_ROOT"
+exec > >(tee "$OUTPUT_ROOT/shared-host-copy-$SLURM_JOB_ID.log") 2>&1
 if [[ ! -f "$WHEEL" ]]; then
     echo "Wheel not found: $WHEEL" >&2
     exit 2
