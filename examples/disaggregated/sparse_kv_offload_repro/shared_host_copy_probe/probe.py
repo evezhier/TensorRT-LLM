@@ -53,6 +53,21 @@ if triton is not None:
             mask=positions < length,
         )
 
+    @triton.jit
+    def _host_pool_scatter_kernel(
+        staging_addr, pool_ptrs, BASE: tl.constexpr, EXTRA: tl.constexpr,
+        GAP: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        segment = tl.program_id(0)
+        tile = tl.program_id(1)
+        length = tl.where(segment < EXTRA, BASE + 1, BASE)
+        source_offset = segment * BASE + tl.minimum(segment, EXTRA) + segment * GAP
+        positions = tile * BLOCK + tl.arange(0, BLOCK)
+        source = staging_addr.to(tl.uint64).to(tl.pointer_type(tl.uint8))
+        destination = tl.load(pool_ptrs + segment).to(tl.uint64).to(tl.pointer_type(tl.uint8))
+        values = tl.load(source + source_offset + positions, mask=positions < length, other=0)
+        tl.store(destination + positions, values, mask=positions < length)
+
 
 def _layout(payload_bytes: int, segments: int, gap_bytes: int) -> tuple[np.ndarray, np.ndarray, int]:
     if payload_bytes <= 0 or segments <= 0 or segments > payload_bytes or gap_bytes < 0:
@@ -212,6 +227,7 @@ def _kvcm_host_pool(payload_bytes: int, segments: int):
 def _case(
     args: argparse.Namespace, segments: int, gap_bytes: int, method: str,
     pool: tuple[list[int], int] | None = None,
+    pool_copy_method: str = "cpu_memcpy",
 ) -> dict:
     offsets, sizes, span = _layout(args.payload_bytes, segments, gap_bytes)
     expected = np.arange(args.payload_bytes, dtype=np.uint8)
@@ -228,7 +244,33 @@ def _case(
     worker = subprocess.Popen(
         command, pass_fds=(fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
     )
+    receiver_registered = False
     try:
+        if pool is not None and pool_copy_method == "gpu_scatter":
+            import torch
+
+            try:
+                from cuda.bindings import runtime as cudart
+            except ImportError:
+                from cuda import cudart
+
+            _cuda_check(
+                cudart.cudaHostRegister(
+                    staging_ptr, span, HOST_REGISTER_PORTABLE | HOST_REGISTER_MAPPED
+                ),
+                "cudaHostRegister(receiver staging)",
+            )
+            receiver_registered = True
+            result = cudart.cudaHostGetDevicePointer(staging_ptr, 0)
+            _cuda_check(result, "cudaHostGetDevicePointer(receiver staging)")
+            device_staging_ptr = int(result[1])
+            pool_device_ptrs = []
+            for pointer in pool[0]:
+                result = cudart.cudaHostGetDevicePointer(pointer, 0)
+                _cuda_check(result, "cudaHostGetDevicePointer(KVCM2 pool page)")
+                pool_device_ptrs.append(int(result[1]))
+            pool_ptrs_cuda = torch.tensor(pool_device_ptrs, dtype=torch.int64, device="cuda")
+            torch.cuda.synchronize()
         assert worker.stdin is not None and worker.stdout is not None
         ready_line = worker.stdout.readline()
         if not ready_line:
@@ -255,12 +297,23 @@ def _case(
             copy_start = time.perf_counter()
             if pool is not None:
                 pointers, _ = pool
-                for segment, (pointer, offset, size) in enumerate(
-                    zip(pointers, offsets, sizes, strict=True)
-                ):
-                    ctypes.memmove(
-                        pointer, staging_ptr + int(offset) + segment * gap_bytes, int(size)
+                if pool_copy_method == "gpu_scatter":
+                    base = args.payload_bytes // segments
+                    extra = args.payload_bytes % segments
+                    _host_pool_scatter_kernel[
+                        (segments, triton.cdiv(base + 1, SCATTER_BLOCK_BYTES))
+                    ](
+                        device_staging_ptr, pool_ptrs_cuda, base, extra, gap_bytes,
+                        SCATTER_BLOCK_BYTES,
                     )
+                    torch.cuda.synchronize()
+                else:
+                    for segment, (pointer, offset, size) in enumerate(
+                        zip(pointers, offsets, sizes, strict=True)
+                    ):
+                        ctypes.memmove(
+                            pointer, staging_ptr + int(offset) + segment * gap_bytes, int(size)
+                        )
             pool_copy_ms = (time.perf_counter() - copy_start) * 1000
             handoff_ms = (time.perf_counter() - handoff_start) * 1000
             _verify(actual, expected, offsets, sizes, gap_bytes)
@@ -286,6 +339,8 @@ def _case(
         if worker.poll() is None:
             worker.kill()
             worker.wait()
+        if receiver_registered:
+            _cuda_check(cudart.cudaHostUnregister(staging_ptr), "cudaHostUnregister(receiver staging)")
         if worker.stdin is not None:
             worker.stdin.close()
         if worker.stdout is not None:
@@ -304,6 +359,7 @@ def _case(
     if pool is not None:
         report.update(
             host_pool="KVCM2 sparse host-backed pool",
+            host_pool_copy_method=pool_copy_method,
             host_pool_stride_bytes=pool[1],
             handoff_samples_ms=handoff_samples,
             handoff_p50_ms=statistics.median(handoff_samples),
@@ -359,6 +415,13 @@ def main() -> None:
             with _kvcm_host_pool(args.payload_bytes, args.segments) as pool:
                 report["cases"].append(
                     _case(args, args.segments, args.gap_bytes, "scatter_kernel", pool)
+                )
+                publish()
+                report["cases"].append(
+                    _case(
+                        args, args.segments, args.gap_bytes, "scatter_kernel", pool,
+                        "gpu_scatter",
+                    )
                 )
         except Exception as error:
             report["kvcm_error"] = f"{type(error).__name__}: {error}"
