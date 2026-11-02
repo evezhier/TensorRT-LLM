@@ -141,6 +141,7 @@ class RecvReqInfo:
     # Context-first receivers send REQUEST_DATA only after the context phase
     # produced the KV cache, so a TxSession must already exist (or have ended).
     context_first: bool = False
+    bounce_writer_capacity_bytes: Optional[int] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -157,6 +158,7 @@ class RecvReqInfo:
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
                 "context_first": self.context_first,
+                "bounce_writer_capacity_bytes": self.bounce_writer_capacity_bytes,
             }
         )
 
@@ -242,6 +244,7 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    bounce_writer_capacity_bytes: Optional[int] = None
     transfer_groups: tuple[_TransferGroup, ...] = ()
 
 
@@ -592,10 +595,7 @@ class _SessionQuiescence:
 
 
 class Sender(SenderBase):
-    # Time-to-live for orphaned RecvReqInfo entries (seconds).
-    # In gen-first ADP broadcast, non-assigned DP ranks accumulate
-    # RecvReqInfo that never gets consumed.  Entries older than this
-    # are evicted during periodic sweeps.
+    # Context-first orphan TTL and minimum generation-first metadata TTL (seconds).
     _STALE_REQ_INFO_TTL_S = 120.0
 
     def __init__(
@@ -605,6 +605,7 @@ class Sender(SenderBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        request_info_timeout_s: Optional[float] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
@@ -612,6 +613,8 @@ class Sender(SenderBase):
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
         self._retirement_watchdog = retirement_watchdog
+        # Generation-first metadata can arrive before its context prefill starts.
+        self._request_info_ttl_s = max(self._STALE_REQ_INFO_TTL_S, request_info_timeout_s or 0.0)
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -694,11 +697,11 @@ class Sender(SenderBase):
             self._peer_requests_timestamps.pop(unique_rid, None)
 
     def sweep_stale_req_infos(self):
-        """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
+        """Evict orphaned metadata after its schedule style's retention period.
 
         Called opportunistically from the listener thread when a new REQUEST_DATA
-        arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
-        entries that are never consumed; this sweep prevents unbounded growth.
+        arrives. Generation-first metadata may wait through the configured
+        transfer timeout for prefill; context-first orphans expire sooner.
 
         A context-first entry that no TxSession claimed within the TTL never will
         be (the session already ended, or the receiver names a request this rank
@@ -707,11 +710,16 @@ class Sender(SenderBase):
         """
         now = time.monotonic()
         with self._peer_requests_lock:
-            stale_rids = [
-                rid
-                for rid, ts in self._peer_requests_timestamps.items()
-                if now - ts > self._STALE_REQ_INFO_TTL_S
-            ]
+            stale_rids = []
+            for rid, ts in self._peer_requests_timestamps.items():
+                infos = self._peer_requests.get(rid, {}).values()
+                ttl = (
+                    self._STALE_REQ_INFO_TTL_S
+                    if any(info.context_first for info in infos)
+                    else self._request_info_ttl_s
+                )
+                if now - ts > ttl:
+                    stale_rids.append(rid)
         if not stale_rids:
             return
         orphaned_infos: list[RecvReqInfo] = []
@@ -1643,9 +1651,10 @@ class Sender(SenderBase):
             is_last_slice=task._chunk.is_last,
             bounce_dst_base=(
                 req_info.bounce_dst_base
-                if all(g.src_memory_type == g.dst_memory_type == "VRAM" for g in transfer_groups)
+                if transfer_groups and all(g.src_memory_type == "VRAM" for g in transfer_groups)
                 else None
             ),
+            bounce_writer_capacity_bytes=req_info.bounce_writer_capacity_bytes,
             transfer_groups=tuple(transfer_groups),
         )
 
@@ -2953,8 +2962,8 @@ class Receiver(ReceiverBase):
         peer_ri: RankInfo,
         receiver_page_table: Optional[KVCachePageTable],
     ) -> bool:
-        """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
-        The split assumes every writer contributes the same size, which holds when:
+        """Whether multi-writer bounce can assign disjoint slots for this overlap.
+        A compact split assumes every writer contributes the same size, which holds when:
           * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
             expected_transfers, so the live writers overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
@@ -2962,8 +2971,8 @@ class Receiver(ReceiverBase):
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
             list isn't available (shorter than the fan-in degree), be conservative and fall back.
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
-        the mismatched case, so this only needs the count to split evenly."""
+        Equal layer count means equal bytes only when per-block sizes match. reserve() uses
+        larger writer slots when the receiver's layer-group sizes differ."""
         if overlap.duplicate_head_factor != 1:
             return False
         if overlap.overlap_pp_size > 1:
@@ -3059,7 +3068,9 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
-        # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
+        # TP fan-in splits one reserved region into disjoint writer slots. The
+        # receiver can reserve a full transfer's worth per writer when its
+        # layer-group sizes differ.
         # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
@@ -3089,11 +3100,10 @@ class Receiver(ReceiverBase):
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=mamba_dst_slot,
                 )
-        # Bounce gather/scatter operates on device allocations. A mixed-memory
-        # handoff writes directly to the published host and device pools.
-        allow_bounce = allow_bounce and not any(
-            page_table is not None and page_table.has_host_pools
-            for page_table in (self._registrar.self_extractor.page_table, peer_infos.page_table)
+        # Gather requires device sources. The receiver can scatter into its
+        # registered host pools after the coalesced device-to-device write.
+        allow_bounce = allow_bounce and not (
+            peer_infos.page_table is not None and peer_infos.page_table.has_host_pools
         )
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes
@@ -4470,6 +4480,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                request_info_timeout_s=self._config.tx_overall_timeout_s,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
@@ -4569,7 +4580,8 @@ class TransferWorker:
                 if getattr(agent, "bounce_enabled", False):
                     logger.info(
                         f"TransferWorker.shutdown: agent {agent.name} bounce_submit_count="
-                        f"{agent.bounce_submit_count} bounce_reject_count={agent.bounce_reject_count}"
+                        f"{agent.bounce_submit_count} bounce_host_submit_count="
+                        f"{agent.bounce_host_submit_count} bounce_reject_count={agent.bounce_reject_count}"
                     )
             except Exception as e:  # observability only; never skip deregister/shutdown below
                 logger.debug(f"TransferWorker.shutdown: bounce counters unavailable: {e}")
