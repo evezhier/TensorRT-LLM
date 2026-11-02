@@ -60,8 +60,9 @@ def analyze(root: Path) -> dict:
         for key in ("context_config", "generation_config")
     )
     complete = all(
-        row["all_requests_passed"] and row["completed"] == row["requests"] == 4096 for row in rows
+        row["all_requests_passed"] and row["completed"] == row["requests"] for row in rows
     )
+    complete = complete and rows[0]["requests"] == rows[1]["requests"]
     timings_complete = all(
         row["send_records"] == row["receive_records"] == row["completed"]
         and row["send_p50_ms"] is not None

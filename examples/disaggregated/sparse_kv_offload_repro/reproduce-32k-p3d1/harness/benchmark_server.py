@@ -62,10 +62,26 @@ async def complete_batch(
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
     connector = aiohttp.TCPConnector(limit=0)
     semaphore = asyncio.Semaphore(concurrency)
+    progress = Counter()
+    batch_started = time.monotonic()
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+
+        async def report_progress() -> None:
+            while True:
+                await asyncio.sleep(30)
+                print(
+                    "SWEEP_PROGRESS "
+                    f"elapsed={time.monotonic() - batch_started:.0f}s "
+                    f"started={progress['started']}/{count} "
+                    f"headers={progress['headers']} "
+                    f"first_token={progress['first_token']} "
+                    f"completed={progress['completed']} failed={progress['failed']}",
+                    flush=True,
+                )
 
         async def one(index: int) -> dict:
             async with semaphore:
+                progress["started"] += 1
                 started = time.monotonic()
                 tokens = []
                 arrivals = []
@@ -81,6 +97,7 @@ async def complete_batch(
                         },
                     ) as response:
                         response.raise_for_status()
+                        progress["headers"] += 1
                         async for line in response.content:
                             if not line.startswith(b"data: ") or line[6:].strip() == b"[DONE]":
                                 continue
@@ -97,6 +114,8 @@ async def complete_batch(
                                 for token in (choice.get("token_ids") or [])
                             ]
                             if new_tokens:
+                                if not arrivals:
+                                    progress["first_token"] += 1
                                 now = time.monotonic() - started
                                 tokens.extend(new_tokens)
                                 arrivals.extend([now] * len(new_tokens))
@@ -104,6 +123,7 @@ async def complete_batch(
                         raise RuntimeError(
                             f"Expected {output_tokens} tokens, received {len(tokens)}"
                         )
+                    progress["completed"] += 1
                     return {
                         "index": index,
                         "id": response_id,
@@ -123,6 +143,12 @@ async def complete_batch(
                     ValueError,
                     KeyError,
                 ) as error:
+                    progress["failed"] += 1
+                    if progress["failed"] <= 5:
+                        print(
+                            f"SWEEP_REQUEST_FAILED index={index} error={type(error).__name__}: {error}",
+                            flush=True,
+                        )
                     return {
                         "index": index,
                         "id": response_id,
@@ -133,7 +159,12 @@ async def complete_batch(
                         "error": f"{type(error).__name__}: {error}",
                     }
 
-        return await asyncio.gather(*(one(index) for index in range(count)))
+        reporter = asyncio.create_task(report_progress())
+        try:
+            return await asyncio.gather(*(one(index) for index in range(count)))
+        finally:
+            reporter.cancel()
+            await asyncio.gather(reporter, return_exceptions=True)
 
 
 def perf_offsets(directory: Path) -> dict[str, int]:
@@ -292,6 +323,10 @@ def main() -> None:
     gen["enable_attention_dp"] = True
     gen["kv_cache_config"]["enable_block_reuse"] = False
     gen["kv_cache_config"]["avg_seq_len"] = args.input_tokens + 2
+    gen_host_cache_gib = int(os.environ.get("SPARSE_REPRO_GEN_HOST_CACHE_GIB", "0"))
+    if gen_host_cache_gib < 0:
+        raise ValueError("SPARSE_REPRO_GEN_HOST_CACHE_GIB must be nonnegative")
+    gen["kv_cache_config"]["host_cache_size"] = gen_host_cache_gib * 1024**3
     if args.mode == "offload":
         bounce_mb = int(os.environ.get("SPARSE_REPRO_KV_BOUNCE_MB", "0"))
         agent_bounce_mb = int(os.environ.get("SPARSE_REPRO_AGENT_BOUNCE_MB", "0"))
@@ -386,6 +421,10 @@ def main() -> None:
     def pinned_popen(command, **kwargs):
         if "--server_role" in command:
             role = command[command.index("--server_role") + 1]
+            kwargs["env"] = {
+                **kwargs["env"],
+                "UCX_TLS": os.environ["UCX_TLS"],
+            }
             if role == "generation":
                 kwargs["env"] = {
                     **kwargs["env"],

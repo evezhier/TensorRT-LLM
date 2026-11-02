@@ -25,6 +25,10 @@ def main() -> None:
         if preflight["variant"] == "compare"
         else (("resident", "resident", None), ("offload", "offload", None))
     )
+    perf_concurrency = os.environ.get("SPARSE_REPRO_PERF_CONCURRENCY")
+    perf_requests = int(os.environ.get("SPARSE_REPRO_PERF_REQUESTS", "4096"))
+    if perf_requests <= 0:
+        raise ValueError("SPARSE_REPRO_PERF_REQUESTS must be positive")
     for name, mode, agent_bounce_mb in cases:
         run = root / "cases" / f"{name}-p{ratio}-d1"
         if (run / "finished.json").exists():
@@ -33,6 +37,12 @@ def main() -> None:
         (run / "commands").mkdir(exist_ok=True)
         batch = 896 if mode == "offload" else 1024
         maximum = 1696 if mode == "offload" else 1204
+        if perf_concurrency is not None:
+            maximum = int(perf_concurrency)
+        if maximum <= 0 or maximum > perf_requests:
+            raise ValueError(
+                "SPARSE_REPRO_PERF_CONCURRENCY must be between 1 and SPARSE_REPRO_PERF_REQUESTS"
+            )
         command = [
             "bash",
             str(root / "launch.sh"),
@@ -85,7 +95,7 @@ def main() -> None:
                     ("000-cold", 1, 1, 160),
                     ("001-warm", 1, 1, 160),
                     ("002-warm-load", 128, 128, 160),
-                    ("100-performance-1", maximum, 4096, 160),
+                    ("100-performance-1", maximum, perf_requests, 160),
                 ]
                 for name, concurrency, count, output_tokens in trials:
                     publish(

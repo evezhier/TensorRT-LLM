@@ -160,6 +160,18 @@ the direct and agent send-phase p50/p95, receive time, throughput, and latency.
 and host-destination bounce count. The job fails when requests or timing records
 are incomplete, payload bytes differ, or host bounce was not exercised.
 
+For a bounded stall diagnostic, set `SPARSE_REPRO_PERF_CONCURRENCY=512` and
+`SPARSE_REPRO_PERF_REQUESTS=1024` on the same submission command. Increase
+concurrency on a later run to find the point where requests stop finishing.
+`SPARSE_REPRO_GEN_HOST_CACHE_GIB=32` gives the generation KV cache a separate
+host tier for an eviction test; the default is zero. These settings keep the
+32K prompt and 160 output tokens but change the offered load, so compare only
+runs with the same settings. The case log at
+`cases/offload-direct-p1-d1.log` prints `SWEEP_PROGRESS` every 30 seconds with
+started, response-header, first-token, completed, and failed request counts.
+The benchmark passes its selected `UCX_TLS` setting through to the workers;
+check their `BindingsNixlTransferAgent init` lines to verify it.
+
 ## Check model output with offload held constant
 
 The serving `resident`/`offload` parity result changes cache residency and
