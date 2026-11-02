@@ -44,7 +44,11 @@ if [[ -n "${WHEEL:-}" ]]; then
 fi
 
 mkdir -p -- "$OUTPUT_ROOT"
-export MOUNTS="${MOUNTS:-$REPO:$REPO,$LLM_MODELS_ROOT:$LLM_MODELS_ROOT,$OUTPUT_ROOT:$OUTPUT_ROOT}"
+MOUNTS="${MOUNTS:-$REPO:$REPO,$LLM_MODELS_ROOT:$LLM_MODELS_ROOT,$OUTPUT_ROOT:$OUTPUT_ROOT}"
+if [[ ",$MOUNTS," != *",$OUTPUT_ROOT:$OUTPUT_ROOT,"* ]]; then
+    MOUNTS+=",$OUTPUT_ROOT:$OUTPUT_ROOT"
+fi
+export MOUNTS
 if [[ -n "${WHEEL:-}" ]]; then
     case "$WHEEL" in
         "$REPO"/*|"$LLM_MODELS_ROOT"/*|"$OUTPUT_ROOT"/*) ;;
@@ -62,4 +66,6 @@ if [[ "$variant" != serving && "$variant" != matched && "$variant" != compare ]]
     echo "SPARSE_REPRO_VARIANT must be serving, matched, or compare" >&2
     exit 2
 fi
-bash "$repro_package/run_slurm.sh" "$variant" "$OUTPUT_ROOT/32k-$variant-$SLURM_JOB_ID"
+output_dir="$OUTPUT_ROOT/32k-$variant-$SLURM_JOB_ID"
+echo "Results directory: $output_dir"
+bash "$repro_package/run_slurm.sh" "$variant" "$output_dir"
