@@ -86,8 +86,18 @@ Before accepting agent-bounce performance, build and run the byte-exact GPU-to-h
 test on the target GPU:
 
 ```bash
-cmake --build cpp/build_RelWithDebInfo --target bounceAgentE2ETest
-ctest --test-dir cpp/build_RelWithDebInfo -R bounceAgentE2ETest --output-on-failure
+cmake --build cpp/build --target bounceAgentE2ETest
+ctest --test-dir cpp/build \
+  -R '^BounceAgentE2E\.Sparse32kPayloadIsByteExactAcrossHostRegistrations$' \
+  --output-on-failure --no-tests=error
+```
+
+On GB300, submit the same check as a Slurm job after building the wheel:
+
+```bash
+REPO=/path/to/TensorRT-LLM IMAGE=/path/to/devel.sqsh \
+  sbatch --export=ALL -A coreai_devtech_all -p gb300 --gpus=1 \
+  examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_host_bounce_accuracy.sbatch
 ```
 
 `Sparse32kPayloadIsByteExactAcrossHostRegistrations` uses the 32K serving
