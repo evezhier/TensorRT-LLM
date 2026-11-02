@@ -45,8 +45,8 @@ def main() -> None:
     output = Path(os.environ["OUTPUT"])
     variant = sys.argv[1]
     visible_gpus = torch.cuda.device_count()
-    if variant == "serving" and visible_gpus not in (4, 8):
-        raise RuntimeError(f"serving requires exactly 4 or 8 visible GPUs; found {visible_gpus}")
+    if variant in ("serving", "compare") and visible_gpus not in (4, 8):
+        raise RuntimeError(f"{variant} requires exactly 4 or 8 visible GPUs; found {visible_gpus}")
     if variant == "matched" and visible_gpus != 4:
         raise RuntimeError(f"matched requires exactly 4 visible GPUs; found {visible_gpus}")
     prefill_workers = visible_gpus // 2 - 1
@@ -62,6 +62,7 @@ def main() -> None:
             "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager",
             "tensorrt_llm._torch.disaggregation.native.transfer",
             "tensorrt_llm._torch.disaggregation.native.bounce.impl",
+            "tensorrt_llm._torch.disaggregation.nixl._agent_cpp",
         ):
             module = importlib.import_module(module_name)
             relative_path = Path(*module_name.split(".")).with_suffix(".py")
@@ -69,6 +70,11 @@ def main() -> None:
                 raise RuntimeError(f"Installed wheel has a different {module_name}; rebuild it")
     if not hasattr(Batch, "move"):
         raise RuntimeError("Rebuild the native bindings: Batch.move is missing")
+    if variant == "compare":
+        from tensorrt_llm.tensorrt_llm_transfer_agent_binding import NixlTransferAgent
+
+        if not hasattr(NixlTransferAgent, "bounce_host_submit_count"):
+            raise RuntimeError("Rebuild the native transfer agent: host bounce counter is missing")
     if not callable(launch_disaggregated_llm):
         raise RuntimeError("Disaggregated integration-test launcher is unavailable")
     wheel_sha256 = None

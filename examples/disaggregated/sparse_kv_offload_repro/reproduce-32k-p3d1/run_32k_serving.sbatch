@@ -58,8 +58,8 @@ export JOB_ID="$SLURM_JOB_ID"
 unset CPUS
 
 variant=${SPARSE_REPRO_VARIANT:-serving}
-if [[ "$variant" != serving && "$variant" != matched ]]; then
-    echo "SPARSE_REPRO_VARIANT must be serving or matched" >&2
+if [[ "$variant" != serving && "$variant" != matched && "$variant" != compare ]]; then
+    echo "SPARSE_REPRO_VARIANT must be serving, matched, or compare" >&2
     exit 2
 fi
 bash "$repro_package/run_slurm.sh" "$variant" "$OUTPUT_ROOT/32k-$variant-$SLURM_JOB_ID"

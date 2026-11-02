@@ -11,6 +11,22 @@ from pathlib import Path
 from analyze_trials import compare
 
 
+def normalize_config(config: dict) -> dict:
+    """Remove per-run paths and transport selection from a serving config."""
+    value = copy.deepcopy(config)
+    value["disaggregation_config"].pop("perf_metrics_output_dir", None)
+    for key in ("context_config", "generation_config"):
+        value[key].pop("perf_metrics_output_dir", None)
+        transport = value[key]["cache_transceiver_config"]
+        for field in (
+            "kv_cache_bounce_size_mb",
+            "agent_bounce_buffer_enable",
+            "agent_bounce_params",
+        ):
+            transport.pop(field, None)
+    return value
+
+
 def analyze(root: Path) -> dict:
     cases = (
         "offload-direct-a-matched-p1-d1",
@@ -33,20 +49,7 @@ def analyze(root: Path) -> dict:
         )
 
     configs = [json.loads((root / "cases" / name / "config.json").read_text()) for name in cases]
-    normalized = []
-    for config in configs:
-        value = copy.deepcopy(config)
-        value["disaggregation_config"].pop("perf_metrics_output_dir", None)
-        for key in ("context_config", "generation_config"):
-            value[key].pop("perf_metrics_output_dir", None)
-            transport = value[key]["cache_transceiver_config"]
-            for field in (
-                "kv_cache_bounce_size_mb",
-                "agent_bounce_buffer_enable",
-                "agent_bounce_params",
-            ):
-                transport.pop(field, None)
-        normalized.append(value)
+    normalized = [normalize_config(config) for config in configs]
     configs_match = normalized[0] == normalized[1] == normalized[2]
     direct_disabled = all(
         not config[key]["cache_transceiver_config"].get("agent_bounce_buffer_enable")

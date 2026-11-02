@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-if [[ $# != 2 || "$1" != "serving" && "$1" != "matched" ]]; then
-    echo "Usage: bash reproduce_32k.sh {serving|matched} /absolute/fresh-output-directory"
-    echo "Run inside a prepared container with 4 or 8 GPUs (serving) or 4 GPUs (matched)."
+if [[ $# != 2 || "$1" != "serving" && "$1" != "matched" && "$1" != "compare" ]]; then
+    echo "Usage: bash reproduce_32k.sh {serving|matched|compare} /absolute/fresh-output-directory"
+    echo "Run inside a prepared container with 4 or 8 GPUs (serving/compare) or 4 GPUs (matched)."
     echo "Required environment: MODEL_DIR or LLM_MODELS_ROOT. REPO defaults to this checkout."
     exit 2
 fi
@@ -47,6 +47,9 @@ if [[ "$repro_variant" == "serving" ]]; then
     python3 -u "$OUTPUT/run_ratios.py" | tee "$OUTPUT/controller.log"
     python3 "$OUTPUT/analyze_ratios.py" | tee "$OUTPUT/ratio-analysis.log"
     python3 "$OUTPUT/analyze_prefill_feed.py" | tee "$OUTPUT/prefill-feed.log"
+elif [[ "$repro_variant" == "compare" ]]; then
+    python3 -u "$OUTPUT/run_ratios.py" | tee "$OUTPUT/controller.log"
+    python3 "$OUTPUT/analyze_transfer_compare.py" | tee "$OUTPUT/transport-performance.log"
 else
     python3 -u "$OUTPUT/run_matched_cases.py" | tee "$OUTPUT/controller.log"
 fi

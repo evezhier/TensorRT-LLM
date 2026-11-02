@@ -12,10 +12,10 @@ fi
 repro_package=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export REPO="${REPO:-$(realpath -- "$repro_package/../../../..")}"
 case "${1:-}" in
-    serving|matched)
+    serving|matched|compare)
         ;;
     *)
-        echo "Usage: run_slurm.sh {serving|matched} /absolute/fresh-output-directory" >&2
+        echo "Usage: run_slurm.sh {serving|matched|compare} /absolute/fresh-output-directory" >&2
         exit 2
         ;;
 esac

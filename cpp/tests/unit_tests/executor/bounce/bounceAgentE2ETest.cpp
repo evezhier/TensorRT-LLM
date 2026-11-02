@@ -197,6 +197,7 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS)
         << "bounce transfer via submitTransferRequests did not succeed";
     EXPECT_TRUE(verifyXferBufs(bufs));
+    EXPECT_EQ(a->getBounceHostSubmitCount(), 0);
 
     a->shutdown();
     b->shutdown();
@@ -236,6 +237,7 @@ TEST(BounceAgentE2E, SubmitTransferRequestsScattersIntoMappedHostMemory)
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS);
     EXPECT_EQ(a->getBounceSubmitCount(), 1);
+    EXPECT_EQ(a->getBounceHostSubmitCount(), 1);
     auto const* bytes = static_cast<unsigned char const*>(hostDst);
     for (std::uint32_t i = 0; i < bufs.nDescs; ++i)
     {
@@ -304,6 +306,7 @@ TEST(BounceAgentE2E, Sparse32kPayloadIsByteExactAcrossHostRegistrations)
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(waitTerminal(status, 60), kvc::TransferState::kSUCCESS);
     EXPECT_EQ(a->getBounceSubmitCount(), 1);
+    EXPECT_EQ(a->getBounceHostSubmitCount(), 1);
     std::vector<unsigned char> expected(bufs.total);
     ASSERT_EQ(cudaMemcpy(expected.data(), bufs.src, bufs.total, cudaMemcpyDeviceToHost), cudaSuccess);
     EXPECT_EQ(std::memcmp(expected.data(), hostDst, bufs.total), 0);

@@ -106,6 +106,40 @@ resident runs, so it does not by itself establish byte-copy correctness.
 The Slurm script requires Google Test to report one passed test; a skipped
 test fails the job.
 
+The DeepSeek V4 Flash disaggregated offload GSM8K test in
+`tests/integration/defs/accuracy/test_disaggregated_serving.py` has direct and
+agent-bounce variants. The agent variant requires a log entry confirming that
+a host-memory destination took the C++ bounce path. Run both against the same
+checkpoint before treating a transport speedup as usable. The 4K GSM8K workload
+checks model accuracy; the byte-exact test above checks the 32K payload shape.
+Set `LLM_MODELS_ROOT` to the parent of `DeepSeek-V4-Flash` when running the
+integration test. The direct and `host_bounce` parameter variants are scheduled
+in the B200 test list and can also be run on GB300 with four GPUs.
+
+## Compare direct and agent transfer at 32K
+
+This job runs two offloaded cases sequentially on the same allocated GPUs. Both
+use the same 32K prompt, 160 output tokens, and 4,096-request performance trial.
+Only the transfer selection differs: direct NIXL versus the 256 MiB C++ agent
+bounce. It requires a wheel built from this checkout, including the native
+`bounce_host_submit_count` binding.
+
+```bash
+REPO=/absolute/path/to/TensorRT-LLM \
+IMAGE=/absolute/path/to/container.sqsh \
+WHEEL=/absolute/path/to/tensorrt_llm.whl \
+MODEL_DIR=/absolute/path/to/DeepSeek-V4-Flash \
+OUTPUT_ROOT=/absolute/path/to/results \
+sbatch --export=ALL --gpus=4 -A YOUR_ACCOUNT -p YOUR_GB300_PARTITION \
+  examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_transfer_compare.sbatch
+```
+
+Read `$OUTPUT_ROOT/32k-compare-$SLURM_JOB_ID/transport-performance.csv` for
+the direct and agent send-phase p50/p95, receive time, throughput, and latency.
+`transport-performance.json` also records the source, wheel, payload comparison,
+and host-destination bounce count. The job fails when requests or timing records
+are incomplete, payload bytes differ, or host bounce was not exercised.
+
 ## Check model output with offload held constant
 
 The serving `resident`/`offload` parity result changes cache residency and
@@ -116,6 +150,8 @@ It compares exact output-token multisets for the cold, warm, batch-1, and
 batch-96 trials. A mismatch between the two direct controls makes the result
 inconclusive; a mismatch between stable direct controls and agent bounce fails
 the job. The job also requires a positive C++ bounce submission count.
+Use the reference-based GSM8K test above as the model accuracy gate; exact
+token equality here is only a diagnostic when the direct controls are stable.
 
 ```bash
 REPO=/absolute/path/to/TensorRT-LLM \

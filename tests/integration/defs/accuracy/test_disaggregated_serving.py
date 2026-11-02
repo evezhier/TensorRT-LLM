@@ -2465,7 +2465,8 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     # The servers take up to an hour to start, before a full GSM8K run.
     @pytest.mark.timeout(5400)
     @pytest.mark.skip_less_device(4)
-    def test_kv_cache_offload(self):
+    @pytest.mark.parametrize("agent_bounce", [False, True], ids=["direct", "host_bounce"])
+    def test_kv_cache_offload(self, agent_bounce: bool):
         """The generation server keeps the ratio-4 compressed history in host memory.
 
         Each decode step fetches the indexer-selected units into a GPU cache.
@@ -2476,6 +2477,15 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
         }
+        if agent_bounce:
+            cache_transceiver_config.update({
+                "kv_cache_bounce_size_mb": 256,
+                "agent_bounce_buffer_enable": True,
+                "agent_bounce_params": {
+                    "min_descriptor_count": "1",
+                    "max_average_descriptor_size": "1MB",
+                },
+            })
         # Both servers lay out the NVFP4 KV cache alike for the transfer.
         kv_cache_config = {
             "dtype": "nvfp4",
@@ -2524,7 +2534,10 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                                       ctx_server_config,
                                       gen_server_config,
                                       self.MODEL_PATH,
-                                      server_waiting_timeout=3600) as llm:
+                                      server_waiting_timeout=3600,
+                                      assert_worker_log_contains=(
+                                          "bounce host destination engaged"
+                                          if agent_bounce else None)) as llm:
             # The DuckLLM's bare LlmArgs knows no checkpoint quantization; these
             # select the reference entry.
             llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
