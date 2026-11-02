@@ -131,6 +131,13 @@ Read `$OUTPUT_ROOT/32k-matched-$SLURM_JOB_ID/transport-accuracy.json`. A pass
 establishes transport equivalence for these controlled requests; expand the
 matched batches before making a broader accuracy claim.
 
+To reanalyze a completed run without launching servers or changing its files:
+
+```bash
+python3 examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/harness/analyze_transport_accuracy.py \
+  /absolute/path/to/32k-matched-JOB_ID
+```
+
 ## Read the result
 
 The main comparison is in `ratio-metrics.csv`: select the

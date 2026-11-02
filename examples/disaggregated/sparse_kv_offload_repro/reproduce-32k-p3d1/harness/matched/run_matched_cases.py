@@ -2,15 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate full-model sparse residency at matched ready batches without profiling."""
 
-import copy
 import json
 import os
-import re
 import subprocess
 import time
 from pathlib import Path
 
-from analyze_trials import compare
+from analyze_transport_accuracy import analyze
 from run_ratios import publish
 
 
@@ -138,84 +136,11 @@ def main() -> None:
         )
         for name, agent_bounce_mb in cases:
             run_case(root, "offload", name, agent_bounce_mb, quick=True)
-        trials = ("000-cold", "001-warm", "100-c1", "101-c96")
-        comparisons = []
-        for trial in trials:
-            results = [
-                json.loads((root / "cases" / name / f"{trial}-results.json").read_text())
-                for name, _ in cases
-            ]
-            comparisons.append(
-                {
-                    "trial": trial,
-                    "direct_repeat": compare(results[0], results[1]),
-                    "direct_to_agent": compare(results[0], results[2]),
-                }
-            )
-        configs = [
-            json.loads((root / "cases" / name / "config.json").read_text()) for name, _ in cases
-        ]
-        normalized = []
-        for config in configs:
-            value = copy.deepcopy(config)
-            for key in ("context_config", "generation_config"):
-                value[key].pop("perf_metrics_output_dir", None)
-                transport = value[key]["cache_transceiver_config"]
-                for field in (
-                    "kv_cache_bounce_size_mb",
-                    "agent_bounce_buffer_enable",
-                    "agent_bounce_params",
-                ):
-                    transport.pop(field, None)
-            normalized.append(value)
-        configs_match = normalized[0] == normalized[1] == normalized[2]
-        direct_disabled = all(
-            not config[key]["cache_transceiver_config"].get("agent_bounce_buffer_enable")
-            for config in configs[:2]
-            for key in ("context_config", "generation_config")
-        )
-        agent_run = root / "cases" / cases[2][0]
-        agent_config = configs[2]
-        agent_enabled = all(
-            agent_config[key]["cache_transceiver_config"].get("agent_bounce_buffer_enable")
-            for key in ("context_config", "generation_config")
-        )
-        submits = [
-            int(value)
-            for value in re.findall(
-                r"bounce_submit_count=(\d+)", agent_run.with_suffix(".log").read_text()
-            )
-        ]
-        baseline_stable = all(
-            row["direct_repeat"]["identical_token_multisets"] for row in comparisons
-        )
-        agent_matches = all(
-            row["direct_to_agent"]["identical_token_multisets"] for row in comparisons
-        )
-        if not configs_match or not direct_disabled:
-            status = "config_mismatch"
-        elif not baseline_stable:
-            status = "baseline_unstable"
-        elif not agent_matches:
-            status = "agent_mismatch"
-        elif not agent_enabled or not any(count > 0 for count in submits):
-            status = "agent_not_engaged"
-        else:
-            status = "pass"
-        publish(
-            root / "transport-accuracy.json",
-            {
-                "status": status,
-                "configs_match_except_transport": configs_match,
-                "direct_agent_bounce_disabled": direct_disabled,
-                "agent_enabled": agent_enabled,
-                "agent_bounce_submit_counts": submits,
-                "comparisons": comparisons,
-            },
-        )
-        print("TRANSPORT_ACCURACY", status, flush=True)
-        if status != "pass":
-            raise RuntimeError(f"Transport accuracy check: {status}")
+        report = analyze(root)
+        publish(root / "transport-accuracy.json", report)
+        print("TRANSPORT_ACCURACY", report["status"], flush=True)
+        if report["status"] != "pass":
+            raise RuntimeError(f"Transport accuracy check: {report['status']}")
         return
     for mode in ("resident", "offload"):
         run_case(root, mode)
