@@ -116,6 +116,26 @@ Set `LLM_MODELS_ROOT` to the parent of `DeepSeek-V4-Flash` when running the
 integration test. The direct and `host_bounce` parameter variants are scheduled
 in the B200 test list and can also be run on GB300 with four GPUs.
 
+To run both variants in one Slurm job, provide the checkpoint directory and the
+local GSM8K dataset directory separately. `DATASET_DIR` must contain
+`main/test-00000-of-00001.parquet`. The job mounts both directories, makes the
+`LLM_MODELS_ROOT` layout expected by the test inside the container, and installs
+a wheel built from this checkout. Request the four GPUs at submission time:
+
+```bash
+REPO=/absolute/path/to/TensorRT-LLM \
+IMAGE=/absolute/path/to/container.sqsh \
+WHEEL=/absolute/path/to/tensorrt_llm.whl \
+MODEL_DIR=/absolute/path/to/DeepSeek-V4-Flash \
+DATASET_DIR=/absolute/path/to/datasets/openai/gsm8k \
+sbatch --export=ALL --gpus=4 -A YOUR_ACCOUNT -p YOUR_GB300_PARTITION \
+  examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_deepseek_offload_e2e.sbatch
+```
+
+The Slurm log contains the GSM8K score and the result of each parameter
+variant. A full run can take more than an hour because the servers start
+separately for each variant.
+
 ## Compare direct and agent transfer at 32K
 
 This job runs two offloaded cases sequentially on the same allocated GPUs. Both
