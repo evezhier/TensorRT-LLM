@@ -29,6 +29,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -246,6 +247,73 @@ TEST(BounceAgentE2E, SubmitTransferRequestsScattersIntoMappedHostMemory)
     a->shutdown();
     b->shutdown();
     EXPECT_EQ(cudaHostUnregister(hostDst), cudaSuccess);
+    EXPECT_EQ(munmap(hostDst, hostBytes), 0);
+    freeXferBufs(bufs);
+}
+
+TEST(BounceAgentE2E, Sparse32kPayloadIsByteExactAcrossHostRegistrations)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    auto makeConfig = [](char const* name)
+    {
+        auto cfg = makeBounceConfig(name, /*arenaSizeMb=*/256, /*granularityBytes=*/"1MB");
+        cfg.bounceParams["max_chunk_size"] = "32MB";
+        cfg.bounceParams["max_average_descriptor_size"] = "1MB";
+        return cfg;
+    };
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeConfig("sparse32kA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeConfig("sparse32kB"), skipMsg) : nullptr;
+    if (!a || !b)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+
+    // The serving transfer has 1,284 descriptors and about 105 MiB of payload. The chosen
+    // descriptor stride crosses each 32 MiB host registration boundary inside a descriptor.
+    constexpr std::uint32_t kDescs = 1284;
+    constexpr std::uint32_t kDescBytes = 85610;
+    constexpr std::size_t kPageBytes = 4096;
+    constexpr std::size_t kRegisterBytes = 32ULL << 20;
+    auto bufs = makeXferBufs(kDescs, kDescBytes, /*seed=*/17);
+    std::size_t const hostBytes = (bufs.total + kPageBytes - 1) / kPageBytes * kPageBytes;
+    void* hostDst = mmap(nullptr, hostBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(hostDst, MAP_FAILED);
+    for (std::size_t offset = 0; offset < hostBytes; offset += kRegisterBytes)
+    {
+        auto const bytes = std::min(kRegisterBytes, hostBytes - offset);
+        ASSERT_EQ(cudaHostRegister(
+                      static_cast<char*>(hostDst) + offset, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable),
+            cudaSuccess);
+    }
+    std::memset(hostDst, 0, hostBytes);
+    std::vector<kvc::MemoryDesc> hostDescs;
+    hostDescs.reserve(bufs.nDescs);
+    for (std::uint32_t i = 0; i < bufs.nDescs; ++i)
+    {
+        auto const addr = reinterpret_cast<std::uintptr_t>(static_cast<char*>(hostDst) + bufs.off[i]);
+        hostDescs.emplace_back(addr, bufs.descBytes, 0);
+    }
+    kvc::TransferDescs const dst{kvc::MemoryType::kDRAM, std::move(hostDescs)};
+    a->loadRemoteAgent("sparse32kB", b->getLocalAgentDesc());
+    kvc::TransferRequest req{kvc::TransferOp::kWRITE, bufs.srcDescs, dst, "sparse32kB", std::nullopt};
+    auto status = a->submitTransferRequests(req);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(waitTerminal(status, 60), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(a->getBounceSubmitCount(), 1);
+    std::vector<unsigned char> expected(bufs.total);
+    ASSERT_EQ(cudaMemcpy(expected.data(), bufs.src, bufs.total, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(std::memcmp(expected.data(), hostDst, bufs.total), 0);
+
+    a->shutdown();
+    b->shutdown();
+    for (std::size_t offset = 0; offset < hostBytes; offset += kRegisterBytes)
+    {
+        EXPECT_EQ(cudaHostUnregister(static_cast<char*>(hostDst) + offset), cudaSuccess);
+    }
     EXPECT_EQ(munmap(hostDst, hostBytes), 0);
     freeXferBufs(bufs);
 }

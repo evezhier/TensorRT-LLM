@@ -82,6 +82,19 @@ bounce gate is relaxed for this benchmark's roughly 86 KiB descriptors. The C++ 
 bounce negotiates its wire version with the peer and falls back to standard
 NIXL when the peer has an incompatible version.
 
+Before accepting agent-bounce performance, build and run the byte-exact GPU-to-host
+test on the target GPU:
+
+```bash
+cmake --build cpp/build_RelWithDebInfo --target bounceAgentE2ETest
+ctest --test-dir cpp/build_RelWithDebInfo -R bounceAgentE2ETest --output-on-failure
+```
+
+`Sparse32kPayloadIsByteExactAcrossHostRegistrations` uses the 32K serving
+transfer's 1,284-descriptor, roughly 105 MiB shape and separate 32 MiB host
+registrations. The serving comparison's token parity can vary between two
+resident runs, so it does not by itself establish byte-copy correctness.
+
 ## Read the result
 
 The main comparison is in `ratio-metrics.csv`: select the

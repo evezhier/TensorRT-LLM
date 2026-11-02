@@ -707,7 +707,7 @@ void BounceReceiver::scatterWorkerLoop()
                     // .. +pieceSize). count-1 and bounceStride are both u32 so the span product cannot
                     // overflow u64. A count of 0 is malformed (a run always carries >= 1 piece).
                     std::uint64_t const span = static_cast<std::uint64_t>(e.count - 1) * e.bounceStride + e.pieceSize;
-                    srcInBounds = srcInBounds && e.count >= 1 && e.bounceOffset <= job.regionBytes
+                    srcInBounds = srcInBounds && e.count >= 1 && e.pieceSize >= 1 && e.bounceOffset <= job.regionBytes
                         && span <= job.regionBytes - e.bounceOffset;
                     rawPieces += std::max<std::uint32_t>(e.count, 1);
                 }
@@ -765,6 +765,21 @@ void BounceReceiver::scatterWorkerLoop()
                                         "rid=%llu chunk=%u",
                                         mCtx.selfName.c_str(), static_cast<int>(mapErr),
                                         static_cast<unsigned long long>(job.rid), job.chunkIdx);
+                                    srcInBounds = false;
+                                    break;
+                                }
+                                void* lastDevicePtr = nullptr;
+                                auto const lastHostAddr = dstAddr + e.pieceSize - 1;
+                                auto const lastMapErr = cudaHostGetDevicePointer(
+                                    &lastDevicePtr, reinterpret_cast<void*>(lastHostAddr), 0);
+                                if (lastMapErr != cudaSuccess
+                                    || reinterpret_cast<std::uintptr_t>(lastDevicePtr)
+                                        != reinterpret_cast<std::uintptr_t>(devicePtr) + e.pieceSize - 1)
+                                {
+                                    TLLM_LOG_WARNING(
+                                        "BounceTransport(%s): host destination alias is not contiguous "
+                                        "rid=%llu chunk=%u",
+                                        mCtx.selfName.c_str(), static_cast<unsigned long long>(job.rid), job.chunkIdx);
                                     srcInBounds = false;
                                     break;
                                 }
