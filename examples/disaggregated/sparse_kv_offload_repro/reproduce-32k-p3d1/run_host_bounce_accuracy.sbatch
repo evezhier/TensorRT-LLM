@@ -34,6 +34,16 @@ srun --nodes=1 --ntasks=1 \
     --container-writable --container-remap-root \
     bash -c 'set -euo pipefail
 cmake --build "$build_dir" --target bounceAgentE2ETest --parallel 16
-ctest --test-dir "$build_dir" \
-    -R "^BounceAgentE2E\\.Sparse32kPayloadIsByteExactAcrossHostRegistrations$" \
-    --output-on-failure --no-tests=error'
+cd "$build_dir/tests/unit_tests/executor/bounce"
+export CUDA_MODULE_LOADING=LAZY
+if ! test_output=$(./bounceAgentE2ETest \
+    --gtest_filter=BounceAgentE2E.Sparse32kPayloadIsByteExactAcrossHostRegistrations \
+    --gtest_color=no 2>&1); then
+    printf "%s\n" "$test_output"
+    exit 1
+fi
+printf "%s\n" "$test_output"
+if [[ "$test_output" != *"[  PASSED  ] 1 test."* ]]; then
+    echo "Byte-exact test did not run to completion (possibly skipped)" >&2
+    exit 1
+fi'

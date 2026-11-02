@@ -87,9 +87,8 @@ test on the target GPU:
 
 ```bash
 cmake --build cpp/build --target bounceAgentE2ETest
-ctest --test-dir cpp/build \
-  -R '^BounceAgentE2E\.Sparse32kPayloadIsByteExactAcrossHostRegistrations$' \
-  --output-on-failure --no-tests=error
+cpp/build/tests/unit_tests/executor/bounce/bounceAgentE2ETest \
+  --gtest_filter=BounceAgentE2E.Sparse32kPayloadIsByteExactAcrossHostRegistrations
 ```
 
 On GB300, submit the same check as a Slurm job after building the wheel:
@@ -104,6 +103,8 @@ REPO=/path/to/TensorRT-LLM IMAGE=/path/to/devel.sqsh \
 transfer's 1,284-descriptor, roughly 105 MiB shape and separate 32 MiB host
 registrations. The serving comparison's token parity can vary between two
 resident runs, so it does not by itself establish byte-copy correctness.
+The Slurm script requires Google Test to report one passed test; a skipped
+test fails the job.
 
 ## Read the result
 
