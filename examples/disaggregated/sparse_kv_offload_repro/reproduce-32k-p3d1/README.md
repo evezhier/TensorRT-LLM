@@ -106,6 +106,31 @@ resident runs, so it does not by itself establish byte-copy correctness.
 The Slurm script requires Google Test to report one passed test; a skipped
 test fails the job.
 
+## Check model output with offload held constant
+
+The serving `resident`/`offload` parity result changes cache residency and
+batching as well as transport. To isolate the transport, run the matched-batch
+accuracy job. It launches two direct-transfer offload controls and one agent
+bounce offload case, all with the same checkpoint, prompt, and serving config.
+It compares exact output-token multisets for the cold, warm, batch-1, and
+batch-96 trials. A mismatch between the two direct controls makes the result
+inconclusive; a mismatch between stable direct controls and agent bounce fails
+the job. The job also requires a positive C++ bounce submission count.
+
+```bash
+REPO=/absolute/path/to/TensorRT-LLM \
+IMAGE=/absolute/path/to/container.sqsh \
+WHEEL=/absolute/path/to/tensorrt_llm.whl \
+MODEL_DIR=/absolute/path/to/DeepSeek-V4-Flash \
+OUTPUT_ROOT=/absolute/path/to/results \
+sbatch --export=ALL --gpus=4 -A YOUR_ACCOUNT -p YOUR_GB300_PARTITION \
+  examples/disaggregated/sparse_kv_offload_repro/reproduce-32k-p3d1/run_32k_transport_accuracy.sbatch
+```
+
+Read `$OUTPUT_ROOT/32k-matched-$SLURM_JOB_ID/transport-accuracy.json`. A pass
+establishes transport equivalence for these controlled requests; expand the
+matched batches before making a broader accuracy claim.
+
 ## Read the result
 
 The main comparison is in `ratio-metrics.csv`: select the

@@ -294,6 +294,21 @@ def main() -> None:
     gen["kv_cache_config"]["enable_block_reuse"] = False
     gen["kv_cache_config"]["avg_seq_len"] = args.input_tokens + 2
     if args.mode == "offload":
+        agent_bounce_mb = int(os.environ.get("SPARSE_REPRO_AGENT_BOUNCE_MB", "0"))
+        if agent_bounce_mb < 0:
+            raise ValueError("SPARSE_REPRO_AGENT_BOUNCE_MB must be nonnegative")
+        if agent_bounce_mb:
+            for config in (ctx, gen):
+                config["cache_transceiver_config"].update(
+                    {
+                        "kv_cache_bounce_size_mb": agent_bounce_mb,
+                        "agent_bounce_buffer_enable": True,
+                        "agent_bounce_params": {
+                            "min_descriptor_count": "1",
+                            "max_average_descriptor_size": "1MB",
+                        },
+                    }
+                )
         gen["sparse_attention_config"].update(
             {
                 "enable_kv_cache_offload": True,
