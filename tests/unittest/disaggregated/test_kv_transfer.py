@@ -1895,6 +1895,7 @@ def test_receive_without_context_session_fails_after_sweep(schedule_style):
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(type(sender), "_STALE_REQ_INFO_TTL_S", 0.0)
+            mp.setattr(sender, "_request_info_ttl_s", 0.0)
             ctx_transfer_worker.sweep_stale_req_infos()
         assert sender._get_req_info(unique_rid) is None
         if schedule_style == DisaggScheduleStyle.CONTEXT_FIRST:

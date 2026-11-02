@@ -16,6 +16,7 @@
 
 import queue
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -47,6 +48,7 @@ def _sender(*, ownership: bool = True) -> transfer_mod.Sender:
     sender._pre_cancelled_rids = {}
     sender._peer_requests_lock = threading.Lock()
     sender._peer_requests, sender._peer_requests_timestamps = {}, {}
+    sender._request_info_ttl_s = transfer_mod.Sender._STALE_REQ_INFO_TTL_S
     sender._shutdown, sender._shutdown_requested = True, False
     sender._retirement_watchdog = None
     sender._instance_rank = 7
@@ -137,6 +139,58 @@ def test_metadata_expiry_does_not_prevent_cancel_acknowledgment() -> None:
     sender._respond_with_kv(b"gen", _request_data())
     _assert_session_ack(sender)
     assert not sender._sessions
+
+
+def test_generation_first_metadata_survives_queued_prefill() -> None:
+    sender = _sender()
+    sender._request_info_ttl_s = 3600.0
+    sender._respond_with_kv(b"gen", _request_data())
+    sender._peer_requests_timestamps[401] = time.monotonic() - 121.0
+
+    sender.sweep_stale_req_infos()
+    assert sender._get_req_info(401) is not None
+
+    sender._peer_requests_timestamps[401] = time.monotonic() - 3601.0
+    sender.sweep_stale_req_infos()
+    assert sender._get_req_info(401) is None
+
+
+def test_sender_retains_metadata_for_configured_transfer_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registrar = Mock()
+    registrar.self_rank_info.device_id = 0
+    registrar.self_rank_info.instance_rank = 0
+    monkeypatch.setattr(
+        transfer_mod,
+        "ZMQMessenger",
+        lambda **kwargs: SimpleNamespace(endpoint="tcp://test:1234"),
+    )
+    monkeypatch.setattr(transfer_mod.Sender, "_start_listener", lambda self: None)
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+
+    sender = transfer_mod.Sender(registrar, Mock(), request_info_timeout_s=3600.0)
+    assert sender._request_info_ttl_s == 3600.0
+
+
+def test_context_first_orphan_still_fails_after_short_ttl() -> None:
+    sender = _sender()
+    sender._request_info_ttl_s = 3600.0
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=401,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=401,
+        context_first=True,
+    )
+    sender._send_failed_result_to_receiver = Mock()
+    sender._respond_with_kv(b"gen", [transfer_mod.MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._peer_requests_timestamps[401] = time.monotonic() - 121.0
+
+    sender.sweep_stale_req_infos()
+    assert sender._get_req_info(401) is None
+    sender._send_failed_result_to_receiver.assert_called_once()
 
 
 @pytest.mark.parametrize("pending_settlement", [False, True])

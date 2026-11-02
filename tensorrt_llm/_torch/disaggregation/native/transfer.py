@@ -595,10 +595,7 @@ class _SessionQuiescence:
 
 
 class Sender(SenderBase):
-    # Time-to-live for orphaned RecvReqInfo entries (seconds).
-    # In gen-first ADP broadcast, non-assigned DP ranks accumulate
-    # RecvReqInfo that never gets consumed.  Entries older than this
-    # are evicted during periodic sweeps.
+    # Context-first orphan TTL and minimum generation-first metadata TTL (seconds).
     _STALE_REQ_INFO_TTL_S = 120.0
 
     def __init__(
@@ -608,6 +605,7 @@ class Sender(SenderBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        request_info_timeout_s: Optional[float] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
@@ -615,6 +613,8 @@ class Sender(SenderBase):
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
         self._retirement_watchdog = retirement_watchdog
+        # Generation-first metadata can arrive before its context prefill starts.
+        self._request_info_ttl_s = max(self._STALE_REQ_INFO_TTL_S, request_info_timeout_s or 0.0)
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -697,11 +697,11 @@ class Sender(SenderBase):
             self._peer_requests_timestamps.pop(unique_rid, None)
 
     def sweep_stale_req_infos(self):
-        """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
+        """Evict orphaned metadata after its schedule style's retention period.
 
         Called opportunistically from the listener thread when a new REQUEST_DATA
-        arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
-        entries that are never consumed; this sweep prevents unbounded growth.
+        arrives. Generation-first metadata may wait through the configured
+        transfer timeout for prefill; context-first orphans expire sooner.
 
         A context-first entry that no TxSession claimed within the TTL never will
         be (the session already ended, or the receiver names a request this rank
@@ -710,11 +710,16 @@ class Sender(SenderBase):
         """
         now = time.monotonic()
         with self._peer_requests_lock:
-            stale_rids = [
-                rid
-                for rid, ts in self._peer_requests_timestamps.items()
-                if now - ts > self._STALE_REQ_INFO_TTL_S
-            ]
+            stale_rids = []
+            for rid, ts in self._peer_requests_timestamps.items():
+                infos = self._peer_requests.get(rid, {}).values()
+                ttl = (
+                    self._STALE_REQ_INFO_TTL_S
+                    if any(info.context_first for info in infos)
+                    else self._request_info_ttl_s
+                )
+                if now - ts > ttl:
+                    stale_rids.append(rid)
         if not stale_rids:
             return
         orphaned_infos: list[RecvReqInfo] = []
@@ -4475,6 +4480,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                request_info_timeout_s=self._config.tx_overall_timeout_s,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
