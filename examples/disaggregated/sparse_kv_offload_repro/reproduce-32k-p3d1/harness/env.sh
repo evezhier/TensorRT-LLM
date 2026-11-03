@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+: "${REPO:?Set REPO}"
+: "${LLM_MODELS_ROOT:?Set LLM_MODELS_ROOT}"
+: "${OUTPUT:?Set OUTPUT}"
+if [[ -n "${WHEEL:-}" ]]; then
+    export PYTHONPATH="$REPO/tests/integration:$REPO/tests${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
+else
+    export PYTHONPATH="$REPO:$REPO/tests/integration:$REPO/tests${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
+fi
+export PATH="$OUTPUT/bin${PYTHONUSERBASE:+:$PYTHONUSERBASE/bin}:$PATH"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+export TMPDIR=/tmp
+export CACHE_DIR="${CACHE_DIR:-$OUTPUT/cache}"
+export XDG_CACHE_HOME="$CACHE_DIR"
+export TRITON_CACHE_DIR="$CACHE_DIR/triton"
+export DG_JIT_CACHE_DIR="$CACHE_DIR/deepgemm"
+export CUDA_CACHE_PATH="$CACHE_DIR/cuda"
+mkdir -p -- "$TRITON_CACHE_DIR" "$DG_JIT_CACHE_DIR" "$CUDA_CACHE_PATH"
+gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null) || gpu_names=
+if [[ -n "${SPARSE_REPRO_UCX_TLS:-}" ]]; then
+    export UCX_TLS="$SPARSE_REPRO_UCX_TLS"
+elif [[ "$gpu_names" == *"NVIDIA GB300"* ]]; then
+    export UCX_TLS='^ib'
+else
+    export UCX_TLS='^ib,gdr_copy'
+fi
+export TRTLLM_NIXL_NUM_THREADS=1
+export OMP_NUM_THREADS=8
+export FORCE_DETERMINISTIC=0
+export FORCE_ATTENTION_KERNEL_DETERMINISTIC=1
+export FORCE_MOE_KERNEL_DETERMINISTIC=1
+export FORCE_ALL_REDUCE_DETERMINISTIC=1
+export FORCE_TOPK_KERNEL_DETERMINISTIC=1
+export FORCE_MHC_KERNEL_DETERMINISTIC=1
+export PRTE_MCA_plm='^slurm'
+export PRTE_MCA_ras='^slurm'
+export TLLM_METRICS_ALL_RANKS=1
+export SWEEP_OUT="$OUTPUT"
+if [[ -n "${WHEEL:-}" ]]; then
+    cd -- "$OUTPUT"
+else
+    cd -- "$REPO"
+fi
