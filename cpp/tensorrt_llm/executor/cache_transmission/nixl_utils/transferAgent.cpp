@@ -57,8 +57,8 @@ namespace tensorrt_llm::executor::kv_cache
 {
 
 // ============================================================================
-// Bounce v2 integration (opt-in via CacheTransceiverConfig.kv_cache_bounce_size_mb > 0). When disabled,
-// transfers remain on the standard NIXL path.
+// Bounce v2 integration (opt-in via CacheTransceiverConfig: agent_bounce_buffer_enable +
+// kv_cache_bounce_size_mb). When disabled, transfers remain on the standard NIXL path.
 // ============================================================================
 #ifdef TLLM_BOUNCE_V2
 namespace bounce
@@ -145,8 +145,9 @@ private:
 void NixlTransferAgent::maybeInitBounce(
     std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams)
 {
-    // The size doubles as the on/off switch (CacheTransceiverConfig.kv_cache_bounce_size_mb): 0
-    // keeps bounce disabled, >0 enables it at that arena capacity. The expert knobs resolve as
+    // The size doubles as the on/off switch (CacheTransceiverConfig.kv_cache_bounce_size_mb when
+    // agent_bounce_buffer_enable is set, 0 otherwise): 0 keeps
+    // bounce disabled, >0 enables it at that arena capacity. The expert knobs resolve as
     // agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_* env var > built-in default.
     if (agentBufferSizeMb == 0)
     {
@@ -154,7 +155,8 @@ void NixlTransferAgent::maybeInitBounce(
         {
             TLLM_LOG_WARNING(
                 "NixlTransferAgent(%s): agent_bounce_params set but the bounce arena size is 0 "
-                "(kv_cache_bounce_size_mb 0) -> bounce stays disabled and the params are ignored",
+                "(agent_bounce_buffer_enable off or kv_cache_bounce_size_mb 0) -> bounce stays "
+                "disabled and the params are ignored",
                 mName.c_str());
         }
         return;
@@ -274,7 +276,9 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
     {
         return BounceRejectReason::kNotWrite;
     }
-    if (request.getSrcDescs().getType() != MemoryType::kVRAM || request.getDstDescs().getType() != MemoryType::kVRAM)
+    if (request.getSrcDescs().getType() != MemoryType::kVRAM
+        || (request.getDstDescs().getType() != MemoryType::kVRAM
+            && request.getDstDescs().getType() != MemoryType::kDRAM))
     {
         return BounceRejectReason::kNotVram;
     }
@@ -409,16 +413,15 @@ void NixlTransferAgent::maybeInitBounce(
     // with a WARNING.
     if (agentBufferSizeMb > 0)
     {
-        TLLM_THROW(
-            "kv_cache_bounce_size_mb > 0 requests the transfer-agent bounce buffer, but this build has no bounce "
-            "support (built without libzmq); set kv_cache_bounce_size_mb to 0 or use a build with libzmq");
+        TLLM_THROW("agent_bounce_buffer_enable requires a build with libzmq; this build has no bounce support");
     }
     // Same diagnostic as the bounce build for params without an arena.
     if (!bounceParams.empty())
     {
         TLLM_LOG_WARNING(
             "NixlTransferAgent(%s): agent_bounce_params set but the bounce arena size is 0 "
-            "(kv_cache_bounce_size_mb 0) -> bounce stays disabled and the params are ignored",
+            "(agent_bounce_buffer_enable off or kv_cache_bounce_size_mb 0) -> bounce stays "
+            "disabled and the params are ignored",
             mName.c_str());
     }
 }
@@ -1042,6 +1045,11 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     if (shouldUseBounce(request))
     {
         mBounceSubmitCount.fetch_add(1, std::memory_order_relaxed);
+        if (request.getDstDescs().getType() == MemoryType::kDRAM
+            && mBounceHostSubmitCount.fetch_add(1, std::memory_order_relaxed) == 0)
+        {
+            TLLM_LOG_INFO("NixlTransferAgent(%s): bounce host destination engaged", mName.c_str());
+        }
         // Debug-level so it's silent by default but lets ops confirm the bounce fast path actually
         // engaged for a given write (enable via TLLM_LOG_LEVEL_BY_MODULE "debug:executor").
         // Programmatic check: getBounceSubmitCount() / bounce_submit_count on the Python binding.

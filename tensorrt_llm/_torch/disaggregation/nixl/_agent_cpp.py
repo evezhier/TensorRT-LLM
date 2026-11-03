@@ -92,8 +92,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         for key, value in backend_params.items():
             backend_params[key] = str(value)
         backend_params["num_threads"] = str(num_threads)
-        # C++ reads "num_workers" (not "num_threads") for progress threads. It is set only from
-        # TRTLLM_NIXL_NUM_WORKERS; otherwise the backend default (1) applies.
+        # C++ reads "num_workers" (not "num_threads") for progress threads, default 1.
+        # Env-gated so the default is unchanged (more threads can hurt the coalesced bounce WRITE).
         # Validate at the boundary: only a positive int reaches the backend.
         nixl_num_workers = os.environ.get("TRTLLM_NIXL_NUM_WORKERS")
         if nixl_num_workers is not None:
@@ -177,6 +177,11 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
     def bounce_submit_count(self) -> int:
         """Number of transfer requests routed to the bounce fast path so far."""
         return self._cpp_agent.bounce_submit_count
+
+    @property
+    def bounce_host_submit_count(self) -> int:
+        """Number of bounced writes with a host-memory destination."""
+        return self._cpp_agent.bounce_host_submit_count
 
     @property
     def bounce_reject_count(self) -> int:

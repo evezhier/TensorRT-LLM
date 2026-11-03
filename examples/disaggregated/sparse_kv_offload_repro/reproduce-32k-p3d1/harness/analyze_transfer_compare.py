@@ -38,7 +38,7 @@ def analyze(root: Path) -> dict:
         sparse_config = generation_config["sparse_attention_config"]
         if not sparse_config.get("enable_kv_cache_offload", False):
             mode = "resident"
-        elif generation_config["cache_transceiver_config"].get("agent_bounce_buffer_enable"):
+        elif generation_config["cache_transceiver_config"].get("kv_cache_bounce_size_mb", 0) > 0:
             mode = "agent-bounce-offload"
         else:
             mode = "direct-offload"
@@ -68,11 +68,11 @@ def analyze(root: Path) -> dict:
     agent_config = configs[2]
     configs_match = normalize_config(direct_config) == normalize_config(agent_config)
     direct_disabled = all(
-        not direct_config[key]["cache_transceiver_config"].get("agent_bounce_buffer_enable")
+        direct_config[key]["cache_transceiver_config"].get("kv_cache_bounce_size_mb", 0) == 0
         for key in ("context_config", "generation_config")
     )
     agent_enabled = all(
-        agent_config[key]["cache_transceiver_config"].get("agent_bounce_buffer_enable")
+        agent_config[key]["cache_transceiver_config"].get("kv_cache_bounce_size_mb", 0) > 0
         for key in ("context_config", "generation_config")
     )
     complete = all(

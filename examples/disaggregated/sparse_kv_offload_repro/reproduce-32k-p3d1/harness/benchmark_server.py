@@ -344,7 +344,6 @@ def main() -> None:
                 config["cache_transceiver_config"].update(
                     {
                         "kv_cache_bounce_size_mb": agent_bounce_mb,
-                        "agent_bounce_buffer_enable": True,
                         "agent_bounce_params": {
                             "min_descriptor_count": "1",
                             "max_average_descriptor_size": "1MB",

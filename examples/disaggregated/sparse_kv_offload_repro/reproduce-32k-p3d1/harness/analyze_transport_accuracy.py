@@ -52,12 +52,12 @@ def analyze(root: Path) -> dict:
     normalized = [normalize_config(config) for config in configs]
     configs_match = normalized[0] == normalized[1] == normalized[2]
     direct_disabled = all(
-        not config[key]["cache_transceiver_config"].get("agent_bounce_buffer_enable")
+        config[key]["cache_transceiver_config"].get("kv_cache_bounce_size_mb", 0) == 0
         for config in configs[:2]
         for key in ("context_config", "generation_config")
     )
     agent_enabled = all(
-        configs[2][key]["cache_transceiver_config"].get("agent_bounce_buffer_enable")
+        configs[2][key]["cache_transceiver_config"].get("kv_cache_bounce_size_mb", 0) > 0
         for key in ("context_config", "generation_config")
     )
     agent_log = root / "cases" / f"{cases[2]}.log"
