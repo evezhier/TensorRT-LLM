@@ -33,9 +33,11 @@ def main() -> None:
     perf_concurrency = os.environ.get("SPARSE_REPRO_PERF_CONCURRENCY")
     perf_requests = int(os.environ.get("SPARSE_REPRO_PERF_REQUESTS", "4096"))
     gpu_fraction_override = os.environ.get("SPARSE_REPRO_GPU_FRACTION")
-    context_gpu_fraction = float(os.environ.get("SPARSE_REPRO_CONTEXT_GPU_FRACTION", "0.5"))
+    context_gpu_fraction = float(os.environ.get("SPARSE_REPRO_CONTEXT_GPU_FRACTION", "0.35"))
     if not 0 < context_gpu_fraction <= 1:
         raise ValueError("SPARSE_REPRO_CONTEXT_GPU_FRACTION must be greater than 0 and at most 1")
+    if compare_variant and context_gpu_fraction > 0.35:
+        raise ValueError("SPARSE_REPRO_CONTEXT_GPU_FRACTION must not exceed the safe compare default 0.35")
     if perf_requests <= 0:
         raise ValueError("SPARSE_REPRO_PERF_REQUESTS must be positive")
     for name, mode, agent_bounce_mb in cases:
@@ -47,10 +49,12 @@ def main() -> None:
         batch = 896 if mode == "offload" or compare_variant else 1024
         maximum = 1024 if compare_variant else (1696 if mode == "offload" else 1204)
         gpu_fraction = float(gpu_fraction_override) if gpu_fraction_override else (
-            0.90 if mode == "offload" or compare_variant else 0.95
+            0.80 if mode == "offload" or compare_variant else 0.95
         )
         if not 0 < gpu_fraction <= 1:
             raise ValueError("SPARSE_REPRO_GPU_FRACTION must be greater than 0 and at most 1")
+        if compare_variant and gpu_fraction > 0.80:
+            raise ValueError("SPARSE_REPRO_GPU_FRACTION must not exceed the safe compare default 0.80")
         if perf_concurrency is not None:
             maximum = int(perf_concurrency)
         if maximum <= 0 or maximum > perf_requests:

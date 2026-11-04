@@ -142,14 +142,15 @@ This job runs three cases sequentially on the same allocated GPUs: resident
 KV (offload disabled), direct NIXL offload, and 256 MiB C++ agent-bounce
 offload. All use the same 32K prompt, 160 output tokens, and
 4,096-request performance trial. The compare variant uses the same maximum
-batch size (896), GPU memory fraction (0.90), and offered concurrency (1,024)
+batch size (896), GPU memory fraction (0.80), and offered concurrency (1,024)
 for all three cases by default; set `SPARSE_REPRO_PERF_CONCURRENCY` to use a
 different common concurrency. Set `SPARSE_REPRO_CONTEXT_GPU_FRACTION` or
-`SPARSE_REPRO_GPU_FRACTION` to adjust the context or generation KV-cache
-memory fractions when a worker cannot allocate its configured cache. The
-defaults are 0.50 and 0.90. The direct and agent cases differ only in transfer
-selection. It requires a wheel built from this checkout, including the native
-`bounce_host_submit_count` binding.
+`SPARSE_REPRO_GPU_FRACTION` to lower the context or generation KV-cache
+fractions further. The compare defaults are 0.35 for context and 0.80 for
+generation; compare runs reject larger values to preserve headroom for model,
+workspace, and CUDA graph allocations. The direct and agent cases differ only
+in transfer selection. The benchmark requires a wheel built from this checkout,
+including the native `bounce_host_submit_count` binding.
 
 ```bash
 REPO=/absolute/path/to/TensorRT-LLM \
