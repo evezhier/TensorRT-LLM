@@ -32,6 +32,10 @@ def main() -> None:
     compare_variant = preflight["variant"] == "compare"
     perf_concurrency = os.environ.get("SPARSE_REPRO_PERF_CONCURRENCY")
     perf_requests = int(os.environ.get("SPARSE_REPRO_PERF_REQUESTS", "4096"))
+    gpu_fraction_override = os.environ.get("SPARSE_REPRO_GPU_FRACTION")
+    context_gpu_fraction = float(os.environ.get("SPARSE_REPRO_CONTEXT_GPU_FRACTION", "0.5"))
+    if not 0 < context_gpu_fraction <= 1:
+        raise ValueError("SPARSE_REPRO_CONTEXT_GPU_FRACTION must be greater than 0 and at most 1")
     if perf_requests <= 0:
         raise ValueError("SPARSE_REPRO_PERF_REQUESTS must be positive")
     for name, mode, agent_bounce_mb in cases:
@@ -42,6 +46,11 @@ def main() -> None:
         (run / "commands").mkdir(exist_ok=True)
         batch = 896 if mode == "offload" or compare_variant else 1024
         maximum = 1024 if compare_variant else (1696 if mode == "offload" else 1204)
+        gpu_fraction = float(gpu_fraction_override) if gpu_fraction_override else (
+            0.90 if mode == "offload" or compare_variant else 0.95
+        )
+        if not 0 < gpu_fraction <= 1:
+            raise ValueError("SPARSE_REPRO_GPU_FRACTION must be greater than 0 and at most 1")
         if perf_concurrency is not None:
             maximum = int(perf_concurrency)
         if maximum <= 0 or maximum > perf_requests:
@@ -63,7 +72,9 @@ def main() -> None:
             "--host-gib",
             "256",
             "--gpu-fraction",
-            "0.90" if mode == "offload" or compare_variant else "0.95",
+            str(gpu_fraction),
+            "--context-gpu-fraction",
+            str(context_gpu_fraction),
             "--context-max-batch-size",
             "128",
             "--context-instances",
@@ -148,6 +159,8 @@ def main() -> None:
                     "generation_workers": 1,
                     "generation_gpus": generation_gpus,
                     "offered_concurrency": maximum,
+                    "gpu_fraction": gpu_fraction,
+                    "context_gpu_fraction": context_gpu_fraction,
                 },
             )
         print(f"RATIO_COMPLETE {name} prefill={ratio}", flush=True)
