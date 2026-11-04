@@ -61,7 +61,6 @@ def main() -> None:
         for module_name in (
             "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager",
             "tensorrt_llm._torch.disaggregation.native.transfer",
-            "tensorrt_llm._torch.disaggregation.native.bounce.impl",
             "tensorrt_llm._torch.disaggregation.nixl._agent_cpp",
         ):
             module = importlib.import_module(module_name)
