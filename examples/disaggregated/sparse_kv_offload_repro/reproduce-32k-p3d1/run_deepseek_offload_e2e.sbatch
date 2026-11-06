@@ -52,7 +52,7 @@ srun --nodes=1 --ntasks=1 \
     bash -c 'set -euo pipefail
 python3 -m pip install -r "$REPO/requirements-dev.txt"
 python3 -m pip install --force-reinstall --no-deps "$WHEEL"
-python3 -c "import torch; assert torch.cuda.device_count() >= 4, 'Expected at least four visible GPUs'"
+python3 -c "import torch; assert torch.cuda.device_count() >= 4"
 models_root=$(mktemp -d)
 mkdir -p "$models_root/datasets/openai"
 ln -s "$MODEL_DIR" "$models_root/DeepSeek-V4-Flash"
