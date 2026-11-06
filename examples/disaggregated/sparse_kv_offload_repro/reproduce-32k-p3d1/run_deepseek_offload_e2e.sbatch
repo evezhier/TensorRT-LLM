@@ -12,16 +12,15 @@ set -euo pipefail
 : "${IMAGE:?Set IMAGE to the enroot image or container name}"
 : "${WHEEL:?Set WHEEL to a wheel built from this checkout}"
 : "${MODEL_DIR:?Set MODEL_DIR to the DeepSeek V4 Flash checkpoint}"
-: "${DATASET_DIR:?Set DATASET_DIR to the local openai/gsm8k dataset}"
+: "${DATASET_DIR:?Set DATASET_DIR to the local LongBench dataset directory}"
 
 REPO=$(realpath -- "$REPO")
 WHEEL=$(realpath -- "$WHEEL")
 MODEL_DIR=$(realpath -- "$MODEL_DIR")
 DATASET_DIR=$(realpath -- "$DATASET_DIR")
 
-if [[ ! -f "$WHEEL" || ! -f "$MODEL_DIR/config.json" || \
-      ! -f "$DATASET_DIR/main/test-00000-of-00001.parquet" ]]; then
-    echo "Expected a wheel, model config.json, and GSM8K main/test-00000-of-00001.parquet" >&2
+if [[ ! -f "$WHEEL" || ! -f "$MODEL_DIR/config.json" || ! -d "$DATASET_DIR" ]]; then
+    echo "Expected a wheel, model config.json, and LongBench dataset directory" >&2
     exit 2
 fi
 
@@ -54,8 +53,8 @@ python3 -m pip install -r "$REPO/requirements-dev.txt"
 python3 -m pip install --force-reinstall --no-deps "$WHEEL"
 python3 -c "import torch; assert torch.cuda.device_count() >= 4"
 models_root=$(mktemp -d)
-mkdir -p "$models_root/datasets/openai"
+mkdir -p "$models_root/datasets/Xnhyacinth"
 ln -s "$MODEL_DIR" "$models_root/DeepSeek-V4-Flash"
-ln -s "$DATASET_DIR" "$models_root/datasets/openai/gsm8k"
+ln -s "$DATASET_DIR" "$models_root/datasets/Xnhyacinth/LongBench"
 LLM_MODELS_ROOT="$models_root" python3 -m pytest -v \
     tests/integration/defs/accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_kv_cache_offload'

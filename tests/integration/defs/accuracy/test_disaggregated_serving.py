@@ -696,6 +696,7 @@ def _test_sparse_offload_long_context(
     index_topk: int,
     unit_tokens: int,
     server_waiting_timeout: int = 1200,
+    assert_worker_log_contains: str | None = None,
 ) -> None:
     """Compare batched GovReport quality against the resident YAML reference."""
     min_input_len = GovReport.MIN_INPUT_LEN
@@ -792,16 +793,19 @@ def _test_sparse_offload_long_context(
     }
     # The launcher adds discovery and authentication settings in place.
     with launch_disaggregated_llm(
-            copy.deepcopy(disaggregated_server_config),
-            copy.deepcopy(ctx_server_config),
-            copy.deepcopy(gen_server_config),
-            model_path,
-            server_waiting_timeout=server_waiting_timeout,
-            max_workers=concurrency) as llm, openai.OpenAI(
-                api_key="1234567890",
-                base_url=f"{llm.serve_url}/v1",
-                timeout=300,
-                max_retries=0) as client:
+        copy.deepcopy(disaggregated_server_config),
+        copy.deepcopy(ctx_server_config),
+        copy.deepcopy(gen_server_config),
+        model_path,
+        server_waiting_timeout=server_waiting_timeout,
+        max_workers=concurrency,
+        assert_worker_log_contains=assert_worker_log_contains,
+    ) as llm, openai.OpenAI(
+        api_key="1234567890",
+        base_url=f"{llm.serve_url}/v1",
+        timeout=300,
+        max_retries=0,
+    ) as client:
         _get_disagg_generation_stats(llm.serve_url)
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = [
@@ -2644,6 +2648,11 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
+            "kv_cache_bounce_size_mb": 256,
+            "agent_bounce_params": {
+                "min_descriptor_count": "1",
+                "max_average_descriptor_size": "1MB",
+            },
         }
         # Both servers lay out the NVFP4 KV cache alike for the transfer.
         kv_cache_config = {
@@ -2685,14 +2694,17 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
-        _test_sparse_offload_long_context(disaggregated_server_config,
-                                          ctx_server_config,
-                                          gen_server_config,
-                                          self.MODEL_PATH,
-                                          model_name=self.MODEL_NAME,
-                                          quant_algo="MIXED_PRECISION",
-                                          index_topk=512,
-                                          unit_tokens=4)
+        _test_sparse_offload_long_context(
+            disaggregated_server_config,
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            model_name=self.MODEL_NAME,
+            quant_algo="MIXED_PRECISION",
+            index_topk=512,
+            unit_tokens=4,
+            assert_worker_log_contains="bounce host destination engaged",
+        )
 
 
 @pytest.mark.timeout(14400)
