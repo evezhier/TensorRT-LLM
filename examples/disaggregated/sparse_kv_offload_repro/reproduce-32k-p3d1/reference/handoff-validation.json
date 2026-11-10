@@ -1,0 +1,30 @@
+{
+  "offline_reanalysis": [
+    {
+      "mode": "resident",
+      "decode_worker_tokens_per_second": 3386.3753716067313,
+      "mean_active_requests": 85.80477243152349
+    },
+    {
+      "mode": "offload",
+      "decode_worker_tokens_per_second": 3415.980664638043,
+      "mean_active_requests": 96.06488621871343
+    }
+  ],
+  "serving_parity": {
+    "left_completed": 4096,
+    "right_completed": 4096,
+    "identical_token_multisets": false,
+    "identical_output_set": true,
+    "exactly_matched_request_pairs": 4082,
+    "exactly_matched_output_tokens_per_mode": 653120,
+    "left_unique_outputs": 13,
+    "right_unique_outputs": 13
+  },
+  "sparse_hit_rate_percent": 87.11528903262806,
+  "new_full_model_e2e_run": false,
+  "python_syntax_files": 15,
+  "shell_syntax_files": 6,
+  "slurm_wrapper_stub_check": true,
+  "refuses_existing_output": true
+}

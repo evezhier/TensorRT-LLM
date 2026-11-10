@@ -1,0 +1,50 @@
+{
+  "source_base": "046f8c84d92a5492d7df908ad71f046cc7cd97ce",
+  "residency_commit": "f4c197fdea4baad546df0e6bba4065ce04e52213",
+  "tested_base": "c7f1fc7960e7588afb6b8944bedac2f3e287d48b",
+  "source_note": "Latest base adds only design documentation. Tested runtime code is preserved by the residency commit plus the host-memory-sizing working patch.",
+  "original_run": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z",
+  "scripts": [
+    {
+      "destination": "harness/benchmark_server.py",
+      "source": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/benchmark_server.py",
+      "sha256": "6f33e61172ec001f16001c651a509a5f7d110a5d389e3aa7c980f83f627d47d5"
+    },
+    {
+      "destination": "harness/run_ratios.py",
+      "source": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/run_ratios.py",
+      "sha256": "990eaed4d474f1b8ff208d011b91af627f15108fe679ba8bb4ec1d6fb9675fa1"
+    },
+    {
+      "destination": "harness/metrics_collection.py",
+      "source": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/metrics_collection.py",
+      "sha256": "ff8601c1a81cfad5c5a552fe6d2ccdb2004d816f23c2f9ea1aef61ac75b20e40"
+    },
+    {
+      "destination": "harness/analyze_decode.py",
+      "source": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_decode.py",
+      "sha256": "de43b6d21fa094d0c5200cb70376b58a124de1cd41e7e0623223b2e94bd9c6cf"
+    },
+    {
+      "destination": "harness/analyze_trials.py",
+      "source": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_trials.py",
+      "sha256": "e4abad15b2a885e2d5628680d48e35ff231181d7263ab7a965c329a5a8ec5e29"
+    },
+    {
+      "destination": "harness/analyze_ratios.py",
+      "source": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_ratios.py",
+      "sha256": "2cc52830487561f2b4fa8b4876aa591befffb4c1b45b679f5c60ac34a1638ebd"
+    },
+    {
+      "destination": "harness/analyze_prefill_feed.py",
+      "source": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_prefill_feed.py",
+      "sha256": "ba23885f13bfd03a069939922ea9adf70e07999f9e80c0515d9301e06e2fbf1d"
+    },
+    {
+      "destination": "harness/analyze_fix.py",
+      "source": "/home/scratch.guijuz_coreai_1/TensorRT-LLM/build/sparse-disagg-e2e-artifacts/sparse-residency-fix-20261019T035901Z/analyze_fix.py",
+      "sha256": "16265f9bf28a9cf70e67cc6de500d2a28f3fb252072ca17c04d9b2d78f9f2143"
+    }
+  ],
+  "matched_controller_change": "Replay the resident 512-request churn trial automatically; that trial was manually enqueued in the original run."
+}
